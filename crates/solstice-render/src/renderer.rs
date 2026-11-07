@@ -1,5 +1,6 @@
 //! The top-level renderer: owns all passes and defines the order of a frame.
 
+use crate::clouds::{CloudBindings, Clouds, Weather};
 use crate::frame::{
     jitter_offset, jitter_projection, Camera, DebugView, Environment, FrameUniform,
 };
@@ -77,6 +78,8 @@ pub struct RendererSettings {
     /// Blend each frame with reprojected history. Off, aliasing returns, but every frame
     /// shows exactly what was rendered, which is what diagnostics and tests want.
     pub temporal_accumulation: bool,
+    /// Draw volumetric clouds, their shadows and their light in the sky.
+    pub clouds: bool,
 }
 
 impl Default for RendererSettings {
@@ -87,6 +90,7 @@ impl Default for RendererSettings {
             render_scale: 1.0,
             debug_view: DebugView::Lit,
             temporal_accumulation: true,
+            clouds: true,
         }
     }
 }
@@ -162,6 +166,7 @@ struct SizedResources {
     raster: RasterBindings,
     resolve: ResolveBindings,
     screen_gi: ScreenGiBindings,
+    clouds: CloudBindings,
     deferred: [wgpu::BindGroup; 2],
     post: PostBindings,
     _hdr: Target,
@@ -190,6 +195,9 @@ pub struct Renderer {
     rasterizer: Rasterizer,
     resolve: Resolve,
     sky: Sky,
+    clouds: Clouds,
+    /// The lighting bind group as cloud passes see it: without the clouds they are making.
+    cloud_environment: wgpu::BindGroup,
     shadows: ShadowMaps,
     volume: GiVolume,
     screen_gi: ScreenGi,
@@ -297,8 +305,24 @@ impl Renderer {
         let shadows = ShadowMaps::new(gpu, &rasterizer);
         let environment_layout = environment_layout(gpu);
         let volume = GiVolume::new(gpu, &scene, &aux_work, &environment_layout);
-        let environment =
-            environment_group(gpu, &environment_layout, &frame_uniform, &volume, &sky);
+        let mut clouds = Clouds::new(gpu, &environment_layout);
+        clouds.set_enabled(settings.clouds);
+        let environment = environment_group(
+            gpu,
+            &environment_layout,
+            &frame_uniform,
+            &volume,
+            &sky,
+            clouds.sky(),
+        );
+        let cloud_environment = environment_group(
+            gpu,
+            &environment_layout,
+            &frame_uniform,
+            &volume,
+            &sky,
+            clouds.placeholders(),
+        );
 
         Self {
             settings,
@@ -318,6 +342,8 @@ impl Renderer {
             aux_raster,
             rasterizer,
             sky,
+            clouds,
+            cloud_environment,
             shadows,
             volume,
             environment,
@@ -370,6 +396,29 @@ impl Renderer {
     }
 
     /// Current counters. They lag a few frames, since readback is asynchronous.
+    /// Changes the weather, easing into it over about `seconds`, or at once for 0. Clouds
+    /// drift with its wind and change shape as they go.
+    pub fn set_weather(&mut self, weather: Weather, seconds: f32) {
+        self.clouds.set_weather(weather, seconds);
+    }
+
+    /// Lets the weather change by itself, starting from the named weather, or stops it: the
+    /// sky drifts, grows and clears through the day.
+    pub fn set_weather_changing(&mut self, changing: bool, start: &str) {
+        self.clouds.set_changing(changing, start);
+    }
+
+    /// Moves the weather on by `seconds` at once, as if that much time had passed: for tools,
+    /// tests, and catching up after a pause.
+    pub fn advance_weather(&mut self, seconds: f32) {
+        self.clouds.advance(seconds);
+    }
+
+    /// The weather now, part way to its target while it changes.
+    pub fn weather(&self) -> Weather {
+        self.clouds.weather()
+    }
+
     pub fn stats(&self) -> FrameStats {
         let stats = self.main_work.stats();
         FrameStats {
@@ -446,6 +495,12 @@ impl Renderer {
             camera.position.y,
         );
 
+        // Clouds come before anything lit: their shadows and their light in the sky feed it all.
+        mark(&self.profiler, &mut encoder, section::CLOUDS);
+        self.clouds.update(gpu, delta_seconds, camera.position);
+        self.clouds
+            .record_lighting(&mut encoder, &self.cloud_environment);
+
         mark(&self.profiler, &mut encoder, section::SHADOWS);
         self.shadows.record(
             &mut encoder,
@@ -512,6 +567,10 @@ impl Renderer {
             .record(&mut encoder, &sized.resolve, render_size);
 
         // Lighting.
+        mark(&self.profiler, &mut encoder, section::CLOUDS_ON_SCREEN);
+        self.clouds
+            .record_screen(&mut encoder, &sized.clouds, &self.cloud_environment, parity);
+
         mark(&self.profiler, &mut encoder, section::SCREEN_GI);
         self.screen_gi
             .record(&mut encoder, &sized.screen_gi, &self.environment, parity);
@@ -600,6 +659,7 @@ impl Renderer {
             &gbuffer,
             [&history[1].view, &history[0].view],
         );
+        let clouds = self.clouds.bindings(gpu, render_size, &gbuffer.depth.view);
         let deferred = self.deferred.bind_groups(
             gpu,
             &gbuffer,
@@ -607,6 +667,7 @@ impl Renderer {
             &hdr.view,
             &self.shadows,
             &self.scene,
+            &clouds,
         );
         let post = self.post.bindings(
             gpu,
@@ -630,6 +691,7 @@ impl Renderer {
             raster,
             resolve,
             screen_gi,
+            clouds,
             deferred,
             post,
             _hdr: hdr,

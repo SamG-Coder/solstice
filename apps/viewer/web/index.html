@@ -29,6 +29,10 @@
   #controls { top: 12px; right: 12px; width: 232px; display: grid; gap: 10px; }
   #controls label { display: grid; gap: 4px; color: var(--muted); }
   #controls select, #controls input { width: 100%; accent-color: var(--accent); }
+  #extras summary { cursor: pointer; color: var(--muted); }
+  #extras[open] { display: grid; gap: 10px; }
+  #extras label:has(input[type=checkbox]) { display: flex; align-items: center; gap: 8px; }
+  #extras input[type=checkbox] { width: auto; }
   #controls select { background: #1c1712; color: var(--ink); border: 1px solid var(--line);
     border-radius: 5px; padding: 5px 6px; font: inherit; }
 
@@ -76,6 +80,7 @@
     <dt>Geometry pages</dt><dd id="pages">-</dd>
     <dt>Downloaded</dt><dd id="fetched">-</dd>
     <dt>GPU errors</dt><dd id="errors">0</dd>
+    <dt>Weather</dt><dd id="weather-now">-</dd>
   </dl>
 </aside>
 
@@ -94,6 +99,17 @@
       <option value="voxels">GI scene (voxels)</option>
     </select>
   </label>
+  <label>Weather
+    <select id="weather">
+      <option value="changing">Changing</option>
+      <option value="clear">Clear</option>
+      <option value="fair">Fair</option>
+      <option value="broken">Broken cloud</option>
+      <option value="overcast">Overcast</option>
+      <option value="storm">Storm</option>
+      <option value="cirrus">Cirrus</option>
+    </select>
+  </label>
   <label>Sun height<input id="sun-elevation" type="range" min="1" max="80" value="25"></label>
   <label>Sun direction<input id="sun-azimuth" type="range" min="0" max="360" value="39"></label>
   <label>Quality
@@ -104,6 +120,16 @@
       <option value="low">Low</option>
     </select>
   </label>
+  <details id="extras">
+    <summary>Extras</summary>
+    <label><input id="live-weather" type="checkbox"> Real weather now</label>
+    <label>Place
+      <select id="live-place">
+        <option value="default">London</option>
+        <option value="here">My location</option>
+      </select>
+    </label>
+  </details>
 </aside>
 
 <aside class="panel" id="help" hidden>
@@ -290,6 +316,86 @@ async function main() {
   el("sun-elevation").addEventListener("input", applySun);
   applySun();
 
+  // Weather: by default the sky changes by itself, drifting through fair, broken, overcast
+  // and stormy weather and clearing again. The menu fixes one weather instead. Under Extras,
+  // "Real weather now" follows a place's current cloud and wind from Open-Meteo (free, no key):
+  // the place is ?lat=&lon= in the address, the browser's location if asked for, or London.
+  const weather = {
+    place: { name: "London", latitude: 51.51, longitude: -0.13 },
+    timer: null,
+    source: "changing",
+    async live() {
+      const p = this.place;
+      const url = "https://api.open-meteo.com/v1/forecast"
+        + `?latitude=${p.latitude.toFixed(2)}&longitude=${p.longitude.toFixed(2)}`
+        + "&current=cloud_cover_low,cloud_cover_mid,cloud_cover_high,wind_speed_10m,"
+        + "wind_direction_10m,weather_code,precipitation";
+      try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const now = (await response.json()).current;
+        // Ease into each report over two minutes, as weather changes.
+        viewer.set_observed_weather(
+          now.cloud_cover_low, now.cloud_cover_mid, now.cloud_cover_high,
+          now.wind_speed_10m, now.wind_direction_10m, now.weather_code, now.precipitation,
+          120);
+        this.source = `real weather, ${p.name}`;
+      } catch (error) {
+        console.warn("real weather unavailable:", error);
+        this.source = `${p.name}: real weather unavailable`;
+      }
+    },
+    stopLive() {
+      clearInterval(this.timer);
+      this.timer = null;
+      el("live-weather").checked = false;
+    },
+    startLive() {
+      this.live();
+      clearInterval(this.timer);
+      // Weather services update about every quarter of an hour.
+      this.timer = setInterval(() => this.live(), 15 * 60 * 1000);
+    },
+    choose(name) {
+      this.stopLive();
+      if (name === "changing") {
+        viewer.set_weather_changing(true, "fair");
+        this.source = "changing";
+      } else {
+        viewer.set_weather(name, 30);
+        this.source = "chosen";
+      }
+    },
+  };
+  const lat = parseFloat(params.get("lat"));
+  const lon = parseFloat(params.get("lon"));
+  if (Number.isFinite(lat) && Number.isFinite(lon)) {
+    weather.place = { name: `${lat.toFixed(2)}, ${lon.toFixed(2)}`, latitude: lat, longitude: lon };
+    el("live-place").options[0].textContent = weather.place.name;
+  }
+  el("weather").value = params.get("weather") ?? "changing";
+  el("weather").addEventListener("change", (e) => weather.choose(e.target.value));
+  weather.choose(el("weather").value);
+  el("live-weather").addEventListener("change", (e) => {
+    if (e.target.checked) weather.startLive(); else weather.choose(el("weather").value);
+  });
+  el("live-place").addEventListener("change", (e) => {
+    if (e.target.value === "here" && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition((position) => {
+        weather.place = {
+          name: "your location",
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        };
+        if (el("live-weather").checked) weather.startLive();
+      }, () => { weather.source = "location not shared"; });
+    }
+  });
+  if (params.has("live")) {
+    el("live-weather").checked = true;
+    weather.startLive();
+  }
+
   el("debug").addEventListener("change", (e) => viewer.set_debug_view(e.target.value));
   if (params.get("debug")) {
     el("debug").value = params.get("debug");
@@ -368,6 +474,7 @@ async function main() {
   window.solstice = {
     viewer,
     file,
+    weather,
     get frames() { return frames; },
     get fps() { return fps; },
     history: [],
@@ -406,6 +513,7 @@ async function main() {
       el("clusters").textContent = compact(viewer.clusters());
       el("software").textContent = compact(viewer.software_clusters());
       el("errors").textContent = viewer.gpu_error_count();
+      el("weather-now").textContent = `${viewer.weather_summary()} (${weather.source})`;
       el("pages").textContent = `${viewer.pages_installed()} of ${viewer.pages_total()}`;
       el("fetched").textContent = `${(file.bytesFetched / 1e6).toFixed(0)} MB`;
       window.solstice.history.push({

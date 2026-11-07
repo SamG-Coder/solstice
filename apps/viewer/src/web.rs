@@ -6,7 +6,8 @@ use crate::{default_environment, initial_camera, CameraInput, FlyCamera};
 use glam::Vec3;
 use solstice_asset::file;
 use solstice_render::{
-    DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamingBudget,
+    DebugView, Environment, Gpu, Observation, Quality, Renderer, RendererSettings, StreamingBudget,
+    Weather,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -256,6 +257,68 @@ impl WebViewer {
             elevation.sin(),
             azimuth.sin() * elevation.cos(),
         );
+    }
+
+    /// Names of the built-in weather, separated by commas.
+    pub fn weather_names() -> String {
+        Weather::names().collect::<Vec<_>>().join(",")
+    }
+
+    /// Lets the weather change by itself, starting from the named weather, or stops it.
+    pub fn set_weather_changing(&mut self, changing: bool, start: &str) {
+        self.renderer.set_weather_changing(changing, start);
+    }
+
+    /// Changes to a built-in weather by name, easing into it over `seconds`. Returns false if
+    /// there is no such weather.
+    pub fn set_weather(&mut self, name: &str, seconds: f32) -> bool {
+        match Weather::by_name(name) {
+            Some(weather) => {
+                self.renderer.set_weather(weather, seconds);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Changes to the weather in a live report, easing into it over `seconds`: cloud cover low,
+    /// middle and high in percent, wind near the ground in km/h and the compass direction it
+    /// blows from, the WMO weather code, and the last hour's precipitation in millimetres.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_observed_weather(
+        &mut self,
+        cover_low: f32,
+        cover_mid: f32,
+        cover_high: f32,
+        wind_kmh: f32,
+        wind_from: f32,
+        code: u32,
+        precipitation: f32,
+        seconds: f32,
+    ) {
+        let report = Observation {
+            cover_low,
+            cover_mid,
+            cover_high,
+            wind_kmh,
+            wind_from,
+            code,
+            precipitation,
+        };
+        self.renderer
+            .set_weather(Weather::observed(&report), seconds);
+    }
+
+    /// The weather now, briefly, for the page to show.
+    pub fn weather_summary(&self) -> String {
+        let w = self.renderer.weather();
+        format!(
+            "{:.0}% cloud, wind {:.0} m/s from {:.0}°{}",
+            w.coverage * 100.0,
+            w.wind_speed,
+            w.wind_from,
+            if w.rain > 0.05 { ", rain" } else { "" }
+        )
     }
 
     pub fn set_camera(&mut self, x: f32, y: f32, z: f32, yaw: f32, pitch: f32) {

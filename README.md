@@ -7,7 +7,9 @@ A real-time renderer in Rust and WebGPU, built on the same core ideas as Unreal 
 Nanite and Lumen: virtualized geometry and dynamic global illumination, running in the browser.
 
 **[Try the live demo](https://samg-coder.github.io/solstice/)** in a WebGPU browser such as Chrome
-or Edge. It streams a 39 MB scene as you look around, and picks a quality level to suit your GPU.
+or Edge. It has three scenes, a ruined temple, a fort on a cove built from photoscans, and a meadow
+at the edge of a wood, streamed as you look around at a quality level that suits your GPU. Over
+them, volumetric clouds drift with the wind while the weather changes by itself.
 
 ![A ruined temple at dusk, firelight glowing from its doorway](docs/dusk.png)
 
@@ -17,6 +19,10 @@ Epic Games code and is not affiliated with Epic Games.
 | Multi-bounce firelight | Daylight | Cluster view |
 |---|---|---|
 | ![Chamber](docs/chamber.png) | ![Daylight](docs/day.png) | ![Clusters](docs/clusters.png) |
+
+| A meadow and wood, all procedural | Fair-weather cumulus over the cove | Broken cloud over the temple |
+|---|---|---|
+| ![Meadow](docs/meadow.jpg) | ![Cove](docs/cove-clouds.jpg) | ![Temple](docs/temple-clouds.jpg) |
 
 ## Quick start
 
@@ -45,7 +51,11 @@ cargo run --release -p viewer
 ```
 
 Both viewers use **click** to look, **WASD** to move, **Q/E** for down and up, and **Shift** to go
-faster. The browser page also has controls for debug views, the sun and render scale.
+faster. The browser page also has controls for debug views, the weather, the sun and render scale.
+Its weather starts as **Changing**, which drifts from one kind of weather to the next on its own;
+the menu fixes one instead, and **Extras** can follow a place's real weather (from
+[Open-Meteo](https://open-meteo.com)). The native viewer takes `--weather NAME` or a weather file,
+and **C** moves to the next kind of weather.
 
 ## Your own models
 
@@ -110,6 +120,50 @@ cargo run --release -p bake -- --scene scenes/cove.txt --output assets/cove.sols
 
 ![Looking through the fort's iron gate into the courtyard](docs/gate.png)
 
+## Trees, grass and weather as data
+
+Trees, grass and weather are each described by a short text file, so a new tree or a change to
+one needs no code. Every setting has a default, so a file names only what differs from it, and a
+mistake is reported with its line number.
+
+```text
+# Abridged from crates/solstice-procgen/species/fir.species
+height 16
+trunk radius=0.22 flare=0.45 gnarl=0.015
+crown cone
+bark fir_bark
+level per_metre=8 span=0.1..0.99 angle=102..74 length=0.2 radius=0.4 droop=0.3 whorl=5
+level per_metre=10 span=0.05..0.97 angle=62 length=0.4 radius=0.55 droop=0.12
+leaves fir_needles per_metre=22 length=0.16..0.26 width=0.17
+```
+
+```text
+# Abridged from crates/solstice-procgen/grass/verge.grass
+size 2
+tufts per_m2=40 blades=6..16 height=0.12..0.35 width=0.004..0.008 lean=0.15..0.85
+weed kind=rosette per_m2=6 leaves=6..12 length=0.08..0.2 flowers=0.6 flower=0.6,0.42,0.01
+weed kind=clover per_m2=20 length=0.01..0.018 stalk=0.04..0.1 flowers=0.4 flower=0.55,0.42,0.45
+```
+
+```text
+# Abridged from crates/solstice-render/weather/broken.weather
+coverage 0.62
+type 0.95          # 0 is flat stratus, 1 heaped cumulus
+base 1000          # metres
+thickness 2600
+wind speed=10 from=240
+```
+
+The built-in files are oak, birch, fir and bush; meadow, lawn, dry, tall and verge grass; and clear,
+fair, broken, overcast, storm and cirrus weather. To see every tree and breed of grass side by
+side, with any files of your own:
+
+```bash
+cargo run --release -p bake -- --plants --species my.species --grass my.grass --output assets/plants.solstice
+```
+
+![Oaks and firs at the edge of the wood](docs/wood.jpg)
+
 ## Using the library
 
 ```rust
@@ -118,6 +172,10 @@ let mut renderer = Renderer::new(&gpu, &scene, surface_format, RendererSettings:
 
 // Every frame:
 renderer.render(&gpu, &camera, &environment, &output_view, output_size, delta_seconds);
+
+// Weather, at any time: one kind, eased into over 30 seconds, or a sky that changes by itself.
+renderer.set_weather(Weather::by_name("broken").unwrap(), 30.0);
+renderer.set_weather_changing(true, "fair");
 ```
 
 Meshes come from `solstice_builder::build_virtual_mesh`, which runs offline. See
@@ -128,6 +186,7 @@ Meshes come from `solstice_builder::build_virtual_mesh`, which runs offline. See
 ```
 crates/solstice-builder   Mesh -> cluster LOD DAG (offline)
 crates/solstice-import    glTF 2.0 -> scene (offline)
+crates/solstice-procgen   Procedural surfaces, trees, grass and weeds (offline)
 crates/solstice-asset     GPU data layouts and the scene file format
 crates/solstice-render    The renderer
 apps/bake                 Bakes scene files: procedural demo content or imported models
@@ -159,8 +218,45 @@ buffer, which a final pass resolves to a G-buffer with analytic derivatives.
   field for fast ray marching and cached radiance on each surface voxel. Those voxels gather
   light from each other over time, which gives unlimited bounces. Sparse screen probes trace into
   this volume, first through the depth buffer for contact detail, and each pixel interpolates them.
+- **Screen traces:** probe rays and reflections first march a pyramid of the nearest depth of each
+  screen tile, as Lumen's screen traces do, skipping whole tiles a ray passes in front of. Hits
+  take their colour from last frame's image, found through motion vectors.
 - **Reflections:** one glossy ray per half-resolution pixel: screen space, then the volume, then sky.
+- **Clouds:** volumetric, ray marched through noise in a layer over a curved planet. They cast
+  shadows on the ground, and a small panorama of them feeds the skylight, GI and reflections, so
+  an overcast sky dims and greys the whole scene. See below.
 - **Post:** temporal anti-aliasing and upscaling, histogram exposure, bloom, ACES tone mapping.
+
+### Clouds and weather
+
+The clouds follow the method of Horizon Zero Dawn and Unreal's volumetric clouds. Tiling 3D noise,
+Perlin-Worley for shapes and Worley for detail, is generated on the GPU once. A weather map says
+where cloud can form; its values are ranked when it is made, so that a coverage of 0.6 really
+covers 60% of the sky. Each kind of cloud has a height profile, from a thin sheet of stratus to
+heaped cumulus and storm anvils, and detail noise erodes the edges into wisps below and billows
+above.
+
+Light comes from a short march towards the sun, a two-lobed phase function, multiple scattering
+in octaves, and a diffusion term for light that has crossed hundreds of metres of cloud, which is
+why thick cloud bases are grey rather than black. Skylight is shaded by the cloud above, sunlit
+ground lights the bases from below, and distant clouds fade into the haze.
+
+Each frame the weather eases towards its target, the wind carries everything along, and shapes
+slowly boil upwards. The clouds on screen are marched at half resolution and blended with last
+frame's, reprojected; texels behind geometry are skipped. At 1080p in the forest they cost about
+0.3 ms of GPU time.
+
+![The six built-in kinds of weather over the temple: clear, fair, broken, overcast, storm and cirrus](docs/weather.jpg)
+
+### Trees and grass
+
+Every leaf, needle and blade is geometry of its own, never a picture on a transparent card. As
+Nanite foliage does, the cluster builder thins small separate pieces with distance and enlarges
+the ones it keeps, so that a meadow covers as much from far away as close up. Trees are grown from
+their species: levels of branches spiral round their parents at the golden angle, or grow in
+whorls on conifers; the crown's outline sets how long the trunk's branches are at each height.
+Barks are surfaces of the procedural library, with a texel per millimetre; oak bark is matched to
+a photoscan by colour statistics and the steepness of its normals.
 
 ### Where WebGPU forced a different design from Unreal
 
@@ -184,7 +280,7 @@ at High quality:
 | Exterior, camera moving | 6.2 ms | 6.9 M |
 | Inside the chamber | 5.9 ms | 9.9 M |
 
-The web scene has 1.22 billion instanced triangles and is a 39 MB file. Native on the AMD
+The web scene has 1.22 billion instanced triangles and is a 52 MB file. Native on the AMD
 integrated GPU of the same machine, with the camera moving, since a still camera hides shadow costs:
 
 | Resolution, quality | Frame time, moving | Worst frame |
@@ -300,7 +396,7 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
 4. **Static scenes only.** Moving objects are not supported: no animation, and the GI volume is
    only rebuilt when the camera moves. Previous-frame transforms exist in the data but are not fed.
 5. **Surface features.** One material per instance (multi-material models become several instances),
-   no translucency, no masked foliage, no subsurface scattering, no volumetric fog, no material graph.
+   no translucency, no subsurface scattering, no volumetric fog, no material graph.
 6. **GI limits.** Voxels mean thin walls can leak light, and the finest voxels are 20 cm, so small
    details get their indirect shadowing only from screen-space passes.
 7. **Texture memory.** All textures are resampled to one size, so models with many materials use a
@@ -308,6 +404,10 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
 8. **Far reflections.** Beyond the reach of screen-space tracing, reflections come from voxels, which
    turn thin objects such as a ship's rigging into solid dark masses on water.
 9. **Alpha.** Masked and transparent surfaces draw solid, so torn sails have no holes.
+10. **Weather's limits.** No rain or snow falls, there is no lightning, and clouds are drawn only
+    where the sky shows, so low cloud never passes in front of a mountain. Under heavy cloud a thin
+    bright fringe can show along ridges against the sky, and the sun's height is set by hand rather
+    than by the time of day.
 
 ## Tests
 
@@ -321,8 +421,12 @@ cargo test --release
 - The importer is tested against small hand-written glTF files, so that every expected value is
   known exactly, including the classic bugs: inverted normal maps and inside-out mirrored instances.
 - GPU tests render real frames and check for validation errors, that no pixel is missing inside a
-  closed surface, and that occlusion culling skips hidden geometry. They skip themselves if no GPU
-  is available.
+  closed surface, and that occlusion culling skips hidden geometry. Others check the clouds: that a
+  clear sky is blue and an overcast one grey, that overcast all but removes shadows, and that the
+  wind moves the clouds. They skip themselves if no GPU is available.
+- Shaders are also checked for operator mixes that browsers reject but native compilers accept.
+- Every built-in tree, breed of grass and kind of weather is read and written back unchanged, and
+  each procedural surface is checked for seams, plausible brightness and steepness.
 
 ## License
 

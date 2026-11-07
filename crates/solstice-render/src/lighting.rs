@@ -1,5 +1,6 @@
 //! The deferred lighting pass and the bind group shared by all lighting passes.
 
+use crate::clouds::{CloudBindings, CloudSky};
 use crate::gi::{GiVolume, ScreenGiBindings};
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
 use crate::scene::GpuScene;
@@ -20,16 +21,20 @@ pub fn environment_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
         .texture()
         .texture()
         .sampler()
+        .texture()
+        .texture()
+        .uniform()
         .build(gpu, "environment")
 }
 
-/// Creates the shared lighting bind group.
+/// Creates the shared lighting bind group, seeing the clouds through `clouds`.
 pub fn environment_group(
     gpu: &Gpu,
     layout: &wgpu::BindGroupLayout,
     frame: &wgpu::Buffer,
     volume: &GiVolume,
     sky: &Sky,
+    clouds: CloudSky,
 ) -> wgpu::BindGroup {
     let clamp_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("environment clamp"),
@@ -55,6 +60,9 @@ pub fn environment_group(
             wgpu::BindingResource::TextureView(&sky.transmittance.view),
             wgpu::BindingResource::TextureView(&sky.sky_view.view),
             wgpu::BindingResource::Sampler(&repeat_sampler),
+            wgpu::BindingResource::TextureView(clouds.sky),
+            wgpu::BindingResource::TextureView(clouds.shadow),
+            clouds.params.as_entire_binding(),
         ],
     )
 }
@@ -77,6 +85,7 @@ impl DeferredLighting {
             .storage_texture(HDR_FORMAT);
         let layout = ShadowMaps::add_to_layout(builder)
             .storage_read()
+            .texture()
             .build(gpu, "deferred");
         let module = shaders::module(&gpu.device, "lighting/deferred.wgsl");
         Self {
@@ -85,7 +94,8 @@ impl DeferredLighting {
         }
     }
 
-    /// One bind group per frame parity, reading that frame's GI output.
+    /// One bind group per frame parity, reading that frame's GI output and clouds.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_groups(
         &self,
         gpu: &Gpu,
@@ -94,6 +104,7 @@ impl DeferredLighting {
         hdr: &wgpu::TextureView,
         shadows: &ShadowMaps,
         scene: &GpuScene,
+        clouds: &CloudBindings,
     ) -> [wgpu::BindGroup; 2] {
         let tex = |view| wgpu::BindingResource::TextureView(view);
         let group = |parity: usize| {
@@ -112,6 +123,7 @@ impl DeferredLighting {
                     tex(&shadows.array_view),
                     wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
                     scene.lights.as_entire_binding(),
+                    tex(&clouds.screen[parity].view),
                 ],
             )
         };

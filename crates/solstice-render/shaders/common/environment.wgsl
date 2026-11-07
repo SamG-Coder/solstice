@@ -1,9 +1,10 @@
-// Bind group 1 of every lighting pass: frame constants, sky LUTs and the GI volume.
+// Bind group 1 of every lighting pass: frame constants, sky LUTs, the GI volume and the clouds.
 // Includes the functions that sample them.
 
 #include "common/math.wgsl"
 #include "common/frame.wgsl"
 #include "common/atmosphere.wgsl"
+#include "clouds/params.wgsl"
 
 const VOLUME_LEVELS: u32 = 5u;
 
@@ -23,23 +24,53 @@ struct VolumeParams {
 @group(1) @binding(4) var transmittance_lut: texture_2d<f32>;
 @group(1) @binding(5) var sky_view_lut: texture_2d<f32>;
 @group(1) @binding(6) var repeat_sampler: sampler;
+// The clouds over the whole sky (light in RGB, how much sky shows through in A), and how much
+// sunlight they let through to the ground around the camera. Cloud passes, which make these,
+// see placeholders: no cloud and no shadow.
+@group(1) @binding(7) var cloud_sky: texture_2d<f32>;
+@group(1) @binding(8) var cloud_shadow_map: texture_2d<f32>;
+@group(1) @binding(9) var<uniform> clouds: CloudParams;
 
 // Height of the viewer above the planet centre, in kilometres.
 fn viewer_radius() -> f32 {
     return GROUND_RADIUS + max(frame.camera_position.y, 1.0) * 0.001;
 }
 
-// Radiance of the sky towards `direction`, excluding the sun disc.
-fn sky_radiance(direction: vec3f) -> vec3f {
+// Radiance of the cloudless sky towards `direction`, excluding the sun disc.
+fn clear_sky_radiance(direction: vec3f) -> vec3f {
     let color = textureSampleLevel(sky_view_lut, repeat_sampler, sky_view_uv(direction), 0.0).rgb;
     return color * frame.sun_illuminance * frame.sky_intensity;
 }
 
-// Sunlight reaching the ground, after the atmosphere has filtered it.
+// Radiance of the sky towards `direction`, clouds included, excluding the sun disc.
+fn sky_radiance(direction: vec3f) -> vec3f {
+    let cloud = textureSampleLevel(cloud_sky, repeat_sampler, sky_view_uv(direction), 0.0);
+    return clear_sky_radiance(direction) * cloud.a + cloud.rgb;
+}
+
+// Sunlight above the clouds, after the atmosphere has filtered it.
 fn sun_irradiance() -> vec3f {
     let uv = transmittance_uv(viewer_radius(), frame.sun_direction.y);
     let transmittance = textureSampleLevel(transmittance_lut, clamp_sampler, uv, 0.0).rgb;
     return transmittance * frame.sun_color * frame.sun_illuminance;
+}
+
+// How much sunlight the clouds let through to `p`: 1 in the open, less in a cloud's shadow.
+fn cloud_shadow(p: vec3f) -> f32 {
+    if clouds.enabled < 0.5 {
+        return 1.0;
+    }
+    // The map holds light at the ground. A point above it is lit along the same line to the
+    // sun, from where that line meets the ground.
+    let ground = p.xz - frame.sun_direction.xz * (p.y / max(frame.sun_direction.y, 0.08));
+    let uv = (ground - clouds.shadow_origin) / clouds.shadow_extent;
+    // Beyond the map, use its average: the edge texel is as good a guess as any.
+    return textureSampleLevel(cloud_shadow_map, clamp_sampler, clamp(uv, vec2f(0.0), vec2f(1.0)), 0.0).r;
+}
+
+// Sunlight reaching `p`, after the atmosphere and the clouds.
+fn sun_irradiance_at(p: vec3f) -> vec3f {
+    return sun_irradiance() * cloud_shadow(p);
 }
 
 // The finest clipmap level containing `p` with some margin, or VOLUME_LEVELS if none.
