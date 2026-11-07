@@ -49,11 +49,13 @@ model ../target/scan/wooden_barrels_01/wooden_barrels_01.gltf 13 ground -14 30 1
 model ../target/scan/brass_vase_01/brass_vase_01.gltf 15.5 ground -12 0 1.2
 
 # ---- Cliffs: behind the fort, and curving forward on both sides until they reach the sea.
+# The two that stand in the sea are sunk well below the water (-0.6): the scan's base is
+# ragged, and any notch above the waterline shows the sea through it, so the cliff floats.
 model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf -68 0 0 90 2.4
 model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf -28 0 -92 12 2.2
 model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf -30 0 92 168 2.2
-model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf 88 -0.6 -128 -8 2.4
-model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf 90 -0.6 130 188 2.4
+model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf 88 -2.4 -128 -8 2.4
+model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf 90 -2.4 130 188 2.4
 
 # ---- Rock scattered at the foot of the walls, thickest towards the corners.
 model ../target/scan/boulder_01/boulder_01.gltf 31 ground:0.2 -24 40 2.2
