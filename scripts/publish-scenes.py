@@ -1,46 +1,51 @@
 #!/usr/bin/env python3
-"""Publishes baked scenes as a GitHub release, uploading only the scenes that changed.
+"""Publishes baked scenes, uploading only the scenes that changed.
 
-Scenes take minutes to bake and hundreds of megabytes to store, so they are baked on a PC and
-kept as release assets rather than baked by CI or committed. scenes/releases.txt records, for
-each scene the site serves, the release that holds it and its SHA-256. Publishing compares
-each scene in assets/ with that record, puts only the changed ones in a new release, and
-updates their lines; unchanged scenes stay in whichever release already holds them. Commit
-scenes/releases.txt for the site to serve the result.
+Scenes take minutes to bake and hundreds of megabytes to store, so they are baked on a PC
+rather than by CI. Each scene has its own repository and GitHub Pages site,
+SamG-Coder/solstice-scene-NAME, which serves it at samg-coder.github.io/solstice-scene-NAME/:
+publishing one never redeploys the viewer or the other scenes. Each repository's scene.txt names
+the release holding its scene and the scene's SHA-256.
 
-    python scripts/publish-scenes.py [TAG] [--check] [--bake [SCENE...]]
+This script compares each scene in assets/ with its repository's scene.txt. For each one that
+changed, it creates a release in that repository holding the new file, and updates scene.txt,
+which deploys it.
 
-TAG defaults to scenes-YYYY-MM-DD-HHMM. --check only reports what would be published. --bake
-bakes scenes first: the ones named, or all. Needs the GitHub CLI, signed in with permission to
-create releases.
+    python scripts/publish-scenes.py [--check] [--bake [SCENE...]]
+
+--check only reports what would be published. --bake bakes scenes first: the ones named, or all.
+Needs the GitHub CLI, signed in with permission to create releases and push to those repositories.
 """
+import base64
 import datetime
 import hashlib
+import json
 import os
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST = os.path.join(ROOT, "scenes", "releases.txt")
-HEADER = """\
-# Which release holds each scene the site serves, and the scene's SHA-256. Written by
-# scripts/publish-scenes.py, which uploads a scene again only when its content changes.
-# The Pages workflow downloads each scene from its release and checks it against this.
-"""
-# Each scene the site offers, and the command that bakes it.
+OWNER = "SamG-Coder"
+# Each scene the site offers: its repository's name, its file, and the command that bakes it.
 SCENES = {
-    "web": ["cargo", "run", "--release", "-p", "bake", "--", "--quality", "web",
-            "--output", "assets/web.solstice"],
-    "cove": ["cargo", "run", "--release", "-p", "bake", "--", "--scene", "scenes/cove.txt",
-             "--texture-size", "1024", "--output", "assets/cove.solstice"],
-    "forest": ["cargo", "run", "--release", "-p", "bake", "--", "--forest",
-               "--output", "assets/forest.solstice"],
+    "temple": ("web.solstice", ["cargo", "run", "--release", "-p", "bake", "--", "--quality", "web",
+                                "--output", "assets/web.solstice"]),
+    "cove": ("cove.solstice", ["cargo", "run", "--release", "-p", "bake", "--", "--scene",
+                               "scenes/cove.txt", "--texture-size", "1024",
+                               "--output", "assets/cove.solstice"]),
+    "forest": ("forest.solstice", ["cargo", "run", "--release", "-p", "bake", "--", "--forest",
+                                   "--output", "assets/forest.solstice"]),
 }
+HEADER = (
+    "# The scene this site serves: its file name, the release that holds it (OWNER/REPO@TAG,\n"
+    "# or a tag of this repository) and its SHA-256. Written by scripts/publish-scenes.py in\n"
+    "# SamG-Coder/solstice; pushing a change deploys the new scene.\n"
+)
 
 
-def run(command):
+def run(command, **kwargs):
     print("$", " ".join(command), flush=True)
-    subprocess.run(command, cwd=ROOT, check=True)
+    return subprocess.run(command, cwd=ROOT, check=True, **kwargs)
 
 
 def output(command):
@@ -55,24 +60,15 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def read_manifest():
-    """Scene file name -> (release tag, SHA-256)."""
-    entries = {}
-    if os.path.exists(MANIFEST):
-        with open(MANIFEST, encoding="utf-8") as f:
-            for line in f:
-                words = line.split("#")[0].split()
-                if len(words) == 3:
-                    entries[words[0]] = (words[1], words[2])
-    return entries
-
-
-def write_manifest(entries):
-    with open(MANIFEST, "w", encoding="utf-8", newline="\n") as f:
-        f.write(HEADER)
-        for name in sorted(entries):
-            tag, digest = entries[name]
-            f.write(f"{name} {tag} {digest}\n")
+def published(repo):
+    """The repository's scene.txt as (its blob SHA, (file, release, SHA-256))."""
+    info = json.loads(output(["gh", "api", f"repos/{repo}/contents/scene.txt"]))
+    text = base64.b64decode(info["content"]).decode()
+    for line in text.splitlines():
+        words = line.split("#")[0].split()
+        if len(words) == 3:
+            return info["sha"], tuple(words)
+    sys.exit(f"{repo}: scene.txt names no scene")
 
 
 def main():
@@ -83,10 +79,8 @@ def main():
         to_bake = [a for a in args[at + 1:] if not a.startswith("--")] or list(SCENES)
         args = args[:at] + [a for a in args[at + 1:] if a.startswith("--")]
     check_only = "--check" in args
-    positional = [a for a in args if not a.startswith("--")]
-    if len(positional) > 1 or any(a not in ("--check",) for a in args if a.startswith("--")):
+    if any(a != "--check" for a in args):
         sys.exit(__doc__)
-    tag = positional[0] if positional else datetime.datetime.now().strftime("scenes-%Y-%m-%d-%H%M")
 
     unknown = [s for s in to_bake if s not in SCENES]
     if unknown:
@@ -94,50 +88,42 @@ def main():
     if "cove" in to_bake:
         run([sys.executable, "scripts/fetch-scans.py", "scenes/cove.txt", "2k"])
     for name in to_bake:
-        run(SCENES[name])
-
-    manifest = read_manifest()
-    changed = []
-    for name in SCENES:
-        file = f"{name}.solstice"
-        path = os.path.join(ROOT, "assets", file)
-        if not os.path.exists(path):
-            if file not in manifest:
-                sys.exit(f"{file} is neither baked nor published yet (run with --bake {name})")
-            print(f"{file}: not baked here, keeping {manifest[file][0]}")
-            continue
-        digest = sha256(path)
-        if file in manifest and manifest[file][1] == digest:
-            print(f"{file}: unchanged, in {manifest[file][0]}")
-        else:
-            changed.append((file, path, digest))
-            print(f"{file}: changed")
-    if not changed:
-        print("nothing to publish")
-        return
-    if check_only:
-        print(f"would publish {len(changed)} scene(s) as {tag}")
-        return
+        run(SCENES[name][1])
 
     commit = output(["git", "rev-parse", "--short", "HEAD"])
-    # Only changes to what bakes the scenes matter, not to this script or its record.
-    baking = ["git", "status", "--porcelain", "--", "apps", "crates", "scenes", "Cargo.lock",
-              ":!scenes/releases.txt"]
+    baking = ["git", "status", "--porcelain", "--", "apps", "crates", "scenes", "Cargo.lock"]
     dirty = " (with uncommitted changes)" if output(baking) else ""
-    lines = [f"Scenes baked from {commit}{dirty}. Scenes not listed are unchanged, in earlier "
-             "releases: see scenes/releases.txt.", "", "| Scene | Size | SHA-256 |", "|---|---|---|"]
-    for file, path, digest in changed:
-        lines.append(f"| {file} | {os.path.getsize(path) / 1e6:.1f} MB | `{digest}` |")
-    notes = "\n".join(lines)
-    print(notes)
-
-    run(["gh", "release", "create", tag, "--title", f"Scenes {tag}", "--notes", notes,
-         *[path for _, path, _ in changed]])
-    for file, _, digest in changed:
-        manifest[file] = (tag, digest)
-    write_manifest(manifest)
-    print(f"published {len(changed)} scene(s) as {tag}. "
-          "Commit scenes/releases.txt for the site to use them.")
+    tag = datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
+    changed = 0
+    for name, (file, _) in SCENES.items():
+        repo = f"{OWNER}/solstice-scene-{name}"
+        path = os.path.join(ROOT, "assets", file)
+        blob, (_, release, recorded) = published(repo)
+        if not os.path.exists(path):
+            print(f"{name}: not baked here, keeping {release}")
+            continue
+        digest = sha256(path)
+        if digest == recorded:
+            print(f"{name}: unchanged, in {release}")
+            continue
+        changed += 1
+        print(f"{name}: changed")
+        if check_only:
+            continue
+        notes = (f"{file}, baked from SamG-Coder/solstice@{commit}{dirty}.\n\n"
+                 f"{os.path.getsize(path) / 1e6:.1f} MB, SHA-256 `{digest}`.")
+        run(["gh", "release", "create", tag, "--repo", repo, "--title", f"{name} {tag}",
+             "--notes", notes, path])
+        content = HEADER + f"{file} {tag} {digest}\n"
+        run(["gh", "api", "-X", "PUT", f"repos/{repo}/contents/scene.txt",
+             "-f", f"message=Serve the {name} scene from {tag}",
+             "-f", f"content={base64.b64encode(content.encode()).decode()}",
+             "-f", f"sha={blob}"], stdout=subprocess.DEVNULL)
+        print(f"{name}: published as {repo}@{tag}; its site is deploying")
+    if changed == 0:
+        print("nothing to publish")
+    elif check_only:
+        print(f"would publish {changed} scene(s)")
 
 
 if __name__ == "__main__":

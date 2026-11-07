@@ -27,6 +27,8 @@ cp apps/viewer/web/index.html dist/
 # Scene files are already compressed where it helps, part by part, so that the page can fetch
 # any part alone. Hard links keep big scenes from taking disk space twice.
 for scene in assets/*.solstice; do
+  # None in CI: there, scenes are served by their own sites.
+  [ -e "$scene" ] || continue
   ln -f "$scene" "dist/assets/$(basename "$scene")" 2>/dev/null || cp "$scene" "dist/assets/"
 done
 

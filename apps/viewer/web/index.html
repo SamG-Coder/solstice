@@ -149,7 +149,15 @@ import init, { WebViewer, header_bytes, read_header } from "./pkg/solstice_viewe
 const params = new URLSearchParams(location.search);
 const sceneName = params.get("scene") ?? "cove";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
-const sceneUrl = `assets/${sceneName}.solstice`;
+// On GitHub Pages each scene is served by its own site on the same domain, so publishing one
+// never redeploys the viewer or the others. Anywhere else, such as a local build, scenes sit in
+// assets/ beside the page. ?scenes=URL points somewhere else, ending in a slash.
+const SCENE_SITES = { web: "temple", cove: "cove", forest: "forest" };
+const sceneBase = params.get("scenes")
+  ?? (location.hostname.endsWith("github.io") && SCENE_SITES[sceneName]
+    ? `/solstice-scene-${SCENE_SITES[sceneName]}/`
+    : "assets/");
+const sceneUrl = `${sceneBase}${sceneName}.solstice`;
 document.querySelector(`#scenes [data-scene="${sceneName}"]`)?.setAttribute("aria-current", "page");
 // GPU memory the scene may use. Add ?geometry-mb=64 or ?texture-mb=32 to try other budgets.
 const budgetBytes = (name, megabytes) => (Number(params.get(name)) || megabytes) * 1048576;

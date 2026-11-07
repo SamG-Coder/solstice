@@ -1,6 +1,0 @@
-# Which release holds each scene the site serves, and the scene's SHA-256. Written by
-# scripts/publish-scenes.py, which uploads a scene again only when its content changes.
-# The Pages workflow downloads each scene from its release and checks it against this.
-cove.solstice scenes-2026-11-08 bb7bd917a459f91c68815450063bd40a51df81b69f270dae9e9174500b04000c
-forest.solstice scenes-2026-11-08 a2df7a92acb8cdfd73a311b7255b80205e4d6acd7c729c39313090fc965005b6
-web.solstice scenes-2026-11-08 ef909fdb4a96a61d8414838a6457c165256072473d6312643dab6aa467da38b0
