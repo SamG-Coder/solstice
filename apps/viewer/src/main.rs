@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use glam::Vec3;
-    use solstice_asset::SceneAsset;
+    use solstice_asset::LoadedScene;
     use solstice_render::{
         Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings,
     };
@@ -148,7 +148,7 @@ mod native {
         Ok(options)
     }
 
-    fn load_scene(path: &PathBuf) -> Result<SceneAsset, Box<dyn std::error::Error>> {
+    fn load_scene(path: &PathBuf) -> Result<LoadedScene, Box<dyn std::error::Error>> {
         let start = Instant::now();
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let scene = solstice_asset::file::decode(&bytes)?;
@@ -195,7 +195,7 @@ mod native {
     }
 
     /// Renders offscreen, saves a PNG, and fails loudly on any GPU validation error.
-    fn capture(options: &Options, scene: &SceneAsset) -> Result<(), Box<dyn std::error::Error>> {
+    fn capture(options: &Options, scene: &LoadedScene) -> Result<(), Box<dyn std::error::Error>> {
         let path = options
             .capture
             .as_ref()
@@ -235,7 +235,7 @@ mod native {
         let mut last_time = Instant::now();
         let mut camera = options
             .camera
-            .unwrap_or_else(|| initial_camera(scene.viewpoint));
+            .unwrap_or_else(|| initial_camera(scene.scene.viewpoint));
         for frame in 0..options.frames {
             camera.position += camera.right() * options.capture_motion;
             renderer.render(
@@ -294,7 +294,7 @@ mod native {
     /// Flies a camera path at a fixed 60 steps per second. Writes an image for each second, plus
     /// `frames.csv` with the time of every frame. Each frame waits for the GPU to finish, so its
     /// time is real GPU work, not hidden by queuing, and image saving is left out of the timing.
-    fn flyover(options: &Options, scene: &SceneAsset) -> Result<(), Box<dyn std::error::Error>> {
+    fn flyover(options: &Options, scene: &LoadedScene) -> Result<(), Box<dyn std::error::Error>> {
         const STEP: f32 = 1.0 / 60.0;
         use solstice_render::profiler::SECTIONS;
 
@@ -590,7 +590,7 @@ mod native {
 
     struct App {
         options: Options,
-        scene: SceneAsset,
+        scene: LoadedScene,
         state: Option<WindowState>,
         input: CameraInput,
         keys: HashSet<KeyCode>,
@@ -635,7 +635,7 @@ mod native {
                 camera: FlyCamera::new(
                     self.options
                         .camera
-                        .unwrap_or_else(|| initial_camera(self.scene.viewpoint)),
+                        .unwrap_or_else(|| initial_camera(self.scene.scene.viewpoint)),
                 ),
                 last_frame: Instant::now(),
                 title_timer: 0.0,

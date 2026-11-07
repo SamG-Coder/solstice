@@ -3,7 +3,7 @@
 use glam::{Mat4, Vec2, Vec3};
 use solstice_asset::{Instance, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
-    build_virtual_mesh, compress_textures, mip_chain, BuildOptions, Mesh, Vertex,
+    build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{Camera, DebugView, Environment, Gpu, Renderer, RendererSettings};
 use std::sync::{Arc, Mutex};
@@ -150,7 +150,7 @@ fn render(
             sink.lock().unwrap().push(error.to_string());
         }));
 
-    let mut renderer = Renderer::new(gpu, scene, FORMAT, settings);
+    let mut renderer = Renderer::new(gpu, &paginate(scene), FORMAT, settings);
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test target"),
         size: wgpu::Extent3d {

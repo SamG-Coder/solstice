@@ -83,7 +83,7 @@ impl WebViewer {
             surface,
             config,
             renderer,
-            camera: FlyCamera::new(initial_camera(scene.viewpoint)),
+            camera: FlyCamera::new(initial_camera(scene.scene.viewpoint)),
             environment: default_environment(),
             gpu_errors,
         })

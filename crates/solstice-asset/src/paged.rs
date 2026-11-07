@@ -1,0 +1,194 @@
+//! A scene divided for on-demand loading.
+//!
+//! A [`PagedScene`] is everything that stays resident: cluster records, the hierarchy, the
+//! tables that say where the rest lives. Vertices and triangles live in fixed-capacity *pages*
+//! that come and go. A page holds whole sibling sets, the clusters that share one parent
+//! group, so swapping a set for its parents is all-or-nothing and can't open a crack.
+//!
+//! See `docs/streaming.md` for the rules that keep a partly loaded scene watertight.
+
+use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
+use crate::scene::{Instance, Light, Material, TextureEncoding, TextureLayer, Viewpoint};
+use bytemuck::{Pod, Zeroable};
+use glam::Vec3;
+
+/// Capacity of one page, and so the size of one slot in the GPU's page pool. It must hold the
+/// largest possible sibling set.
+pub const PAGE_BYTES: usize = 128 * 1024;
+/// Vertices a page could hold if it held nothing else.
+pub const PAGE_VERTICES: u32 = (PAGE_BYTES / std::mem::size_of::<PackedVertex>()) as u32;
+/// Words of triangle data a page could hold if it held nothing else.
+pub const PAGE_WORDS: u32 = (PAGE_BYTES / 4) as u32;
+
+/// Texture mips no larger than this travel with the manifest, so every material can draw from
+/// the first frame.
+pub const BASE_TEXTURE_EDGE: u32 = 128;
+
+/// [`ClusterSet::round`] of a set with no parents, which must always stay loaded.
+pub const ROOT_ROUND: u32 = u32::MAX;
+
+/// Clusters that share one parent group, and the parents simplified from them.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct ClusterSet {
+    pub first_cluster: u32,
+    pub cluster_count: u32,
+    /// Range in the `generated` list: the clusters simplified from this set. Those clusters
+    /// draw in this set's place until it is installed.
+    pub first_generated: u32,
+    pub generated_count: u32,
+    /// Which simplification pass made this set's group. Parents always come from a later
+    /// pass. [`ROOT_ROUND`] for a set with no parents.
+    pub round: u32,
+    /// Leaf node of the hierarchy for this set. Meaningful once paged.
+    pub leaf_node: u32,
+    /// Page holding this set. Meaningful once paged.
+    pub page: u32,
+    pub _pad: u32,
+}
+
+/// Where one page is and what it holds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct PageInfo {
+    /// Offset of the compressed page from the start of the file's data area.
+    pub offset: u64,
+    /// Size of the compressed page. Zero for a pinned page, which is held in the manifest.
+    pub stored_bytes: u32,
+    pub vertex_count: u32,
+    pub triangle_count: u32,
+    pub first_set: u32,
+    pub set_count: u32,
+    pub _pad: u32,
+}
+
+impl PageInfo {
+    /// Size of the page once unpacked: all its vertices, then all its triangles.
+    pub fn raw_bytes(&self) -> usize {
+        self.vertex_count as usize * std::mem::size_of::<PackedVertex>()
+            + self.triangle_count as usize * 4
+    }
+}
+
+/// How to decode one mesh's vertices. Instances copy this.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeshInfo {
+    /// Index of the hierarchy root in [`PagedScene::nodes`], if the mesh has any geometry.
+    pub root_node: Option<u32>,
+    pub quant_origin: Vec3,
+    pub quant_step: f32,
+    pub uv_origin: [f32; 2],
+    pub uv_step: [f32; 2],
+}
+
+/// The resident part of a scene: all of it is uploaded when the scene opens.
+#[derive(Clone, Debug, Default)]
+pub struct PagedScene {
+    /// Offsets are relative to the start of the cluster's page and rewritten on install.
+    pub clusters: Vec<PackedCluster>,
+    pub nodes: Vec<PackedNode>,
+    /// Sorted by page.
+    pub sets: Vec<ClusterSet>,
+    /// See [`ClusterSet::first_generated`].
+    pub generated: Vec<u32>,
+    /// Pinned pages first, then coarse to fine, so a page's dependencies have lower ids.
+    pub pages: Vec<PageInfo>,
+    /// How many of the first `pages` are always loaded.
+    pub pinned_pages: u32,
+    /// The raw contents of the pinned pages, one after another.
+    pub pinned_data: Vec<u8>,
+
+    pub meshes: Vec<MeshInfo>,
+    pub instances: Vec<Instance>,
+    pub materials: Vec<Material>,
+    pub lights: Vec<Light>,
+    pub viewpoint: Option<Viewpoint>,
+    /// Longest root-to-leaf path over all meshes, which sets the traversal dispatch count.
+    pub hierarchy_depth: u32,
+    /// Triangles drawn if every instance used its finest LOD.
+    pub source_triangles: u64,
+    /// Triangles stored once per mesh, regardless of instancing.
+    pub unique_triangles: u64,
+
+    /// Edge length of the largest level of each texture.
+    pub texture_size: u32,
+    pub texture_encoding: TextureEncoding,
+    /// The levels of each layer from [`BASE_TEXTURE_EDGE`] down.
+    pub base_textures: Vec<TextureLayer>,
+    /// For each layer, for each level above the base: where its colour, normal and material
+    /// data begin in the data area, in that order.
+    pub upper_mip_offsets: Vec<u64>,
+
+    /// Where the data area begins in the file. Set when a file is read.
+    pub data_offset: u64,
+}
+
+impl PagedScene {
+    /// How many mip levels each texture has above the base levels in the manifest.
+    pub fn upper_mip_count(&self) -> usize {
+        upper_mip_count(self.texture_size)
+    }
+
+    /// The contents of a pinned page.
+    pub fn pinned_page(&self, page: u32) -> &[u8] {
+        let start: usize = self.pages[..page as usize]
+            .iter()
+            .map(PageInfo::raw_bytes)
+            .sum();
+        &self.pinned_data[start..start + self.pages[page as usize].raw_bytes()]
+    }
+
+    /// For each page, the other pages that must be installed before it. These hold the
+    /// parents of its clusters, which have to be swappable for those clusters. Sorted.
+    pub fn page_dependencies(&self) -> Vec<Vec<u32>> {
+        let mut set_page = vec![0u32; self.clusters.len()];
+        for set in &self.sets {
+            let range =
+                set.first_cluster as usize..(set.first_cluster + set.cluster_count) as usize;
+            set_page[range].fill(set.page);
+        }
+        let mut dependencies = vec![Vec::new(); self.pages.len()];
+        for set in &self.sets {
+            let range =
+                set.first_generated as usize..(set.first_generated + set.generated_count) as usize;
+            let list: &mut Vec<u32> = &mut dependencies[set.page as usize];
+            list.extend(self.generated[range].iter().map(|&c| set_page[c as usize]));
+        }
+        for (page, list) in dependencies.iter_mut().enumerate() {
+            list.sort_unstable();
+            list.dedup();
+            list.retain(|&other| other != page as u32);
+        }
+        dependencies
+    }
+}
+
+/// How many mip levels of a texture of this edge lie above [`BASE_TEXTURE_EDGE`].
+pub fn upper_mip_count(texture_size: u32) -> usize {
+    let mut count = 0;
+    while texture_size >> count > BASE_TEXTURE_EDGE {
+        count += 1;
+    }
+    count
+}
+
+/// A paged scene with its loadable data in memory, as baked or as read from a whole file.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedScene {
+    pub scene: PagedScene,
+    /// The raw contents of each page that is not pinned, indexed by page minus `pinned_pages`.
+    pub pages: Vec<Vec<u8>>,
+    /// For each layer, the levels above the base, largest first.
+    pub upper_textures: Vec<TextureLayer>,
+}
+
+impl LoadedScene {
+    /// The raw contents of a page.
+    pub fn page(&self, page: u32) -> &[u8] {
+        if page < self.scene.pinned_pages {
+            self.scene.pinned_page(page)
+        } else {
+            &self.pages[(page - self.scene.pinned_pages) as usize]
+        }
+    }
+}

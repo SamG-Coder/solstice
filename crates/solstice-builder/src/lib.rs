@@ -26,7 +26,10 @@ mod partition;
 mod simplify;
 mod texture;
 
+mod paging;
+
 pub use bounds::Sphere;
 pub use dag::{build_virtual_mesh, BuildOptions};
 pub use mesh::{Mesh, Vertex};
+pub use paging::paginate;
 pub use texture::{compress_textures, mip_chain};

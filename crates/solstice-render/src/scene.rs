@@ -1,14 +1,14 @@
-//! Uploads a [`SceneAsset`] into one shared pool of GPU buffers.
+//! Creates a scene's GPU resources.
 //!
-//! WebGPU has no bindless resources. Everything geometric lives in a few big buffers
-//! that all passes share, and each instance records where its mesh begins.
+//! WebGPU has no bindless resources. Everything geometric lives in a few big buffers that all
+//! passes share. Hierarchy nodes and cluster records stay resident, while vertices and triangles
+//! live in a fixed pool of page slots filled by [`crate::streaming`].
 
 use crate::gpu::Gpu;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
-use solstice_asset::{
-    Material, PackedCluster, PackedNode, PackedVertex, SceneAsset, TextureEncoding,
-};
+use solstice_asset::paged::{PagedScene, BASE_TEXTURE_EDGE, PAGE_BYTES};
+use solstice_asset::{Material, TextureEncoding, TextureLayer};
 
 /// Twin of `Instance` in `common/scene.wgsl`.
 #[repr(C)]
@@ -34,12 +34,15 @@ fn affine_rows(m: Mat4) -> [Vec4; 3] {
     [m.row(0), m.row(1), m.row(2)]
 }
 
-/// A scene resident on the GPU.
+/// A scene on the GPU. Everything but the page pool is fully resident.
 pub struct GpuScene {
     pub instances: wgpu::Buffer,
     pub nodes: wgpu::Buffer,
     pub clusters: wgpu::Buffer,
+    /// The page pool, seen as vertices. See [`Self::triangles`].
     pub vertices: wgpu::Buffer,
+    /// The page pool again, seen as triangles. Each slot holds a page's vertices and then its
+    /// triangles, and cluster records hold offsets into the two views.
     pub triangles: wgpu::Buffer,
     pub materials: wgpu::Buffer,
     pub lights: wgpu::Buffer,
@@ -58,15 +61,22 @@ pub struct GpuScene {
 }
 
 impl GpuScene {
-    pub fn new(gpu: &Gpu, asset: &SceneAsset) -> Self {
-        let pool = GeometryPool::build(asset);
+    /// Creates everything but the contents of the page pool, which holds `slots` pages.
+    /// `upper_textures` holds the texture levels above the base ones, if they are known.
+    pub fn new(
+        gpu: &Gpu,
+        scene: &PagedScene,
+        slots: u32,
+        upper_textures: Option<&[TextureLayer]>,
+    ) -> Self {
+        let instances = gpu_instances(scene);
         let fallback_material = [Material::default()];
-        let materials: &[Material] = if asset.materials.is_empty() {
+        let materials: &[Material] = if scene.materials.is_empty() {
             &fallback_material
         } else {
-            &asset.materials
+            &scene.materials
         };
-        let textures = upload_textures(gpu, asset);
+        let textures = upload_textures(gpu, scene, upper_textures);
 
         let material_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("material"),
@@ -79,106 +89,64 @@ impl GpuScene {
             ..Default::default()
         });
 
+        let pool = gpu.storage_buffer(
+            "page pool",
+            u64::from(slots.max(1)) * PAGE_BYTES as u64,
+            wgpu::BufferUsages::COPY_DST,
+        );
         Self {
-            instances: gpu.storage_buffer_init("instances", &pool.instances),
-            nodes: gpu.storage_buffer_init("nodes", &pool.nodes),
-            clusters: gpu.storage_buffer_init("clusters", &pool.clusters),
-            vertices: gpu.storage_buffer_init("vertices", &pool.vertices),
-            triangles: gpu.storage_buffer_init("triangles", &pool.triangles),
+            instances: gpu.storage_buffer_init("instances", &instances),
+            nodes: gpu.storage_buffer_init("nodes", &scene.nodes),
+            clusters: gpu.storage_buffer_init("clusters", &scene.clusters),
+            vertices: pool.clone(),
+            triangles: pool,
             materials: gpu.storage_buffer_init("materials", materials),
-            lights: gpu.storage_buffer_init("lights", &asset.lights),
+            lights: gpu.storage_buffer_init("lights", &scene.lights),
             color_textures: textures.color,
             normal_textures: textures.normal,
             material_textures: textures.material,
             texture_summary: textures.summary,
             material_sampler,
-            instance_count: pool.instances.len() as u32,
-            light_count: asset.lights.len() as u32,
-            max_hierarchy_depth: pool.max_hierarchy_depth,
-            source_triangles: asset.total_source_triangles(),
-            unique_triangles: asset.unique_source_triangles(),
+            instance_count: instances.len() as u32,
+            light_count: scene.lights.len() as u32,
+            max_hierarchy_depth: scene.hierarchy_depth,
+            source_triangles: scene.source_triangles,
+            unique_triangles: scene.unique_triangles,
         }
     }
 }
 
-/// All meshes concatenated, with offsets rebased to the shared arrays.
-struct GeometryPool {
-    instances: Vec<GpuInstance>,
-    nodes: Vec<PackedNode>,
-    clusters: Vec<PackedCluster>,
-    vertices: Vec<PackedVertex>,
-    triangles: Vec<u32>,
-    max_hierarchy_depth: u32,
-}
-
-impl GeometryPool {
-    fn build(asset: &SceneAsset) -> Self {
-        let mut pool = Self {
-            instances: Vec::with_capacity(asset.instances.len()),
-            nodes: Vec::new(),
-            clusters: Vec::new(),
-            vertices: Vec::new(),
-            triangles: Vec::new(),
-            max_hierarchy_depth: 1,
+/// Builds the GPU's view of each instance. Instances of meshes with no geometry are left out.
+fn gpu_instances(scene: &PagedScene) -> Vec<GpuInstance> {
+    let mut out = Vec::with_capacity(scene.instances.len());
+    for instance in &scene.instances {
+        let mesh = &scene.meshes[instance.mesh as usize];
+        let Some(root_node) = mesh.root_node else {
+            continue;
         };
-
-        let mut root_nodes = Vec::with_capacity(asset.meshes.len());
-        for mesh in &asset.meshes {
-            let node_base = pool.nodes.len() as u32;
-            let cluster_base = pool.clusters.len() as u32;
-            let vertex_base = pool.vertices.len() as u32;
-            let triangle_base = pool.triangles.len() as u32;
-
-            pool.nodes.extend(mesh.nodes.iter().map(|node| PackedNode {
-                first: node.first
-                    + if node.is_leaf != 0 {
-                        cluster_base
-                    } else {
-                        node_base
-                    },
-                ..*node
-            }));
-            pool.clusters
-                .extend(mesh.clusters.iter().map(|cluster| PackedCluster {
-                    vertex_offset: cluster.vertex_offset + vertex_base,
-                    triangle_offset: cluster.triangle_offset + triangle_base,
-                    ..*cluster
-                }));
-            pool.vertices.extend_from_slice(&mesh.vertices);
-            pool.triangles.extend_from_slice(&mesh.triangles);
-            pool.max_hierarchy_depth = pool.max_hierarchy_depth.max(mesh.hierarchy_depth);
-            root_nodes.push(mesh.root_node + node_base);
-        }
-
-        for instance in &asset.instances {
-            let mesh = &asset.meshes[instance.mesh as usize];
-            if mesh.clusters.is_empty() {
-                continue;
-            }
-            let world = instance.transform;
-            let linear = Mat3::from_mat4(world);
-            let normal = Mat4::from_mat3(linear.inverse().transpose());
-            let max_scale = linear
-                .x_axis
-                .length()
-                .max(linear.y_axis.length())
-                .max(linear.z_axis.length());
-            pool.instances.push(GpuInstance {
-                world: affine_rows(world),
-                prev_world: affine_rows(world),
-                normal: affine_rows(normal),
-                quant_origin: mesh.quant_origin,
-                quant_step: mesh.quant_step,
-                uv_origin: Vec2::from_array(mesh.uv_origin),
-                uv_step: Vec2::from_array(mesh.uv_step),
-                root_node: root_nodes[instance.mesh as usize],
-                material: instance.material,
-                max_scale,
-                _pad: 0,
-            });
-        }
-        pool
+        let world = instance.transform;
+        let linear = Mat3::from_mat4(world);
+        let normal = Mat4::from_mat3(linear.inverse().transpose());
+        let max_scale = linear
+            .x_axis
+            .length()
+            .max(linear.y_axis.length())
+            .max(linear.z_axis.length());
+        out.push(GpuInstance {
+            world: affine_rows(world),
+            prev_world: affine_rows(world),
+            normal: affine_rows(normal),
+            quant_origin: mesh.quant_origin,
+            quant_step: mesh.quant_step,
+            uv_origin: Vec2::from_array(mesh.uv_origin),
+            uv_step: Vec2::from_array(mesh.uv_step),
+            root_node,
+            material: instance.material,
+            max_scale,
+            _pad: 0,
+        });
     }
+    out
 }
 
 /// The largest edge kept when textures must be unpacked, because the GPU can't sample BC.
@@ -194,31 +162,33 @@ struct UploadedTextures {
 }
 
 /// Creates the three texture arrays, or 1x1 stand-ins if the scene has no textures.
-fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> UploadedTextures {
-    let has_textures = !asset.textures.is_empty();
+fn upload_textures(
+    gpu: &Gpu,
+    scene: &PagedScene,
+    upper_textures: Option<&[TextureLayer]>,
+) -> UploadedTextures {
+    let has_textures = !scene.base_textures.is_empty();
     // The stand-ins for a scene without textures are never blocks, whatever it says it holds.
-    let stored_as_blocks = has_textures && asset.texture_encoding == TextureEncoding::Block;
+    let stored_as_blocks = has_textures && scene.texture_encoding == TextureEncoding::Block;
     let block = stored_as_blocks && gpu.block_compressed_textures;
     let unpack = stored_as_blocks && !gpu.block_compressed_textures;
 
+    // The largest level on hand: the whole chain if the upper levels are here, else the base.
+    let largest = if upper_textures.is_some() {
+        scene.texture_size
+    } else {
+        scene.texture_size.min(BASE_TEXTURE_EDGE)
+    };
     // Unpacking can drop a chain's largest levels, so it no longer starts at `texture_size`.
     let mut skip = 0;
     if unpack {
-        while asset.texture_size >> skip > UNPACKED_MAX_EDGE {
+        while largest >> skip > UNPACKED_MAX_EDGE {
             skip += 1;
         }
     }
-    let size = if has_textures {
-        asset.texture_size >> skip
-    } else {
-        1
-    };
-    let layers = asset.textures.len().max(1) as u32;
-    let mips = asset
-        .textures
-        .first()
-        .map_or(1, |t| t.color_mips.len() - skip)
-        .max(1) as u32;
+    let size = if has_textures { largest >> skip } else { 1 };
+    let layers = scene.base_textures.len().max(1) as u32;
+    let mips = if has_textures { size.ilog2() + 1 } else { 1 };
 
     let create = |label: &str, format: wgpu::TextureFormat| {
         gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -289,16 +259,26 @@ fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> UploadedTextures {
     };
 
     if has_textures {
-        for (layer, set) in asset.textures.iter().enumerate() {
-            for (mip, data) in set.color_mips[skip..].iter().enumerate() {
+        let empty = TextureLayer::default();
+        for (layer, base) in scene.base_textures.iter().enumerate() {
+            let upper = upper_textures.map_or(&empty, |upper| &upper[layer]);
+            let color_chain = upper.color_mips.iter().chain(&base.color_mips);
+            for (mip, data) in color_chain.skip(skip).enumerate() {
                 if unpack {
                     write(&color, layer, mip, &unpack_bc7((size >> mip).max(1), data));
                 } else {
                     write(&color, layer, mip, data);
                 }
             }
-            for (texture, chain) in [(&normal, &set.normal_mips), (&material, &set.material_mips)] {
-                for (mip, data) in chain[skip..].iter().enumerate() {
+            let data_chains = [
+                (&normal, upper.normal_mips.iter().chain(&base.normal_mips)),
+                (
+                    &material,
+                    upper.material_mips.iter().chain(&base.material_mips),
+                ),
+            ];
+            for (texture, chain) in data_chains {
+                for (mip, data) in chain.skip(skip).enumerate() {
                     if unpack {
                         write(texture, layer, mip, &unpack_bc5((size >> mip).max(1), data));
                     } else {

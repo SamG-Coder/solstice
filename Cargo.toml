@@ -17,6 +17,8 @@ block_compression = { version = "0.11", default-features = false, features = ["b
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
 log = "0.4"
+# Pure Rust. Compresses pages when baking and unpacks them natively.
+miniz_oxide = "0.8"
 naga = { version = "30", features = ["wgsl-in"] }
 pollster = "0.4"
 rayon = "1"

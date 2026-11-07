@@ -11,12 +11,13 @@ use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT};
 use crate::sky::Sky;
+use crate::streaming::Streamer;
 use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, PassView, RasterBindings, Rasterizer,
     Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
 };
 use glam::{Mat4, Vec2};
-use solstice_asset::SceneAsset;
+use solstice_asset::LoadedScene;
 
 /// Scales texture gradients, selecting finer mips than one texel per pixel, about 0.75 of a mip
 /// here. Temporal filtering averages over several frames' jitter, which softens the image and
@@ -141,6 +142,8 @@ struct History {
 
 /// Renders a scene with virtualized geometry and global illumination.
 pub struct Renderer {
+    #[allow(dead_code)]
+    streamer: Streamer,
     settings: RendererSettings,
     scene: GpuScene,
     frame_uniform: wgpu::Buffer,
@@ -167,15 +170,26 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// Creates a renderer for `asset`, drawing to textures of `output_format`, which must not
-    /// be sRGB: the renderer applies its own display encoding.
+    /// Creates a renderer for a scene held entirely in memory, with all of it on the GPU. It
+    /// draws to textures of `output_format`, which must not be sRGB: the renderer applies its
+    /// own display encoding.
     pub fn new(
         gpu: &Gpu,
-        asset: &SceneAsset,
+        loaded: &LoadedScene,
         output_format: wgpu::TextureFormat,
         settings: RendererSettings,
     ) -> Self {
-        let scene = GpuScene::new(gpu, asset);
+        let scene = GpuScene::new(
+            gpu,
+            &loaded.scene,
+            loaded.scene.pages.len() as u32,
+            Some(&loaded.upper_textures),
+        );
+        let mut streamer = Streamer::new(&loaded.scene, loaded.scene.pages.len() as u32);
+        for page in 0..loaded.scene.pages.len() as u32 {
+            streamer.install_now(gpu, &scene, page, loaded.page(page));
+        }
+        streamer.flush(gpu, &scene);
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
         let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
 
@@ -222,6 +236,7 @@ impl Renderer {
             post: PostProcess::new(gpu, output_format),
             profiler: Profiler::new(gpu),
             scene,
+            streamer,
             frame_uniform,
             view_slots,
             cull,

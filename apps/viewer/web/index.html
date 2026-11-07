@@ -292,6 +292,8 @@ async function main() {
     lookYaw = 0;
     lookPitch = 0;
 
+    // The moment the first image was submitted, for measuring load times.
+    if (frames === 0) performance.mark("first-frame");
     frames += 1;
     sinceReport += delta;
     if (sinceReport >= 0.5) {

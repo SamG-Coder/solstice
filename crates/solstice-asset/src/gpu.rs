@@ -18,6 +18,17 @@ pub const MAX_CLUSTER_VERTICES: usize = 255;
 /// infinities are implementation-defined in WGSL.
 pub const ROOT_PARENT_ERROR: f32 = 1.0e30;
 
+/// Set in [`PackedCluster::counts`] when the sibling set simplified into this cluster isn't
+/// installed, so this cluster must draw however coarse it is.
+pub const CLUSTER_CHILDREN_MISSING: u32 = 1 << 16;
+
+/// Set in [`PackedNode::is_leaf`] on a leaf. The low bits hold the page of its sibling set.
+pub const NODE_LEAF: u32 = 1 << 31;
+/// Set in [`PackedNode::is_leaf`] while that page is installed.
+pub const NODE_INSTALLED: u32 = 1 << 30;
+/// The bits of [`PackedNode::is_leaf`] holding a page.
+pub const NODE_PAGE_MASK: u32 = NODE_INSTALLED - 1;
+
 /// A vertex compressed to 16 bytes.
 ///
 /// Positions sit on a single mesh-wide 16-bit grid. Using one grid rather than
@@ -48,7 +59,7 @@ pub struct PackedCluster {
     pub vertex_offset: u32,
     /// First triangle in the shared triangle pool.
     pub triangle_offset: u32,
-    /// `vertex_count | triangle_count << 8`.
+    /// `vertex_count | triangle_count << 8`, plus [`CLUSTER_CHILDREN_MISSING`].
     pub counts: u32,
 }
 
@@ -70,7 +81,8 @@ pub struct PackedNode {
     pub first: u32,
     /// Number of children or clusters.
     pub count: u32,
-    /// Non-zero if `first` indexes clusters instead of nodes.
+    /// Non-zero if `first` indexes clusters instead of nodes. In a paged scene, a leaf
+    /// holds [`NODE_LEAF`], [`NODE_INSTALLED`] and its page.
     pub is_leaf: u32,
 }
 

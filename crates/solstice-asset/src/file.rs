@@ -1,19 +1,28 @@
-//! A flat, versioned binary encoding of [`SceneAsset`].
+//! The scene file: a small manifest, then pages and texture levels that can each be read alone.
 //!
-//! The format is deliberately trivial: little-endian lengths followed by raw
-//! `Pod` slices, so loading is one bounds-checked copy per array and the data
-//! can go straight to the GPU.
+//! ```text
+//! header    magic, version, where the manifest and data area are
+//! manifest  deflated: everything in a [`PagedScene`]
+//! data      each page deflated on its own, then texture levels as they are
+//! ```
+//!
+//! Block-compressed textures barely shrink further, so they aren't deflated. Pages are deflated
+//! separately so a client can fetch any one with an HTTP Range request. All values are
+//! little-endian, and loading is one bounds-checked copy per array.
 
-use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
-use crate::scene::{
-    Instance, Light, Material, SceneAsset, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
+use crate::gpu::{PackedCluster, PackedNode};
+use crate::paged::{
+    upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
 };
+use crate::scene::{Instance, Light, Material, TextureEncoding, TextureLayer, Viewpoint};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::fmt;
 
 const MAGIC: [u8; 8] = *b"SOLSTICE";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
+/// How hard to compress when baking. Unpacking takes the same time at any level.
+const DEFLATE_LEVEL: u8 = 9;
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +32,7 @@ pub enum DecodeError {
     Truncated,
     BadInstanceReference,
     BadTextures,
+    BadPages,
 }
 
 impl fmt::Display for DecodeError {
@@ -40,11 +50,41 @@ impl fmt::Display for DecodeError {
                 )
             }
             Self::BadTextures => write!(f, "the texture data does not match its stated format"),
+            Self::BadPages => write!(f, "the page tables are inconsistent"),
         }
     }
 }
 
 impl std::error::Error for DecodeError {}
+
+/// The fixed start of a file. It says how to fetch the rest.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct Header {
+    magic: [u8; 8],
+    version: u32,
+    _pad: u32,
+    /// Where the deflated manifest begins.
+    pub manifest_offset: u64,
+    /// Size of the deflated manifest. The data area follows it.
+    pub manifest_bytes: u64,
+}
+
+/// Bytes a client must fetch first, to read a [`Header`].
+pub const HEADER_BYTES: usize = std::mem::size_of::<Header>();
+
+/// Parses the start of a file.
+pub fn decode_header(bytes: &[u8]) -> Result<Header, DecodeError> {
+    if bytes.len() < MAGIC.len() || bytes[..MAGIC.len()] != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    let raw = bytes.get(..HEADER_BYTES).ok_or(DecodeError::Truncated)?;
+    let header: Header = bytemuck::pod_read_unaligned(raw);
+    if header.version != VERSION {
+        return Err(DecodeError::UnsupportedVersion(header.version));
+    }
+    Ok(header)
+}
 
 /// On-disk form of an [`Instance`].
 #[repr(C)]
@@ -55,32 +95,78 @@ struct RawInstance {
     transform: [f32; 16],
 }
 
-/// Serialises a scene to bytes.
-pub fn encode(scene: &SceneAsset) -> Vec<u8> {
-    let mut w = Writer::default();
-    w.bytes(&MAGIC);
-    w.pod(&VERSION);
+/// On-disk form of a [`MeshInfo`].
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RawMesh {
+    /// `u32::MAX` for a mesh with no geometry.
+    root_node: u32,
+    quant_origin: [f32; 3],
+    quant_step: f32,
+    uv_origin: [f32; 2],
+    uv_step: [f32; 2],
+}
 
-    w.pod(&(scene.meshes.len() as u32));
-    for mesh in &scene.meshes {
-        w.slice(&mesh.clusters);
-        w.slice(&mesh.nodes);
-        w.slice(&mesh.vertices);
-        w.slice(&mesh.triangles);
-        w.pod(&mesh.root_node);
-        w.pod(&mesh.hierarchy_depth);
-        w.pod(&mesh.quant_origin.to_array());
-        w.pod(&mesh.quant_step);
-        w.pod(&mesh.uv_origin);
-        w.pod(&mesh.uv_step);
-        w.pod(&mesh.bounds_center.to_array());
-        w.pod(&mesh.bounds_radius);
-        w.pod(&mesh.source_triangles);
+/// Serialises a scene.
+pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
+    let pinned = loaded.scene.pinned_pages as usize;
+    let upper_count = upper_mip_count(loaded.scene.texture_size);
+
+    let mut scene = loaded.scene.clone();
+    let mut data = Vec::new();
+    for (info, raw) in scene.pages[pinned..].iter_mut().zip(&loaded.pages) {
+        let packed = miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL);
+        info.offset = data.len() as u64;
+        info.stored_bytes = packed.len() as u32;
+        data.extend_from_slice(&packed);
+    }
+    scene.upper_mip_offsets.clear();
+    for layer in &loaded.upper_textures {
+        for mip in 0..upper_count {
+            scene.upper_mip_offsets.push(data.len() as u64);
+            data.extend_from_slice(&layer.color_mips[mip]);
+            data.extend_from_slice(&layer.normal_mips[mip]);
+            data.extend_from_slice(&layer.material_mips[mip]);
+        }
     }
 
-    w.slice(&scene.materials);
-    w.slice(&scene.lights);
+    let manifest = miniz_oxide::deflate::compress_to_vec(&encode_manifest(&scene), DEFLATE_LEVEL);
+    let header = Header {
+        magic: MAGIC,
+        version: VERSION,
+        _pad: 0,
+        manifest_offset: HEADER_BYTES as u64,
+        manifest_bytes: manifest.len() as u64,
+    };
+    let mut out = Vec::with_capacity(HEADER_BYTES + manifest.len() + data.len());
+    out.extend_from_slice(bytemuck::bytes_of(&header));
+    out.extend_from_slice(&manifest);
+    out.extend_from_slice(&data);
+    out
+}
 
+fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.slice(&scene.clusters);
+    w.slice(&scene.nodes);
+    w.slice(&scene.sets);
+    w.slice(&scene.generated);
+    w.slice(&scene.pages);
+    w.pod(&scene.pinned_pages);
+    w.slice(&scene.pinned_data);
+
+    let meshes: Vec<RawMesh> = scene
+        .meshes
+        .iter()
+        .map(|mesh| RawMesh {
+            root_node: mesh.root_node.unwrap_or(u32::MAX),
+            quant_origin: mesh.quant_origin.to_array(),
+            quant_step: mesh.quant_step,
+            uv_origin: mesh.uv_origin,
+            uv_step: mesh.uv_step,
+        })
+        .collect();
+    w.slice(&meshes);
     let instances: Vec<RawInstance> = scene
         .instances
         .iter()
@@ -91,14 +177,21 @@ pub fn encode(scene: &SceneAsset) -> Vec<u8> {
         })
         .collect();
     w.slice(&instances);
+    w.slice(&scene.materials);
+    w.slice(&scene.lights);
+    w.pod(&u32::from(scene.viewpoint.is_some()));
+    w.pod(&scene.viewpoint.unwrap_or_default());
+    w.pod(&scene.hierarchy_depth);
+    w.pod(&scene.source_triangles);
+    w.pod(&scene.unique_triangles);
 
     w.pod(&scene.texture_size);
     w.pod(&match scene.texture_encoding {
         TextureEncoding::Raw => 0u32,
         TextureEncoding::Block => 1u32,
     });
-    w.pod(&(scene.textures.len() as u32));
-    for layer in &scene.textures {
+    w.pod(&(scene.base_textures.len() as u32));
+    for layer in &scene.base_textures {
         w.pod(&(layer.color_mips.len() as u32));
         for mip in layer
             .color_mips
@@ -109,51 +202,32 @@ pub fn encode(scene: &SceneAsset) -> Vec<u8> {
             w.slice(mip);
         }
     }
-
-    w.pod(&u32::from(scene.viewpoint.is_some()));
-    w.pod(&scene.viewpoint.unwrap_or_default());
-
+    w.slice(&scene.upper_mip_offsets);
     w.finish()
 }
 
-/// Parses bytes produced by [`encode`].
-pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
+/// Parses an unpacked manifest. `data_offset` is where the file's data area begins.
+pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, DecodeError> {
     let mut r = Reader { bytes };
-    if r.take(MAGIC.len()).ok() != Some(MAGIC.as_slice()) {
-        return Err(DecodeError::BadMagic);
-    }
-    let version: u32 = r.pod()?;
-    if version != VERSION {
-        return Err(DecodeError::UnsupportedVersion(version));
-    }
+    let clusters: Vec<PackedCluster> = r.slice()?;
+    let nodes: Vec<PackedNode> = r.slice()?;
+    let sets: Vec<ClusterSet> = r.slice()?;
+    let generated: Vec<u32> = r.slice()?;
+    let pages: Vec<PageInfo> = r.slice()?;
+    let pinned_pages: u32 = r.pod()?;
+    let pinned_data: Vec<u8> = r.slice()?;
 
-    let mesh_count: u32 = r.pod()?;
-    let mut meshes = Vec::new();
-    for _ in 0..mesh_count {
-        let clusters: Vec<PackedCluster> = r.slice()?;
-        let nodes: Vec<PackedNode> = r.slice()?;
-        let vertices: Vec<PackedVertex> = r.slice()?;
-        let triangles: Vec<u32> = r.slice()?;
-        meshes.push(VirtualMesh {
-            clusters,
-            nodes,
-            vertices,
-            triangles,
-            root_node: r.pod()?,
-            hierarchy_depth: r.pod()?,
-            quant_origin: Vec3::from_array(r.pod()?),
-            quant_step: r.pod()?,
-            uv_origin: r.pod()?,
-            uv_step: r.pod()?,
-            bounds_center: Vec3::from_array(r.pod()?),
-            bounds_radius: r.pod()?,
-            source_triangles: r.pod()?,
-        });
-    }
-
-    let materials: Vec<Material> = r.slice()?;
-    let lights: Vec<Light> = r.slice()?;
-
+    let raw_meshes: Vec<RawMesh> = r.slice()?;
+    let meshes: Vec<MeshInfo> = raw_meshes
+        .iter()
+        .map(|mesh| MeshInfo {
+            root_node: (mesh.root_node != u32::MAX).then_some(mesh.root_node),
+            quant_origin: Vec3::from_array(mesh.quant_origin),
+            quant_step: mesh.quant_step,
+            uv_origin: mesh.uv_origin,
+            uv_step: mesh.uv_step,
+        })
+        .collect();
     let raw_instances: Vec<RawInstance> = r.slice()?;
     let instances: Vec<Instance> = raw_instances
         .iter()
@@ -163,12 +237,20 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
             transform: Mat4::from_cols_array(&raw.transform),
         })
         .collect();
+    let materials: Vec<Material> = r.slice()?;
+    let lights: Vec<Light> = r.slice()?;
     let references_valid = instances
         .iter()
         .all(|i| (i.mesh as usize) < meshes.len() && (i.material as usize) < materials.len());
     if !references_valid {
         return Err(DecodeError::BadInstanceReference);
     }
+
+    let has_viewpoint: u32 = r.pod()?;
+    let viewpoint: Viewpoint = r.pod()?;
+    let hierarchy_depth: u32 = r.pod()?;
+    let source_triangles: u64 = r.pod()?;
+    let unique_triangles: u64 = r.pod()?;
 
     let texture_size: u32 = r.pod()?;
     let texture_encoding = match r.pod::<u32>()? {
@@ -177,7 +259,7 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
         _ => return Err(DecodeError::BadTextures),
     };
     let layer_count: u32 = r.pod()?;
-    let mut textures = Vec::new();
+    let mut base_textures = Vec::new();
     for _ in 0..layer_count {
         let mip_count: u32 = r.pod()?;
         let mut layer = TextureLayer::default();
@@ -190,35 +272,176 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
         for _ in 0..mip_count {
             layer.material_mips.push(r.slice()?);
         }
-        if !layer_is_well_formed(&layer, texture_size, texture_encoding) {
+        if !base_is_well_formed(&layer, texture_size, texture_encoding) {
             return Err(DecodeError::BadTextures);
         }
-        textures.push(layer);
+        base_textures.push(layer);
     }
+    let upper_mip_offsets: Vec<u64> = r.slice()?;
 
-    let has_viewpoint: u32 = r.pod()?;
-    let viewpoint: Viewpoint = r.pod()?;
-
-    Ok(SceneAsset {
+    let scene = PagedScene {
+        clusters,
+        nodes,
+        sets,
+        generated,
+        pages,
+        pinned_pages,
+        pinned_data,
         meshes,
-        materials,
         instances,
+        materials,
         lights,
+        viewpoint: (has_viewpoint != 0).then_some(viewpoint),
+        hierarchy_depth,
+        source_triangles,
+        unique_triangles,
         texture_size,
         texture_encoding,
-        textures,
-        viewpoint: (has_viewpoint != 0).then_some(viewpoint),
+        base_textures,
+        upper_mip_offsets,
+        data_offset,
+    };
+    if !tables_are_consistent(&scene) {
+        return Err(DecodeError::BadPages);
+    }
+    Ok(scene)
+}
+
+/// Unpacks a whole file held in memory, pages and all.
+pub fn decode(bytes: &[u8]) -> Result<LoadedScene, DecodeError> {
+    let header = decode_header(bytes)?;
+    let end = header
+        .manifest_offset
+        .checked_add(header.manifest_bytes)
+        .ok_or(DecodeError::Truncated)?;
+    let packed = usize::try_from(header.manifest_offset)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(start, end)| bytes.get(start..end))
+        .ok_or(DecodeError::Truncated)?;
+    let manifest = inflate(packed)?;
+    let scene = decode_manifest(&manifest, end)?;
+    drop(manifest);
+
+    let mut pages = Vec::new();
+    for page in 0..scene.pages.len() as u32 {
+        if page >= scene.pinned_pages {
+            let packed = stored_range(bytes, page_range(&scene, page))?;
+            pages.push(unpack_page(&scene, page, packed)?);
+        }
+    }
+
+    let upper_count = upper_mip_count(scene.texture_size);
+    let mut upper_textures = Vec::new();
+    for layer in 0..scene.base_textures.len() {
+        let mut out = TextureLayer::default();
+        for mip in 0..upper_count {
+            let range = upper_mip_range(&scene, layer, mip).ok_or(DecodeError::BadTextures)?;
+            let stored = stored_range(bytes, range)?;
+            let edge = scene.texture_size >> mip;
+            let color = scene.texture_encoding.color_mip_bytes(edge);
+            let data = scene.texture_encoding.data_mip_bytes(edge);
+            out.color_mips.push(stored[..color].to_vec());
+            out.normal_mips.push(stored[color..color + data].to_vec());
+            out.material_mips.push(stored[color + data..].to_vec());
+        }
+        upper_textures.push(out);
+    }
+
+    Ok(LoadedScene {
+        scene,
+        pages,
+        upper_textures,
     })
 }
 
-/// Checks that every mip is the size the GPU will expect, which a bad file could otherwise
+/// The bytes of a page in the file, as absolute offsets.
+pub fn page_range(scene: &PagedScene, page: u32) -> (u64, u64) {
+    let info = &scene.pages[page as usize];
+    let start = scene.data_offset + info.offset;
+    (start, start + u64::from(info.stored_bytes))
+}
+
+/// The bytes of one upper mip level of one layer in the file, as absolute offsets: its colour,
+/// normal and material data, in that order. `None` if the file has no such level.
+pub fn upper_mip_range(scene: &PagedScene, layer: usize, mip: usize) -> Option<(u64, u64)> {
+    let count = upper_mip_count(scene.texture_size);
+    if mip >= count {
+        return None;
+    }
+    let offset = *scene.upper_mip_offsets.get(layer * count + mip)?;
+    let edge = scene.texture_size >> mip;
+    let encoding = scene.texture_encoding;
+    let bytes = encoding.color_mip_bytes(edge) + 2 * encoding.data_mip_bytes(edge);
+    let start = scene.data_offset + offset;
+    Some((start, start + bytes as u64))
+}
+
+fn stored_range(bytes: &[u8], (start, end): (u64, u64)) -> Result<&[u8], DecodeError> {
+    usize::try_from(start)
+        .ok()
+        .zip(usize::try_from(end).ok())
+        .and_then(|(start, end)| bytes.get(start..end))
+        .ok_or(DecodeError::Truncated)
+}
+
+/// Unpacks a deflated block.
+pub fn inflate(packed: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    miniz_oxide::inflate::decompress_to_vec(packed).map_err(|_| DecodeError::Truncated)
+}
+
+/// Unpacks a page and checks that it is the size the tables say.
+pub fn unpack_page(scene: &PagedScene, page: u32, packed: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    let raw = inflate(packed)?;
+    if raw.len() != scene.pages[page as usize].raw_bytes() {
+        return Err(DecodeError::BadPages);
+    }
+    Ok(raw)
+}
+
+/// Checks everything the renderer would otherwise index blindly while installing pages. A bad
+/// file should fail here rather than panic later.
+fn tables_are_consistent(scene: &PagedScene) -> bool {
+    let clusters = scene.clusters.len() as u64;
+    let generated = scene.generated.len() as u64;
+    let sets = scene.sets.len() as u64;
+    let pages = scene.pages.len() as u64;
+    let sets_ok = scene.sets.iter().all(|set| {
+        u64::from(set.first_cluster) + u64::from(set.cluster_count) <= clusters
+            && u64::from(set.first_generated) + u64::from(set.generated_count) <= generated
+            && u64::from(set.page) < pages
+            && (set.leaf_node as usize) < scene.nodes.len()
+    });
+    let pages_ok = scene.pages.iter().all(|page| {
+        page.raw_bytes() <= PAGE_BYTES
+            && u64::from(page.first_set) + u64::from(page.set_count) <= sets
+    });
+    let pinned = scene.pinned_pages as usize;
+    let pinned_ok = pinned <= scene.pages.len()
+        && scene.pages[..pinned]
+            .iter()
+            .map(PageInfo::raw_bytes)
+            .sum::<usize>()
+            == scene.pinned_data.len();
+    sets_ok
+        && pages_ok
+        && pinned_ok
+        && scene.generated.iter().all(|&c| u64::from(c) < clusters)
+        && scene.meshes.iter().all(|mesh| {
+            mesh.root_node
+                .is_none_or(|root| (root as usize) < scene.nodes.len())
+        })
+}
+
+/// Checks that every level is the size the GPU will expect, which a bad file could otherwise
 /// turn into a validation error much later.
-fn layer_is_well_formed(layer: &TextureLayer, size: u32, encoding: TextureEncoding) -> bool {
+fn base_is_well_formed(layer: &TextureLayer, size: u32, encoding: TextureEncoding) -> bool {
     if !size.is_power_of_two() || (encoding == TextureEncoding::Block && size < 4) {
         return false;
     }
-    let levels = size.ilog2() as usize + 1;
-    let edge = |level: usize| size >> level;
+    let upper = upper_mip_count(size);
+    let levels = size.ilog2() as usize + 1 - upper;
+    let edge = |level: usize| size >> (level + upper);
     layer.color_mips.len() == levels
         && (0..levels).all(|level| {
             layer.color_mips[level].len() == encoding.color_mip_bytes(edge(level))
@@ -287,25 +510,81 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::{pack_triangle, PackedVertex, NODE_LEAF};
 
-    fn sample_scene() -> SceneAsset {
-        SceneAsset {
-            meshes: vec![VirtualMesh {
-                clusters: vec![PackedCluster {
+    /// One pinned page and one that loads on demand, with textures above and below the base.
+    fn sample_scene() -> LoadedScene {
+        let page_bytes = |vertex: u8| {
+            let vertices = [PackedVertex {
+                data: [u16::from(vertex); 8],
+            }; 3];
+            let mut bytes: Vec<u8> = bytemuck::cast_slice(&vertices).to_vec();
+            bytes.extend_from_slice(bytemuck::bytes_of(&pack_triangle(0, 1, 2)));
+            bytes
+        };
+        let info = PageInfo {
+            vertex_count: 3,
+            triangle_count: 1,
+            set_count: 1,
+            ..Default::default()
+        };
+        let edge = 256u32;
+        let encoding = TextureEncoding::Raw;
+        let mip =
+            |edge: u32, bytes: usize, fill: u8| vec![fill; edge as usize * edge as usize * bytes];
+        let chain = |first: u32, bytes: usize, fill: u8| -> Vec<Vec<u8>> {
+            (first..=edge.ilog2())
+                .map(|m| mip(edge >> m, bytes, fill))
+                .collect()
+        };
+        let scene = PagedScene {
+            clusters: vec![
+                PackedCluster {
                     radius: 2.0,
                     counts: 3 | 1 << 8,
                     ..Default::default()
-                }],
-                nodes: vec![PackedNode::default()],
-                vertices: vec![PackedVertex { data: [7; 8] }; 3],
-                triangles: vec![crate::gpu::pack_triangle(0, 1, 2)],
+                };
+                2
+            ],
+            nodes: vec![
+                PackedNode {
+                    is_leaf: NODE_LEAF,
+                    ..Default::default()
+                },
+                PackedNode {
+                    is_leaf: NODE_LEAF | 1,
+                    first: 1,
+                    count: 1,
+                    ..Default::default()
+                },
+            ],
+            sets: vec![
+                ClusterSet {
+                    cluster_count: 1,
+                    ..Default::default()
+                },
+                ClusterSet {
+                    first_cluster: 1,
+                    cluster_count: 1,
+                    generated_count: 1,
+                    leaf_node: 1,
+                    page: 1,
+                    ..Default::default()
+                },
+            ],
+            generated: vec![0],
+            pages: vec![
+                info,
+                PageInfo {
+                    first_set: 1,
+                    ..info
+                },
+            ],
+            pinned_pages: 1,
+            pinned_data: page_bytes(1),
+            meshes: vec![MeshInfo {
+                root_node: Some(0),
                 quant_step: 0.5,
-                source_triangles: 1,
-                ..Default::default()
-            }],
-            materials: vec![Material::default()],
-            lights: vec![Light {
-                range: 4.0,
                 ..Default::default()
             }],
             instances: vec![Instance {
@@ -313,34 +592,96 @@ mod tests {
                 material: 0,
                 transform: Mat4::from_translation(Vec3::X),
             }],
-            texture_size: 1,
-            texture_encoding: TextureEncoding::Raw,
-            textures: vec![TextureLayer {
-                color_mips: vec![vec![1, 2, 3, 4]],
-                normal_mips: vec![vec![5, 6]],
-                material_mips: vec![vec![7, 8]],
+            materials: vec![Material::default()],
+            lights: vec![Light {
+                range: 4.0,
+                ..Default::default()
             }],
             viewpoint: Some(Viewpoint {
                 position: [1.0, 2.0, 3.0],
                 yaw: 0.5,
                 pitch: -0.25,
             }),
+            hierarchy_depth: 3,
+            source_triangles: 7,
+            unique_triangles: 5,
+            texture_size: edge,
+            texture_encoding: encoding,
+            base_textures: vec![TextureLayer {
+                color_mips: chain(1, 4, 1),
+                normal_mips: chain(1, 2, 2),
+                material_mips: chain(1, 2, 3),
+            }],
+            ..Default::default()
+        };
+        LoadedScene {
+            scene,
+            pages: vec![page_bytes(2)],
+            upper_textures: vec![TextureLayer {
+                color_mips: vec![mip(edge, 4, 4)],
+                normal_mips: vec![mip(edge, 2, 5)],
+                material_mips: vec![mip(edge, 2, 6)],
+            }],
         }
     }
 
     #[test]
     fn round_trip_preserves_everything() {
-        let scene = sample_scene();
-        let decoded = decode(&encode(&scene)).unwrap();
-        assert_eq!(decoded.meshes[0].clusters, scene.meshes[0].clusters);
-        assert_eq!(decoded.meshes[0].vertices, scene.meshes[0].vertices);
-        assert_eq!(decoded.meshes[0].triangles, scene.meshes[0].triangles);
-        assert_eq!(decoded.materials, scene.materials);
-        assert_eq!(decoded.lights, scene.lights);
-        assert_eq!(decoded.viewpoint, scene.viewpoint);
-        assert_eq!(decoded.instances[0].transform, scene.instances[0].transform);
-        assert_eq!(decoded.textures[0].normal_mips, vec![vec![5, 6]]);
-        assert_eq!(decoded.textures[0].material_mips, vec![vec![7, 8]]);
+        let loaded = sample_scene();
+        let decoded = decode(&encode(&loaded)).unwrap();
+        let (a, b) = (&decoded.scene, &loaded.scene);
+        assert_eq!(a.clusters, b.clusters);
+        assert_eq!(a.nodes, b.nodes);
+        assert_eq!(a.sets, b.sets);
+        assert_eq!(a.generated, b.generated);
+        assert_eq!(a.pinned_pages, 1);
+        assert_eq!(a.pinned_data, b.pinned_data);
+        assert_eq!(a.materials, b.materials);
+        assert_eq!(a.lights, b.lights);
+        assert_eq!(a.viewpoint, b.viewpoint);
+        assert_eq!(a.meshes, b.meshes);
+        assert_eq!(a.instances[0].transform, b.instances[0].transform);
+        assert_eq!(a.hierarchy_depth, 3);
+        assert_eq!(a.source_triangles, 7);
+        assert_eq!(
+            a.base_textures[0].normal_mips,
+            b.base_textures[0].normal_mips
+        );
+        assert_eq!(decoded.pages, loaded.pages);
+        assert_eq!(
+            decoded.upper_textures[0].color_mips,
+            loaded.upper_textures[0].color_mips
+        );
+        assert_eq!(
+            decoded.upper_textures[0].normal_mips,
+            loaded.upper_textures[0].normal_mips
+        );
+        assert_eq!(
+            decoded.upper_textures[0].material_mips,
+            loaded.upper_textures[0].material_mips
+        );
+        assert_eq!(decoded.page(0), loaded.page(0));
+        assert_eq!(decoded.page(1), loaded.page(1));
+    }
+
+    #[test]
+    fn a_page_and_a_mip_can_be_read_without_the_rest() {
+        let loaded = sample_scene();
+        let file = encode(&loaded);
+        let header = decode_header(&file[..HEADER_BYTES]).unwrap();
+        let start = header.manifest_offset as usize;
+        let end = start + header.manifest_bytes as usize;
+        let scene = decode_manifest(&inflate(&file[start..end]).unwrap(), end as u64).unwrap();
+
+        let (from, to) = page_range(&scene, 1);
+        let page = unpack_page(&scene, 1, &file[from as usize..to as usize]).unwrap();
+        assert_eq!(page, loaded.pages[0]);
+
+        let (from, to) = upper_mip_range(&scene, 0, 0).unwrap();
+        let stored = &file[from as usize..to as usize];
+        assert_eq!(stored.len(), 256 * 256 * 8);
+        assert_eq!((stored[0], *stored.last().unwrap()), (4, 6));
+        assert_eq!(upper_mip_range(&scene, 0, 1), None);
     }
 
     #[test]
@@ -354,25 +695,19 @@ mod tests {
     }
 
     #[test]
-    fn block_encoding_round_trips_with_small_mips_filling_a_block() {
-        let mut scene = sample_scene();
-        scene.texture_size = 4;
-        scene.texture_encoding = TextureEncoding::Block;
-        let chain = vec![vec![9; 16]; 3];
-        scene.textures = vec![TextureLayer {
-            color_mips: chain.clone(),
-            normal_mips: chain.clone(),
-            material_mips: chain,
-        }];
-        let decoded = decode(&encode(&scene)).unwrap();
-        assert_eq!(decoded.texture_encoding, TextureEncoding::Block);
-        assert_eq!(decoded.textures[0].color_mips[2], vec![9; 16]);
+    fn rejects_other_versions() {
+        let mut bytes = encode(&sample_scene());
+        bytes[8] = 3;
+        assert_eq!(
+            decode(&bytes).unwrap_err(),
+            DecodeError::UnsupportedVersion(3)
+        );
     }
 
     #[test]
     fn rejects_textures_of_the_wrong_size() {
         let mut scene = sample_scene();
-        scene.textures[0].normal_mips[0].pop();
+        scene.scene.base_textures[0].normal_mips[0].pop();
         assert_eq!(
             decode(&encode(&scene)).unwrap_err(),
             DecodeError::BadTextures
@@ -382,10 +717,21 @@ mod tests {
     #[test]
     fn rejects_dangling_instance_references() {
         let mut scene = sample_scene();
-        scene.instances[0].mesh = 9;
+        scene.scene.instances[0].mesh = 9;
         assert_eq!(
             decode(&encode(&scene)).unwrap_err(),
             DecodeError::BadInstanceReference
         );
+    }
+
+    #[test]
+    fn rejects_page_tables_that_point_outside_the_scene() {
+        let mut scene = sample_scene();
+        scene.scene.sets[1].first_generated = 40;
+        assert_eq!(decode(&encode(&scene)).unwrap_err(), DecodeError::BadPages);
+
+        let mut scene = sample_scene();
+        scene.scene.pinned_data.pop();
+        assert_eq!(decode(&encode(&scene)).unwrap_err(), DecodeError::BadPages);
     }
 }

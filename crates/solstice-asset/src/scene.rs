@@ -1,6 +1,7 @@
 //! CPU-side description of a scene.
 
 use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
+use crate::paged::ClusterSet;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
@@ -11,6 +12,10 @@ pub struct VirtualMesh {
     pub nodes: Vec<PackedNode>,
     pub vertices: Vec<PackedVertex>,
     pub triangles: Vec<u32>,
+    /// Clusters grouped by shared parent. Each hierarchy leaf is one set.
+    pub sets: Vec<ClusterSet>,
+    /// See [`ClusterSet::first_generated`].
+    pub generated: Vec<u32>,
     /// Index of the hierarchy root in `nodes`.
     pub root_node: u32,
     /// Longest root-to-leaf path in the hierarchy, in nodes.

@@ -2,13 +2,16 @@
 //!
 //! * [`gpu`] defines the exact memory layout of everything the shaders read.
 //! * [`scene`] defines the CPU-side description of a scene.
-//! * [`file`] serialises a scene to a single flat binary.
+//! * [`paged`] divides a scene into what stays resident and what loads on demand.
+//! * [`file`] stores a paged scene so that its pages can be read one at a time.
 
 pub mod file;
 pub mod gpu;
+pub mod paged;
 pub mod scene;
 
-pub use gpu::{PackedCluster, PackedNode, PackedVertex};
+pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedVertex};
+pub use paged::{LoadedScene, PagedScene};
 pub use scene::{
     Instance, Light, Material, SceneAsset, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
 };

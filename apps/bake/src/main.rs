@@ -113,7 +113,7 @@ fn main() -> Result<(), String> {
         scene.total_source_triangles(),
     );
 
-    let bytes = solstice_asset::file::encode(&scene);
+    let bytes = solstice_asset::file::encode(&solstice_builder::paginate(&scene));
     if let Some(parent) = options.output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
