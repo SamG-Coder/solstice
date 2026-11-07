@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use solstice_asset::{Instance, Light, Material, SceneAsset, Viewpoint};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 use solstice_procgen::noise::{fbm, random};
+use solstice_procgen::surface::TILE_METRES;
 use solstice_procgen::surfaces;
 
 /// How much geometry to generate.
@@ -106,22 +107,29 @@ fn materials() -> Vec<Material> {
         roughness,
         normal_strength,
         base_color: [1.0; 4],
-        macro_variation: 1.0,
+
         ..Default::default()
     };
+    // Surfaces span TILE_METRES, so this shows them at their real size.
+    let real_size = 1.0 / TILE_METRES;
     vec![
-        textured(0, 0.45, 1.0, 1.0),
+        textured(0, real_size, 1.0, 1.0),
         Material {
             base_color: [0.74, 0.71, 0.66, 1.0],
-            ..textured(1, 0.35, 1.0, 0.7)
+            ..textured(1, real_size, 1.0, 1.0)
         },
         Material {
             base_color: [0.74, 0.71, 0.66, 1.0],
-            roughness: 0.28,
-            ..textured(1, 0.22, 1.0, 0.25)
+            // A multiplier on the marble's own polish, leaving this floor a little more worn.
+            roughness: 0.75,
+            ..textured(1, real_size, 1.0, 1.0)
         },
-        textured(2, 0.22, 1.0, 1.0),
-        textured(3, 0.3, 1.0, 1.0),
+        // Only the ground spreads far enough for its repetition to show.
+        Material {
+            macro_variation: 1.0,
+            ..textured(2, real_size, 1.0, 1.0)
+        },
+        textured(3, real_size, 1.0, 1.0),
         Material {
             base_color: [0.0, 0.0, 0.0, 1.0],
             emissive: [60.0, 21.0, 4.5, 0.0],
@@ -590,7 +598,7 @@ fn rocks(out: &mut Vec<Instance>, boulders: u32, pebbles: u32) {
 pub fn build_temple(quality: Quality) -> SceneAsset {
     let (texture_size, boulders, pebbles) = match quality {
         Quality::Draft => (256, 300, 2000),
-        Quality::Web => (512, 900, 12_000),
+        Quality::Web => (1024, 900, 12_000),
         Quality::High => (1024, 1500, 24_000),
     };
 
@@ -607,7 +615,7 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
     let textures = vec![
         surfaces::sandstone(0).bake(texture_size),
         surfaces::marble(0).bake(texture_size),
-        surfaces::ground(0).bake(texture_size),
+        surfaces::sand(0).bake(texture_size),
         surfaces::basalt(0).bake(texture_size),
     ];
 

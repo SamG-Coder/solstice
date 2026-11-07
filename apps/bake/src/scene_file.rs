@@ -22,6 +22,7 @@ use solstice_asset::{Instance, Light, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
 use solstice_procgen::noise::fbm;
+use solstice_procgen::surface::TILE_METRES;
 use solstice_procgen::surfaces;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -234,14 +235,14 @@ fn add_terrain(scene: &mut SceneAsset, size: f32, cells: u32, height: f32, shore
     let layer = scene.textures.len() as i32;
     scene
         .textures
-        .push(surfaces::ground(0).bake(scene.texture_size));
+        .push(surfaces::sand(0).bake(scene.texture_size));
     scene.materials.push(Material {
-        // The texture is a bright desert. Darkened to real sand, about 0.35 albedo, so that
-        // it sits correctly next to scanned materials and does not skew auto exposure.
-        base_color: [0.55, 0.53, 0.5, 1.0],
+        // Darkened to about 0.35 albedo, as damp beach sand is, so that it sits correctly next to
+        // scanned materials and does not skew auto exposure.
+        base_color: [0.68, 0.68, 0.68, 1.0],
         roughness: 1.0,
-        uv_scale: 0.3,
-        normal_strength: 0.5,
+        uv_scale: 1.0 / TILE_METRES,
+        normal_strength: 1.0,
         texture_layer: layer,
         macro_variation: 1.0,
         ..Default::default()
@@ -258,7 +259,7 @@ fn add_terrain(scene: &mut SceneAsset, size: f32, cells: u32, height: f32, shore
 }
 
 /// Adds a flat, glossy water surface. The ground texture supplies its ripples, at a scale
-/// where the pebbles read as small waves, and is too dark to be seen as colour.
+/// where the sand's ripples read as small waves, and is too dark to be seen as colour.
 fn add_water(scene: &mut SceneAsset, height: f32, color: [f32; 3], ripples_layer: i32) {
     // Ripples need fine UVs, which the 16-bit grid only allows over a limited area.
     const SIZE: f32 = 4000.0;

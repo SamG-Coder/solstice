@@ -23,8 +23,13 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Bake the demo scene
+            - name: Bake the temple
         run: cargo run --release -p bake -- --quality web --output assets/web.solstice
+      - name: Fetch the cove's scans
+        run: python3 scripts/fetch-scans.py scenes/cove.txt 2k
+      - name: Bake the cove
+        run: cargo run --release -p bake -- --scene scenes/cove.txt --texture-size 1024 --output assets/cove.solstice
+
       - name: Build the site
         run: bash scripts/build-web.sh
       - uses: actions/upload-pages-artifact@v3

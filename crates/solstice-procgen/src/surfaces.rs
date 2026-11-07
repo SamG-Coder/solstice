@@ -7,8 +7,8 @@ use crate::cracks::{CrackNetwork, Generation};
 use crate::field::{
     billow, fbm, ridged, smoothstep, Blades, Cell, Cells, Facets, Field, Leaves, Stones, Strokes,
 };
-use crate::noise::{lattice_random, tiling_fbm};
-use crate::surface::{Shade, Surface, Texel, TILE_METRES};
+use crate::noise::lattice_random;
+use crate::surface::{Shade, Surface, TILE_METRES};
 use glam::Vec3;
 
 /// Every surface in the library, by name.
@@ -45,7 +45,7 @@ pub fn by_name(name: &str, seed: u32) -> Option<Surface> {
         "snow" => snow(seed),
         "sandstone" => sandstone(seed),
         "marble" => marble(seed),
-        "ground" => ground(seed),
+
         "basalt" => basalt(seed),
         _ => return None,
     })
@@ -1143,29 +1143,6 @@ pub fn marble(seed: u32) -> Surface {
     )
 }
 
-/// Wind-blown desert ground with small stones. The original demo ground, kept so that existing
-/// scenes do not change.
-pub fn ground(seed: u32) -> Surface {
-    Surface::new(0.2, move |u, v| {
-        let dunes = tiling_fbm(u, v, 4, 4, seed + 90);
-        let pebbles = (tiling_fbm(u, v, 28, 3, seed + 100) - 0.4).max(0.0) * 3.0;
-        let dust = tiling_fbm(u, v, 80, 3, seed + 110);
-        let base = mix(
-            Vec3::new(0.50, 0.37, 0.25),
-            Vec3::new(0.68, 0.53, 0.38),
-            dunes * 0.5 + 0.5,
-        );
-        let color =
-            mix(base, Vec3::new(0.34, 0.27, 0.21), pebbles.min(1.0) * 0.3) * (0.95 + dust * 0.1);
-        Texel {
-            color,
-            height: 0.45 + dunes * 0.1 + pebbles.min(1.0) * 0.3 + dust * 0.05,
-            roughness: 0.95,
-            cavity: 1.0 - (0.28 - pebbles).max(0.0) * 0.6,
-        }
-    })
-}
-
 /// Dark volcanic rock for boulders and cliffs.
 pub fn basalt(seed: u32) -> Surface {
     // Basalt is fine-grained, so it has no visible crystals. Its character comes from breaking
@@ -1288,7 +1265,6 @@ mod tests {
     fn all(seed: u32) -> Vec<(&'static str, Surface)> {
         NAMES
             .iter()
-            .chain(&["ground"])
             .map(|&name| (name, by_name(name, seed).expect("listed surface exists")))
             .collect()
     }
