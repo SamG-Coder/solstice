@@ -21,7 +21,8 @@ pub struct Texel {
     pub cavity: f32,
 }
 
-/// How many metres one repeat of a shaped surface covers, which gives its heights real meaning.
+/// How many metres one repeat of a shaped surface covers unless it says otherwise, which gives
+/// its heights real meaning. See [`Surface::with_tile_metres`].
 pub const TILE_METRES: f32 = 4.0;
 
 /// What a shaped surface's colour can depend on at a point. Heights are in metres, relative to
@@ -62,6 +63,7 @@ enum Source {
 /// A seamlessly tiling material, ready to be generated at any size.
 pub struct Surface {
     source: Source,
+    tile_metres: f32,
 }
 
 impl Surface {
@@ -77,6 +79,7 @@ impl Surface {
                 normal_strength,
                 sample: Box::new(sample),
             },
+            tile_metres: TILE_METRES,
         }
     }
 
@@ -92,7 +95,21 @@ impl Surface {
                 height: Box::new(height),
                 shade: Box::new(shade),
             },
+            tile_metres: TILE_METRES,
         }
+    }
+
+    /// Sets how many metres one repeat of this surface covers. A smaller tile packs the same
+    /// texture size into less of the world, for materials seen close up whose detail is a few
+    /// millimetres, such as bark. Materials using it set their UV scale to match.
+    pub fn with_tile_metres(mut self, metres: f32) -> Self {
+        self.tile_metres = metres;
+        self
+    }
+
+    /// How many metres one repeat of this surface covers.
+    pub fn tile_metres(&self) -> f32 {
+        self.tile_metres
     }
 
     /// The material at one point, with shaped surfaces read as if flat around it. Only for testing
@@ -153,7 +170,7 @@ impl Surface {
                     .collect();
                 let heights: Vec<f32> = shape.iter().map(|s| s.0).collect();
                 let radius = |metres: f32| {
-                    ((metres / TILE_METRES * size as f32).round() as usize).clamp(1, n / 4 + 1)
+                    ((metres / self.tile_metres * size as f32).round() as usize).clamp(1, n / 4 + 1)
                 };
                 let fine = blur(&heights, n, radius(0.01));
                 let medium = blur(&heights, n, radius(0.05));
@@ -178,7 +195,7 @@ impl Surface {
                     })
                     .collect();
                 // The slope in real units: height change per metre across two texels.
-                (texels, 0.5 / TILE_METRES)
+                (texels, 0.5 / self.tile_metres)
             }
         }
     }

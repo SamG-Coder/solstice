@@ -11,7 +11,7 @@
 //! assert!((0.0..=1.0).contains(&patches.at(0.25, 0.75)));
 //! ```
 
-use crate::noise::{lattice_random, tiling_billow, tiling_fbm, tiling_ridged};
+use crate::noise::{lattice_random, tiling_billow, tiling_fbm, tiling_fbm_xy, tiling_ridged};
 use glam::Vec2;
 
 /// A seamlessly tiling value at every point of a square.
@@ -87,6 +87,12 @@ impl<F: Fn(f32, f32) -> f32 + Send + Sync> Field for F {
 /// Soft fractal noise in roughly `-1..1`, with `period` features across the square at its coarsest.
 pub fn fbm(period: i32, octaves: u32, seed: u32) -> impl Field + Copy {
     move |u: f32, v: f32| tiling_fbm(u, v, period, octaves, seed)
+}
+
+/// Soft fractal noise in roughly `-1..1`, with `across` features over the square in X and
+/// `down` in Y at its coarsest, so its features are drawn out along the axis with fewer.
+pub fn fbm_xy(across: i32, down: i32, octaves: u32, seed: u32) -> impl Field + Copy {
+    move |u: f32, v: f32| tiling_fbm_xy(u, v, across, down, octaves, seed)
 }
 
 /// Fractal noise in `0..1` with sharp creases, like eroded stone.

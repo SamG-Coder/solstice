@@ -7,12 +7,13 @@ use crate::cracks::{CrackNetwork, Generation};
 use crate::field::{
     billow, fbm, ridged, smoothstep, Blades, Cell, Cells, Facets, Field, Leaves, Stones, Strokes,
 };
+use crate::foliage::bark::Bark;
 use crate::noise::lattice_random;
 use crate::surface::{Shade, Surface, TILE_METRES};
 use glam::Vec3;
 
 /// Every surface in the library, by name.
-pub const NAMES: [&str; 14] = [
+pub const NAMES: [&str; 19] = [
     "sand",
     "wet_sand",
     "dirt",
@@ -27,6 +28,11 @@ pub const NAMES: [&str; 14] = [
     "sandstone",
     "marble",
     "basalt",
+    "oak_bark",
+    "birch_bark",
+    "fir_bark",
+    "pine_bark",
+    "beech_bark",
 ];
 
 /// Finds a surface by name, or `None` if the library has no such surface.
@@ -47,7 +53,7 @@ pub fn by_name(name: &str, seed: u32) -> Option<Surface> {
         "marble" => marble(seed),
 
         "basalt" => basalt(seed),
-        _ => return None,
+        _ => return Bark::by_name(name).map(|bark| bark.surface(seed)),
     })
 }
 

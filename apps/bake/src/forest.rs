@@ -5,8 +5,10 @@ use glam::{Mat4, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
-use solstice_procgen::foliage::grass::{blade_atlas, Meadow};
-use solstice_procgen::foliage::tree::{bark, leaf_atlas, Species};
+use solstice_procgen::foliage::bark::{Bark, BARK_TILE_METRES};
+use solstice_procgen::foliage::grass::Meadow;
+use solstice_procgen::foliage::leaf::LeafKind;
+use solstice_procgen::foliage::tree::Species;
 use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
@@ -18,15 +20,43 @@ const GROUND_SIZE: f32 = 160.0;
 const MEADOW_SIZE: f32 = 70.0;
 /// Different grass patches, laid out at random so no repeat shows.
 const PATCH_VARIANTS: u32 = 4;
-/// Different trees of each species.
-const TREE_VARIANTS: u32 = 2;
-const BUSH_VARIANTS: u32 = 2;
+/// The plants of the wood, and how many differently grown copies of each.
+const PLANTS: [(&str, u32); 4] = [("oak", 2), ("birch", 2), ("fir", 2), ("bush", 2)];
 
 mod material {
     pub const GROUND: u32 = 0;
     pub const GRASS: u32 = 1;
-    pub const BARK: u32 = 2;
-    pub const LEAVES: u32 = 3;
+}
+
+/// The texture layers a scene has so far, so each bark and leaf atlas is generated only once.
+struct Layers {
+    names: Vec<String>,
+    textures: Vec<solstice_asset::TextureLayer>,
+    size: u32,
+}
+
+impl Layers {
+    fn layer(
+        &mut self,
+        name: &str,
+        make: impl FnOnce() -> solstice_procgen::surface::Surface,
+    ) -> i32 {
+        if let Some(index) = self.names.iter().position(|n| n == name) {
+            return index as i32;
+        }
+        println!("  {name}");
+        self.names.push(name.to_string());
+        self.textures.push(make().bake(self.size));
+        self.textures.len() as i32 - 1
+    }
+}
+
+/// Meshes and materials of one species, wood then leaves for each grown copy.
+struct Grown {
+    first_mesh: u32,
+    variants: u32,
+    bark: u32,
+    leaves: u32,
 }
 
 /// Gently rolling ground.
@@ -77,40 +107,24 @@ pub fn build(texture_size: u32) -> SceneAsset {
         &options,
     )];
     for seed in 0..PATCH_VARIANTS {
-        let mesh = Meadow { seed, ..meadow }.mesh();
+        let mesh = Meadow {
+            seed,
+            ..meadow.clone()
+        }
+        .mesh();
         println!("  patch {seed}: {} triangles", mesh.triangle_count());
         meshes.push(build_virtual_mesh(&mesh, &options));
     }
 
-    // Each plant is two meshes, wood then leaves, placed together.
-    println!("growing trees...");
-    let first_tree = meshes.len() as u32;
-    let mut plants = Vec::new();
-    for seed in 0..TREE_VARIANTS {
-        plants.push(Species::broadleaf().grow(seed));
-    }
-    let first_bush = first_tree + TREE_VARIANTS * 2;
-    for seed in 0..BUSH_VARIANTS {
-        plants.push(Species::bush().grow(seed));
-    }
-    for plant in &plants {
-        println!(
-            "  {} wood and {} leaf triangles",
-            plant.wood.triangle_count(),
-            plant.leaves.triangle_count()
-        );
-        meshes.push(build_virtual_mesh(&plant.wood, &options));
-        meshes.push(build_virtual_mesh(&plant.leaves, &options));
-    }
-
     println!("generating textures...");
-    let textures = vec![
-        surfaces::grass(0).bake(texture_size),
-        blade_atlas(0).bake(texture_size),
-        bark(0).bake(texture_size),
-        leaf_atlas(0).bake(texture_size),
-    ];
-    let materials = vec![
+    let mut layers = Layers {
+        names: Vec::new(),
+        textures: Vec::new(),
+        size: texture_size,
+    };
+    layers.layer("grass", || surfaces::grass(0));
+    layers.layer("grass_blades", || meadow.atlas(0));
+    let mut materials = vec![
         Material {
             base_color: [0.8, 0.8, 0.8, 1.0],
             roughness: 1.0,
@@ -127,23 +141,52 @@ pub fn build(texture_size: u32) -> SceneAsset {
             flags: Material::TWO_SIDED | Material::FOLIAGE,
             ..Default::default()
         },
-        Material {
+    ];
+
+    // Each plant is two meshes, wood then leaves, placed together.
+    println!("growing trees...");
+    let mut grown = Vec::new();
+    for (name, variants) in PLANTS {
+        let species = Species::by_name(name).expect("listed species exists");
+        let first_mesh = meshes.len() as u32;
+        for seed in 0..variants {
+            let plant = species.grow(seed);
+            println!(
+                "  {name} {seed}: {} wood and {} leaf triangles",
+                plant.wood.triangle_count(),
+                plant.leaves.triangle_count()
+            );
+            meshes.push(build_virtual_mesh(&plant.wood, &options));
+            meshes.push(build_virtual_mesh(&plant.leaves, &options));
+        }
+        let bark: Bark = species.bark;
+        let leaf: LeafKind = species.leaves.kind;
+        let bark_layer = layers.layer(bark.name(), || bark.surface(0));
+        let leaf_layer = layers.layer(leaf.name(), || leaf.atlas(0));
+        materials.push(Material {
             base_color: [1.0; 4],
             roughness: 1.0,
-            uv_scale: 1.0 / TILE_METRES,
+            uv_scale: 1.0 / BARK_TILE_METRES,
             normal_strength: 1.0,
-            texture_layer: 2,
+            texture_layer: bark_layer,
             ..Default::default()
-        },
-        Material {
+        });
+        materials.push(Material {
             base_color: [1.0; 4],
             roughness: 1.0,
             normal_strength: 1.0,
-            texture_layer: 3,
+            texture_layer: leaf_layer,
             flags: Material::TWO_SIDED | Material::FOLIAGE,
             ..Default::default()
-        },
-    ];
+        });
+        grown.push(Grown {
+            first_mesh,
+            variants,
+            bark: materials.len() as u32 - 2,
+            leaves: materials.len() as u32 - 1,
+        });
+    }
+    let [oak, birch, fir, bush] = [0, 1, 2, 3].map(|i| &grown[i]);
 
     let mut instances = vec![Instance {
         mesh: 0,
@@ -167,23 +210,25 @@ pub fn build(texture_size: u32) -> SceneAsset {
     }
     println!("{} grass patches", instances.len() - 1);
 
-    let place_plant = |instances: &mut Vec<Instance>, mesh: u32, x: f32, z: f32, k: u32| {
-        let turn = (hash(x as i32, z as i32, k) % 1000) as f32 / 1000.0 * std::f32::consts::TAU;
-        let size = 0.8 + (hash(x as i32, z as i32, k + 1) % 1000) as f32 / 1000.0 * 0.45;
-        let transform = Mat4::from_translation(Vec3::new(x, ground_height(x, z) - 0.05, z))
-            * Mat4::from_rotation_y(turn)
-            * Mat4::from_scale(Vec3::splat(size));
-        instances.push(Instance {
-            mesh,
-            material: material::BARK,
-            transform,
-        });
-        instances.push(Instance {
-            mesh: mesh + 1,
-            material: material::LEAVES,
-            transform,
-        });
-    };
+    let place_plant =
+        |instances: &mut Vec<Instance>, plant: &Grown, variant: u32, x: f32, z: f32, k: u32| {
+            let mesh = plant.first_mesh + (variant % plant.variants) * 2;
+            let turn = (hash(x as i32, z as i32, k) % 1000) as f32 / 1000.0 * std::f32::consts::TAU;
+            let size = 0.8 + (hash(x as i32, z as i32, k + 1) % 1000) as f32 / 1000.0 * 0.45;
+            let transform = Mat4::from_translation(Vec3::new(x, ground_height(x, z) - 0.05, z))
+                * Mat4::from_rotation_y(turn)
+                * Mat4::from_scale(Vec3::splat(size));
+            instances.push(Instance {
+                mesh,
+                material: plant.bark,
+                transform,
+            });
+            instances.push(Instance {
+                mesh: mesh + 1,
+                material: plant.leaves,
+                transform,
+            });
+        };
     // A wood beyond the meadow, thickening with distance, a few trees standing alone in the
     // meadow, and bushes along the wood's edge. Trees are scattered by dart throwing, which keeps
     // each one its own space as competition for light does, without the rows of a jittered grid.
@@ -205,9 +250,21 @@ pub fn build(texture_size: u32) -> SceneAsset {
             stands.push((x, z));
         }
     }
+    // Firs gather deep in the wood, birches in groups at its edge, oaks everywhere between.
+    let mut counts = [0; 3];
     for (index, &(x, z)) in stands.iter().enumerate() {
-        let variant = index as u32 % TREE_VARIANTS;
-        place_plant(&mut instances, first_tree + variant * 2, x, z, 9);
+        let depth = wood_density(x, z);
+        let stand = fbm(Vec3::new(x * 0.03, 7.0, z * 0.03), 3, 5);
+        let pick = if depth > 0.6 && stand > -0.05 {
+            2
+        } else if depth < 0.7 && stand < 0.05 {
+            1
+        } else {
+            0
+        };
+        counts[pick] += 1;
+        let plant = [oak, birch, fir][pick];
+        place_plant(&mut instances, plant, index as u32, x, z, 9);
     }
     let trees = stands.len();
     let mut bushes = 0;
@@ -217,12 +274,15 @@ pub fn build(texture_size: u32) -> SceneAsset {
         let edge = x.abs().max(z.abs());
         let chance = (1.0 - ((edge - 34.0) / 7.0).abs()).max(0.0);
         if rng.unit() < chance * 0.12 {
-            let variant = rng.index(BUSH_VARIANTS as usize) as u32;
-            place_plant(&mut instances, first_bush + variant * 2, x, z, 11);
+            let variant = rng.index(bush.variants as usize) as u32;
+            place_plant(&mut instances, bush, variant, x, z, 11);
             bushes += 1;
         }
     }
-    println!("{trees} trees and {bushes} bushes");
+    println!(
+        "{trees} trees ({} oaks, {} birches, {} firs) and {bushes} bushes",
+        counts[0], counts[1], counts[2]
+    );
 
     let eye = Vec3::new(0.0, 0.0, 12.0);
     SceneAsset {
@@ -230,7 +290,7 @@ pub fn build(texture_size: u32) -> SceneAsset {
         materials,
         instances,
         texture_size,
-        textures,
+        textures: layers.textures,
         viewpoint: Some(Viewpoint {
             position: [eye.x, ground_height(eye.x, eye.z) + 1.6, eye.z],
             yaw: 0.0,

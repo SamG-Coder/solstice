@@ -1,4 +1,4 @@
-//! Trees and bushes, grown from a species description.
+//! Trees and bushes, grown from a [`Species`] description.
 //!
 //! A plant is a trunk that carries levels of branches, each level spiralling around its parent at
 //! the golden angle as real shoots do, and the last level carries leaves. Every stem is a tube of
@@ -6,187 +6,23 @@
 //! one a separate piece, which the cluster builder can thin out with distance like a leaf.
 //!
 //! The crown's outline comes from how long the trunk's branches are at each height, which is how
-//! species differ most at a glance: a rounded oak, a narrow birch, a wide bush.
+//! species differ most at a glance: a rounded oak, a narrow birch, a wide bush. Conifers carry
+//! their branches in whorls, rings of several at one height, rather than in a spiral.
+//!
+//! Each species names its [`Bark`] and [`LeafKind`], which decide both the textures to use and
+//! the outline each leaf is built with.
 
+use super::bark::BARK_REPEAT;
+use super::leaf::{LeafKind, LEAF_VARIANTS};
+pub use super::species::{Crown, Leaves, Level, Species};
 use super::Rng;
-use crate::field::{fbm, ridged, smoothstep, Field};
-use crate::surface::{Relief, Shade, Surface, Texel, TILE_METRES};
+use crate::field::smoothstep;
 use glam::{Quat, Vec2, Vec3};
 use solstice_builder::{Mesh, Vertex};
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 
 /// The golden angle, at which successive shoots spiral around a stem.
 const GOLDEN_ANGLE: f32 = 2.399_963;
-/// Bark repeats around a stem in whole multiples of this, in metres, so its seam never shows.
-pub const BARK_REPEAT: f32 = TILE_METRES / 16.0;
-/// Leaf colour variants in the leaf atlas, side by side.
-pub const LEAF_VARIANTS: u32 = 4;
-
-/// The outline of a crown: how long the trunk's branches are at each height.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Crown {
-    /// Longest a third of the way up, as on an oak or a beech in the open.
-    Round,
-    /// Longest at the bottom, as on a young conifer or a narrow birch.
-    Cone,
-    /// Much the same length all the way up, as on a bush.
-    Even,
-}
-
-impl Crown {
-    /// Branch length at `x`, from the bottom of the crown (0) to the top (1).
-    fn envelope(self, x: f32) -> f32 {
-        match self {
-            Self::Round => (PI * (x * 0.85 + 0.12)).sin().powf(0.7),
-            Self::Cone => 1.0 - x * 0.85,
-            Self::Even => 1.0 - x * 0.3,
-        }
-    }
-}
-
-/// One level of branching.
-#[derive(Clone, Copy, Debug)]
-pub struct Level {
-    /// Children per metre of the parent's length.
-    pub per_metre: f32,
-    /// Stretch of the parent they grow from, as fractions of its length.
-    pub span: (f32, f32),
-    /// Angle from the parent, in degrees.
-    pub angle: f32,
-    /// Length as a fraction of the parent's.
-    pub length: f32,
-    /// Radius where it starts, as a fraction of the parent's there.
-    pub radius: f32,
-    /// How strongly it turns towards the light, per metre.
-    pub upturn: f32,
-    /// How strongly it sags under its weight, per metre, most towards its tip.
-    pub droop: f32,
-    /// How much it wanders, per metre.
-    pub gnarl: f32,
-}
-
-/// How leaves grow.
-#[derive(Clone, Copy, Debug)]
-pub struct Leaves {
-    /// Leaves per metre of the last level of stem.
-    pub per_metre: f32,
-    /// Range of leaf lengths, in metres.
-    pub length: (f32, f32),
-    /// Width as a fraction of length.
-    pub width: f32,
-    /// How likely each atlas variant is.
-    pub variants: [f32; LEAF_VARIANTS as usize],
-    /// How far leaf normals lean out from the centre of the crown, which lights a crown as one
-    /// soft mass rather than thousands of separately facing leaves.
-    pub crown_normals: f32,
-}
-
-/// Everything that decides how a plant grows.
-#[derive(Clone, Debug)]
-pub struct Species {
-    /// Length of the trunk, in metres.
-    pub height: f32,
-    pub trunk_radius: f32,
-    /// How much wider the trunk spreads at the ground, as a fraction of its radius.
-    pub root_flare: f32,
-    pub trunk_gnarl: f32,
-    pub crown: Crown,
-    /// Branching levels, starting with those on the trunk.
-    pub levels: Vec<Level>,
-    pub leaves: Leaves,
-}
-
-impl Species {
-    /// A broadleaf tree with a rounded crown, like a young oak or beech.
-    pub fn broadleaf() -> Self {
-        Self {
-            height: 11.0,
-            trunk_radius: 0.24,
-            root_flare: 0.6,
-            trunk_gnarl: 0.05,
-            crown: Crown::Round,
-            levels: vec![
-                Level {
-                    per_metre: 4.2,
-                    span: (0.28, 0.97),
-                    angle: 52.0,
-                    length: 0.5,
-                    radius: 0.55,
-                    upturn: 0.12,
-                    droop: 0.05,
-                    gnarl: 0.25,
-                },
-                Level {
-                    per_metre: 2.6,
-                    span: (0.15, 0.95),
-                    angle: 42.0,
-                    length: 0.42,
-                    radius: 0.6,
-                    upturn: 0.25,
-                    droop: 0.1,
-                    gnarl: 0.4,
-                },
-                Level {
-                    per_metre: 8.0,
-                    span: (0.2, 1.0),
-                    angle: 48.0,
-                    length: 0.35,
-                    radius: 0.6,
-                    upturn: 0.3,
-                    droop: 0.2,
-                    gnarl: 0.6,
-                },
-            ],
-            leaves: Leaves {
-                per_metre: 42.0,
-                length: (0.08, 0.13),
-                width: 0.55,
-                variants: [0.4, 0.3, 0.2, 0.1],
-                crown_normals: 0.45,
-            },
-        }
-    }
-
-    /// A dense bush of many stems from the ground.
-    pub fn bush() -> Self {
-        Self {
-            height: 0.25,
-            trunk_radius: 0.05,
-            root_flare: 0.2,
-            trunk_gnarl: 0.1,
-            crown: Crown::Even,
-            levels: vec![
-                Level {
-                    per_metre: 64.0,
-                    span: (0.0, 1.0),
-                    angle: 38.0,
-                    length: 6.0,
-                    radius: 0.55,
-                    upturn: 0.15,
-                    droop: 0.35,
-                    gnarl: 0.6,
-                },
-                Level {
-                    per_metre: 12.0,
-                    span: (0.2, 1.0),
-                    angle: 45.0,
-                    length: 0.35,
-                    radius: 0.6,
-                    upturn: 0.4,
-                    droop: 0.2,
-                    gnarl: 0.8,
-                },
-            ],
-            leaves: Leaves {
-                per_metre: 55.0,
-                length: (0.04, 0.065),
-                width: 0.6,
-                variants: [0.3, 0.4, 0.3, 0.0],
-                crown_normals: 0.55,
-            },
-        }
-    }
-}
 
 /// A grown plant: wood and leaves, which take different materials.
 pub struct Plant {
@@ -261,14 +97,9 @@ impl Species {
     pub fn grow(&self, seed: u32) -> Plant {
         let mut rng = Rng::new(seed, 7);
         let trunk_level = Level {
-            per_metre: 0.0,
-            span: (0.0, 1.0),
-            angle: 0.0,
-            length: 1.0,
-            radius: 1.0,
             upturn: 0.02,
-            droop: 0.0,
             gnarl: self.trunk_gnarl,
+            ..Level::default()
         };
         let lean = Vec3::new(rng.signed(), 0.0, rng.signed()) * 0.05;
         let trunk = grow(
@@ -289,25 +120,20 @@ impl Species {
                 let parent_length = stems[parent_index].length;
                 let span = level.span.1 - level.span.0;
                 let count = (parent_length * span * level.per_metre).round().max(1.0) as usize;
-                let mut spin = rng.range(0.0, TAU);
-                for k in 0..count {
-                    let t = level.span.0 + span * (k as f32 + rng.range(0.2, 0.8)) / count as f32;
+                for (t, spin) in shoot_positions(level, count, &mut rng) {
                     let (point, along, parent_radius) = stems[parent_index].at(t);
-                    spin += GOLDEN_ANGLE;
                     let side = perpendicular(along, spin);
-                    let mut angle = level.angle + rng.signed() * 10.0;
-                    if depth == 0 {
-                        // Lower limbs spread out wide, upper ones reach up, as on an open-grown tree.
-                        angle += (1.0 - (t - level.span.0) / span) * 28.0 - 8.0;
-                    }
+                    let along_span = ((t - level.span.0) / span.max(1.0e-6)).clamp(0.0, 1.0);
+                    let angle = level.angle.0
+                        + (level.angle.1 - level.angle.0) * along_span
+                        + rng.signed() * 10.0;
                     let angle = angle.to_radians();
                     let direction = along * angle.cos() + side * angle.sin();
                     let mut length = parent_length * level.length * rng.range(0.75, 1.2);
                     if depth == 0 {
-                        length *= self.crown.envelope((t - level.span.0) / span);
+                        length *= self.crown.envelope(along_span);
                     } else {
-                        // Shoots near a branch's tip are shorter, which rounds off its end.
-                        length *= 1.0 - 0.5 * (t - level.span.0) / span;
+                        length *= 1.0 - level.taper * along_span;
                     }
                     if length < 0.03 {
                         continue;
@@ -348,6 +174,35 @@ impl Species {
         }
         Plant { wood, leaves }
     }
+}
+
+/// Where shoots leave their parent: `(fraction along it, angle around it)` for each of `count`.
+fn shoot_positions(level: &Level, count: usize, rng: &mut Rng) -> Vec<(f32, f32)> {
+    let span = level.span.1 - level.span.0;
+    let mut positions = Vec::with_capacity(count);
+    if level.whorl > 0 {
+        // Rings of shoots at one height, each ring turned against the last.
+        let per_ring = level.whorl as usize;
+        let rings = count.div_ceil(per_ring).max(1);
+        for ring in 0..rings {
+            let t = level.span.0 + span * (ring as f32 + rng.range(0.35, 0.65)) / rings as f32;
+            let start = rng.range(0.0, TAU);
+            for k in 0..per_ring {
+                let spin = start + (k as f32 + rng.signed() * 0.15) / per_ring as f32 * TAU;
+                positions.push((t + rng.signed() * 0.004, spin));
+            }
+        }
+    } else {
+        let mut spin = rng.range(0.0, TAU);
+        for k in 0..count {
+            spin += GOLDEN_ANGLE;
+            positions.push((
+                level.span.0 + span * (k as f32 + rng.range(0.2, 0.8)) / count as f32,
+                spin,
+            ));
+        }
+    }
+    positions
 }
 
 /// A unit vector perpendicular to `axis`, turned `angle` around it.
@@ -452,12 +307,79 @@ fn add_leaves(mesh: &mut Mesh, stem: &Stem, leaves: &Leaves, crown: Vec3, rng: &
             point + side * radius,
             out,
             length,
-            leaves.width,
+            leaves,
             roll,
             variant as u32,
             crown,
-            leaves.crown_normals,
         );
+    }
+}
+
+/// Angle between a needle and its shoot.
+const NEEDLE_ANGLE: f32 = 0.95;
+/// Distance between fans of needles along each side of a shoot, in metres.
+const NEEDLE_SPACING: f32 = 0.03;
+
+/// A shoot's needles, splayed out either side of it in a flat spray, as on a fir. Each triangle
+/// is a fan of several needles: as wide as the spacing where it leaves the shoot, so the fans
+/// cover the shoot between them, and drawn to a point. The atlas draws the needles in each
+/// fan. Fans are separate pieces, so the cluster builder thins them with distance and widens
+/// the ones it keeps, like any other leaf.
+#[allow(clippy::too_many_arguments)]
+fn add_needle_spray(
+    mesh: &mut Mesh,
+    base: Vec3,
+    axis: Vec3,
+    length: f32,
+    leaves: &Leaves,
+    roll: f32,
+    variant: u32,
+    crown: Vec3,
+) {
+    let up_ish = (Vec3::Y - axis * axis.dot(Vec3::Y)).normalize_or(perpendicular(axis, 0.0));
+    let face = Quat::from_axis_angle(axis, roll) * up_ish;
+    let side = axis.cross(face).normalize();
+    let curl = |s: f32| -face * (s * s * length * leaves.kind.curl());
+    let lit = |at: Vec3| {
+        let out = (at - crown).normalize_or(face);
+        (face * (1.0 - leaves.crown_normals) + out * leaves.crown_normals).normalize()
+    };
+    let u = |across: f32| (variant as f32 + 0.5 + across * 0.47) / LEAF_VARIANTS as f32;
+    let per_side = ((length / NEEDLE_SPACING).round() as usize).max(2);
+    for i in 0..per_side {
+        let s = (i as f32 + 0.5) / per_side as f32;
+        let root = base + axis * (s * length) + curl(s);
+        // Needles shorten towards the shoot's tip, where they are newest.
+        let needle = length * leaves.width * (1.0 - 0.45 * s);
+        for sign in [1.0, -1.0] {
+            // Alternate sides are offset half a spacing, as needles spiral round a real shoot.
+            let root = root + axis * (sign * 0.25 * NEEDLE_SPACING);
+            let direction = (axis * NEEDLE_ANGLE.cos() + side * (sign * NEEDLE_ANGLE.sin())
+                - face * 0.12)
+                .normalize();
+            let tip = root + direction * needle;
+            let first = mesh.vertices.len() as u32;
+            let half = NEEDLE_SPACING * 0.5;
+            for (position, across, v) in [
+                (root - axis * half, -sign, 0.0),
+                (root + axis * half, sign, 0.0),
+                (tip, 0.0, 1.0),
+            ] {
+                mesh.vertices.push(Vertex {
+                    position,
+                    normal: lit(position),
+                    uv: Vec2::new(u(across), v),
+                });
+            }
+            // Counter-clockwise seen from the face, whichever side the needle is on.
+            if sign > 0.0 {
+                mesh.indices
+                    .extend_from_slice(&[first, first + 2, first + 1]);
+            } else {
+                mesh.indices
+                    .extend_from_slice(&[first, first + 1, first + 2]);
+            }
+        }
     }
 }
 
@@ -468,19 +390,23 @@ fn add_leaf(
     base: Vec3,
     axis: Vec3,
     length: f32,
-    width_ratio: f32,
+    leaves: &Leaves,
     roll: f32,
     variant: u32,
     crown: Vec3,
-    crown_normals: f32,
 ) {
+    let kind = leaves.kind;
+    let crown_normals = leaves.crown_normals;
+    if kind == LeafKind::Needles {
+        add_needle_spray(mesh, base, axis, length, leaves, roll, variant, crown);
+        return;
+    }
     let up_ish = (Vec3::Y - axis * axis.dot(Vec3::Y)).normalize_or(perpendicular(axis, 0.0));
     let face = Quat::from_axis_angle(axis, roll) * up_ish;
     let side = axis.cross(face).normalize();
-    let width = length * width_ratio;
-    // Widest a third of the way along, then tapering to a point.
-    let half_width = |s: f32| width * 0.5 * (s.powf(0.6) * (1.0 - s).powf(0.9)) / 0.47;
-    let curl = |s: f32| -face * (s * s * length * 0.18);
+    let width = length * leaves.width;
+    let half_width = |s: f32| width * kind.half_width(s);
+    let curl = |s: f32| -face * (s * s * length * kind.curl());
     let u = |across: f32| (variant as f32 + 0.5 + across * 0.47) / LEAF_VARIANTS as f32;
     let lit = |n: Vec3, at: Vec3| {
         let out = (at - crown).normalize_or(n);
@@ -496,7 +422,7 @@ fn add_leaf(
     for &s in &LEAF_ROWS {
         let center = base + axis * (s * length) + curl(s);
         let half = half_width(s);
-        let fold = face * (half * 0.25);
+        let fold = face * (half * kind.fold());
         for (across, offset, tilt) in [
             (-1.0, -side * half, side),
             (0.0, -fold, Vec3::ZERO),
@@ -529,81 +455,6 @@ fn add_leaf(
     ]);
 }
 
-/// The leaf atlas: [`LEAF_VARIANTS`] columns, each a leaf from stalk (v = 0) to tip (v = 1) and
-/// across it (u), with the midrib in the middle. Variants run from deep green to the first yellow
-/// of autumn.
-pub fn leaf_atlas(seed: u32) -> Surface {
-    const COLORS: [Vec3; LEAF_VARIANTS as usize] = [
-        Vec3::new(0.040, 0.085, 0.016),
-        Vec3::new(0.060, 0.110, 0.020),
-        Vec3::new(0.095, 0.135, 0.025),
-        Vec3::new(0.200, 0.150, 0.030),
-    ];
-    let mottle = fbm(24, 4, seed + 1);
-    let blotches = fbm(8, 3, seed + 2);
-    Surface::new(0.004, move |u, v| {
-        let variant = ((u * LEAF_VARIANTS as f32) as u32).min(LEAF_VARIANTS - 1);
-        let across = (u * LEAF_VARIANTS as f32).fract() * 2.0 - 1.0;
-        let d = across.abs();
-        // Side veins leave the midrib towards the tip.
-        let phase = v * 7.0 - d * 2.2;
-        let side_veins = (-((phase - phase.round()) * 9.0).powi(2)).exp() * (1.0 - d);
-        let midrib = (-(across * 18.0).powi(2)).exp();
-        let veins = side_veins.max(midrib);
-
-        let mut color = COLORS[variant as usize];
-        color *= 1.0 + 0.18 * mottle.at(u, v) + 0.1 * blotches.at(u, v);
-        // Veins are paler, and the edge is a little darker.
-        color = color.lerp(color * Vec3::new(1.6, 1.5, 1.3), veins * 0.5);
-        color *= 1.0 - 0.18 * smoothstep(0.75, 1.0, d);
-        Texel {
-            color,
-            // Veins sit in grooves on a leaf's upper face.
-            height: -veins,
-            roughness: 0.45,
-            cavity: 1.0 - veins * 0.15,
-        }
-    })
-}
-
-/// Furrowed bark, as on an oak: long ridged plates split by deep fissures, grey on the plates and
-/// brown in the fissures, with patches of lichen.
-pub fn bark(seed: u32) -> Surface {
-    // Bark repeats every BARK_REPEAT around a stem, so features across it repeat 16 times per tile.
-    let fissures = ridged(5, 4, seed)
-        .warped(fbm(6, 3, seed + 1), 0.04)
-        .repeated(16, 1);
-    let breaks = fbm(4, 3, seed + 2).repeated(16, 3);
-    let plates = fbm(14, 4, seed + 3).repeated(16, 1);
-    let grain = fbm(60, 2, seed + 4).repeated(16, 1);
-    let lichen = fbm(5, 5, seed + 5).unit().smooth(0.62, 0.72);
-    let tint = fbm(3, 3, seed + 6).unit();
-    Surface::shaped(
-        move |u, v| {
-            let fissure = smoothstep(0.55, 0.95, fissures.at(u, v));
-            let broken = smoothstep(0.3, 0.6, breaks.at(u, v).abs());
-            let depth = fissure.max(broken * 0.6);
-            let height = -0.018 * depth + 0.003 * plates.at(u, v) + 0.0008 * grain.at(u, v);
-            (height, depth)
-        },
-        move |u, v, depth, relief: Relief| {
-            let plate =
-                Vec3::new(0.17, 0.155, 0.135).lerp(Vec3::new(0.12, 0.1, 0.085), tint.at(u, v));
-            let fissure = Vec3::new(0.05, 0.035, 0.025);
-            let mut color = plate.lerp(fissure, smoothstep(0.2, 0.8, depth));
-            // Worn high points are paler.
-            color *= 1.0 + (relief.fine * 60.0).clamp(-0.15, 0.2);
-            let moss = lichen.at(u, v) * (1.0 - depth);
-            color = color.lerp(Vec3::new(0.11, 0.13, 0.06), moss * 0.8);
-            Shade {
-                color,
-                roughness: 0.9,
-                cavity: 1.0 - depth * 0.6,
-            }
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,7 +469,7 @@ mod tests {
 
     #[test]
     fn a_broadleaf_tree_has_the_shape_and_size_asked_for() {
-        let species = Species::broadleaf();
+        let species = Species::oak();
         let plant = species.grow(0);
         let (lo, hi) = bounds(&plant.wood);
         assert!(
@@ -640,7 +491,7 @@ mod tests {
 
     #[test]
     fn surfaces_face_the_way_their_triangles_wind() {
-        let plant = Species::broadleaf().grow(1);
+        let plant = Species::oak().grow(1);
         for mesh in [&plant.wood, &plant.leaves] {
             let mut wrong = 0;
             let mut total = 0;
@@ -676,19 +527,56 @@ mod tests {
     }
 
     #[test]
-    fn bark_wraps_without_a_seam() {
-        // Features across the bark repeat every sixteenth of the tile.
-        let surface = bark(0);
-        for i in 0..20 {
-            let v = i as f32 / 20.0;
-            let a = surface.formula_at(0.0, v);
-            let b = surface.formula_at(1.0 / 16.0, v);
-            assert!(
-                (a.height - b.height).abs() < 1.0e-3,
-                "{} against {}",
-                a.height,
-                b.height
+    fn every_species_grows_to_its_height_within_budget() {
+        for name in Species::names() {
+            let species = Species::by_name(name).unwrap();
+            let plant = species.grow(0);
+            let (lo, hi) = bounds(&plant.wood);
+            let spread = (hi.x - lo.x).max(hi.z - lo.z);
+            let leaves = plant.leaves.triangle_count();
+            let wood = plant.wood.triangle_count();
+            println!(
+                "{name}: top {:.1} m, spread {spread:.1} m, {leaves} leaf and {wood} wood triangles",
+                hi.y
             );
+            assert!(hi.y > species.height * 0.85, "{name} top at {}", hi.y);
+            assert!(
+                leaves > 16_000 && leaves < 700_000,
+                "{name}: {leaves} leaf triangles"
+            );
+            assert!(wood < 150_000, "{name}: {wood} wood triangles");
         }
+        assert!(Species::by_name("baobab").is_none());
+    }
+
+    #[test]
+    fn a_fir_is_a_narrow_cone_and_a_birch_is_slimmer_than_an_oak() {
+        let shape = |species: Species| {
+            let plant = species.grow(2);
+            let (lo, hi) = bounds(&plant.leaves);
+            let width = (hi.x - lo.x).max(hi.z - lo.z);
+            // Width of the crown in its top third against its bottom third.
+            let third = |from: f32, to: f32| {
+                let (mut a, mut b) = (f32::MAX, f32::MIN);
+                for v in &plant.leaves.vertices {
+                    let y = (v.position.y - lo.y) / (hi.y - lo.y);
+                    if y >= from && y < to {
+                        a = a.min(v.position.x);
+                        b = b.max(v.position.x);
+                    }
+                }
+                b - a
+            };
+            (width / hi.y, third(0.67, 1.0) / third(0.0, 0.33))
+        };
+        let (fir_ratio, fir_taper) = shape(Species::fir());
+        let (birch_ratio, _) = shape(Species::birch());
+        let (oak_ratio, _) = shape(Species::oak());
+        assert!(fir_taper < 0.6, "fir tapers to {fir_taper}");
+        assert!(fir_ratio < 0.7, "fir is {fir_ratio} as wide as tall");
+        assert!(
+            birch_ratio < oak_ratio,
+            "birch {birch_ratio}, oak {oak_ratio}"
+        );
     }
 }

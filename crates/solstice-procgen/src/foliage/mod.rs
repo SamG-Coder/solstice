@@ -9,11 +9,20 @@
 //! Materials using these meshes should be [`Material::FOLIAGE`](solstice_asset::Material::FOLIAGE)
 //! and two-sided, so that light from behind shines through.
 //!
-//! Each texture here is an atlas of variants side by side, and each blade or leaf picks one, so a
+//! Barks are surfaces of the procedural library, found by name like any other, and each kind of
+//! leaf has its own atlas. A [`species::Species`] names one of each and is plain data with a text
+//! form, so a new tree, or a change to one, is a matter of description rather than code.
+//!
+//! Each leaf and blade texture here is an atlas of variants side by side, and each blade or leaf picks one, so a
 //! single material gives a field of many shades.
 
+pub mod bark;
 pub mod grass;
+pub mod leaf;
+pub mod species;
+mod text;
 pub mod tree;
+pub mod weed;
 
 /// A small, fast, deterministic random number generator (PCG32), so a seed always grows the same
 /// plant on every platform.
