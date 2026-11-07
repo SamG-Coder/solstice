@@ -217,16 +217,35 @@ fn seat_height(
         .fold(f32::MAX, f32::min)
 }
 
-/// Gently rolling ground that falls away into the sea beyond `shore_x`.
+/// How far inland the coast around the rest of the island lies from the origin, before its bays
+/// and points. With the slope down to the seabed, this keeps the land well inside the terrain
+/// square, so that its edges lie under the sea rather than showing as straight lines.
+const ISLAND_RADIUS: f32 = 270.0;
+/// How far the seabed lies beyond the waterline.
+const SHELF_WIDTH: f32 = 90.0;
+const SEABED_DEPTH: f32 = 9.0;
+
+/// Gently rolling ground that falls away into the sea beyond `shore_x`, and beyond a wandering
+/// coast all the way round, so that the land is an island whose edges never show.
 fn terrain_height(x: f32, z: f32, amplitude: f32, shore_x: f32) -> f32 {
     let p = Vec3::new(x, 0.0, z);
     let broad = fbm(p * 0.015, 4, 301) * amplitude;
     let ripples = fbm(p * 0.25, 4, 303) * 0.04;
+    let shelf = |offshore: f32| {
+        let t = (offshore / SHELF_WIDTH).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
     // Bays and points, so that the waterline wanders rather than running ruler-straight.
     let wander = fbm(Vec3::new(0.0, 7.0, z) * 0.011, 4, 305) * 28.0;
-    let t = ((x - shore_x - wander) / 90.0).clamp(0.0, 1.0);
-    let seabed = t * t * (3.0 - 2.0 * t) * 9.0;
-    broad + ripples - seabed
+    let cove = shelf(x - shore_x - wander);
+    // The coast round the rest of the island, sampled around a circle so that it wanders
+    // seamlessly: broad headlands and bays, with smaller points along them.
+    let radius = x.hypot(z);
+    let around = Vec3::new(x, 0.0, z) / radius.max(1.0);
+    let headlands = fbm(around * 1.6 + Vec3::new(0.0, 3.0, 0.0), 3, 307) * 45.0;
+    let points = fbm(around * 7.0 + Vec3::new(0.0, 11.0, 0.0), 3, 309) * 14.0;
+    let island = shelf(radius - ISLAND_RADIUS - headlands - points);
+    broad + ripples - cove.max(island) * SEABED_DEPTH
 }
 
 /// Adds the terrain as one mesh, with its own ground material and texture.
@@ -543,6 +562,40 @@ mod tests {
             terrain_height(130.0, 0.0, 0.0, 40.0) < -8.0,
             "deep offshore"
         );
+    }
+
+    #[test]
+    fn the_terrain_edges_lie_under_the_sea_on_every_side() {
+        // The cove's terrain is 900 m square, with rolling ground of amplitude 0.3.
+        let water = -0.6;
+        for i in 0..=200 {
+            let along = -450.0 + 4.5 * i as f32;
+            for (x, z) in [
+                (-445.0, along),
+                (along, 445.0),
+                (along, -445.0),
+                (445.0, along),
+            ] {
+                let height = terrain_height(x, z, 0.3, 52.0);
+                assert!(
+                    height < water - 4.0,
+                    "({x}, {z}) is {height}, above the seabed"
+                );
+            }
+        }
+        // The fort and the ground around it are untouched.
+        for (x, z) in [
+            (0.0, 0.0),
+            (-68.0, 0.0),
+            (-30.0, 92.0),
+            (-30.0, -92.0),
+            (-150.0, 0.0),
+        ] {
+            assert!(
+                terrain_height(x, z, 0.0, 52.0).abs() < 0.1,
+                "({x}, {z}) moved"
+            );
+        }
     }
 
     #[test]
