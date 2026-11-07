@@ -1,8 +1,8 @@
 # Code of Conduct
 
-Solstice is written entirely by frontier AI models. People direct the work, review it and decide
-what is merged; they do not write it. This document sets out that rule and how everyone working
-on the project is expected to behave.
+Solstice is written and reviewed entirely by frontier AI models. People direct the work and decide
+what is merged; they do not write or review it. This document sets out that rule and how everyone
+working on the project is expected to behave.
 
 ## 1. Everything is written by frontier AI models
 
@@ -11,7 +11,9 @@ All of the project's written work must be produced by a frontier AI model. This 
 - **Code**: source, shaders, tests, scripts, build and CI configuration.
 - **Pull requests**: their commits, titles and descriptions.
 - **Issues**: reports, feature requests and their descriptions.
-- **Comments and reviews**: on issues, pull requests and commits, and comments in the code itself.
+- **Reviews**: every review of a pull request, its findings and requested changes, is carried out
+  and written by a frontier AI model.
+- **Comments**: on issues, pull requests and commits, and comments in the code itself.
 - **Documentation**: the README, this file and everything under `docs/`.
 - **Assets made from code**: scene descriptions, species, grass and weather files, and procedural
   content.
@@ -24,15 +26,16 @@ time the work is done, used directly or through an agent such as Claude Code.
 
 ## 2. What people do
 
-People take part as directors and reviewers. They may:
+People take part as directors and decision-makers. They may:
 
 - Describe what they want, in their own words, as instructions to a model.
 - Share screenshots, measurements, references and other material for a model to work from.
-- Review a model's work, ask for changes, and approve, merge or close pull requests.
+- Look at the results, such as renders and the live site, and tell a model what to change.
+- Ask a model to review a pull request, and decide, from that review, whether to merge or close it.
 - Report a problem to a model, which then writes the issue.
 
-They may not write or edit code, pull request text, issues or comments themselves, nor paste in
-code from elsewhere as their own contribution.
+They may not write or edit code, pull request text, issues, reviews or comments themselves, nor
+paste in code from elsewhere as their own contribution.
 
 Third-party material that the project uses, such as scanned models, textures and libraries, keeps
 its own authorship and licence, and is brought in by a model, with its source and licence stated.
@@ -47,7 +50,8 @@ its own authorship and licence, and is brought in by a model, with its source an
 
 Work by a model is held to the same standard as any work: it must build, pass the tests and lints,
 and be checked by running it, with measurements where performance or image quality is at stake.
-Changes that cannot be verified are not merged.
+Every pull request is reviewed by a frontier AI model before it is merged, ideally not the same
+session that wrote it. Changes that cannot be verified are not merged.
 
 ## 5. Conduct
 

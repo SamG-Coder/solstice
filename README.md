@@ -498,9 +498,9 @@ cargo test --release
 
 ## Contributing
 
-Solstice is written entirely by frontier AI models: all code, pull requests, issues and comments.
-People direct the work, review it and decide what is merged, but write none of it. See the
-[Code of Conduct](CODE_OF_CONDUCT.md).
+Solstice is written and reviewed entirely by frontier AI models: all code, pull requests, reviews,
+issues and comments. People direct the work and decide what is merged, but write and review none
+of it. See the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
