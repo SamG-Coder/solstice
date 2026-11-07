@@ -273,9 +273,11 @@ fn split_textures(scene: &SceneAsset, out: &mut PagedScene) -> Vec<TextureLayer>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag::tests::bumpy_sphere;
+    use crate::dag::tests::{bumpy_sphere, open_edges};
+    use crate::Sphere;
     use crate::{build_virtual_mesh, BuildOptions};
-    use glam::Mat4;
+    use glam::{Mat4, Vec3};
+    use solstice_asset::gpu::NODE_PAGE_MASK;
     use solstice_asset::{unpack_triangle, Instance, Material};
 
     fn scene(subdivisions: &[u32]) -> SceneAsset {
@@ -409,5 +411,171 @@ mod tests {
             .filter(|c| c.counts & CLUSTER_CHILDREN_MISSING != 0)
             .count();
         assert_eq!(finest + waiting, paged.clusters.len());
+    }
+
+    /// Selects a cut with the same rule as `vg/cull.wgsl`, given which pages are installed. A
+    /// one-mesh scene keeps the mesh's cluster numbering, so the mesh's data can be read back.
+    fn select_resident_cut(
+        paged: &PagedScene,
+        installed: &[bool],
+        error_of: &dyn Fn(Sphere, f32) -> f32,
+        threshold: f32,
+    ) -> Vec<u32> {
+        let mut children_missing = vec![false; paged.clusters.len()];
+        for set in &paged.sets {
+            if !installed[set.page as usize] {
+                let range = set.first_generated as usize
+                    ..(set.first_generated + set.generated_count) as usize;
+                for &parent in &paged.generated[range] {
+                    children_missing[parent as usize] = true;
+                }
+            }
+        }
+
+        let mut selected = Vec::new();
+        let mut stack = vec![paged.meshes[0].root_node.unwrap()];
+        while let Some(index) = stack.pop() {
+            let node = paged.nodes[index as usize];
+            let sphere = Sphere {
+                center: node.lod_center.into(),
+                radius: node.lod_radius,
+            };
+            if error_of(sphere, node.max_parent_error) <= threshold {
+                continue;
+            }
+            if node.is_leaf == 0 {
+                stack.extend(node.first..node.first + node.count);
+                continue;
+            }
+            if !installed[(node.is_leaf & NODE_PAGE_MASK) as usize] {
+                continue;
+            }
+            for c in node.first..node.first + node.count {
+                let cluster = paged.clusters[c as usize];
+                let sphere = Sphere {
+                    center: cluster.lod_center.into(),
+                    radius: cluster.lod_radius,
+                };
+                if error_of(sphere, cluster.lod_error) <= threshold || children_missing[c as usize]
+                {
+                    selected.push(c);
+                }
+            }
+        }
+        selected
+    }
+
+    /// Picks a random set of pages that includes every dependency of each page it holds.
+    fn random_closed_pages(paged: &PagedScene, next: &mut impl FnMut() -> u64) -> Vec<bool> {
+        let dependencies = paged.page_dependencies();
+        let keep = next() % 100;
+        let mut installed = vec![false; paged.pages.len()];
+        // Dependencies have lower ids, so a parent has been decided before its children.
+        for page in 0..paged.pages.len() {
+            installed[page] = page < paged.pinned_pages as usize
+                || (next() % 100 < keep
+                    && dependencies[page].iter().all(|&d| installed[d as usize]));
+        }
+        installed
+    }
+
+    fn perspective(viewpoint: Vec3) -> impl Fn(Sphere, f32) -> f32 {
+        move |sphere: Sphere, error: f32| {
+            let distance = (sphere.center.distance(viewpoint) - sphere.radius).max(0.01);
+            1000.0 * error / distance
+        }
+    }
+
+    /// The heart of streaming: whichever valid set of pages is loaded, from wherever it's seen,
+    /// there are no holes, cracks or overlaps.
+    #[test]
+    fn partly_loaded_scenes_are_watertight_from_any_viewpoint() {
+        let source = scene(&[6]);
+        let loaded = paginate(&source);
+        let paged = &loaded.scene;
+        assert!(
+            paged.pages.len() > 4,
+            "this test needs a mesh of many pages"
+        );
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let viewpoints = [
+            Vec3::new(0.0, 0.0, 1.5),
+            Vec3::new(3.0, 0.5, 0.0),
+            Vec3::new(-1.2, 1.2, 1.2),
+            Vec3::new(0.0, -8.0, 0.0),
+            Vec3::new(40.0, 40.0, 40.0),
+        ];
+        let mut partial_cuts = 0;
+        for round in 0..200 {
+            let installed = random_closed_pages(paged, &mut next);
+            let project = perspective(viewpoints[round % viewpoints.len()]);
+            let cut = select_resident_cut(paged, &installed, &project, 1.0);
+            assert!(!cut.is_empty());
+            assert_eq!(open_edges(&source.meshes[0], &cut), 0, "round {round}");
+            if installed.iter().any(|&page| !page) {
+                partial_cuts += 1;
+            }
+        }
+        assert!(partial_cuts > 100, "too few sets were actually partial");
+    }
+
+    #[test]
+    fn pinned_pages_alone_cover_the_whole_mesh_and_all_pages_change_nothing() {
+        let source = scene(&[6]);
+        let paged = &paginate(&source).scene;
+        let near = perspective(Vec3::new(0.0, 0.0, 1.5));
+
+        let mut pinned = vec![false; paged.pages.len()];
+        pinned[..paged.pinned_pages as usize].fill(true);
+        let coarse = select_resident_cut(paged, &pinned, &near, 1.0);
+        assert_eq!(open_edges(&source.meshes[0], &coarse), 0);
+
+        let all = vec![true; paged.pages.len()];
+        let fine = select_resident_cut(paged, &all, &near, 1.0);
+        let triangles = |cut: &[u32]| -> u32 {
+            cut.iter()
+                .map(|&c| paged.clusters[c as usize].triangle_count())
+                .sum()
+        };
+        assert!(triangles(&coarse) < triangles(&fine));
+
+        // With everything loaded, the flag never overrides the plain LOD rule.
+        for &c in &fine {
+            let cluster = paged.clusters[c as usize];
+            let sphere = Sphere {
+                center: cluster.lod_center.into(),
+                radius: cluster.lod_radius,
+            };
+            assert!(near(sphere, cluster.lod_error) <= 1.0);
+        }
+    }
+
+    /// Loading pages parent-first, never skipping one, keeps every step watertight.
+    #[test]
+    fn each_step_of_loading_is_watertight() {
+        let source = scene(&[6]);
+        let paged = &paginate(&source).scene;
+        let near = perspective(Vec3::new(0.0, 0.0, 1.5));
+        let mut installed = vec![false; paged.pages.len()];
+        installed[..paged.pinned_pages as usize].fill(true);
+        let mut previous = 0;
+        for page in paged.pinned_pages as usize..paged.pages.len() {
+            installed[page] = true;
+            let cut = select_resident_cut(paged, &installed, &near, 1.0);
+            assert_eq!(open_edges(&source.meshes[0], &cut), 0, "page {page}");
+            let triangles: u32 = cut
+                .iter()
+                .map(|&c| paged.clusters[c as usize].triangle_count())
+                .sum();
+            assert!(triangles >= previous, "loading made the view coarser");
+            previous = triangles;
+        }
     }
 }

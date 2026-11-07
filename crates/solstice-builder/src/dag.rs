@@ -695,7 +695,7 @@ pub(crate) mod tests {
     }
 
     /// Counts edges in the cut that are not shared by exactly two triangles.
-    fn open_edges(mesh: &VirtualMesh, selected: &[u32]) -> usize {
+    pub(crate) fn open_edges(mesh: &VirtualMesh, selected: &[u32]) -> usize {
         let mut uses: FxHashMap<([u16; 3], [u16; 3]), u32> = FxHashMap::default();
         for &index in selected {
             let cluster = mesh.clusters[index as usize];

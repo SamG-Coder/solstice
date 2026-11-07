@@ -116,6 +116,8 @@ pub struct GiVolume {
     light_count: u32,
     schedule_index: usize,
     pending: Option<PendingRebuild>,
+    /// Levels still to voxelize again where they stand, as finer geometry has arrived.
+    outdated: [bool; LEVEL_COUNT],
 }
 
 /// What [`GiVolume::prepare`] decided should happen this frame.
@@ -384,6 +386,7 @@ impl GiVolume {
             light_count: scene.light_count,
             schedule_index: 0,
             pending: None,
+            outdated: [false; LEVEL_COUNT],
         }
     }
 
@@ -414,7 +417,8 @@ impl GiVolume {
             }
         } else {
             if self.pending.is_none() {
-                self.pending = choose_rebuild(&self.levels, camera_position);
+                self.pending = choose_rebuild(&self.levels, camera_position)
+                    .or_else(|| self.choose_outdated());
                 if let Some(pending) = self.pending {
                     let level = &self.levels[pending.level];
                     write_level_view(
@@ -438,6 +442,7 @@ impl GiVolume {
                 pending.next_pass = end;
                 if commit {
                     self.levels[pending.level].origin_voxels = Some(pending.origin);
+                    self.outdated[pending.level] = false;
                 }
             }
         }
@@ -670,6 +675,24 @@ impl GiVolume {
         pass.set_pipeline(&self.write_pipeline);
         pass.set_bind_group(0, &self.levels[index].write_group, &[]);
         pass.dispatch_workgroups(groups, groups, groups);
+    }
+}
+
+impl GiVolume {
+    /// Makes every level voxelize again, one at a time, as finer geometry has arrived.
+    pub fn mark_stale(&mut self) {
+        self.outdated = [true; LEVEL_COUNT];
+    }
+
+    /// An outdated level to rebuild where it stands, coarsest first: those cover the most
+    /// and were the most wrong.
+    fn choose_outdated(&self) -> Option<PendingRebuild> {
+        let level = (0..LEVEL_COUNT).rev().find(|&level| self.outdated[level])?;
+        Some(PendingRebuild {
+            level,
+            origin: self.levels[level].origin_voxels?,
+            next_pass: 0,
+        })
     }
 }
 

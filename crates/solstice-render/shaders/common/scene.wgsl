@@ -9,7 +9,7 @@ struct Cluster {
     lod_error: f32,
     vertex_offset: u32,
     triangle_offset: u32,
-    counts: u32, // vertex_count | triangle_count << 8
+    counts: u32, // vertex_count | triangle_count << 8 | CLUSTER_CHILDREN_MISSING
 }
 
 struct Node {
@@ -20,7 +20,7 @@ struct Node {
     max_parent_error: f32,
     first: u32,
     count: u32,
-    is_leaf: u32,
+    is_leaf: u32, // 0 for an interior node. See the NODE_ constants in vg/cull.wgsl.
 }
 
 // x y | z nx | ny u | v _

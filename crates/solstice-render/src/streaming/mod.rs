@@ -4,10 +4,12 @@
 //! fetches them however suits its platform, and this module puts them on the GPU. Installing
 //! rewrites records the GPU already holds, between frames, so a frame never sees half a page.
 
+mod feedback;
 pub mod residency;
 
 use crate::scene::GpuScene;
 use crate::Gpu;
+use feedback::RequestFeedback;
 use residency::{Install, Residency};
 use solstice_asset::gpu::{CLUSTER_CHILDREN_MISSING, NODE_INSTALLED, NODE_LEAF};
 use solstice_asset::paged::{ClusterSet, PageInfo, PagedScene, PAGE_VERTICES, PAGE_WORDS};
@@ -18,6 +20,27 @@ use std::collections::HashMap;
 const NODE_FLAGS_OFFSET: u64 = std::mem::offset_of!(PackedNode, is_leaf) as u64;
 /// Close runs of changed cluster records are written as one, as each write has a cost.
 const MERGE_GAP_CLUSTERS: usize = 8;
+/// Pages to install per frame. Each costs little, but many at once would be felt as a hitch.
+const INSTALLS_PER_FRAME: u32 = 8;
+/// Frames between redraws of cached views, which a stream of arriving pages would otherwise
+/// make redraw constantly.
+const REFRESH_INTERVAL_FRAMES: u32 = 30;
+
+/// How streaming is going, for on-screen readouts and tests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamingStats {
+    pub pages: u32,
+    pub installed: u32,
+    /// Size of the page pool.
+    pub slots: u32,
+    /// Being fetched, or fetched and waiting to install.
+    pub in_transit: u32,
+    /// Wanted but with no room in the pool.
+    pub starved: u32,
+    pub evictions: u64,
+    /// Bytes of the GPU's page pool.
+    pub pool_bytes: u64,
+}
 
 /// Keeps the GPU's cluster and node records in step with which pages are installed.
 pub struct Streamer {
@@ -33,13 +56,19 @@ pub struct Streamer {
     /// Pool slot of each installed page.
     slots: Vec<u32>,
     frame: u32,
-    /// Counts up by one for each change to what's installed.
-    generation: u32,
+    feedback: RequestFeedback,
+    /// The latest requests read back, not yet planned for.
+    fresh_requests: Option<Vec<u32>>,
+    slot_count: u32,
+    evictions: u64,
+    /// Whether what's installed changed since cached views last refreshed.
+    changed_since_refresh: bool,
+    frames_since_refresh: u32,
 }
 
 impl Streamer {
     /// Starts with nothing installed and a pool of `slots`.
-    pub fn new(scene: &PagedScene, slots: u32) -> Self {
+    pub fn new(gpu: &Gpu, scene: &PagedScene, slots: u32) -> Self {
         Self {
             pages: scene.pages.clone(),
             sets: scene.sets.clone(),
@@ -50,17 +79,78 @@ impl Streamer {
             dirty_clusters: Vec::new(),
             slots: vec![u32::MAX; scene.pages.len()],
             frame: 0,
-            generation: 0,
+            feedback: RequestFeedback::new(gpu, scene.pages.len() as u32),
+            fresh_requests: None,
+            slot_count: slots,
+            evictions: 0,
+            changed_since_refresh: false,
+            frames_since_refresh: 0,
+        }
+    }
+
+    /// The buffer that culling records requests in.
+    pub fn requests_buffer(&self) -> &wgpu::Buffer {
+        self.feedback.buffer()
+    }
+
+    /// Clears the requests for this frame's culling.
+    pub fn begin_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.clear_buffer(self.feedback.buffer(), 0, None);
+    }
+
+    /// Queues a copy of this frame's requests, if the last copy has been dealt with.
+    pub fn capture_requests(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.feedback.capture(encoder);
+    }
+
+    /// Starts reading back requests captured this frame. Call after submitting.
+    pub fn map_requests(&mut self) {
+        self.feedback.request_map();
+    }
+
+    /// One frame's work: picks up requests read back and installs waiting pages.
+    pub fn update(&mut self, gpu: &Gpu, scene: &GpuScene) {
+        self.frame = self.frame.wrapping_add(1);
+        self.frames_since_refresh = self.frames_since_refresh.saturating_add(1);
+        if let Some(requests) = self.feedback.take_latest() {
+            self.fresh_requests = Some(requests);
+        }
+        self.install_waiting(gpu, scene, INSTALLS_PER_FRAME);
+    }
+
+    /// The pages to start fetching now, from the latest requests read back.
+    pub fn take_fetches(&mut self, max_fetching: u32) -> Vec<u32> {
+        match self.fresh_requests.take() {
+            Some(requests) => self.plan(&requests, max_fetching),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether shadows and GI should redraw now, because finer geometry has arrived. They
+    /// keep what they have otherwise, so this also says when they last changed.
+    pub fn should_refresh_cached_views(&mut self) -> bool {
+        if !self.changed_since_refresh || self.frames_since_refresh < REFRESH_INTERVAL_FRAMES {
+            return false;
+        }
+        self.changed_since_refresh = false;
+        self.frames_since_refresh = 0;
+        true
+    }
+
+    pub fn stats(&self) -> StreamingStats {
+        StreamingStats {
+            pages: self.pages.len() as u32,
+            installed: self.residency.installed_count(),
+            slots: self.slot_count,
+            in_transit: self.residency.in_transit(),
+            starved: self.residency.starved(),
+            evictions: self.evictions,
+            pool_bytes: u64::from(self.slot_count) * u64::from(PAGE_WORDS) * 4,
         }
     }
 
     pub fn residency(&self) -> &Residency {
         &self.residency
-    }
-
-    /// Changes each time pages come or go, so cached results can tell they've gone stale.
-    pub fn generation(&self) -> u32 {
-        self.generation
     }
 
     /// Installs a page at once, which must have all its dependencies. For scene setup.
@@ -70,8 +160,7 @@ impl Streamer {
     }
 
     /// Records one frame's requests, and returns the pages the host should start fetching.
-    pub fn plan(&mut self, requests: &[u32], max_fetching: u32) -> Vec<u32> {
-        self.frame = self.frame.wrapping_add(1);
+    fn plan(&mut self, requests: &[u32], max_fetching: u32) -> Vec<u32> {
         self.residency.plan(self.frame, requests, max_fetching)
     }
 
@@ -95,7 +184,7 @@ impl Streamer {
     }
 
     /// Installs waiting pages, at most `limit` of them, then writes all changed records.
-    pub fn install_waiting(&mut self, gpu: &Gpu, scene: &GpuScene, limit: u32) {
+    fn install_waiting(&mut self, gpu: &Gpu, scene: &GpuScene, limit: u32) {
         self.arrived
             .retain(|&page, _| self.residency.is_waiting(page));
         for _ in 0..limit {
@@ -110,6 +199,7 @@ impl Streamer {
             if let Some(victim) = evicted {
                 self.apply_eviction(gpu, scene, victim);
             }
+            self.changed_since_refresh = true;
             let data = self
                 .arrived
                 .remove(&page)
@@ -120,7 +210,6 @@ impl Streamer {
     }
 
     fn apply_install(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32, slot: u32, data: &[u8]) {
-        self.generation = self.generation.wrapping_add(1);
         self.slots[page as usize] = slot;
         gpu.queue.write_buffer(
             &scene.vertices,
@@ -147,7 +236,7 @@ impl Streamer {
     }
 
     fn apply_eviction(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32) {
-        self.generation = self.generation.wrapping_add(1);
+        self.evictions += 1;
         let slot = self.slots[page as usize];
         let info = self.pages[page as usize];
         let (vertex_base, triangle_base) = slot_bases(slot, info.vertex_count);

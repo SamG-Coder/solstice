@@ -11,12 +11,13 @@ use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT};
 use crate::sky::Sky;
-use crate::streaming::Streamer;
+use crate::streaming::{Streamer, StreamingStats};
 use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, PassView, RasterBindings, Rasterizer,
     Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
 };
 use glam::{Mat4, Vec2};
+use solstice_asset::paged::{PagedScene, PAGE_BYTES};
 use solstice_asset::LoadedScene;
 
 /// Scales texture gradients, selecting finer mips than one texel per pixel, about 0.75 of a mip
@@ -114,6 +115,7 @@ pub struct FrameStats {
     pub instances: u32,
     pub source_triangles: u64,
     pub unique_triangles: u64,
+    pub streaming: StreamingStats,
 }
 
 /// Everything whose size depends on the resolution.
@@ -142,7 +144,6 @@ struct History {
 
 /// Renders a scene with virtualized geometry and global illumination.
 pub struct Renderer {
-    #[allow(dead_code)]
     streamer: Streamer,
     settings: RendererSettings,
     scene: GpuScene,
@@ -185,11 +186,43 @@ impl Renderer {
             loaded.scene.pages.len() as u32,
             Some(&loaded.upper_textures),
         );
-        let mut streamer = Streamer::new(&loaded.scene, loaded.scene.pages.len() as u32);
+        let mut streamer = Streamer::new(gpu, &loaded.scene, loaded.scene.pages.len() as u32);
         for page in 0..loaded.scene.pages.len() as u32 {
             streamer.install_now(gpu, &scene, page, loaded.page(page));
         }
         streamer.flush(gpu, &scene);
+        Self::from_parts(gpu, scene, streamer, output_format, settings)
+    }
+
+    /// Creates a renderer that starts with only a scene's pinned pages, and draws with what
+    /// it has while the host supplies the rest: see [`Self::page_requests`]. The page pool
+    /// holds `geometry_budget` bytes, or the pinned pages if that is too little.
+    pub fn streaming(
+        gpu: &Gpu,
+        paged: &PagedScene,
+        output_format: wgpu::TextureFormat,
+        settings: RendererSettings,
+        geometry_budget: u64,
+    ) -> Self {
+        let slots = ((geometry_budget / PAGE_BYTES as u64) as u32)
+            .max(paged.pinned_pages)
+            .min(paged.pages.len() as u32);
+        let scene = GpuScene::new(gpu, paged, slots, None);
+        let mut streamer = Streamer::new(gpu, paged, slots);
+        for page in 0..paged.pinned_pages {
+            streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
+        }
+        streamer.flush(gpu, &scene);
+        Self::from_parts(gpu, scene, streamer, output_format, settings)
+    }
+
+    fn from_parts(
+        gpu: &Gpu,
+        scene: GpuScene,
+        streamer: Streamer,
+        output_format: wgpu::TextureFormat,
+        settings: RendererSettings,
+    ) -> Self {
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
         let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
 
@@ -200,6 +233,7 @@ impl Renderer {
             "main cull",
             MAIN_QUEUE_CAPACITY,
             MAIN_VISIBLE_CAPACITY,
+            streamer.requests_buffer(),
         );
         let aux_work = CullWork::new(
             gpu,
@@ -207,6 +241,7 @@ impl Renderer {
             "aux cull",
             AUX_QUEUE_CAPACITY,
             AUX_VISIBLE_CAPACITY,
+            streamer.requests_buffer(),
         );
         let rasterizer = Rasterizer::new(gpu);
 
@@ -256,6 +291,23 @@ impl Renderer {
         }
     }
 
+    /// The pages to start fetching now, most wanted first. Each must later be handed to
+    /// [`Self::deliver_page`] or [`Self::page_failed`]. `max_fetching` caps those outstanding.
+    pub fn page_requests(&mut self, max_fetching: u32) -> Vec<u32> {
+        self.streamer.take_fetches(max_fetching)
+    }
+
+    /// Takes the unpacked contents of a requested page. It installs within a few frames.
+    /// Returns false if it wasn't wanted any more or is the wrong size.
+    pub fn deliver_page(&mut self, page: u32, data: Vec<u8>) -> bool {
+        self.streamer.deliver(page, data)
+    }
+
+    /// Reports that a requested page could not be fetched, so it may be requested again.
+    pub fn page_failed(&mut self, page: u32) {
+        self.streamer.fetch_failed(page);
+    }
+
     /// How the scene's textures ended up on the GPU, for logs and on-screen readouts.
     pub fn texture_summary(&self) -> &str {
         &self.scene.texture_summary
@@ -275,6 +327,7 @@ impl Renderer {
             instances: self.scene.instance_count,
             source_triangles: self.scene.source_triangles,
             unique_triangles: self.scene.unique_triangles,
+            streaming: self.streamer.stats(),
         }
     }
 
@@ -301,6 +354,13 @@ impl Renderer {
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
 
+        // Everything below draws what's installed from here on.
+        self.streamer.update(gpu, &self.scene);
+        if self.streamer.should_refresh_cached_views() {
+            self.shadows.mark_stale();
+            self.volume.mark_stale();
+        }
+
         let aspect = render_size.0 as f32 / render_size.1 as f32;
         let parity = (self.frame_index & 1) as usize;
 
@@ -323,6 +383,8 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+
+        self.streamer.begin_frame(&mut encoder);
 
         mark(&self.profiler, &mut encoder, section::SKY);
         self.sky.record(
@@ -420,8 +482,10 @@ impl Renderer {
             profiler.resolve(&mut encoder);
         }
         self.main_work.capture_stats(&mut encoder);
+        self.streamer.capture_requests(&mut encoder);
         gpu.queue.submit([encoder.finish()]);
         self.main_work.map_stats();
+        self.streamer.map_requests();
         if let Some(profiler) = &mut self.profiler {
             profiler.request_map();
         }
