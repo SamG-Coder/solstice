@@ -7,7 +7,7 @@ mod web;
 
 use glam::Vec3;
 use solstice_asset::scene::Viewpoint;
-use solstice_render::{Camera, Environment};
+use solstice_render::{Camera, Environment, Place, TimeOfDay};
 
 /// Keyboard and mouse state, in a form both front ends can fill in.
 #[derive(Clone, Copy, Debug, Default)]
@@ -79,6 +79,54 @@ pub fn default_environment() -> Environment {
     }
 }
 
+/// Real seconds a whole day takes to pass, by default: twenty minutes, slow enough to watch
+/// the light change, fast enough to see a day go by.
+pub const DEFAULT_DAY_SECONDS: f32 = 20.0 * 60.0;
+
+/// The time of day, passing at a chosen speed, and the light it gives.
+#[derive(Clone, Copy, Debug)]
+pub struct DayClock {
+    pub time: TimeOfDay,
+    pub place: Place,
+    /// Real seconds a whole day takes, or 0 to hold the time still.
+    pub day_seconds: f32,
+    /// How the scene is lit by a high sun; the clock moves the sun and moon around it.
+    pub daylight: Environment,
+}
+
+impl DayClock {
+    pub fn new(time: TimeOfDay, day_seconds: f32) -> Self {
+        Self {
+            time,
+            place: Place::default(),
+            day_seconds,
+            daylight: default_environment(),
+        }
+    }
+
+    /// Moves the time on by `real_seconds` of real time, and returns the light it gives.
+    pub fn tick(&mut self, real_seconds: f32) -> Environment {
+        if self.day_seconds > 0.0 {
+            self.time.advance(real_seconds * 24.0 / self.day_seconds);
+        }
+        self.environment()
+    }
+
+    /// The light at the current time.
+    pub fn environment(&self) -> Environment {
+        self.time.environment(&self.place, &self.daylight)
+    }
+}
+
+/// Reads a time of day written `HH:MM`, or plain hours.
+pub fn parse_time(text: &str) -> Option<f32> {
+    let hours = match text.split_once(':') {
+        Some((h, m)) => h.parse::<f32>().ok()? + m.parse::<f32>().ok()? / 60.0,
+        None => text.parse::<f32>().ok()?,
+    };
+    (0.0..=24.0).contains(&hours).then_some(hours)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +169,37 @@ mod tests {
             difference < 0.5,
             "travelled {difference} m apart in one second"
         );
+    }
+
+    #[test]
+    fn times_read_as_hours() {
+        assert_eq!(parse_time("18:30"), Some(18.5));
+        assert_eq!(parse_time("6"), Some(6.0));
+        assert_eq!(parse_time("25:00"), None);
+        assert_eq!(parse_time("dusk"), None);
+    }
+
+    #[test]
+    fn a_clock_passes_a_day_in_its_day_length() {
+        let mut clock = DayClock::new(
+            TimeOfDay {
+                day: 100.0,
+                hours: 6.0,
+            },
+            60.0,
+        );
+        for _ in 0..60 {
+            clock.tick(1.0);
+        }
+        assert!((clock.time.hours - 6.0).abs() < 1.0e-2 && (clock.time.day - 101.0).abs() < 1.0e-3);
+        let mut still = DayClock::new(
+            TimeOfDay {
+                day: 100.0,
+                hours: 6.0,
+            },
+            0.0,
+        );
+        still.tick(100.0);
+        assert_eq!(still.time.hours, 6.0);
     }
 }

@@ -22,9 +22,11 @@ mod native {
     use solstice_asset::LoadedScene;
     use solstice_render::{
         Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamRequest,
-        StreamingBudget, Weather,
+        StreamingBudget, TimeOfDay, Weather,
     };
-    use solstice_viewer::{default_environment, initial_camera, CameraInput, FlyCamera};
+    use solstice_viewer::{
+        default_environment, initial_camera, parse_time, CameraInput, DayClock, FlyCamera,
+    };
     use std::collections::HashSet;
     use std::io::{Read, Seek, SeekFrom};
     use std::path::Path;
@@ -179,6 +181,17 @@ mod native {
         stability: bool,
         /// The weather to start with: a built-in state's name, or a weather file.
         weather: Weather,
+        /// When set, the sun and moon follow the time of day instead of `environment`.
+        clock: Option<DayClock>,
+    }
+
+    /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
+    /// fixed environment when there is no clock.
+    fn light(clock: &mut Option<DayClock>, fixed: Environment, seconds: f32) -> Environment {
+        match clock {
+            Some(clock) => clock.tick(seconds),
+            None => fixed,
+        }
     }
 
     fn parse_args() -> Result<Options, String> {
@@ -199,7 +212,11 @@ mod native {
             flyover_out: PathBuf::from("screenshots/flyover"),
             stability: false,
             weather: Weather::default(),
+            clock: None,
         };
+        // The time of day, built up from its options and made at the end.
+        let (mut time, mut day_seconds, mut latitude) = (None, 0.0, None);
+        let mut day = TimeOfDay::default().day;
         let floats = |text: &str| -> Result<Vec<f32>, String> {
             text.split(',')
                 .map(|part| part.parse::<f32>().map_err(|e| format!("{part}: {e}")))
@@ -248,6 +265,18 @@ mod native {
                 "--stability" => options.stability = true,
                 "--no-taa" => options.settings.temporal_accumulation = false,
                 "--no-clouds" => options.settings.clouds = false,
+                "--time" => {
+                    let text = value()?;
+                    time =
+                        Some(parse_time(&text).ok_or(format!("--time expects HH:MM, not {text}"))?);
+                }
+                "--day" => day = value()?.parse().map_err(|e| format!("--day: {e}"))?,
+                "--latitude" => {
+                    latitude = Some(value()?.parse().map_err(|e| format!("--latitude: {e}"))?);
+                }
+                "--day-length" => {
+                    day_seconds = value()?.parse().map_err(|e| format!("--day-length: {e}"))?;
+                }
                 "--weather" => {
                     let name = value()?;
                     options.weather = match Weather::by_name(&name) {
@@ -302,6 +331,14 @@ mod native {
                 other if !other.starts_with('-') => options.scene = PathBuf::from(other),
                 other => return Err(format!("unknown argument: {other}")),
             }
+        }
+        if let Some(hours) = time {
+            let mut clock = DayClock::new(TimeOfDay { day, hours }, day_seconds);
+            if let Some(latitude) = latitude {
+                clock.place.latitude = latitude;
+            }
+            clock.daylight = options.environment;
+            options.clock = Some(clock);
         }
         Ok(options)
     }
@@ -405,19 +442,14 @@ mod native {
         if let Some(reader) = &mut reader {
             settle(&gpu, &mut renderer, reader, &camera, &view, options)?;
         }
+        let mut clock = options.clock;
         for frame in 0..options.frames {
             camera.position += camera.right() * options.capture_motion;
             if let Some(reader) = &mut reader {
                 reader.pump(&mut renderer);
             }
-            renderer.render(
-                &gpu,
-                &camera,
-                &options.environment,
-                &view,
-                options.size,
-                1.0 / 60.0,
-            );
+            let environment = light(&mut clock, options.environment, 1.0 / 60.0);
+            renderer.render(&gpu, &camera, &environment, &view, options.size, 1.0 / 60.0);
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             if frame > 10 {
                 slowest = slowest.max(last_time.elapsed().as_secs_f32());
@@ -506,7 +538,9 @@ mod native {
             renderer.render(
                 gpu,
                 camera,
-                &options.environment,
+                &options
+                    .clock
+                    .map_or(options.environment, |clock| clock.environment()),
                 view,
                 options.size,
                 1.0 / 60.0,
@@ -584,13 +618,15 @@ mod native {
             Vec::with_capacity(frames as usize);
         let mut previous_grid: Option<Vec<f32>> = None;
         let mut changes: Vec<(f32, GridChange)> = Vec::new();
+        let mut clock = options.clock;
         for frame in 0..=frames {
             let time = frame as f32 * STEP;
             let start = Instant::now();
+            let environment = light(&mut clock, options.environment, STEP);
             renderer.render(
                 &gpu,
                 &path.sample(time),
-                &options.environment,
+                &environment,
                 &view,
                 options.size,
                 STEP,
@@ -902,8 +938,8 @@ mod native {
             let right = self.axis(KeyCode::KeyD, KeyCode::KeyA);
             let up = self.axis(KeyCode::KeyE, KeyCode::KeyQ);
             let fast = self.keys.contains(&KeyCode::ShiftLeft);
-            let environment = self.options.environment;
             let look = std::mem::take(&mut self.input);
+            let (fixed, clock) = (self.options.environment, &mut self.options.clock);
             let Some(state) = self.state.as_mut() else {
                 return;
             };
@@ -915,6 +951,7 @@ mod native {
             let now = Instant::now();
             let delta = (now - state.last_frame).as_secs_f32();
             state.last_frame = now;
+            let environment = light(clock, fixed, delta);
             state.camera.update(
                 &CameraInput {
                     forward,
@@ -1001,6 +1038,17 @@ mod native {
                                 // Cycles through the built-in weather, easing into each.
                                 if code == KeyCode::KeyC {
                                     self.next_weather();
+                                }
+                                // Moves the clock on an hour, starting one if there is none.
+                                if code == KeyCode::KeyT {
+                                    let fixed = self.options.environment;
+                                    let clock = self.options.clock.get_or_insert_with(|| {
+                                        let mut clock = DayClock::new(TimeOfDay::default(), 0.0);
+                                        clock.daylight = fixed;
+                                        clock
+                                    });
+                                    clock.time.advance(1.0);
+                                    log::info!("time {:.0}:00", clock.time.hours.floor());
                                 }
                             }
                             ElementState::Released => {

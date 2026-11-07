@@ -9,7 +9,9 @@ Nanite and Lumen: virtualized geometry and dynamic global illumination, running 
 **[Try the live demo](https://samg-coder.github.io/solstice/)** in a WebGPU browser such as Chrome
 or Edge. It has three scenes, a ruined temple, a fort on a cove built from photoscans, and a meadow
 at the edge of a wood, streamed as you look around at a quality level that suits your GPU. Over
-them, volumetric clouds drift with the wind while the weather changes by itself.
+them, volumetric clouds drift with the wind while the weather changes by itself, and the day
+passes: the sun crosses the sky, and night brings the moon in its true phase, the stars and the
+Milky Way.
 
 ![A ruined temple at dusk, firelight glowing from its doorway](docs/dusk.png)
 
@@ -23,6 +25,10 @@ Epic Games code and is not affiliated with Epic Games.
 | A meadow and wood, all procedural | Fair-weather cumulus over the cove | Broken cloud over the temple |
 |---|---|---|
 | ![Meadow](docs/meadow.jpg) | ![Cove](docs/cove-clouds.jpg) | ![Temple](docs/temple-clouds.jpg) |
+
+| Sunrise over the cove | A gibbous moon at midnight | The Milky Way on a moonless night |
+|---|---|---|
+| ![Sunrise](docs/sunrise.jpg) | ![Moonlit](docs/moonlit.jpg) | ![Milky Way](docs/milky-way.jpg) |
 
 ## Quick start
 
@@ -67,11 +73,16 @@ cargo run --release -p viewer
 ```
 
 Both viewers use **click** to look, **WASD** to move, **Q/E** for down and up, and **Shift** to go
-faster. The browser page also has controls for debug views, the weather, the sun and render scale.
-Its weather starts as **Changing**, which drifts from one kind of weather to the next on its own;
-the menu fixes one instead, and **Extras** can follow a place's real weather (from
-[Open-Meteo](https://open-meteo.com)). The native viewer takes `--weather NAME` or a weather file,
-and **C** moves to the next kind of weather.
+faster. The browser page also has controls for debug views, the weather, the time of day and render
+scale. Its weather starts as **Changing**, which drifts from one kind of weather to the next on its
+own; the menu fixes one instead, and **Extras** can follow a place's real weather (from
+[Open-Meteo](https://open-meteo.com)). A day passes in 20 minutes: the **Time of day** slider follows
+the clock and sets it, **Time passes** speeds it up, slows it to real time or stops it, and **North**
+turns the sky around the scene. The page also takes `?time=HH:MM` and `?day-length=SECONDS`.
+
+The native viewer takes `--weather NAME` or a weather file, and **C** moves to the next kind of
+weather. `--time HH:MM` starts a clock, with `--day N` (day of the year), `--latitude DEGREES` and
+`--day-length SECONDS`; **T** moves the clock on an hour.
 
 ## Your own models
 
@@ -192,6 +203,12 @@ renderer.render(&gpu, &camera, &environment, &output_view, output_size, delta_se
 // Weather, at any time: one kind, eased into over 30 seconds, or a sky that changes by itself.
 renderer.set_weather(Weather::by_name("broken").unwrap(), 30.0);
 renderer.set_weather_changing(true, "fair");
+
+// The time of day: where the sun, moon and stars are, and how they light the scene. `daylight`
+// is the scene's lighting under a high sun; the time keeps its colour and strength.
+let mut time = TimeOfDay { day: 172.0, hours: 20.5 };
+let environment = time.environment(&Place::default(), &daylight);
+time.advance(delta_seconds / 3600.0);
 ```
 
 Meshes come from `solstice_builder::build_virtual_mesh`, which runs offline. See
@@ -241,7 +258,9 @@ buffer, which a final pass resolves to a G-buffer with analytic derivatives.
 - **Clouds:** volumetric, ray marched through noise in a layer over a curved planet. They cast
   shadows on the ground, and a small panorama of them feeds the skylight, GI and reflections, so
   an overcast sky dims and greys the whole scene. See below.
-- **Post:** temporal anti-aliasing and upscaling, histogram exposure, bloom, ACES tone mapping.
+- **Post:** temporal anti-aliasing and upscaling, histogram exposure, bloom, ACES tone mapping, and
+  contrast-adaptive sharpening on the displayed values, held within each pixel's neighbours so that
+  no edge gets a dark halo.
 
 ### Clouds and weather
 
@@ -263,6 +282,36 @@ frame's, reprojected; texels behind geometry are skipped. At 1080p in the forest
 0.3 ms of GPU time.
 
 ![The six built-in kinds of weather over the temple: clear, fair, broken, overcast, storm and cirrus](docs/weather.jpg)
+
+### Time of day, the moon and the stars
+
+The sun follows the standard formulas for its declination through the year and its hour angle
+through the day, at the scene's latitude. The moon is a simpler model, good for the look rather than
+an almanac: it goes through its phases every 29.53 days, is opposite the sun when full, and so rises
+about 50 minutes later each day. The stars sit on a celestial sphere placed from the sidereal time,
+so that the constellations and the Milky Way stand where they would that night: from 38 degrees
+north at midnight in late June, the galactic centre is 23 degrees up in the south, as a test checks.
+
+- **Twilight.** As the sun sets, the sky tables keep the air glowing. The night sky's own faint
+  glow, of airglow and starlight, is always there, lost by day, so twilight fades down to it and can
+  never dip below night. Below 10 degrees the moon takes over the lighting, in near darkness where
+  the change cannot be seen. Exposure stays tied to daylight, so night is dark rather than grey.
+- **Stars.** Three layers, from about 150 bright stars to many thousands of faint ones, with each
+  fainter magnitude about three times as common, as in the real sky. Each is coloured by its
+  temperature through Planck's law, dimmed and reddened by the air near the horizon, and twinkles
+  more the lower it is. They are drawn as spots about a pixel across at any resolution, found from
+  the eight nearest cells of a thin shell, which keeps the whole night sky to about 0.2 ms.
+- **The Milky Way.** Placed by the real galactic coordinates, brightest towards Sagittarius, with
+  star clouds and dust lanes along the Great Rift. It never changes on the celestial sphere, so it is
+  worked out once into a map, and costs one texture read a pixel.
+- **The moon.** It shows the near side's real seas, sized from their true diameters, with Tycho's
+  rays at full moon, and keeps its north towards the celestial pole. It reflects light as dusty
+  regolith does (Lommel-Seeliger), so the full moon is as bright at its edge as at its centre, and
+  earthshine lights its dark side when it is a crescent. By day it is as bright as it truly is and
+  shows pale against the blue; by night it is dimmed, as the eye adapts to it, so its face shows.
+- **The horizon.** Over a long path the air takes the colour of the sky at the horizon, so distant
+  land and sea fade into exactly that colour, and anything seen or reflected beyond the scene below
+  the horizon takes it too: sea and sky meet without a seam.
 
 ### Trees and grass
 
@@ -422,8 +471,7 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
 9. **Alpha.** Masked and transparent surfaces draw solid, so torn sails have no holes.
 10. **Weather's limits.** No rain or snow falls, there is no lightning, and clouds are drawn only
     where the sky shows, so low cloud never passes in front of a mountain. Under heavy cloud a thin
-    bright fringe can show along ridges against the sky, and the sun's height is set by hand rather
-    than by the time of day.
+    bright fringe can show along ridges against the sky.
 
 ## Tests
 
@@ -439,7 +487,11 @@ cargo test --release
 - GPU tests render real frames and check for validation errors, that no pixel is missing inside a
   closed surface, and that occlusion culling skips hidden geometry. Others check the clouds: that a
   clear sky is blue and an overcast one grey, that overcast all but removes shadows, and that the
-  wind moves the clouds. They skip themselves if no GPU is available.
+  wind moves the clouds. Others check the time of day: that twilight only ever grows darker on its
+  way into night, that the moon has no dark halo, and that a moonless night is full of stars. They
+  skip themselves if no GPU is available.
+- The sky's positions are checked against the real sky: sunrise in the east, the sun due south at
+  noon, the moon's phases, the sun at its own place among the stars, and the galactic centre.
 - Shaders are also checked for operator mixes that browsers reject but native compilers accept.
 - Every built-in tree, breed of grass and kind of weather is read and written back unchanged, and
   each procedural surface is checked for seams, plausible brightness and steepness.

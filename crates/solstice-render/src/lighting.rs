@@ -2,7 +2,7 @@
 
 use crate::clouds::{CloudBindings, CloudSky};
 use crate::gi::{GiVolume, ScreenGiBindings};
-use crate::gpu::{groups_for, Gpu, LayoutBuilder};
+use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
 use crate::scene::GpuScene;
 use crate::shaders;
 use crate::shadow::ShadowMaps;
@@ -10,6 +10,9 @@ use crate::sky::Sky;
 use crate::vg::GBuffer;
 
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The Milky Way's map of the celestial sphere: a fifth of a degree per texel.
+const MILKY_WAY_SIZE: (u32, u32) = (2048, 1024);
+const MILKY_WAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 /// Creates the layout of the shared lighting bind group. See `common/environment.wgsl`.
 pub fn environment_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
@@ -71,6 +74,8 @@ pub fn environment_group(
 pub struct DeferredLighting {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+    /// The Milky Way, which never changes on the celestial sphere, so is worked out once.
+    milky_way: Target,
 }
 
 impl DeferredLighting {
@@ -86,11 +91,13 @@ impl DeferredLighting {
         let layout = ShadowMaps::add_to_layout(builder)
             .storage_read()
             .texture()
+            .texture()
             .build(gpu, "deferred");
         let module = shaders::module(&gpu.device, "lighting/deferred.wgsl");
         Self {
             pipeline: gpu.compute_pipeline("deferred", &module, "main", &[&layout, environment]),
             layout,
+            milky_way: bake_milky_way(gpu),
         }
     }
 
@@ -124,6 +131,7 @@ impl DeferredLighting {
                     wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
                     scene.lights.as_entire_binding(),
                     tex(&clouds.screen[parity].view),
+                    tex(&self.milky_way.view),
                 ],
             )
         };
@@ -146,4 +154,36 @@ impl DeferredLighting {
         pass.set_bind_group(1, environment, &[]);
         pass.dispatch_workgroups(groups_for(size.0, 8), groups_for(size.1, 8), 1);
     }
+}
+
+/// Works out the Milky Way's map of the celestial sphere, once.
+fn bake_milky_way(gpu: &Gpu) -> Target {
+    let none = wgpu::TextureUsages::empty();
+    let map = Target::new(gpu, "milky way", MILKY_WAY_SIZE, MILKY_WAY_FORMAT, none);
+    let layout = LayoutBuilder::new()
+        .storage_texture(MILKY_WAY_FORMAT)
+        .build(gpu, "milky way bake");
+    let module = shaders::module(&gpu.device, "sky/milky_way_bake.wgsl");
+    let pipeline = gpu.compute_pipeline("milky way bake", &module, "main", &[&layout]);
+    let group = gpu.bind_group(
+        "milky way bake",
+        &layout,
+        &[wgpu::BindingResource::TextureView(&map.view)],
+    );
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("milky way bake"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups(
+            groups_for(MILKY_WAY_SIZE.0, 8),
+            groups_for(MILKY_WAY_SIZE.1, 8),
+            1,
+        );
+    }
+    gpu.queue.submit([encoder.finish()]);
+    map
 }
