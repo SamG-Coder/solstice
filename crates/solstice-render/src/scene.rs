@@ -5,6 +5,7 @@
 //! live in a fixed pool of page slots filled by [`crate::streaming`].
 
 use crate::gpu::Gpu;
+use crate::streaming::textures::TierPlan;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use solstice_asset::paged::{PagedScene, BASE_TEXTURE_EDGE, PAGE_BYTES};
@@ -24,7 +25,7 @@ pub struct GpuInstance {
     root_node: u32,
     material: u32,
     max_scale: f32,
-    _pad: u32,
+    texture_info: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<GpuInstance>() == 192);
@@ -46,9 +47,7 @@ pub struct GpuScene {
     pub triangles: wgpu::Buffer,
     pub materials: wgpu::Buffer,
     pub lights: wgpu::Buffer,
-    pub color_textures: wgpu::TextureView,
-    pub normal_textures: wgpu::TextureView,
-    pub material_textures: wgpu::TextureView,
+    pub textures: TextureArrays,
     pub texture_summary: String,
     pub material_sampler: wgpu::Sampler,
     pub instance_count: u32,
@@ -62,21 +61,18 @@ pub struct GpuScene {
 
 impl GpuScene {
     /// Creates everything but the contents of the page pool, which holds `slots` pages.
-    /// `upper_textures` holds the texture levels above the base ones, if they are known.
+    /// Texture levels are written straight away if `upper_textures` holds them all. Otherwise
+    /// tiers follow `plan`, with only the base tier filled, and streaming does the rest.
     pub fn new(
         gpu: &Gpu,
         scene: &PagedScene,
         slots: u32,
         upper_textures: Option<&[TextureLayer]>,
+        plan: Option<TierPlan>,
     ) -> Self {
         let instances = gpu_instances(scene);
-        let fallback_material = [Material::default()];
-        let materials: &[Material] = if scene.materials.is_empty() {
-            &fallback_material
-        } else {
-            &scene.materials
-        };
-        let textures = upload_textures(gpu, scene, upper_textures);
+        let materials = starting_materials(scene);
+        let (textures, texture_summary) = upload_textures(gpu, scene, upper_textures, plan);
 
         let material_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("material"),
@@ -100,12 +96,10 @@ impl GpuScene {
             clusters: gpu.storage_buffer_init("clusters", &scene.clusters),
             vertices: pool.clone(),
             triangles: pool,
-            materials: gpu.storage_buffer_init("materials", materials),
+            materials: gpu.storage_buffer_init("materials", &materials),
             lights: gpu.storage_buffer_init("lights", &scene.lights),
-            color_textures: textures.color,
-            normal_textures: textures.normal,
-            material_textures: textures.material,
-            texture_summary: textures.summary,
+            textures,
+            texture_summary,
             material_sampler,
             instance_count: instances.len() as u32,
             light_count: scene.lights.len() as u32,
@@ -113,6 +107,31 @@ impl GpuScene {
             source_triangles: scene.source_triangles,
             unique_triangles: scene.unique_triangles,
         }
+    }
+}
+
+/// The scene's materials, as they stand with every texture in the base tier.
+pub fn starting_materials(scene: &PagedScene) -> Vec<Material> {
+    let mut materials = scene.materials.clone();
+    if materials.is_empty() {
+        materials.push(Material::default());
+    }
+    for material in &mut materials {
+        material.texture_tier = 0;
+        material.texture_slot = material.texture_layer.max(0) as u32;
+    }
+    materials
+}
+
+/// `Instance.texture_info` in `common/scene.wgsl`: what culling needs to work out how sharp a
+/// texture must be, without having to read materials.
+fn texture_info(material: Option<&Material>) -> u32 {
+    match material {
+        Some(material) if material.texture_layer >= 0 && material.uv_scale > 0.0 => {
+            let log2_scale = ((material.uv_scale.log2() + 128.0) * 256.0).clamp(0.0, 65535.0);
+            (material.texture_layer as u32) << 16 | log2_scale as u32
+        }
+        _ => u32::MAX,
     }
 }
 
@@ -143,7 +162,7 @@ fn gpu_instances(scene: &PagedScene) -> Vec<GpuInstance> {
             root_node,
             material: instance.material,
             max_scale,
-            _pad: 0,
+            texture_info: texture_info(scene.materials.get(instance.material as usize)),
         });
     }
     out
@@ -152,28 +171,208 @@ fn gpu_instances(scene: &PagedScene) -> Vec<GpuInstance> {
 /// The largest edge kept when textures must be unpacked, because the GPU can't sample BC.
 /// Unpacked textures take 8 bytes per texel rather than 3, so this keeps a scene baked at a
 /// larger size from taking far more memory on the devices least able to spare it.
-const UNPACKED_MAX_EDGE: u32 = 512;
+pub const UNPACKED_MAX_EDGE: u32 = 512;
 
-struct UploadedTextures {
-    color: wgpu::TextureView,
-    normal: wgpu::TextureView,
-    material: wgpu::TextureView,
-    summary: String,
+/// One tier: an array per map. A tier a scene doesn't use is a 1x1 stand-in, as WebGPU has no
+/// optional bindings.
+pub struct TierArrays {
+    pub color: wgpu::Texture,
+    pub normal: wgpu::Texture,
+    pub material: wgpu::Texture,
+    pub color_view: wgpu::TextureView,
+    pub normal_view: wgpu::TextureView,
+    pub material_view: wgpu::TextureView,
+    /// Edge of the largest level.
+    pub edge: u32,
 }
 
-/// Creates the three texture arrays, or 1x1 stand-ins if the scene has no textures.
+/// Every texture array of a scene. A scene loaded whole has all of it in the base tier.
+pub struct TextureArrays {
+    pub base: TierArrays,
+    pub middle: TierArrays,
+    pub top: TierArrays,
+    /// Whether the arrays hold BC blocks rather than plain texels.
+    pub block: bool,
+    /// Whether arriving levels hold BC blocks that must be unpacked, for lack of GPU support.
+    pub unpack: bool,
+    /// Bytes of GPU memory across all tiers.
+    pub bytes: u64,
+}
+
+impl TierArrays {
+    fn new(gpu: &Gpu, edge: u32, layers: u32, block: bool, name: &str) -> Self {
+        let (color_format, data_format) = if block {
+            (
+                wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+                wgpu::TextureFormat::Bc5RgUnorm,
+            )
+        } else {
+            (
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::TextureFormat::Rg8Unorm,
+            )
+        };
+        let create = |map: &str, format: wgpu::TextureFormat| {
+            gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("{name} {map}")),
+                size: wgpu::Extent3d {
+                    width: edge,
+                    height: edge,
+                    depth_or_array_layers: layers,
+                },
+                mip_level_count: edge.ilog2() + 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let view = |texture: &wgpu::Texture| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        };
+        let color = create("color", color_format);
+        let normal = create("normal", data_format);
+        let material = create("data", data_format);
+        Self {
+            color_view: view(&color),
+            normal_view: view(&normal),
+            material_view: view(&material),
+            color,
+            normal,
+            material,
+            edge,
+        }
+    }
+
+    /// Writes all three maps of one level, given data in the arrays' own form.
+    pub fn write_level(
+        &self,
+        gpu: &Gpu,
+        block: bool,
+        slot: u32,
+        level: u32,
+        [color, normal, material]: [&[u8]; 3],
+    ) {
+        write_level(gpu, &self.color, block, slot, level, color);
+        write_level(gpu, &self.normal, block, slot, level, normal);
+        write_level(gpu, &self.material, block, slot, level, material);
+    }
+
+    /// Records a copy of all of `from`'s levels of a layer into this tier's matching levels.
+    pub fn copy_lower_levels(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        from: &TierArrays,
+        block: bool,
+        from_slot: u32,
+        to_slot: u32,
+    ) {
+        let offset = (self.edge / from.edge).ilog2();
+        for level in 0..from.edge.ilog2() + 1 {
+            let edge = (from.edge >> level).max(1);
+            let extent = if block { edge.div_ceil(4) * 4 } else { edge };
+            for (source, target) in [
+                (&from.color, &self.color),
+                (&from.normal, &self.normal),
+                (&from.material, &self.material),
+            ] {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: source,
+                        mip_level: level,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: from_slot,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target,
+                        mip_level: level + offset,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: to_slot,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: extent,
+                        height: extent,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Writes one level of one layer of one array.
+fn write_level(
+    gpu: &Gpu,
+    texture: &wgpu::Texture,
+    block: bool,
+    slot: u32,
+    level: u32,
+    data: &[u8],
+) {
+    let edge = (texture.width() >> level).max(1);
+    // Copies of block formats cover whole blocks, even when the mip itself is smaller.
+    let (copy_edge, rows, bytes_per_row) = if block {
+        let blocks = edge.div_ceil(4);
+        (blocks * 4, blocks, blocks * 16)
+    } else {
+        let texel_bytes = data.len() as u32 / (edge * edge);
+        (edge, edge, edge * texel_bytes)
+    };
+    gpu.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: level,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: slot,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(rows),
+        },
+        wgpu::Extent3d {
+            width: copy_edge,
+            height: copy_edge,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+/// Creates the texture arrays and fills what's known, or uses 1x1 stand-ins if the scene has
+/// no textures.
 fn upload_textures(
     gpu: &Gpu,
     scene: &PagedScene,
     upper_textures: Option<&[TextureLayer]>,
-) -> UploadedTextures {
+    plan: Option<TierPlan>,
+) -> (TextureArrays, String) {
     let has_textures = !scene.base_textures.is_empty();
     // The stand-ins for a scene without textures are never blocks, whatever it says it holds.
     let stored_as_blocks = has_textures && scene.texture_encoding == TextureEncoding::Block;
     let block = stored_as_blocks && gpu.block_compressed_textures;
     let unpack = stored_as_blocks && !gpu.block_compressed_textures;
+    let layers = scene.base_textures.len().max(1) as u32;
 
-    // The largest level on hand: the whole chain if the upper levels are here, else the base.
+    // The base tier holds the whole chain if it's all here, else the levels in the manifest.
     let largest = if upper_textures.is_some() {
         scene.texture_size
     } else {
@@ -187,118 +386,55 @@ fn upload_textures(
         }
     }
     let size = if has_textures { largest >> skip } else { 1 };
-    let layers = scene.base_textures.len().max(1) as u32;
-    let mips = if has_textures { size.ilog2() + 1 } else { 1 };
 
-    let create = |label: &str, format: wgpu::TextureFormat| {
-        gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: size,
-                height: size,
-                depth_or_array_layers: layers,
-            },
-            mip_level_count: mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        })
+    let base = TierArrays::new(gpu, size, layers, block, "base");
+    let tier = |edge: Option<u32>, slots: u32, name: &str| match edge.filter(|_| has_textures) {
+        Some(edge) => TierArrays::new(gpu, edge, slots.max(1), block, name),
+        None => TierArrays::new(gpu, 1, 1, false, name),
     };
-    let (color_format, data_format) = if block {
-        (
-            wgpu::TextureFormat::Bc7RgbaUnormSrgb,
-            wgpu::TextureFormat::Bc5RgUnorm,
-        )
-    } else {
-        (
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            wgpu::TextureFormat::Rg8Unorm,
-        )
-    };
-    let color = create("material color", color_format);
-    let normal = create("material normal", data_format);
-    let material = create("material data", data_format);
+    let middle = tier(plan.and_then(|p| p.middle_edge), layers, "middle");
+    let (top_edge, top_slots) = plan.and_then(|p| p.top).unzip();
+    let top = tier(top_edge, top_slots.unwrap_or(1), "top");
 
-    let mut bytes = 0u64;
-    let mut write = |texture: &wgpu::Texture, layer: usize, mip: usize, data: &[u8]| {
-        bytes += data.len() as u64;
-        let edge = (size >> mip).max(1);
-        // Copies of block formats cover whole blocks, even when the mip itself is smaller.
-        let (copy_edge, rows, bytes_per_row) = if block {
-            let blocks = edge.div_ceil(4);
-            (blocks * 4, blocks, blocks * 16)
-        } else {
-            let texel_bytes = data.len() as u32 / (edge * edge);
-            (edge, edge, edge * texel_bytes)
-        };
-        gpu.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: mip as u32,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer as u32,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(rows),
-            },
-            wgpu::Extent3d {
-                width: copy_edge,
-                height: copy_edge,
-                depth_or_array_layers: 1,
-            },
-        );
-    };
-
+    let mut written = 0u64;
     if has_textures {
         let empty = TextureLayer::default();
-        for (layer, base) in scene.base_textures.iter().enumerate() {
+        for (layer, set) in scene.base_textures.iter().enumerate() {
             let upper = upper_textures.map_or(&empty, |upper| &upper[layer]);
-            let color_chain = upper.color_mips.iter().chain(&base.color_mips);
-            for (mip, data) in color_chain.skip(skip).enumerate() {
+            let color_chain = upper.color_mips.iter().chain(&set.color_mips);
+            let normal_chain = upper.normal_mips.iter().chain(&set.normal_mips);
+            let material_chain = upper.material_mips.iter().chain(&set.material_mips);
+            let levels = color_chain.zip(normal_chain).zip(material_chain).skip(skip);
+            for (level, ((color, normal), material)) in levels.enumerate() {
+                written += (color.len() + normal.len() + material.len()) as u64;
+                let edge = (size >> level).max(1);
                 if unpack {
-                    write(&color, layer, mip, &unpack_bc7((size >> mip).max(1), data));
+                    base.write_level(
+                        gpu,
+                        block,
+                        layer as u32,
+                        level as u32,
+                        [
+                            &unpack_bc7(edge, color),
+                            &unpack_bc5(edge, normal),
+                            &unpack_bc5(edge, material),
+                        ],
+                    );
                 } else {
-                    write(&color, layer, mip, data);
-                }
-            }
-            let data_chains = [
-                (&normal, upper.normal_mips.iter().chain(&base.normal_mips)),
-                (
-                    &material,
-                    upper.material_mips.iter().chain(&base.material_mips),
-                ),
-            ];
-            for (texture, chain) in data_chains {
-                for (mip, data) in chain.skip(skip).enumerate() {
-                    if unpack {
-                        write(texture, layer, mip, &unpack_bc5((size >> mip).max(1), data));
-                    } else {
-                        write(texture, layer, mip, data);
-                    }
+                    base.write_level(
+                        gpu,
+                        block,
+                        layer as u32,
+                        level as u32,
+                        [color, normal, material],
+                    );
                 }
             }
         }
     } else {
-        write(&color, 0, 0, &[255; 4]);
-        write(&normal, 0, 0, &[128; 2]);
-        write(&material, 0, 0, &[128; 2]);
+        base.write_level(gpu, false, 0, 0, [&[255; 4], &[128; 2], &[128; 2]]);
     }
 
-    let view = |texture: &wgpu::Texture| {
-        texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        })
-    };
     let form = if block {
         "BC7 + BC5"
     } else if unpack {
@@ -306,23 +442,57 @@ fn upload_textures(
     } else {
         "RGBA8 + RG8"
     };
-    let summary = format!("{layers} x {size}, {form}, {:.0} MB", bytes as f64 / 1.0e6);
+    let (bytes, summary) = match plan.filter(|_| has_textures) {
+        Some(plan) => {
+            let encoding = if block {
+                TextureEncoding::Block
+            } else {
+                TextureEncoding::Raw
+            };
+            let bytes = plan.bytes(layers, encoding);
+            let tiers = format!(
+                "{layers} x {}{}{}",
+                plan.base_edge,
+                plan.middle_edge
+                    .map_or(String::new(), |edge| format!(" / {edge}")),
+                plan.top.map_or(String::new(), |(edge, slots)| format!(
+                    " / {slots} x {edge}"
+                )),
+            );
+            (
+                bytes,
+                format!("{tiers}, {form}, {:.0} MB", bytes as f64 / 1.0e6),
+            )
+        }
+        None => (
+            written,
+            format!(
+                "{layers} x {size}, {form}, {:.0} MB",
+                written as f64 / 1.0e6
+            ),
+        ),
+    };
     log::info!("textures: {summary}");
-    UploadedTextures {
-        color: view(&color),
-        normal: view(&normal),
-        material: view(&material),
+    (
+        TextureArrays {
+            base,
+            middle,
+            top,
+            block,
+            unpack,
+            bytes,
+        },
         summary,
-    }
+    )
 }
 
 /// Unpacks a BC7 mip level to RGBA8.
-fn unpack_bc7(edge: u32, blocks: &[u8]) -> Vec<u8> {
+pub fn unpack_bc7(edge: u32, blocks: &[u8]) -> Vec<u8> {
     unpack_blocks::<4>(edge, blocks, block_compression::decode::decode_block_bc7)
 }
 
 /// Unpacks a BC5 mip level to RG8.
-fn unpack_bc5(edge: u32, blocks: &[u8]) -> Vec<u8> {
+pub fn unpack_bc5(edge: u32, blocks: &[u8]) -> Vec<u8> {
     unpack_blocks::<2>(edge, blocks, block_compression::decode::decode_block_bc5)
 }
 
@@ -363,6 +533,24 @@ mod tests {
         block[8] = green;
         block[9] = green;
         block
+    }
+
+    #[test]
+    fn materials_start_in_the_base_tier_at_their_own_layer() {
+        let material = |texture_layer| Material {
+            texture_layer,
+            texture_tier: 2,
+            texture_slot: 9,
+            ..Default::default()
+        };
+        let scene = PagedScene {
+            materials: vec![material(3), material(-1)],
+            ..Default::default()
+        };
+        let started = starting_materials(&scene);
+        assert_eq!((started[0].texture_tier, started[0].texture_slot), (0, 3));
+        assert_eq!(started[1].texture_tier, 0);
+        assert_eq!(starting_materials(&PagedScene::default()).len(), 1);
     }
 
     #[test]

@@ -55,7 +55,10 @@ pub struct Material {
     /// How strongly to hide repetition, for textures that tile. Leave at 0 for textures made
     /// for one object, such as scans, whose colour would otherwise be stained.
     pub macro_variation: f32,
-    pub _pad: [u32; 2],
+    /// Which texture array holds the layer right now. Set by the renderer, zero on disk.
+    pub texture_tier: u32,
+    /// Where in that array the layer is. Set by the renderer, zero on disk.
+    pub texture_slot: u32,
 }
 
 impl Default for Material {
@@ -69,7 +72,8 @@ impl Default for Material {
             normal_strength: 1.0,
             texture_layer: -1,
             macro_variation: 0.0,
-            _pad: [0; 2],
+            texture_tier: 0,
+            texture_slot: 0,
         }
     }
 }

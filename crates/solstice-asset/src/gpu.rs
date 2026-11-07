@@ -22,6 +22,24 @@ pub const ROOT_PARENT_ERROR: f32 = 1.0e30;
 /// installed, so this cluster must draw however coarse it is.
 pub const CLUSTER_CHILDREN_MISSING: u32 = 1 << 16;
 
+/// The bits of [`PackedCluster::counts`] holding the cluster's UV density, see
+/// [`encode_uv_density`]. Tells culling how sharp a texture this cluster needs on screen.
+pub const CLUSTER_UV_DENSITY_SHIFT: u32 = 24;
+
+/// Quantises texture repeats per object-space unit to a byte, at eighths of an octave. Zero means
+/// the cluster has no usable UVs.
+pub fn encode_uv_density(density: f32) -> u32 {
+    if !density.is_finite() || density <= 0.0 {
+        return 0;
+    }
+    ((density.log2() + 16.0) * 8.0).round().clamp(1.0, 255.0) as u32
+}
+
+/// Inverse of [`encode_uv_density`], for non-zero values. `shaders/vg/cull.wgsl` has a twin.
+pub fn decode_uv_density(code: u32) -> f32 {
+    (code as f32 / 8.0 - 16.0).exp2()
+}
+
 /// Set in [`PackedNode::is_leaf`] on a leaf. The low bits hold the page of its sibling set.
 pub const NODE_LEAF: u32 = 1 << 31;
 /// Set in [`PackedNode::is_leaf`] while that page is installed.
@@ -59,7 +77,8 @@ pub struct PackedCluster {
     pub vertex_offset: u32,
     /// First triangle in the shared triangle pool.
     pub triangle_offset: u32,
-    /// `vertex_count | triangle_count << 8`, plus [`CLUSTER_CHILDREN_MISSING`].
+    /// `vertex_count | triangle_count << 8`, plus [`CLUSTER_CHILDREN_MISSING`] and the UV
+    /// density above [`CLUSTER_UV_DENSITY_SHIFT`].
     pub counts: u32,
 }
 

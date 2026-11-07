@@ -11,7 +11,7 @@ use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT};
 use crate::sky::Sky;
-use crate::streaming::{Streamer, StreamingStats};
+use crate::streaming::{choose_tiers, StreamRequest, Streamer, StreamingStats};
 use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, PassView, RasterBindings, Rasterizer,
     Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
@@ -106,6 +106,39 @@ impl RendererSettings {
     }
 }
 
+/// How much GPU memory a streaming renderer may spend on a scene, in bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamingBudget {
+    pub geometry_bytes: u64,
+    pub texture_bytes: u64,
+}
+
+impl Default for StreamingBudget {
+    /// Enough for a detailed view of the cove in every direction at once.
+    fn default() -> Self {
+        Self {
+            geometry_bytes: 128 << 20,
+            texture_bytes: 64 << 20,
+        }
+    }
+}
+
+/// GPU memory holding a scene's own data, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SceneMemory {
+    /// Instances, materials, lights, hierarchy nodes and cluster records. Always resident.
+    pub records: u64,
+    /// The page pool.
+    pub pages: u64,
+    pub textures: u64,
+}
+
+impl SceneMemory {
+    pub fn total(&self) -> u64 {
+        self.records + self.pages + self.textures
+    }
+}
+
 /// Measurements from a recent frame.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
@@ -185,8 +218,9 @@ impl Renderer {
             &loaded.scene,
             loaded.scene.pages.len() as u32,
             Some(&loaded.upper_textures),
+            None,
         );
-        let mut streamer = Streamer::new(gpu, &loaded.scene, loaded.scene.pages.len() as u32);
+        let mut streamer = Streamer::new(gpu, &loaded.scene, loaded.scene.pages.len() as u32, None);
         for page in 0..loaded.scene.pages.len() as u32 {
             streamer.install_now(gpu, &scene, page, loaded.page(page));
         }
@@ -194,21 +228,24 @@ impl Renderer {
         Self::from_parts(gpu, scene, streamer, output_format, settings)
     }
 
-    /// Creates a renderer that starts with only a scene's pinned pages, and draws with what
-    /// it has while the host supplies the rest: see [`Self::page_requests`]. The page pool
-    /// holds `geometry_budget` bytes, or the pinned pages if that is too little.
+    /// Creates a renderer that starts with only a scene's pinned pages and smallest textures,
+    /// and draws with what it has while the host supplies the rest: see
+    /// [`Self::stream_requests`]. GPU memory for the scene stays within `budget`, apart from
+    /// what the scene can't do without: its records, pinned pages and smallest textures.
     pub fn streaming(
         gpu: &Gpu,
         paged: &PagedScene,
         output_format: wgpu::TextureFormat,
         settings: RendererSettings,
-        geometry_budget: u64,
+        budget: StreamingBudget,
     ) -> Self {
-        let slots = ((geometry_budget / PAGE_BYTES as u64) as u32)
+        let slots = u32::try_from(budget.geometry_bytes / PAGE_BYTES as u64)
+            .unwrap_or(u32::MAX)
             .max(paged.pinned_pages)
             .min(paged.pages.len() as u32);
-        let scene = GpuScene::new(gpu, paged, slots, None);
-        let mut streamer = Streamer::new(gpu, paged, slots);
+        let plan = choose_tiers(gpu, paged, budget.texture_bytes);
+        let scene = GpuScene::new(gpu, paged, slots, None, Some(plan));
+        let mut streamer = Streamer::new(gpu, paged, slots, Some(plan));
         for page in 0..paged.pinned_pages {
             streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
         }
@@ -291,21 +328,36 @@ impl Renderer {
         }
     }
 
-    /// The pages to start fetching now, most wanted first. Each must later be handed to
-    /// [`Self::deliver_page`] or [`Self::page_failed`]. `max_fetching` caps those outstanding.
-    pub fn page_requests(&mut self, max_fetching: u32) -> Vec<u32> {
+    /// The ranges of the scene file to start fetching now, most wanted first. Each must later
+    /// be handed to [`Self::deliver`] or [`Self::request_failed`]. `max_fetching` caps the
+    /// pages outstanding, and a few texture levels may come on top.
+    pub fn stream_requests(&mut self, max_fetching: u32) -> Vec<StreamRequest> {
         self.streamer.take_fetches(max_fetching)
     }
 
-    /// Takes the unpacked contents of a requested page. It installs within a few frames.
-    /// Returns false if it wasn't wanted any more or is the wrong size.
-    pub fn deliver_page(&mut self, page: u32, data: Vec<u8>) -> bool {
-        self.streamer.deliver(page, data)
+    /// Takes the bytes of a request, unpacked if it was deflated. They reach the GPU within a
+    /// few frames. Returns false if they aren't wanted any more or are the wrong size.
+    pub fn deliver(&mut self, id: u32, data: Vec<u8>) -> bool {
+        self.streamer.deliver_request(id, data)
     }
 
-    /// Reports that a requested page could not be fetched, so it may be requested again.
-    pub fn page_failed(&mut self, page: u32) {
-        self.streamer.fetch_failed(page);
+    /// Reports that a request could not be fetched, so what it holds may be requested again.
+    pub fn request_failed(&mut self, id: u32) {
+        self.streamer.request_failed(id);
+    }
+
+    /// Bytes of GPU memory holding this scene's own data, not counting render targets.
+    pub fn scene_bytes(&self) -> SceneMemory {
+        let buffer_bytes = self.scene.instances.size()
+            + self.scene.nodes.size()
+            + self.scene.clusters.size()
+            + self.scene.materials.size()
+            + self.scene.lights.size();
+        SceneMemory {
+            records: buffer_bytes,
+            pages: self.scene.vertices.size(),
+            textures: self.scene.textures.bytes,
+        }
     }
 
     /// How the scene's textures ended up on the GPU, for logs and on-screen readouts.
@@ -384,7 +436,7 @@ impl Renderer {
                 label: Some("frame"),
             });
 
-        self.streamer.begin_frame(&mut encoder);
+        self.streamer.begin_frame(gpu, &self.scene, &mut encoder);
 
         mark(&self.profiler, &mut encoder, section::SKY);
         self.sky.record(

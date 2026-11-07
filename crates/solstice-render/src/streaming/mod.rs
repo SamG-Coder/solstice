@@ -6,15 +6,21 @@
 
 mod feedback;
 pub mod residency;
+pub mod textures;
 
-use crate::scene::GpuScene;
+use crate::scene::{
+    starting_materials, unpack_bc5, unpack_bc7, GpuScene, TierArrays, UNPACKED_MAX_EDGE,
+};
 use crate::Gpu;
 use feedback::RequestFeedback;
 use residency::{Install, Residency};
 use solstice_asset::gpu::{CLUSTER_CHILDREN_MISSING, NODE_INSTALLED, NODE_LEAF};
-use solstice_asset::paged::{ClusterSet, PageInfo, PagedScene, PAGE_VERTICES, PAGE_WORDS};
-use solstice_asset::{PackedCluster, PackedNode};
+use solstice_asset::paged::{
+    upper_mip_count, ClusterSet, PageInfo, PagedScene, BASE_TEXTURE_EDGE, PAGE_VERTICES, PAGE_WORDS,
+};
+use solstice_asset::{Material, PackedCluster, PackedNode, TextureEncoding};
 use std::collections::HashMap;
+use textures::{MipFetch, TextureResidency, TierPlan, TIER_MIDDLE, TIER_TOP};
 
 /// Byte offset of `is_leaf` within a hierarchy node.
 const NODE_FLAGS_OFFSET: u64 = std::mem::offset_of!(PackedNode, is_leaf) as u64;
@@ -25,6 +31,29 @@ const INSTALLS_PER_FRAME: u32 = 8;
 /// Frames between redraws of cached views, which a stream of arriving pages would otherwise
 /// make redraw constantly.
 const REFRESH_INTERVAL_FRAMES: u32 = 30;
+
+/// Levels of texture to fetch at once. They're much larger than pages, and fewer.
+const MAX_TEXTURE_FETCHES: u32 = 4;
+/// Texture levels to write per frame.
+const TEXTURE_WRITES_PER_FRAME: usize = 2;
+/// Sharper than a texel per pixel, matching `TEXTURE_DETAIL` in the renderer. Textures load a
+/// little before they would be seen to blur.
+const TEXTURE_DEMAND_SCALE: f32 = 1.0 / 0.6;
+/// Marks a request's id as a texture level rather than a page.
+const TEXTURE_REQUEST_BIT: u32 = 1 << 31;
+
+/// Something for the host to fetch: a range of the scene file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamRequest {
+    /// What to pass back to [`crate::Renderer::deliver`].
+    pub id: u32,
+    /// First byte in the file.
+    pub start: u64,
+    /// One past the last byte.
+    pub end: u64,
+    /// Whether the range must be inflated before delivery.
+    pub deflated: bool,
+}
 
 /// How streaming is going, for on-screen readouts and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,6 +69,11 @@ pub struct StreamingStats {
     pub evictions: u64,
     /// Bytes of the GPU's page pool.
     pub pool_bytes: u64,
+    /// Layers usable at the middle and top tiers.
+    pub middle_layers: u32,
+    pub top_layers: u32,
+    /// Texture levels being fetched.
+    pub texture_fetches: u32,
 }
 
 /// Keeps the GPU's cluster and node records in step with which pages are installed.
@@ -60,6 +94,8 @@ pub struct Streamer {
     /// The latest requests read back, not yet planned for.
     fresh_requests: Option<Vec<u32>>,
     slot_count: u32,
+    data_offset: u64,
+    textures: Option<TextureStreamer>,
     evictions: u64,
     /// Whether what's installed changed since cached views last refreshed.
     changed_since_refresh: bool,
@@ -67,8 +103,9 @@ pub struct Streamer {
 }
 
 impl Streamer {
-    /// Starts with nothing installed and a pool of `slots`.
-    pub fn new(gpu: &Gpu, scene: &PagedScene, slots: u32) -> Self {
+    /// Starts with nothing installed and a pool of `slots`. Textures stream only if a plan is
+    /// given, and otherwise stay as they were created.
+    pub fn new(gpu: &Gpu, scene: &PagedScene, slots: u32, plan: Option<TierPlan>) -> Self {
         Self {
             pages: scene.pages.clone(),
             sets: scene.sets.clone(),
@@ -79,9 +116,16 @@ impl Streamer {
             dirty_clusters: Vec::new(),
             slots: vec![u32::MAX; scene.pages.len()],
             frame: 0,
-            feedback: RequestFeedback::new(gpu, scene.pages.len() as u32),
+            feedback: RequestFeedback::new(
+                gpu,
+                (scene.pages.len() + scene.base_textures.len()) as u32,
+            ),
             fresh_requests: None,
             slot_count: slots,
+            data_offset: scene.data_offset,
+            textures: plan
+                .filter(|_| !scene.base_textures.is_empty())
+                .map(|plan| TextureStreamer::new(scene, plan)),
             evictions: 0,
             changed_since_refresh: false,
             frames_since_refresh: 0,
@@ -93,9 +137,12 @@ impl Streamer {
         self.feedback.buffer()
     }
 
-    /// Clears the requests for this frame's culling.
-    pub fn begin_frame(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    /// Clears the requests for this frame's culling, and finishes textures that are complete.
+    pub fn begin_frame(&mut self, gpu: &Gpu, scene: &GpuScene, encoder: &mut wgpu::CommandEncoder) {
         encoder.clear_buffer(self.feedback.buffer(), 0, None);
+        if let Some(textures) = &mut self.textures {
+            textures.begin_frame(gpu, scene, encoder);
+        }
     }
 
     /// Queues a copy of this frame's requests, if the last copy has been dealt with.
@@ -116,13 +163,55 @@ impl Streamer {
             self.fresh_requests = Some(requests);
         }
         self.install_waiting(gpu, scene, INSTALLS_PER_FRAME);
+        if let Some(textures) = &mut self.textures {
+            textures.write_waiting(gpu, scene);
+        }
     }
 
-    /// The pages to start fetching now, from the latest requests read back.
-    pub fn take_fetches(&mut self, max_fetching: u32) -> Vec<u32> {
-        match self.fresh_requests.take() {
-            Some(requests) => self.plan(&requests, max_fetching),
-            None => Vec::new(),
+    /// What to start fetching now, from the latest requests read back. At most `max_fetching`
+    /// pages and a few texture levels are ever outstanding.
+    pub fn take_fetches(&mut self, max_fetching: u32) -> Vec<StreamRequest> {
+        let Some(requests) = self.fresh_requests.take() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for page in self.plan(&requests, max_fetching) {
+            let info = &self.pages[page as usize];
+            let start = self.data_offset + info.offset;
+            out.push(StreamRequest {
+                id: page,
+                start,
+                end: start + u64::from(info.stored_bytes),
+                deflated: true,
+            });
+        }
+        if let Some(textures) = &mut self.textures {
+            out.extend(textures.plan(self.frame, &requests));
+        }
+        out
+    }
+
+    /// Takes the bytes of a request: unpacked, if it was deflated. Returns false if they aren't
+    /// wanted any more or are the wrong size.
+    pub fn deliver_request(&mut self, id: u32, data: Vec<u8>) -> bool {
+        if id & TEXTURE_REQUEST_BIT != 0 {
+            match &mut self.textures {
+                Some(textures) => textures.deliver(id, data),
+                None => false,
+            }
+        } else {
+            self.deliver(id, data)
+        }
+    }
+
+    /// A fetch failed. What it was for may be requested again.
+    pub fn request_failed(&mut self, id: u32) {
+        if id & TEXTURE_REQUEST_BIT != 0 {
+            if let Some(textures) = &mut self.textures {
+                textures.failed(id);
+            }
+        } else {
+            self.fetch_failed(id);
         }
     }
 
@@ -146,6 +235,9 @@ impl Streamer {
             starved: self.residency.starved(),
             evictions: self.evictions,
             pool_bytes: u64::from(self.slot_count) * u64::from(PAGE_WORDS) * 4,
+            middle_layers: self.textures.as_ref().map_or(0, |t| t.residency.counts().0),
+            top_layers: self.textures.as_ref().map_or(0, |t| t.residency.counts().1),
+            texture_fetches: self.textures.as_ref().map_or(0, |t| t.residency.fetching()),
         }
     }
 
@@ -272,6 +364,199 @@ impl Streamer {
     /// Whether every page has been installed.
     pub fn all_installed(&self) -> bool {
         self.residency.installed_count() as usize == self.residency.page_count()
+    }
+}
+
+/// Chooses tier sizes for a scene, on this GPU, within a budget in bytes.
+pub fn choose_tiers(gpu: &Gpu, scene: &PagedScene, budget: u64) -> TierPlan {
+    let stored_as_blocks = scene.texture_encoding == TextureEncoding::Block;
+    let block = stored_as_blocks && gpu.block_compressed_textures;
+    let unpack = stored_as_blocks && !gpu.block_compressed_textures;
+    TierPlan::choose(
+        scene.texture_size,
+        scene.base_textures.len() as u32,
+        BASE_TEXTURE_EDGE,
+        if block {
+            TextureEncoding::Block
+        } else {
+            TextureEncoding::Raw
+        },
+        budget,
+        if unpack { UNPACKED_MAX_EDGE } else { u32::MAX },
+    )
+}
+
+/// Moves texture levels between the file and the tiers.
+struct TextureStreamer {
+    residency: TextureResidency,
+    /// Each layer's materials, whose tier and slot change together.
+    materials: Vec<Material>,
+    size: u32,
+    encoding: TextureEncoding,
+    upper_count: usize,
+    /// For each layer, each upper level: its range in the file.
+    ranges: Vec<(u64, u64)>,
+    /// Fetched levels waiting for their turn to be written.
+    waiting: Vec<(MipFetch, Vec<u8>)>,
+    /// Layers whose top levels are written, for which lower levels should copy and then draw.
+    complete: Vec<(u32, u32)>,
+    /// Written tier changes, to apply to materials, whose buffer may be written any time.
+    dirty_materials: bool,
+}
+
+impl TextureStreamer {
+    fn new(scene: &PagedScene, plan: TierPlan) -> Self {
+        let upper_count = upper_mip_count(scene.texture_size);
+        let layers = scene.base_textures.len();
+        let mut ranges = Vec::with_capacity(layers * upper_count);
+        for layer in 0..layers {
+            for mip in 0..upper_count {
+                ranges.push(
+                    solstice_asset::file::upper_mip_range(scene, layer, mip).unwrap_or((0, 0)),
+                );
+            }
+        }
+        // The unpacked path's base tier might start lower than a tier's scale would suggest,
+        // but levels are always addressed from the file's largest.
+        Self {
+            residency: TextureResidency::new(plan, scene.texture_size, layers as u32),
+            materials: starting_materials(scene),
+            size: scene.texture_size,
+            encoding: scene.texture_encoding,
+            upper_count,
+            ranges,
+            waiting: Vec::new(),
+            complete: Vec::new(),
+            dirty_materials: false,
+        }
+    }
+
+    fn plan(&mut self, frame: u32, requests: &[u32]) -> Vec<StreamRequest> {
+        let layers = self.ranges.len().checked_div(self.upper_count).unwrap_or(0);
+        if layers == 0 || requests.len() < layers {
+            return Vec::new();
+        }
+        // These are stored from the end of the array, so that pages need no offset.
+        let demands: Vec<u32> = (0..layers)
+            .map(|layer| {
+                let edge = requests[requests.len() - 1 - layer];
+                (edge as f32 * TEXTURE_DEMAND_SCALE) as u32
+            })
+            .collect();
+        self.residency
+            .plan(frame, &demands, MAX_TEXTURE_FETCHES)
+            .into_iter()
+            .filter_map(|fetch| {
+                let index = fetch.layer as usize * self.upper_count + fetch.mip as usize;
+                let &(start, end) = self.ranges.get(index)?;
+                Some(StreamRequest {
+                    id: TEXTURE_REQUEST_BIT | fetch.layer << 8 | fetch.mip,
+                    start,
+                    end,
+                    deflated: false,
+                })
+            })
+            .collect()
+    }
+
+    fn decode_id(id: u32) -> MipFetch {
+        MipFetch {
+            layer: (id & !TEXTURE_REQUEST_BIT) >> 8,
+            mip: id & 0xff,
+        }
+    }
+
+    fn deliver(&mut self, id: u32, data: Vec<u8>) -> bool {
+        let fetch = Self::decode_id(id);
+        let edge = self.size >> fetch.mip;
+        let expected = self.encoding.color_mip_bytes(edge) + 2 * self.encoding.data_mip_bytes(edge);
+        if data.len() != expected {
+            self.residency.failed(fetch);
+            return false;
+        }
+        self.waiting.push((fetch, data));
+        true
+    }
+
+    fn failed(&mut self, id: u32) {
+        self.residency.failed(Self::decode_id(id));
+    }
+
+    /// Writes a few fetched levels to their arrays.
+    fn write_waiting(&mut self, gpu: &Gpu, scene: &GpuScene) {
+        for _ in 0..TEXTURE_WRITES_PER_FRAME.min(self.waiting.len()) {
+            let (fetch, data) = self.waiting.remove(0);
+            let Some(target) = self.residency.arrived(fetch) else {
+                continue;
+            };
+            let tier: &TierArrays = match target.tier {
+                TIER_TOP => &scene.textures.top,
+                _ => &scene.textures.middle,
+            };
+            let edge = self.size >> fetch.mip;
+            let color_bytes = self.encoding.color_mip_bytes(edge);
+            let data_bytes = self.encoding.data_mip_bytes(edge);
+            let color = &data[..color_bytes];
+            let normal = &data[color_bytes..color_bytes + data_bytes];
+            let material = &data[color_bytes + data_bytes..];
+            let block = scene.textures.block;
+            if scene.textures.unpack {
+                tier.write_level(
+                    gpu,
+                    block,
+                    target.slot,
+                    target.tier_mip,
+                    [
+                        &unpack_bc7(edge, color),
+                        &unpack_bc5(edge, normal),
+                        &unpack_bc5(edge, material),
+                    ],
+                );
+            } else {
+                tier.write_level(
+                    gpu,
+                    block,
+                    target.slot,
+                    target.tier_mip,
+                    [color, normal, material],
+                );
+            }
+            if target.completes {
+                self.complete.push((fetch.layer, target.tier));
+            }
+        }
+    }
+
+    /// Copies lower levels up for tiers that have all their own, then lets materials use them.
+    fn begin_frame(&mut self, gpu: &Gpu, scene: &GpuScene, encoder: &mut wgpu::CommandEncoder) {
+        for (layer, tier) in std::mem::take(&mut self.complete) {
+            let arrays = &scene.textures;
+            if tier == TIER_MIDDLE {
+                arrays
+                    .middle
+                    .copy_lower_levels(encoder, &arrays.base, arrays.block, layer, layer);
+            } else {
+                let slot = self.residency.top_slot(layer).unwrap_or(0);
+                arrays
+                    .top
+                    .copy_lower_levels(encoder, &arrays.middle, arrays.block, layer, slot);
+            }
+            self.residency.commit(layer, tier);
+        }
+        for change in self.residency.take_changes() {
+            for material in &mut self.materials {
+                if material.texture_layer == change.layer as i32 {
+                    material.texture_tier = change.tier;
+                    material.texture_slot = change.slot;
+                    self.dirty_materials = true;
+                }
+            }
+        }
+        if self.dirty_materials {
+            self.dirty_materials = false;
+            gpu.queue
+                .write_buffer(&scene.materials, 0, bytemuck::cast_slice(&self.materials));
+        }
     }
 }
 

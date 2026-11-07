@@ -28,5 +28,5 @@ pub mod vg;
 
 pub use frame::{Camera, DebugView, Environment};
 pub use gpu::{Gpu, GpuError};
-pub use renderer::{FrameStats, Quality, Renderer, RendererSettings};
-pub use streaming::StreamingStats;
+pub use renderer::{FrameStats, Quality, Renderer, RendererSettings, SceneMemory, StreamingBudget};
+pub use streaming::{StreamRequest, StreamingStats};

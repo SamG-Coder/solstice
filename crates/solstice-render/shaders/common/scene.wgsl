@@ -49,7 +49,8 @@ struct Instance {
     root_node: u32,
     material: u32,
     max_scale: f32,
-    _pad: u32,
+    // Texture layer << 16 | (log2(uv scale) + 128) * 256, or NO_TEXTURE.
+    texture_info: u32,
 }
 
 struct Material {
@@ -61,8 +62,9 @@ struct Material {
     normal_strength: f32,
     texture_layer: i32,
     macro_variation: f32,
-    _pad0: u32,
-    _pad1: u32,
+    // Which texture array holds the layer right now, and where in it.
+    texture_tier: u32,
+    texture_slot: u32,
 }
 
 struct Light {

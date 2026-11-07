@@ -21,7 +21,8 @@ mod native {
     use solstice_asset::scene::Viewpoint;
     use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings,
+        Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamRequest,
+        StreamingBudget,
     };
     use solstice_viewer::{default_environment, initial_camera, CameraInput, FlyCamera};
     use std::collections::HashSet;
@@ -42,7 +43,6 @@ mod native {
 
     /// Reads pages from a scene file on background threads.
     struct PageReader {
-        scene: Arc<PagedScene>,
         path: Arc<PathBuf>,
         finished_sender: mpsc::Sender<(u32, Option<Vec<u8>>)>,
         finished: mpsc::Receiver<(u32, Option<Vec<u8>>)>,
@@ -53,10 +53,9 @@ mod native {
         /// Pages to read at once: enough to use the disk, few enough to stay out of the way.
         const MAX_FETCHING: u32 = 8;
 
-        fn new(scene: PagedScene, path: &Path) -> Self {
+        fn new(path: &Path) -> Self {
             let (finished_sender, finished) = mpsc::channel();
             Self {
-                scene: Arc::new(scene),
                 path: Arc::new(path.to_owned()),
                 finished_sender,
                 finished,
@@ -66,22 +65,22 @@ mod native {
 
         /// Hands over what has been read, and starts reading what's now wanted. Call per frame.
         fn pump(&mut self, renderer: &mut Renderer) {
-            while let Ok((page, data)) = self.finished.try_recv() {
+            while let Ok((id, data)) = self.finished.try_recv() {
                 self.running -= 1;
                 match data {
                     Some(data) => {
-                        renderer.deliver_page(page, data);
+                        renderer.deliver(id, data);
                     }
-                    None => renderer.page_failed(page),
+                    None => renderer.request_failed(id),
                 }
             }
-            for page in renderer.page_requests(Self::MAX_FETCHING) {
+            for request in renderer.stream_requests(Self::MAX_FETCHING) {
                 self.running += 1;
-                let (scene, path) = (self.scene.clone(), self.path.clone());
+                let path = self.path.clone();
                 let sender = self.finished_sender.clone();
                 std::thread::spawn(move || {
-                    let data = read_page(&scene, &path, page).ok();
-                    let _ = sender.send((page, data));
+                    let data = read_range(&path, &request).ok();
+                    let _ = sender.send((request.id, data));
                 });
             }
         }
@@ -91,17 +90,18 @@ mod native {
         }
     }
 
-    fn read_page(
-        scene: &PagedScene,
+    fn read_range(
         path: &Path,
-        page: u32,
+        request: &StreamRequest,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let (start, end) = solstice_asset::file::page_range(scene, page);
         let mut file = std::fs::File::open(path)?;
-        file.seek(SeekFrom::Start(start))?;
-        let mut packed = vec![0; (end - start) as usize];
-        file.read_exact(&mut packed)?;
-        Ok(solstice_asset::file::unpack_page(scene, page, &packed)?)
+        file.seek(SeekFrom::Start(request.start))?;
+        let mut bytes = vec![0; (request.end - request.start) as usize];
+        file.read_exact(&mut bytes)?;
+        if request.deflated {
+            bytes = solstice_asset::file::inflate(&bytes)?;
+        }
+        Ok(bytes)
     }
 
     /// Reads just the part of a scene file that stays resident.
@@ -145,14 +145,8 @@ mod native {
                     (Renderer::new(gpu, loaded, format, options.settings), None)
                 }
                 Self::Streamed(paged) => (
-                    Renderer::streaming(
-                        gpu,
-                        paged,
-                        format,
-                        options.settings,
-                        options.geometry_budget,
-                    ),
-                    Some(PageReader::new(paged.clone(), &options.scene)),
+                    Renderer::streaming(gpu, paged, format, options.settings, options.budget),
+                    Some(PageReader::new(&options.scene)),
                 ),
             }
         }
@@ -161,8 +155,8 @@ mod native {
     struct Options {
         /// Load pages from disk as they're wanted, rather than all at the start.
         stream: bool,
-        /// Bytes of GPU memory for geometry pages when streaming.
-        geometry_budget: u64,
+        /// GPU memory for the scene when streaming.
+        budget: StreamingBudget,
         scene: PathBuf,
         capture: Option<PathBuf>,
         frames: u32,
@@ -186,7 +180,7 @@ mod native {
     fn parse_args() -> Result<Options, String> {
         let mut options = Options {
             stream: false,
-            geometry_budget: 128 << 20,
+            budget: StreamingBudget::default(),
             scene: PathBuf::from("assets/temple.solstice"),
             capture: None,
             frames: 60,
@@ -253,7 +247,13 @@ mod native {
                     let megabytes: u64 = value()?
                         .parse()
                         .map_err(|e| format!("--geometry-budget-mb: {e}"))?;
-                    options.geometry_budget = megabytes << 20;
+                    options.budget.geometry_bytes = megabytes << 20;
+                }
+                "--texture-budget-mb" => {
+                    let megabytes: u64 = value()?
+                        .parse()
+                        .map_err(|e| format!("--texture-budget-mb: {e}"))?;
+                    options.budget.texture_bytes = megabytes << 20;
                 }
                 "--flyover" => options.flyover = Some(PathBuf::from(value()?)),
                 "--out" => options.flyover_out = PathBuf::from(value()?),
@@ -417,6 +417,16 @@ mod native {
                 streaming.evictions,
                 streaming.starved,
             );
+            let memory = renderer.scene_bytes();
+            println!(
+                "scene memory: {:.1} MiB of records, {:.1} MiB of pages, {:.1} MiB of textures | textures: {}, {} at middle, {} at top",
+                memory.records as f64 / 1048576.0,
+                memory.pages as f64 / 1048576.0,
+                memory.textures as f64 / 1048576.0,
+                renderer.texture_summary(),
+                streaming.middle_layers,
+                streaming.top_layers,
+            );
         }
         println!(
             "avg {:.2} ms, worst {:.2} ms | {} clusters ({} software), {} triangles of {} source ({} unique), {} instances",
@@ -480,7 +490,12 @@ mod native {
             );
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             let stats = renderer.stats().streaming;
-            if stats.installed == before && stats.in_transit == 0 && reader.is_idle() {
+            let textures_busy = stats.texture_fetches > 0;
+            if stats.installed == before
+                && stats.in_transit == 0
+                && !textures_busy
+                && reader.is_idle()
+            {
                 quiet += 1;
             } else {
                 quiet = 0;

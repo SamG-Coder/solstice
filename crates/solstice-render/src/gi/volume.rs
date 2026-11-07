@@ -268,7 +268,7 @@ impl GiVolume {
                             work.state().as_entire_binding(),
                             scene.materials.as_entire_binding(),
                             voxels.as_entire_binding(),
-                            wgpu::BindingResource::TextureView(&scene.color_textures),
+                            wgpu::BindingResource::TextureView(&scene.textures.base.color_view),
                             wgpu::BindingResource::Sampler(&scene.material_sampler),
                         ],
                     ),

@@ -36,6 +36,8 @@ const REQUEST_PER_PIXEL: f32 = 16.0;
 const REQUEST_MAX_PIXELS: f32 = 100000.0;
 // Shadow and voxel views only affect the image indirectly, so they yield to the main camera.
 const REQUEST_ORTHO_WEIGHT: f32 = 0.125;
+// `Instance.texture_info` of a material with no texture.
+const NO_TEXTURE: u32 = 0xffffffffu;
 // Clusters projecting smaller than this are rasterized in the compute shader.
 const SOFTWARE_MAX_DIAMETER_PX: f32 = 40.0;
 
@@ -50,6 +52,7 @@ const SOFTWARE_MAX_DIAMETER_PX: f32 = 40.0;
 @group(1) @binding(2) var<storage, read_write> retry: array<QueueEntry>;
 @group(1) @binding(3) var<storage, read_write> visible: array<VisibleCluster>;
 // Per page: 0 if not reached this frame, else how much it is wanted. See `residency.rs`.
+// From the end, per texture layer: the edge a texture must have to look sharp in this frame.
 @group(1) @binding(4) var<storage, read_write> page_requests: array<atomic<u32>>;
 
 fn push_queue(entry: QueueEntry) {
@@ -145,6 +148,22 @@ fn passes_occlusion(center: vec3f, radius: f32) -> bool {
     return nearest_depth >= farthest;
 }
 
+// Works out how many texels across its texture this cluster could show: its pixels per object
+// unit, divided by the texture repeats per object unit.
+fn request_texture_detail(cluster: Cluster, instance: Instance, distance: f32) {
+    let density_code = cluster.counts >> 24u;
+    if view.is_ortho != 0u || instance.texture_info == NO_TEXTURE || density_code == 0u {
+        return;
+    }
+    let layer = instance.texture_info >> 16u;
+    let log2_uv_scale = f32(instance.texture_info & 0xffffu) / 256.0 - 128.0;
+    let log2_density = f32(density_code) / 8.0 - 16.0;
+    let pixels_per_unit = view.lod_scale * instance.max_scale / max(distance, view.near);
+    let edge = pixels_per_unit * exp2(-log2_density - log2_uv_scale);
+    let slot = arrayLength(&page_requests) - 1u - layer;
+    atomicMax(&page_requests[slot], u32(min(edge, 65536.0)));
+}
+
 fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     let cluster = clusters[cluster_index];
     let center = transform_point(instance, cluster.center);
@@ -168,6 +187,7 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
         }
     }
     emit_cluster(entry.instance, cluster_index, software);
+    request_texture_detail(cluster, instance, length(center - view.camera_position) - radius);
     atomicAdd(&state.triangle_count, cluster_triangle_count(cluster));
 }
 

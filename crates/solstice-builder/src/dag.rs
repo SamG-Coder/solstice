@@ -10,7 +10,8 @@ use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use solstice_asset::gpu::{
-    pack_triangle, MAX_CLUSTER_TRIANGLES, MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
+    encode_uv_density, pack_triangle, CLUSTER_UV_DENSITY_SHIFT, MAX_CLUSTER_TRIANGLES,
+    MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
 };
 use solstice_asset::paged::{ClusterSet, ROOT_ROUND};
 use solstice_asset::{PackedCluster, PackedVertex, VirtualMesh};
@@ -547,8 +548,23 @@ fn pack_cluster(
         lod_error: cluster.lod_error,
         vertex_offset,
         triangle_offset,
-        counts: local.len() as u32 | (cluster.triangles.len() as u32) << 8,
+        counts: local.len() as u32
+            | (cluster.triangles.len() as u32) << 8
+            | encode_uv_density(uv_density(welded, &cluster.triangles)) << CLUSTER_UV_DENSITY_SHIFT,
     }
+}
+
+/// Texture repeats per object-space unit across some triangles. It's an area ratio, so seams
+/// and slivers with wild UVs count only as much as their small area.
+fn uv_density(welded: &WeldedMesh, triangles: &[Triangle]) -> f32 {
+    let (mut uv_area, mut area) = (0.0, 0.0);
+    for triangle in triangles {
+        let p = triangle.map(|corner| welded.positions[corner.position as usize]);
+        let uv = triangle.map(|corner| welded.attributes[corner.attribute as usize].uv);
+        area += (p[1] - p[0]).cross(p[2] - p[0]).length();
+        uv_area += (uv[1] - uv[0]).perp_dot(uv[2] - uv[0]).abs();
+    }
+    (uv_area / area.max(1.0e-12)).sqrt()
 }
 
 fn pack_vertex(welded: &WeldedMesh, corner: Corner) -> PackedVertex {
@@ -723,6 +739,39 @@ pub(crate) mod tests {
 
     fn built(subdivisions: u32) -> VirtualMesh {
         build_virtual_mesh(&bumpy_sphere(subdivisions), &BuildOptions::default())
+    }
+
+    /// A flat 2 by 2 quad with UVs running 0 to 1 repeats once per 2 units.
+    #[test]
+    fn uv_density_measures_repeats_per_unit() {
+        let welded = WeldedMesh {
+            positions: vec![Vec3::ZERO, Vec3::X * 2.0, Vec3::Y * 2.0],
+            attributes: vec![
+                Attribute {
+                    normal: Vec3::Z,
+                    uv: Vec2::ZERO,
+                },
+                Attribute {
+                    normal: Vec3::Z,
+                    uv: Vec2::X,
+                },
+                Attribute {
+                    normal: Vec3::Z,
+                    uv: Vec2::Y,
+                },
+            ],
+            triangles: Vec::new(),
+            origin: Vec3::ZERO,
+            step: 1.0,
+            uv_origin: Vec2::ZERO,
+            uv_step: Vec2::ONE,
+        };
+        let corner = |index| Corner {
+            position: index,
+            attribute: index,
+        };
+        let density = uv_density(&welded, &[[corner(0), corner(1), corner(2)]]);
+        assert!((density - 0.5).abs() < 1.0e-5, "{density}");
     }
 
     #[test]
