@@ -475,8 +475,18 @@ impl Renderer {
         // Geometry: two occlusion phases into one visibility buffer, then its G-buffer.
         sized.visibility.clear(&mut encoder);
         for (phase, slot, cull_section, raster_section) in [
-            (CullPhase::First, SLOT_MAIN_FIRST, section::CULL_FIRST, section::RASTER_FIRST),
-            (CullPhase::Second, SLOT_MAIN_SECOND, section::CULL_SECOND, section::RASTER_SECOND),
+            (
+                CullPhase::First,
+                SLOT_MAIN_FIRST,
+                section::CULL_FIRST,
+                section::RASTER_FIRST,
+            ),
+            (
+                CullPhase::Second,
+                SLOT_MAIN_SECOND,
+                section::CULL_SECOND,
+                section::RASTER_SECOND,
+            ),
         ] {
             mark(&self.profiler, &mut encoder, cull_section);
             self.cull.record(

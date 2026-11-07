@@ -113,7 +113,11 @@ impl Profiler {
         for skipped in first..=index {
             encoder.write_timestamp(&self.queries, skipped as u32);
         }
-        self.last_mark.set(if index == section::END { None } else { Some(index) });
+        self.last_mark.set(if index == section::END {
+            None
+        } else {
+            Some(index)
+        });
     }
 
     /// Consumes any finished readback and queues the next. Call at the end of encoding.
