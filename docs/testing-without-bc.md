@@ -22,7 +22,7 @@ const a = await navigator.gpu.requestAdapter();
 The renderer refuses to start with fewer than 8 storage buffers or 5 storage textures per stage, which
 some phones may have. That would be a renderer limit, not a texture problem, and it would end this test.
 
-**2. Load the small scene first:** `/?scene=web`, a 37 MB download.
+**2. Load the small scene first:** `/?scene=web`, which starts small and loads the rest as it goes.
 
 - The Textures line reads `4 x 512, RGBA8 + RG8 unpacked from BC`. If it says `BC7 + BC5`, this GPU
   has BC and the test proves nothing.
@@ -30,12 +30,13 @@ some phones may have. That would be a renderer limit, not a texture problem, and
 - The image has colour, relief and highlights. Compare with the same view on a desktop: unpacking
   mistakes show as noise or stripes in colour, or as flat, wrongly lit surfaces.
 
-**3. Then the cove:** `/?scene=cove_web`, a 209 MB download that unpacks to a 295 MB file, and loading
-briefly holds two copies of it in memory.
+**3. Then the cove:** `/?scene=cove_web`, which starts from a 6 MB download and fetches the rest as
+it's needed. Unpacking happens on the page's main thread as textures arrive.
 
-- The Textures line reads `23 x 512, RGBA8 + RG8 unpacked from BC, 64 MB`.
+- The Textures line reads `23 x 128 / 256 / 16 x 512, RGBA8 + RG8 unpacked from BC, 65 MB`.
 - The tab survives loading. A reload or a "page crashed" message means the phone ran out of memory.
-- Note how long it takes between "Preparing the GPU" and the first image.
+- Note how long it takes between "Preparing the GPU" and the first image, and whether the view
+  stutters as textures sharpen.
 
 **4. Report back:** the device and browser, the output of step 1, the Textures line, GPU errors, frame
 rate, load time, and a screenshot of the fort wall. Add

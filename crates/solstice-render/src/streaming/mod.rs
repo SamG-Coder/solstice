@@ -360,11 +360,6 @@ impl Streamer {
         }
         self.dirty_clusters.clear();
     }
-
-    /// Whether every page has been installed.
-    pub fn all_installed(&self) -> bool {
-        self.residency.installed_count() as usize == self.residency.page_count()
-    }
 }
 
 /// Chooses tier sizes for a scene, on this GPU, within a budget in bytes.

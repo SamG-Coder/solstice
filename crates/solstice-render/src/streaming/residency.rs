@@ -77,10 +77,6 @@ impl Residency {
         }
     }
 
-    pub fn page_count(&self) -> usize {
-        self.states.len()
-    }
-
     pub fn is_installed(&self, page: u32) -> bool {
         matches!(self.states[page as usize], State::Installed(_))
     }
@@ -182,8 +178,8 @@ impl Residency {
         count
     }
 
-    /// Marks a page as being fetched, for pages loaded by other means such as pinned pages.
-    pub fn mark_fetching(&mut self, page: u32) {
+    #[cfg(test)]
+    fn mark_fetching(&mut self, page: u32) {
         if self.states[page as usize] == State::Absent {
             self.states[page as usize] = State::Fetching;
             self.fetching += 1;

@@ -1,8 +1,8 @@
-# On-demand streaming: design
+# On-demand streaming
 
-Status: proposed, awaiting approval. Nothing here is built yet.
+This is the design as built. [Results](#results) are at the end.
 
-## What the data says
+## What the data said
 
 Measured from the current browser cove (`cove_web.solstice`, file v3, textures at 1024):
 
@@ -147,7 +147,8 @@ back-off while rendering continues.
 
 ## Stages
 
-Each stage keeps rendering correct and passes fmt, clippy and tests.
+Each stage kept rendering correct and passed fmt, clippy and tests. Textures came before the
+browser in the end, as the page needed them to look right.
 
 0. **Baseline.** Measure download, time to first image and GPU memory on current `main`, with a throttled server.
 1. **Format.** Sets, rounds, page assignment and file v4. Loading still installs everything. Rebake; renders
@@ -162,20 +163,44 @@ Each stage keeps rendering correct and passes fmt, clippy and tests.
 5. **Textures.** Tiers, demand and promotion.
 6. **Report.** Before and after numbers, README, Status section.
 
-## Expected results, to be replaced by measurements
+## Results
 
-| | Today | Target |
+The browser cove at 1024, on an RTX 5080, in a 1024x768 canvas, with `scripts/serve.py` limiting
+all traffic to 50 Mbit/s with 30 ms latency. Whole-viewer memory is `nvidia-smi` total used minus
+idle, with both versions measured back to back. Idle drifted by about 70 MiB, so treat those two
+as approximate.
+
+| | Before | After |
 |---|---|---|
-| Initial download, browser cove | 209 MB | About 6 MB |
-| Time to first image at 50 Mbit/s | About 35 s | About 1 to 2 s, then detail fills in |
-| Scene GPU memory | 294 MB | Fixed: 128 MiB geometry + 64 MiB textures + 7 MB records |
-| Whole viewer GPU memory, browser | 1,133 MiB | About 1,040 MiB |
+| Download before the first image | 209 MB | **6.0 MB** |
+| First image | 36.5 s | **1.4 s** |
+| The opening view at full detail | At the first image | About 17 s, 61 MB in all |
+| Scene data on the GPU | 280 MiB | **195 MiB, fixed**: 128 geometry, 60 textures, 6 records |
+| Whole viewer on the GPU, browser | 855 MiB | **668 MiB** |
+| On the server | 209 MB | 226 MB |
+
+Scene data accounts for about 85 MiB of the 187 MiB fall in whole-viewer memory. The rest wasn't
+traced. From the same camera, a settled streamed image differs from a whole load by 44 to 48 dB,
+no more than two whole loads differ from each other (45 dB), using 396 of 1,640 pages.
+
+The 2048 bake is 515 MB on the server, and starts the same way: 6.0 MB and 1.4 s to the first image.
+With the budget cut to 24 MiB of geometry and 16 MiB of textures, flying between three viewpoints
+evicted 46 pages with no GPU errors and stayed within the pool. Parts of the view were coarser
+and textures softer, as intended.
+
+A server without Range support, such as `python -m http.server`, also works: the page downloads
+the file once, in that test 226 MB, and streams from memory.
+
+**Not measured:** flyover frame times, real networks, and GitHub Pages serving a `.solstice` file.
+Range was tested on Pages with a `.gz` file only. The on-screen frame rate looked the same as before
+in the browser, at 102 to 110 fps, but with no controlled comparison.
 
 ## Known limits
 
-- **Whole-viewer memory falls only modestly.** The scene is about a quarter of it: the rest is render targets,
-  cull lists and the GI volume, which this work doesn't touch. The memory gain is larger on bigger bakes,
-  because the budget stays fixed as the file grows.
+- **Most of the viewer's memory isn't the scene.** The rest is render targets, cull lists and the GI
+  volume, which this work doesn't touch.
+- **A pool that's too small favours what came first.** Recently used pages aren't evicted, so when one
+  view wants more than the pool holds, fine pages already in stay, even if a waiting page would help more.
 - **Detail pops in with no cross-fade**, softened only by temporal accumulation.
 - **A fast flight outruns the network.** The result is coarser geometry until pages arrive, not holes.
 - **The live demo stays procedural for now.** CI bakes without scans, so putting the cove on Pages is separate work.
