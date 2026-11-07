@@ -149,6 +149,7 @@ impl CullWork {
         label: &str,
         queue_capacity: u64,
         visible_capacity: u64,
+        page_requests: &wgpu::Buffer,
     ) -> Self {
         let state = gpu.storage_buffer(
             label,
@@ -169,6 +170,7 @@ impl CullWork {
                     queue.as_entire_binding(),
                     retry.as_entire_binding(),
                     visible.as_entire_binding(),
+                    page_requests.as_entire_binding(),
                 ],
             )
         };
@@ -344,6 +346,7 @@ impl CullPipelines {
             .texture_unfilterable()
             .build(gpu, "cull scene");
         let work_layout = LayoutBuilder::new()
+            .storage_write()
             .storage_write()
             .storage_write()
             .storage_write()

@@ -7,7 +7,7 @@ A real-time renderer in Rust and WebGPU, built on the same core ideas as Unreal 
 Nanite and Lumen: virtualized geometry and dynamic global illumination, running in the browser.
 
 **[Try the live demo](https://samg-coder.github.io/solstice/)** in a WebGPU browser such as Chrome
-or Edge. It downloads a 37 MB scene, and picks a quality level to suit your GPU.
+or Edge. It streams a 39 MB scene as you look around, and picks a quality level to suit your GPU.
 
 ![A ruined temple at dusk, firelight glowing from its doorway](docs/dusk.png)
 
@@ -29,7 +29,7 @@ bash scripts/build-web.sh
 ```
 
 ```bash
-python -m http.server 8765 --bind 127.0.0.1 --directory dist
+python scripts/serve.py
 ```
 
 Then open <http://localhost:8765> in Chrome or Edge.
@@ -184,7 +184,7 @@ at High quality:
 | Exterior, camera moving | 6.2 ms | 6.9 M |
 | Inside the chamber | 5.9 ms | 9.9 M |
 
-The web scene has 1.22 billion instanced triangles and downloads as 37 MB. Native on the AMD
+The web scene has 1.22 billion instanced triangles and is a 39 MB file. Native on the AMD
 integrated GPU of the same machine, with the camera moving, since a still camera hides shadow costs:
 
 | Resolution, quality | Frame time, moving | Worst frame |
@@ -210,11 +210,42 @@ errors in any, and frame rates at each display's limit where it could be measure
 Safari, phones, Mac and Linux GPUs, and any browser running on integrated graphics. The GI volume
 takes about 150 MB of GPU memory regardless of quality level, which may rule out the smallest GPUs.
 
+### Streaming
+
+Scenes load on demand. A file holds a small manifest, then geometry in 128 KiB pages and textures
+by mip level, so the browser reads what the view needs with HTTP Range requests. For the browser
+cove at 50 Mbit/s, on an RTX 5080, with [the details here](docs/streaming.md):
+
+| | Before | After |
+|---|---|---|
+| Download before the first image | 209 MB | **6.0 MB** |
+| First image | 36.5 s | **1.4 s** |
+| The opening view at full detail | At the first image | About 17 s, 61 MB in all |
+| Scene data on the GPU | 280 MiB | **195 MiB, fixed** |
+| Whole viewer on the GPU, browser | 855 MiB | **668 MiB** |
+
+**No holes.** Culling records which pages each view wants, and the CPU loads them. A cluster keeps
+drawing until the set simplified into it has arrived. Parents always install before children and
+leave after them, so a partly loaded scene is still a valid cut through the DAG.
+
+**Fixed memory.** Geometry goes in a pool of page slots, evicting the least recently used page that
+nothing depends on. Textures go in three tiers of arrays, since WebGPU has no sparse textures:
+every layer at 128 and 512, and a few slots at the largest size that fits. Add `?geometry-mb=64` or
+`?texture-mb=32` to the page to try other budgets.
+
+**Natively**, the viewer still loads everything, which keeps frame times comparable. Add `--stream`
+to read from disk as needed, with `--geometry-budget-mb` and `--texture-budget-mb`.
+
+A static host needs no setup. Without Range support, the page downloads the file once and streams
+from memory. `scripts/serve.py` adds Range and a bandwidth limit for local testing, with
+`--throttle-mbps`.
+
 ### Texture compression
 
 Scene files hold GPU block-compressed textures, at 3 bytes per texel where they used to take 8.
-For the cove, with 23 texture layers, measured on the RTX 5080. GPU memory is the whole viewer's
-and most of it is not textures, which is why it falls by less than the file does:
+For the cove, with 23 texture layers, measured on the RTX 5080 before streaming, when files were
+gzipped and loaded whole. GPU memory is the whole viewer's and most of it is not textures, which is
+why it falls by less than the file does:
 
 | Scene | File | Gzipped download | Textures on the GPU | GPU memory, native | GPU memory, browser |
 |---|---|---|---|---|---|
@@ -260,12 +291,12 @@ The goal is Unreal-quality rendering in the browser. The core architecture is re
 The image is not yet at Unreal's level, and these are the main reasons, roughly in order of impact:
 
 1. **Demo content.** Unreal's best images come from photoscanned assets. Real models can now be
-   imported and look far better, but the built-in web demo is still entirely procedural and looks
-   it, because the scanned cove is currently too large a download at 209 MB, most of it geometry.
+   imported and look far better, but the live demo is still entirely procedural and looks it. The
+   scanned cove now starts from a 6 MB download, but the site's build doesn't bake it yet.
 2. **Shadow resolution.** Cascaded shadow maps stand in for Virtual Shadow Maps, so shadows lack
    the per-pixel sharpness that makes dense geometry read properly.
-3. **No geometry streaming.** All geometry stays resident in GPU memory, so scene size is limited
-   by memory and download size, where Nanite streams pages on demand.
+3. **Streaming's limits.** Cluster records stay resident at 48 bytes each, about 0.7 GB for a
+   billion unique triangles, where Nanite pages those too. Detail appears with no cross-fade.
 4. **Static scenes only.** Moving objects are not supported: no animation, and the GI volume is
    only rebuilt when the camera moves. Previous-frame transforms exist in the data but are not fed.
 5. **Surface features.** One material per instance (multi-material models become several instances),

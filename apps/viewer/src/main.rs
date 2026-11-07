@@ -17,13 +17,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use glam::Vec3;
-    use solstice_asset::SceneAsset;
+    use solstice_asset::paged::PagedScene;
+    use solstice_asset::scene::Viewpoint;
+    use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings,
+        Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamRequest,
+        StreamingBudget,
     };
     use solstice_viewer::{default_environment, initial_camera, CameraInput, FlyCamera};
     use std::collections::HashSet;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::Instant;
     use winit::application::ApplicationHandler;
@@ -35,7 +41,122 @@ mod native {
 
     const CAPTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+    /// Reads pages from a scene file on background threads.
+    struct PageReader {
+        path: Arc<PathBuf>,
+        finished_sender: mpsc::Sender<(u32, Option<Vec<u8>>)>,
+        finished: mpsc::Receiver<(u32, Option<Vec<u8>>)>,
+        running: u32,
+    }
+
+    impl PageReader {
+        /// Pages to read at once: enough to use the disk, few enough to stay out of the way.
+        const MAX_FETCHING: u32 = 8;
+
+        fn new(path: &Path) -> Self {
+            let (finished_sender, finished) = mpsc::channel();
+            Self {
+                path: Arc::new(path.to_owned()),
+                finished_sender,
+                finished,
+                running: 0,
+            }
+        }
+
+        /// Hands over what has been read, and starts reading what's now wanted. Call per frame.
+        fn pump(&mut self, renderer: &mut Renderer) {
+            while let Ok((id, data)) = self.finished.try_recv() {
+                self.running -= 1;
+                match data {
+                    Some(data) => {
+                        renderer.deliver(id, data);
+                    }
+                    None => renderer.request_failed(id),
+                }
+            }
+            for request in renderer.stream_requests(Self::MAX_FETCHING) {
+                self.running += 1;
+                let path = self.path.clone();
+                let sender = self.finished_sender.clone();
+                std::thread::spawn(move || {
+                    let data = read_range(&path, &request).ok();
+                    let _ = sender.send((request.id, data));
+                });
+            }
+        }
+
+        fn is_idle(&self) -> bool {
+            self.running == 0
+        }
+    }
+
+    fn read_range(
+        path: &Path,
+        request: &StreamRequest,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(request.start))?;
+        let mut bytes = vec![0; (request.end - request.start) as usize];
+        file.read_exact(&mut bytes)?;
+        if request.deflated {
+            bytes = solstice_asset::file::inflate(&bytes)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Reads just the part of a scene file that stays resident.
+    fn read_manifest(path: &Path) -> Result<PagedScene, Box<dyn std::error::Error>> {
+        let mut file = std::fs::File::open(path)?;
+        let mut head = [0; solstice_asset::file::HEADER_BYTES];
+        file.read_exact(&mut head)?;
+        let header = solstice_asset::file::decode_header(&head)?;
+        file.seek(SeekFrom::Start(header.manifest_offset))?;
+        let mut packed = vec![0; header.manifest_bytes as usize];
+        file.read_exact(&mut packed)?;
+        let manifest = solstice_asset::file::inflate(&packed)?;
+        Ok(solstice_asset::file::decode_manifest(
+            &manifest,
+            header.manifest_offset + header.manifest_bytes,
+        )?)
+    }
+
+    /// A scene as this run holds it: all in memory, or read from disk as wanted.
+    enum Source {
+        Loaded(LoadedScene),
+        Streamed(PagedScene),
+    }
+
+    impl Source {
+        fn viewpoint(&self) -> Option<Viewpoint> {
+            match self {
+                Self::Loaded(loaded) => loaded.scene.viewpoint,
+                Self::Streamed(paged) => paged.viewpoint,
+            }
+        }
+
+        fn renderer(
+            &self,
+            gpu: &Gpu,
+            format: wgpu::TextureFormat,
+            options: &Options,
+        ) -> (Renderer, Option<PageReader>) {
+            match self {
+                Self::Loaded(loaded) => {
+                    (Renderer::new(gpu, loaded, format, options.settings), None)
+                }
+                Self::Streamed(paged) => (
+                    Renderer::streaming(gpu, paged, format, options.settings, options.budget),
+                    Some(PageReader::new(&options.scene)),
+                ),
+            }
+        }
+    }
+
     struct Options {
+        /// Load pages from disk as they're wanted, rather than all at the start.
+        stream: bool,
+        /// GPU memory for the scene when streaming.
+        budget: StreamingBudget,
         scene: PathBuf,
         capture: Option<PathBuf>,
         frames: u32,
@@ -58,6 +179,8 @@ mod native {
 
     fn parse_args() -> Result<Options, String> {
         let mut options = Options {
+            stream: false,
+            budget: StreamingBudget::default(),
             scene: PathBuf::from("assets/temple.solstice"),
             capture: None,
             frames: 60,
@@ -119,6 +242,19 @@ mod native {
                 }
                 "--stability" => options.stability = true,
                 "--no-taa" => options.settings.temporal_accumulation = false,
+                "--stream" => options.stream = true,
+                "--geometry-budget-mb" => {
+                    let megabytes: u64 = value()?
+                        .parse()
+                        .map_err(|e| format!("--geometry-budget-mb: {e}"))?;
+                    options.budget.geometry_bytes = megabytes << 20;
+                }
+                "--texture-budget-mb" => {
+                    let megabytes: u64 = value()?
+                        .parse()
+                        .map_err(|e| format!("--texture-budget-mb: {e}"))?;
+                    options.budget.texture_bytes = megabytes << 20;
+                }
                 "--flyover" => options.flyover = Some(PathBuf::from(value()?)),
                 "--out" => options.flyover_out = PathBuf::from(value()?),
                 "--move" => {
@@ -148,7 +284,7 @@ mod native {
         Ok(options)
     }
 
-    fn load_scene(path: &PathBuf) -> Result<SceneAsset, Box<dyn std::error::Error>> {
+    fn load_scene(path: &PathBuf) -> Result<LoadedScene, Box<dyn std::error::Error>> {
         let start = Instant::now();
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let scene = solstice_asset::file::decode(&bytes)?;
@@ -167,9 +303,16 @@ mod native {
         )
         .init();
         let options = parse_args()?;
-        let scene = load_scene(&options.scene)?;
+        let scene = if options.stream {
+            Source::Streamed(read_manifest(&options.scene)?)
+        } else {
+            Source::Loaded(load_scene(&options.scene)?)
+        };
         if options.flyover.is_some() {
-            flyover(&options, &scene)
+            let Source::Loaded(scene) = &scene else {
+                return Err("flyovers load the whole scene, so they can't use --stream".into());
+            };
+            flyover(&options, scene)
         } else if options.capture.is_some() {
             capture(&options, &scene)
         } else {
@@ -195,7 +338,7 @@ mod native {
     }
 
     /// Renders offscreen, saves a PNG, and fails loudly on any GPU validation error.
-    fn capture(options: &Options, scene: &SceneAsset) -> Result<(), Box<dyn std::error::Error>> {
+    fn capture(options: &Options, scene: &Source) -> Result<(), Box<dyn std::error::Error>> {
         let path = options
             .capture
             .as_ref()
@@ -211,7 +354,7 @@ mod native {
             }));
 
         let start = Instant::now();
-        let mut renderer = Renderer::new(&gpu, scene, CAPTURE_FORMAT, options.settings);
+        let (mut renderer, mut reader) = scene.renderer(&gpu, CAPTURE_FORMAT, options);
         log::info!("renderer created in {:.2}s", start.elapsed().as_secs_f32());
 
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -235,9 +378,15 @@ mod native {
         let mut last_time = Instant::now();
         let mut camera = options
             .camera
-            .unwrap_or_else(|| initial_camera(scene.viewpoint));
+            .unwrap_or_else(|| initial_camera(scene.viewpoint()));
+        if let Some(reader) = &mut reader {
+            settle(&gpu, &mut renderer, reader, &camera, &view, options)?;
+        }
         for frame in 0..options.frames {
             camera.position += camera.right() * options.capture_motion;
+            if let Some(reader) = &mut reader {
+                reader.pump(&mut renderer);
+            }
             renderer.render(
                 &gpu,
                 &camera,
@@ -257,6 +406,28 @@ mod native {
         save_png(&gpu, &target, options.size, path)?;
 
         let stats = renderer.stats();
+        if reader.is_some() {
+            let streaming = stats.streaming;
+            println!(
+                "pages: {} of {} installed in a pool of {} ({} MiB), {} evicted, {} short of room",
+                streaming.installed,
+                streaming.pages,
+                streaming.slots,
+                streaming.pool_bytes >> 20,
+                streaming.evictions,
+                streaming.starved,
+            );
+            let memory = renderer.scene_bytes();
+            println!(
+                "scene memory: {:.1} MiB of records, {:.1} MiB of pages, {:.1} MiB of textures | textures: {}, {} at middle, {} at top",
+                memory.records as f64 / 1048576.0,
+                memory.pages as f64 / 1048576.0,
+                memory.textures as f64 / 1048576.0,
+                renderer.texture_summary(),
+                streaming.middle_layers,
+                streaming.top_layers,
+            );
+        }
         println!(
             "avg {:.2} ms, worst {:.2} ms | {} clusters ({} software), {} triangles of {} source ({} unique), {} instances",
             average * 1000.0,
@@ -291,10 +462,60 @@ mod native {
         }
     }
 
+    /// Renders from one spot until streaming has nothing left to do, so a capture shows what
+    /// the view settles on rather than how far loading got.
+    fn settle(
+        gpu: &Gpu,
+        renderer: &mut Renderer,
+        reader: &mut PageReader,
+        camera: &Camera,
+        view: &wgpu::TextureView,
+        options: &Options,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        const QUIET_FRAMES: u32 = 30;
+        const MAX_FRAMES: u32 = 20000;
+        let start = Instant::now();
+        let mut quiet = 0;
+        let mut frames = 0;
+        while quiet < QUIET_FRAMES && frames < MAX_FRAMES {
+            let before = renderer.stats().streaming.installed;
+            reader.pump(renderer);
+            renderer.render(
+                gpu,
+                camera,
+                &options.environment,
+                view,
+                options.size,
+                1.0 / 60.0,
+            );
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let stats = renderer.stats().streaming;
+            let textures_busy = stats.texture_fetches > 0;
+            if stats.installed == before
+                && stats.in_transit == 0
+                && !textures_busy
+                && reader.is_idle()
+            {
+                quiet += 1;
+            } else {
+                quiet = 0;
+            }
+            frames += 1;
+        }
+        let stats = renderer.stats().streaming;
+        println!(
+            "streaming settled after {frames} frames, {:.2}s: {} of {} pages",
+            start.elapsed().as_secs_f32(),
+            stats.installed,
+            stats.pages,
+        );
+        Ok(())
+    }
+
     /// Flies a camera path at a fixed 60 steps per second. Writes an image for each second, plus
     /// `frames.csv` with the time of every frame. Each frame waits for the GPU to finish, so its
     /// time is real GPU work, not hidden by queuing, and image saving is left out of the timing.
-    fn flyover(options: &Options, scene: &SceneAsset) -> Result<(), Box<dyn std::error::Error>> {
+    fn flyover(options: &Options, scene: &LoadedScene) -> Result<(), Box<dyn std::error::Error>> {
         const STEP: f32 = 1.0 / 60.0;
         use solstice_render::profiler::SECTIONS;
 
@@ -582,6 +803,7 @@ mod native {
         config: wgpu::SurfaceConfiguration,
         gpu: Gpu,
         renderer: Renderer,
+        reader: Option<PageReader>,
         camera: FlyCamera,
         last_frame: Instant,
         title_timer: f32,
@@ -590,7 +812,7 @@ mod native {
 
     struct App {
         options: Options,
-        scene: SceneAsset,
+        scene: Source,
         state: Option<WindowState>,
         input: CameraInput,
         keys: HashSet<KeyCode>,
@@ -625,8 +847,9 @@ mod native {
             config.present_mode = wgpu::PresentMode::AutoVsync;
             surface.configure(&gpu.device, &config);
 
-            let renderer = Renderer::new(&gpu, &self.scene, config.format, self.options.settings);
+            let (renderer, reader) = self.scene.renderer(&gpu, config.format, &self.options);
             Ok(WindowState {
+                reader,
                 window,
                 surface,
                 config,
@@ -635,7 +858,7 @@ mod native {
                 camera: FlyCamera::new(
                     self.options
                         .camera
-                        .unwrap_or_else(|| initial_camera(self.scene.viewpoint)),
+                        .unwrap_or_else(|| initial_camera(self.scene.viewpoint())),
                 ),
                 last_frame: Instant::now(),
                 title_timer: 0.0,
@@ -658,6 +881,10 @@ mod native {
             let Some(state) = self.state.as_mut() else {
                 return;
             };
+
+            if let Some(reader) = &mut state.reader {
+                reader.pump(&mut state.renderer);
+            }
 
             let now = Instant::now();
             let delta = (now - state.last_frame).as_secs_f32();

@@ -4,7 +4,10 @@
 
 use crate::{default_environment, initial_camera, CameraInput, FlyCamera};
 use glam::Vec3;
-use solstice_render::{DebugView, Environment, Gpu, Quality, Renderer, RendererSettings};
+use solstice_asset::file;
+use solstice_render::{
+    DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamingBudget,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -35,16 +38,21 @@ pub struct WebViewer {
 
 #[wasm_bindgen]
 impl WebViewer {
-    /// Creates a viewer from the bytes of a scene file. Rejects if WebGPU is unavailable or
-    /// the GPU lacks required capabilities, with a message suitable for showing to the user.
-    /// `unpack_textures` acts as if the GPU had no block compression, to test that path.
+    /// Creates a viewer from an unpacked manifest of a scene, which draws what it has while
+    /// `requests` asks for more. `data_offset` is where the file's data area begins. Budgets
+    /// are in bytes of GPU memory. Rejects if WebGPU is unavailable or the GPU lacks required
+    /// capabilities, with a message suitable for showing to the user. `unpack_textures` acts as
+    /// if the GPU had no block compression, to test that path.
     pub async fn create(
         canvas: HtmlCanvasElement,
-        scene_bytes: Vec<u8>,
+        manifest: Vec<u8>,
+        data_offset: f64,
+        geometry_budget: f64,
+        texture_budget: f64,
         unpack_textures: bool,
     ) -> Result<WebViewer, JsValue> {
-        let scene = solstice_asset::file::decode(&scene_bytes).map_err(error_string)?;
-        drop(scene_bytes);
+        let scene = file::decode_manifest(&manifest, data_offset as u64).map_err(error_string)?;
+        drop(manifest);
 
         let (width, height) = (canvas.width().max(1), canvas.height().max(1));
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -77,7 +85,17 @@ impl WebViewer {
         config.format = config.format.remove_srgb_suffix();
         surface.configure(&gpu.device, &config);
 
-        let renderer = Renderer::new(&gpu, &scene, config.format, RendererSettings::default());
+        let budget = StreamingBudget {
+            geometry_bytes: geometry_budget as u64,
+            texture_bytes: texture_budget as u64,
+        };
+        let renderer = Renderer::streaming(
+            &gpu,
+            &scene,
+            config.format,
+            RendererSettings::default(),
+            budget,
+        );
         Ok(WebViewer {
             gpu,
             surface,
@@ -87,6 +105,73 @@ impl WebViewer {
             environment: default_environment(),
             gpu_errors,
         })
+    }
+
+    /// What to fetch next, as a flat array with four numbers per request: its id, the first
+    /// byte in the file, one past the last byte, and 1 if it must be inflated. Each request
+    /// must later go to `deliver` or `request_failed`.
+    pub fn stream_requests(&mut self, max_fetching: u32) -> Vec<f64> {
+        self.renderer
+            .stream_requests(max_fetching)
+            .iter()
+            .flat_map(|request| {
+                [
+                    f64::from(request.id),
+                    request.start as f64,
+                    request.end as f64,
+                    f64::from(u8::from(request.deflated)),
+                ]
+            })
+            .collect()
+    }
+
+    /// Takes the bytes of a request, inflated if it needed that.
+    pub fn deliver(&mut self, id: u32, bytes: Vec<u8>) -> bool {
+        self.renderer.deliver(id, bytes)
+    }
+
+    /// Reports that a request could not be fetched.
+    pub fn request_failed(&mut self, id: u32) {
+        self.renderer.request_failed(id);
+    }
+
+    /// Geometry pages on the GPU.
+    pub fn pages_installed(&self) -> u32 {
+        self.renderer.stats().streaming.installed
+    }
+
+    pub fn pages_total(&self) -> u32 {
+        self.renderer.stats().streaming.pages
+    }
+
+    /// Size of the page pool, in pages.
+    pub fn page_slots(&self) -> u32 {
+        self.renderer.stats().streaming.slots
+    }
+
+    pub fn pages_evicted(&self) -> f64 {
+        self.renderer.stats().streaming.evictions as f64
+    }
+
+    /// Wanted pages with no room in the pool.
+    pub fn pages_starved(&self) -> u32 {
+        self.renderer.stats().streaming.starved
+    }
+
+    /// Layers sharpened beyond the base tier, as middle and top counts.
+    pub fn texture_layers_sharp(&self) -> Vec<u32> {
+        let streaming = self.renderer.stats().streaming;
+        vec![streaming.middle_layers, streaming.top_layers]
+    }
+
+    /// Bytes of GPU memory for this scene: records, page pool, then textures.
+    pub fn scene_memory(&self) -> Vec<f64> {
+        let memory = self.renderer.scene_bytes();
+        vec![
+            memory.records as f64,
+            memory.pages as f64,
+            memory.textures as f64,
+        ]
     }
 
     /// Updates the canvas size. Pass physical pixels.
@@ -208,4 +293,20 @@ impl WebViewer {
     pub fn gpu_error_count(&self) -> u32 {
         self.gpu_errors.load(Ordering::Relaxed)
     }
+}
+
+/// Bytes to fetch first, to learn about the rest of a scene file.
+#[wasm_bindgen]
+pub fn header_bytes() -> u32 {
+    file::HEADER_BYTES as u32
+}
+
+/// Reads the start of a scene file. Returns where the manifest starts and how large it is.
+#[wasm_bindgen]
+pub fn read_header(bytes: &[u8]) -> Result<Vec<f64>, JsValue> {
+    let header = file::decode_header(bytes).map_err(error_string)?;
+    Ok(vec![
+        header.manifest_offset as f64,
+        header.manifest_bytes as f64,
+    ])
 }
