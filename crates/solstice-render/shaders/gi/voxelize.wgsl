@@ -1,0 +1,172 @@
+// Bakes the triangles of selected clusters into a clipmap level of the GI volume.
+//
+// This is the scene representation that lighting rays trace. Because culling chooses
+// clusters by LOD error against the voxel size, coarse levels read only coarse triangles
+// and voxelization cost stays nearly independent of source triangle counts.
+//
+// Each triangle is scanned over the two axes its normal is least aligned with, marking
+// the depth range it covers per column. This leaves no holes, and it bounds the work per
+// triangle by the area of a grid face rather than the volume of its bounding box.
+
+#include "common/math.wgsl"
+#include "common/scene.wgsl"
+#include "vg/pass_view.wgsl"
+
+struct Params {
+    origin: vec3f,
+    voxel_size: f32,
+    resolution: u32,
+    level_offset: u32, // First voxel of this level in `voxels`.
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> instances: array<Instance>;
+@group(0) @binding(2) var<storage, read> clusters: array<Cluster>;
+@group(0) @binding(3) var<storage, read> vertices: array<PackedVertex>;
+@group(0) @binding(4) var<storage, read> triangles: array<u32>;
+@group(0) @binding(5) var<storage, read> visible: array<VisibleCluster>;
+@group(0) @binding(6) var<storage, read> state: CullStateRead;
+@group(0) @binding(7) var<storage, read> materials: array<Material>;
+// Three words per voxel: albedo with occupancy flag, octahedral normal, emissive RGBM.
+@group(0) @binding(8) var<storage, read_write> voxels: array<atomic<u32>>;
+@group(0) @binding(9) var color_textures: texture_2d_array<f32>;
+@group(0) @binding(10) var material_sampler: sampler;
+
+// Texture mip used for voxel colour: an area average, not any one texel.
+const COLOR_MIP: f32 = 5.0;
+const EMISSIVE_RANGE: f32 = 128.0;
+
+struct VoxelData {
+    albedo: u32,
+    normal: u32,
+    emissive: u32,
+}
+
+fn encode_emissive(e: vec3f) -> u32 {
+    let peak = clamp(max(e.x, max(e.y, e.z)) / EMISSIVE_RANGE, 1.0e-6, 1.0);
+    let scale = ceil(peak * 255.0) / 255.0;
+    return pack4x8unorm(vec4f(e / (EMISSIVE_RANGE * scale), scale));
+}
+
+fn write_voxel(coord: vec3i, data: VoxelData) {
+    let n = i32(params.resolution);
+    if any(coord < vec3i(0)) || any(coord >= vec3i(n)) {
+        return;
+    }
+    let index = u32(coord.z * n * n + coord.y * n + coord.x) + params.level_offset;
+    atomicStore(&voxels[index * 3u], data.albedo);
+    atomicStore(&voxels[index * 3u + 1u], data.normal);
+    atomicStore(&voxels[index * 3u + 2u], data.emissive);
+}
+
+fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
+    let normal = cross(v1 - v0, v2 - v0);
+    let abs_normal = abs(normal);
+
+    // Choose the projection axis `w` that the triangle faces most directly.
+    var u_axis = 0;
+    var v_axis = 1;
+    var w_axis = 2;
+    if abs_normal.x >= abs_normal.y && abs_normal.x >= abs_normal.z {
+        u_axis = 1;
+        v_axis = 2;
+        w_axis = 0;
+    } else if abs_normal.y >= abs_normal.z {
+        u_axis = 0;
+        v_axis = 2;
+        w_axis = 1;
+    }
+    if abs_normal[w_axis] < 1.0e-8 {
+        return;
+    }
+
+    let a = vec2f(v0[u_axis], v0[v_axis]);
+    let b = vec2f(v1[u_axis], v1[v_axis]);
+    let c = vec2f(v2[u_axis], v2[v_axis]);
+    let limit = f32(params.resolution);
+    let lo = clamp(floor(min(min(a, b), c)), vec2f(0.0), vec2f(limit - 1.0));
+    let hi = clamp(floor(max(max(a, b), c)), vec2f(0.0), vec2f(limit - 1.0));
+
+    // Orient edges so the inside is positive, and widen them to cover any touched column.
+    let orientation = select(-1.0, 1.0, (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) >= 0.0);
+    let widen = 0.5;
+    let e0 = vec3f(a.y - b.y, b.x - a.x, 0.0) * orientation;
+    let e1 = vec3f(b.y - c.y, c.x - b.x, 0.0) * orientation;
+    let e2 = vec3f(c.y - a.y, a.x - c.x, 0.0) * orientation;
+    let bias0 = -dot(e0.xy, a) + (abs(e0.x) + abs(e0.y)) * widen;
+    let bias1 = -dot(e1.xy, b) + (abs(e1.x) + abs(e1.y)) * widen;
+    let bias2 = -dot(e2.xy, c) + (abs(e2.x) + abs(e2.y)) * widen;
+
+    // Depth across the plane, and how much it varies within one column.
+    let dw_du = -normal[u_axis] / normal[w_axis];
+    let dw_dv = -normal[v_axis] / normal[w_axis];
+    let w0 = v0[w_axis] - dw_du * a.x - dw_dv * a.y;
+    let spread = 0.5 * (abs(dw_du) + abs(dw_dv));
+
+    for (var y = lo.y; y <= hi.y; y += 1.0) {
+        for (var x = lo.x; x <= hi.x; x += 1.0) {
+            let p = vec2f(x + 0.5, y + 0.5);
+            if dot(e0.xy, p) + bias0 < 0.0 || dot(e1.xy, p) + bias1 < 0.0 || dot(e2.xy, p) + bias2 < 0.0 {
+                continue;
+            }
+            let w = w0 + dw_du * p.x + dw_dv * p.y;
+            let first = i32(floor(w - spread));
+            let last = i32(floor(w + spread));
+            for (var z = first; z <= last; z++) {
+                var coord = vec3i(0);
+                coord[u_axis] = i32(x);
+                coord[v_axis] = i32(y);
+                coord[w_axis] = z;
+                write_voxel(coord, data);
+            }
+        }
+    }
+}
+
+// Matches SOFTWARE_GROUP_SIZE in cull_control.wgsl: this pass consumes the "software" list.
+@compute @workgroup_size(16)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    if id.x >= state.sw_count {
+        return;
+    }
+    let entry = visible[id.x];
+    let cluster = clusters[entry.cluster];
+    let instance = instances[entry.instance];
+    let material = materials[instance.material];
+    let inv_voxel = 1.0 / params.voxel_size;
+
+    let triangle_count = cluster_triangle_count(cluster);
+    for (var t = 0u; t < triangle_count; t++) {
+        let packed = triangles[cluster.triangle_offset + t];
+        let vertex0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
+        let vertex1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
+        let vertex2 = vertices[cluster.vertex_offset + ((packed >> 16u) & 0xffu)];
+        let world0 = transform_point(instance, decode_position(instance, vertex0));
+        let world1 = transform_point(instance, decode_position(instance, vertex1));
+        let world2 = transform_point(instance, decode_position(instance, vertex2));
+
+        var albedo = material.base_color.rgb;
+        if material.texture_layer >= 0 {
+            let uv = decode_uv(instance, vertex0) * material.uv_scale;
+            albedo *= textureSampleLevel(color_textures, material_sampler, uv, material.texture_layer, COLOR_MIP).rgb;
+        }
+        let face = cross(world1 - world0, world2 - world0);
+        let face_length = length(face);
+        if face_length <= 0.0 {
+            continue;
+        }
+        let data = VoxelData(
+            pack4x8unorm(vec4f(albedo, 1.0)),
+            pack2x16snorm(oct_encode(face / face_length)),
+            encode_emissive(material.emissive.rgb),
+        );
+        voxelize_triangle(
+            (world0 - params.origin) * inv_voxel,
+            (world1 - params.origin) * inv_voxel,
+            (world2 - params.origin) * inv_voxel,
+            data,
+        );
+    }
+}

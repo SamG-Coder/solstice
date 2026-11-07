@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solstice</title>
+<style>
+  :root {
+    --ink: #f4efe6;
+    --muted: #b9b0a2;
+    --panel: rgba(16, 13, 10, 0.72);
+    --line: rgba(244, 239, 230, 0.16);
+    --accent: #e8a35a;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: #0b0908; color: var(--ink);
+    font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+
+  .panel { position: fixed; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); padding: 12px 14px; }
+  #hud { top: 12px; left: 12px; min-width: 232px; font-variant-numeric: tabular-nums; }
+  #hud h1 { font-size: 13px; font-weight: 600; margin: 0 0 8px; letter-spacing: 0.02em; }
+  #hud dl { display: grid; grid-template-columns: 1fr auto; gap: 2px 16px; margin: 0; }
+  #hud dt { color: var(--muted); }
+  #hud dd { margin: 0; text-align: right; }
+  #fps { color: var(--accent); font-weight: 600; }
+
+  #controls { top: 12px; right: 12px; width: 232px; display: grid; gap: 10px; }
+  #controls label { display: grid; gap: 4px; color: var(--muted); }
+  #controls select, #controls input { width: 100%; accent-color: var(--accent); }
+  #controls select { background: #1c1712; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 5px; padding: 5px 6px; font: inherit; }
+
+  #help { left: 12px; bottom: 12px; color: var(--muted); padding: 8px 12px; }
+  #help b { color: var(--ink); font-weight: 600; }
+
+  #overlay { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; }
+  #overlay[hidden] { display: none; }
+  #message { max-width: 44ch; font-size: 15px; }
+  #message.error { color: #ffb4a2; }
+  progress { width: 280px; height: 6px; margin-top: 14px; accent-color: var(--accent); }
+
+  @media (max-width: 620px) {
+    #controls { top: auto; bottom: 12px; right: 12px; left: 12px; width: auto; }
+    #help { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="view" tabindex="0"></canvas>
+
+<aside class="panel" id="hud" hidden>
+  <h1>Solstice</h1>
+  <dl>
+    <dt>Frame rate</dt><dd id="fps">-</dd>
+    <dt>Drawn triangles</dt><dd id="triangles">-</dd>
+    <dt>Source triangles</dt><dd id="source">-</dd>
+    <dt>Clusters</dt><dd id="clusters">-</dd>
+    <dt>In software raster</dt><dd id="software">-</dd>
+    <dt>Instances</dt><dd id="instances">-</dd>
+    <dt>GPU errors</dt><dd id="errors">0</dd>
+  </dl>
+</aside>
+
+<aside class="panel" id="controls" hidden>
+  <label>View
+    <select id="debug">
+      <option value="lit">Final image</option>
+      <option value="clusters">Clusters</option>
+      <option value="triangles">Triangles</option>
+      <option value="raster">Rasterizer (green: software)</option>
+      <option value="instances">Instances</option>
+      <option value="albedo">Base color</option>
+      <option value="normals">Normals</option>
+      <option value="gi">Indirect diffuse</option>
+      <option value="reflections">Reflections</option>
+      <option value="voxels">GI scene (voxels)</option>
+    </select>
+  </label>
+  <label>Sun height<input id="sun-elevation" type="range" min="1" max="80" value="25"></label>
+  <label>Sun direction<input id="sun-azimuth" type="range" min="0" max="360" value="39"></label>
+  <label>Render scale
+    <select id="scale">
+      <option value="1">100%</option>
+      <option value="0.75">75% (upscaled)</option>
+      <option value="0.5">50% (upscaled)</option>
+    </select>
+  </label>
+</aside>
+
+<aside class="panel" id="help" hidden>
+  <b>Click</b> to look around, <b>WASD</b> to move, <b>Q E</b> down and up, <b>Shift</b> faster, <b>Esc</b> to release
+</aside>
+
+<div id="overlay">
+  <div>
+    <div id="message">Starting…</div>
+    <progress id="progress" max="1" value="0" hidden></progress>
+  </div>
+</div>
+
+<script type="module">
+import init, { WebViewer } from "./pkg/solstice_viewer.js";
+
+const params = new URLSearchParams(location.search);
+const sceneName = params.get("scene") ?? "web";
+if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
+const sceneUrl = `assets/${sceneName}.solstice`;
+
+const el = (id) => document.getElementById(id);
+const canvas = el("view");
+
+function fail(text) {
+  el("overlay").hidden = false;
+  el("progress").hidden = true;
+  el("message").textContent = text;
+  el("message").className = "error";
+}
+
+/// Downloads with progress, since scene files are large.
+async function download(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`Could not load ${url} (HTTP ${response.status}). Run the bake tool first.`);
+  }
+  const total = Number(response.headers.get("content-length")) || 0;
+  const reader = response.body.getReader();
+  const chunks = [];
+  let received = 0;
+  el("progress").hidden = total === 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (total) el("progress").value = received / total;
+    el("message").textContent = `Downloading scene: ${(received / 1e6).toFixed(0)} MB`;
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  el("progress").hidden = true;
+  return bytes;
+}
+
+const canvasSize = () => {
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  return [
+    Math.max(1, Math.round(canvas.clientWidth * ratio)),
+    Math.max(1, Math.round(canvas.clientHeight * ratio)),
+  ];
+};
+
+function compact(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)} M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)} K`;
+  return String(n);
+}
+
+async function main() {
+  if (!navigator.gpu) {
+    fail("This browser does not support WebGPU. Try a recent version of Chrome or Edge.");
+    return;
+  }
+  await init();
+  const bytes = await download(sceneUrl);
+  el("message").textContent = "Preparing the GPU…";
+
+  [canvas.width, canvas.height] = canvasSize();
+  const viewer = await WebViewer.create(canvas, bytes);
+
+  const camera = params.get("camera")?.split(",").map(Number);
+  if (camera?.length === 5) viewer.set_camera(...camera);
+
+  const applySun = () => {
+    const azimuth = el("sun-azimuth").valueAsNumber * Math.PI / 180;
+    const elevation = el("sun-elevation").valueAsNumber * Math.PI / 180;
+    viewer.set_sun(azimuth, elevation);
+  };
+  el("sun-azimuth").addEventListener("input", applySun);
+  el("sun-elevation").addEventListener("input", applySun);
+  applySun();
+
+  el("debug").addEventListener("change", (e) => viewer.set_debug_view(e.target.value));
+  if (params.get("debug")) {
+    el("debug").value = params.get("debug");
+    viewer.set_debug_view(params.get("debug"));
+  }
+  el("scale").addEventListener("change", (e) => viewer.set_render_scale(Number(e.target.value)));
+
+  const keys = new Set();
+  let lookYaw = 0;
+  let lookPitch = 0;
+  addEventListener("keydown", (e) => keys.add(e.code));
+  addEventListener("keyup", (e) => keys.delete(e.code));
+  addEventListener("blur", () => keys.clear());
+  canvas.addEventListener("click", () => canvas.requestPointerLock());
+  addEventListener("mousemove", (e) => {
+    if (document.pointerLockElement === canvas) {
+      lookYaw -= e.movementX * 0.002;
+      lookPitch -= e.movementY * 0.002;
+    }
+  });
+  const axis = (positive, negative) => (keys.has(positive) ? 1 : 0) - (keys.has(negative) ? 1 : 0);
+
+  new ResizeObserver(() => {
+    const [width, height] = canvasSize();
+    if (width !== canvas.width || height !== canvas.height) {
+      canvas.width = width;
+      canvas.height = height;
+      viewer.resize(width, height);
+    }
+  }).observe(canvas);
+
+  el("overlay").hidden = true;
+  for (const id of ["hud", "controls", "help"]) el(id).hidden = false;
+
+  el("source").textContent = compact(viewer.source_triangles());
+  el("instances").textContent = viewer.instances().toLocaleString();
+
+  let previous = performance.now();
+  let frames = 0;
+  let sinceReport = 0;
+  let fps = 0;
+
+  // Exposed for scripted checks.
+  window.solstice = { viewer, get frames() { return frames; }, get fps() { return fps; } };
+
+  function tick(now) {
+    const delta = Math.min((now - previous) / 1000, 0.1);
+    previous = now;
+
+    viewer.frame(
+      delta,
+      axis("KeyW", "KeyS"),
+      axis("KeyD", "KeyA"),
+      axis("KeyE", "KeyQ"),
+      lookYaw,
+      lookPitch,
+      keys.has("ShiftLeft") || keys.has("ShiftRight"),
+    );
+    lookYaw = 0;
+    lookPitch = 0;
+
+    frames += 1;
+    sinceReport += delta;
+    if (sinceReport >= 0.5) {
+      fps = (frames - (tick.lastFrames ?? 0)) / sinceReport;
+      tick.lastFrames = frames;
+      sinceReport = 0;
+      el("fps").textContent = `${fps.toFixed(0)} fps`;
+      el("triangles").textContent = compact(viewer.triangles());
+      el("clusters").textContent = compact(viewer.clusters());
+      el("software").textContent = compact(viewer.software_clusters());
+      el("errors").textContent = viewer.gpu_error_count();
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+}
+
+main().catch((error) => {
+  console.error(error);
+  fail(error.message ?? String(error));
+});
+</script>
+</body>
+</html>

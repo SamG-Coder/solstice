@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+      # These runners have no GPU, so tests/gpu.rs skips itself here. Shader validation
+      # and all geometry tests still run. Run `cargo test` locally to cover the GPU tests.
+      - name: Test
+        run: cargo test --workspace --release
+      - name: Build for the browser
+        run: cargo build --release --target wasm32-unknown-unknown -p viewer --lib

@@ -1,0 +1,219 @@
+// Hierarchical LOD selection and culling, one breadth-first level per dispatch.
+//
+// WebGPU has no way for a dispatch to grow its own workload, so traversal runs as a
+// fixed series of dispatches over a shared queue: each reads the range appended by
+// the previous one and appends the next level behind it (see cull_control.wgsl).
+//
+// Occlusion culling uses two phases. Phase 0 tests against the previous frame's
+// depth, which is mostly right, and defers everything it rejects to a retry list.
+// After that result is rasterized and a fresh depth pyramid built, phase 1 re-tests
+// the retry list and draws whatever had been wrongly rejected.
+
+#include "common/math.wgsl"
+#include "common/scene.wgsl"
+#include "vg/pass_view.wgsl"
+
+struct QueueEntry {
+    instance: u32,
+    item: u32, // Node index, or cluster index with CLUSTER_BIT set.
+}
+
+const CLUSTER_BIT: u32 = 0x80000000u;
+// Clusters projecting smaller than this are rasterized in the compute shader.
+const SOFTWARE_MAX_DIAMETER_PX: f32 = 40.0;
+
+@group(0) @binding(0) var<uniform> view: PassView;
+@group(0) @binding(1) var<storage, read> instances: array<Instance>;
+@group(0) @binding(2) var<storage, read> nodes: array<Node>;
+@group(0) @binding(3) var<storage, read> clusters: array<Cluster>;
+@group(0) @binding(4) var hzb: texture_2d<f32>;
+
+@group(1) @binding(0) var<storage, read_write> state: CullState;
+@group(1) @binding(1) var<storage, read_write> queue: array<QueueEntry>;
+@group(1) @binding(2) var<storage, read_write> retry: array<QueueEntry>;
+@group(1) @binding(3) var<storage, read_write> visible: array<VisibleCluster>;
+
+fn push_queue(entry: QueueEntry) {
+    let slot = atomicAdd(&state.write_head, 1u);
+    if slot < arrayLength(&queue) {
+        queue[slot] = entry;
+    }
+}
+
+fn push_retry(entry: QueueEntry) {
+    let slot = atomicAdd(&state.retry_count, 1u);
+    if slot < arrayLength(&retry) {
+        retry[slot] = entry;
+    }
+}
+
+// Software clusters fill the list from the front and hardware from the back, so
+// both can append concurrently and each still forms one contiguous range.
+fn emit_cluster(instance: u32, cluster: u32, software: bool) {
+    let capacity = arrayLength(&visible);
+    if atomicLoad(&state.sw_count) + atomicLoad(&state.hw_count) + 256u >= capacity {
+        return;
+    }
+    if software {
+        visible[atomicAdd(&state.sw_count, 1u)] = VisibleCluster(instance, cluster);
+    } else {
+        visible[capacity - 1u - atomicAdd(&state.hw_count, 1u)] = VisibleCluster(instance, cluster);
+    }
+}
+
+// Screen-space size of an error metric living on a sphere. Using the sphere's
+// nearest point makes this conservative and, since parent spheres contain their
+// children, monotonic up the DAG.
+fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
+    if view.is_ortho != 0u {
+        return error * view.lod_scale;
+    }
+    let distance = max(length(center - view.camera_position) - radius, view.near);
+    return error * view.lod_scale / distance;
+}
+
+fn in_frustum(center: vec3f, radius: f32) -> bool {
+    for (var i = 0u; i < 6u; i++) {
+        let p = view.planes[i];
+        if dot(p.xyz, center) + p.w < -radius {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Tests a world-space sphere against the depth pyramid. The pyramid stores the
+// farthest depth per texel, so a sphere whose nearest point is beyond that is hidden.
+fn passes_occlusion(center: vec3f, radius: f32) -> bool {
+    if view.occlusion_enabled == 0u {
+        return true;
+    }
+    let c_view = (view.occlusion_view * vec4f(center, 1.0)).xyz;
+    let c = vec3f(c_view.x, c_view.y, -c_view.z);
+    if c.z < radius + view.near {
+        return true; // Touches the near plane: cannot be projected safely.
+    }
+
+    // Tight projected bounds of a sphere (Mara & McGuire 2013).
+    let cx = -c.xz;
+    let vx = vec2f(sqrt(dot(cx, cx) - radius * radius), radius);
+    let minx = mat2x2f(vx.x, vx.y, -vx.y, vx.x) * cx;
+    let maxx = mat2x2f(vx.x, -vx.y, vx.y, vx.x) * cx;
+    let cy = -c.yz;
+    let vy = vec2f(sqrt(dot(cy, cy) - radius * radius), radius);
+    let miny = mat2x2f(vy.x, vy.y, -vy.y, vy.x) * cy;
+    let maxy = mat2x2f(vy.x, -vy.y, vy.y, vy.x) * cy;
+
+    let x0 = minx.x / minx.y * view.proj_scale.x * 0.5 + 0.5;
+    let x1 = maxx.x / maxx.y * view.proj_scale.x * 0.5 + 0.5;
+    let y0 = 0.5 - miny.x / miny.y * view.proj_scale.y * 0.5;
+    let y1 = 0.5 - maxy.x / maxy.y * view.proj_scale.y * 0.5;
+    let uv_min = clamp(vec2f(min(x0, x1), min(y0, y1)), vec2f(0.0), vec2f(1.0));
+    let uv_max = clamp(vec2f(max(x0, x1), max(y0, y1)), vec2f(0.0), vec2f(1.0));
+
+    let extent = (uv_max - uv_min) * view.hzb_size;
+    let level = u32(clamp(ceil(log2(max(max(extent.x, extent.y), 1.0))), 0.0, f32(textureNumLevels(hzb) - 1u)));
+    let dims = vec2i(textureDimensions(hzb, level));
+    let t0 = clamp(vec2i(uv_min * vec2f(dims)), vec2i(0), dims - 1);
+    let t1 = clamp(vec2i(uv_max * vec2f(dims)), vec2i(0), dims - 1);
+
+    var farthest = textureLoad(hzb, t0, level).r;
+    farthest = min(farthest, textureLoad(hzb, vec2i(t1.x, t0.y), level).r);
+    farthest = min(farthest, textureLoad(hzb, vec2i(t0.x, t1.y), level).r);
+    farthest = min(farthest, textureLoad(hzb, t1, level).r);
+
+    let nearest_depth = view.near / (c.z - radius);
+    return nearest_depth >= farthest;
+}
+
+fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
+    let cluster = clusters[cluster_index];
+    let center = transform_point(instance, cluster.center);
+    let radius = cluster.radius * instance.max_scale;
+    if !in_frustum(center, radius) {
+        return;
+    }
+    if !passes_occlusion(center, radius) {
+        if view.phase == 0u {
+            push_retry(QueueEntry(entry.instance, cluster_index | CLUSTER_BIT));
+        }
+        return;
+    }
+
+    // 2 means the list is consumed by a compute pass, not a rasterizer: voxelization.
+    var software = view.allow_software == 2u;
+    if view.allow_software == 1u {
+        let distance = length(center - view.camera_position) - radius;
+        if distance > view.near {
+            software = 2.0 * radius * view.lod_scale / distance < SOFTWARE_MAX_DIAMETER_PX;
+        }
+    }
+    emit_cluster(entry.instance, cluster_index, software);
+    atomicAdd(&state.triangle_count, cluster_triangle_count(cluster));
+}
+
+// Queues every instance's hierarchy root.
+@compute @workgroup_size(64)
+fn seed(@builtin(global_invocation_id) id: vec3u) {
+    if id.x < arrayLength(&instances) {
+        push_queue(QueueEntry(id.x, instances[id.x].root_node));
+    }
+}
+
+@compute @workgroup_size(32)
+fn process(@builtin(global_invocation_id) id: vec3u) {
+    let slot = state.read_begin + id.x;
+    if slot >= state.read_end || slot >= arrayLength(&queue) {
+        return;
+    }
+    let entry = queue[slot];
+    let instance = instances[entry.instance];
+
+    if (entry.item & CLUSTER_BIT) != 0u {
+        try_emit(entry, entry.item & ~CLUSTER_BIT, instance);
+        return;
+    }
+
+    let node = nodes[entry.item];
+
+    // If even the coarsest parent below is good enough, everything below is finer
+    // than required and this subtree cannot contribute to the cut.
+    let lod_center = transform_point(instance, node.lod_center);
+    let lod_radius = node.lod_radius * instance.max_scale;
+    let scaled_error = node.max_parent_error * instance.max_scale;
+    if projected_error(lod_center, lod_radius, scaled_error) <= view.lod_threshold {
+        return;
+    }
+
+    let center = transform_point(instance, node.center);
+    let radius = node.radius * instance.max_scale;
+    if !in_frustum(center, radius) {
+        return;
+    }
+    if !passes_occlusion(center, radius) {
+        if view.phase == 0u {
+            push_retry(entry);
+        }
+        return;
+    }
+
+    if node.is_leaf == 0u {
+        for (var i = 0u; i < node.count; i++) {
+            push_queue(QueueEntry(entry.instance, node.first + i));
+        }
+        return;
+    }
+
+    // Leaf: the parent is too coarse for all these siblings, so each one is in the
+    // cut exactly when it is itself fine enough.
+    for (var i = 0u; i < node.count; i++) {
+        let cluster_index = node.first + i;
+        let cluster = clusters[cluster_index];
+        let own_center = transform_point(instance, cluster.lod_center);
+        let own_radius = cluster.lod_radius * instance.max_scale;
+        let own_error = cluster.lod_error * instance.max_scale;
+        if projected_error(own_center, own_radius, own_error) <= view.lod_threshold {
+            try_emit(entry, cluster_index, instance);
+        }
+    }
+}

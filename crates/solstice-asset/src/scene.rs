@@ -1,0 +1,123 @@
+//! CPU-side description of a scene.
+
+use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
+use bytemuck::{Pod, Zeroable};
+use glam::{Mat4, Vec3};
+
+/// A mesh preprocessed into a cluster LOD DAG, ready for upload.
+#[derive(Clone, Debug, Default)]
+pub struct VirtualMesh {
+    pub clusters: Vec<PackedCluster>,
+    pub nodes: Vec<PackedNode>,
+    pub vertices: Vec<PackedVertex>,
+    pub triangles: Vec<u32>,
+    /// Index of the hierarchy root in `nodes`.
+    pub root_node: u32,
+    /// Longest root-to-leaf path in the hierarchy, in nodes.
+    pub hierarchy_depth: u32,
+    /// Object-space position of the 16-bit grid's origin.
+    pub quant_origin: Vec3,
+    /// Object-space size of one grid step.
+    pub quant_step: f32,
+    /// UV decoding: `uv = uv_origin + packed * uv_step`.
+    pub uv_origin: [f32; 2],
+    pub uv_step: [f32; 2],
+    /// Object-space bounding sphere of the whole mesh.
+    pub bounds_center: Vec3,
+    pub bounds_radius: f32,
+    /// Triangle count of the source mesh (finest LOD only).
+    pub source_triangles: u64,
+}
+
+/// A physically based surface description.
+///
+/// `#[repr(C)]` so the runtime can upload this slice directly; mirrored by
+/// `Material` in `common/scene.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct Material {
+    pub base_color: [f32; 4],
+    /// RGB radiance, A unused.
+    pub emissive: [f32; 4],
+    pub roughness: f32,
+    pub metallic: f32,
+    /// Texture repeats per world unit of UV.
+    pub uv_scale: f32,
+    /// Strength of the normal map; 0 disables it.
+    pub normal_strength: f32,
+    /// Index into the texture array, or -1 for an untextured material.
+    pub texture_layer: i32,
+    pub _pad: [u32; 3],
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            base_color: [0.8, 0.8, 0.8, 1.0],
+            emissive: [0.0; 4],
+            roughness: 0.7,
+            metallic: 0.0,
+            uv_scale: 1.0,
+            normal_strength: 1.0,
+            texture_layer: -1,
+            _pad: [0; 3],
+        }
+    }
+}
+
+/// An omnidirectional local light. Mirrored by `Light` in `common/scene.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Light {
+    pub position: [f32; 3],
+    /// Distance at which the light fades to nothing.
+    pub range: f32,
+    /// Linear RGB intensity, in candela.
+    pub intensity: [f32; 3],
+    pub _pad: u32,
+}
+
+/// One texture set: colour and surface data, with a full mip chain.
+///
+/// * `color`: RGB base colour (sRGB), A cavity.
+/// * `surface`: RG tangent-space normal XY, B roughness multiplier, A height.
+#[derive(Clone, Debug, Default)]
+pub struct TextureLayer {
+    pub color_mips: Vec<Vec<u8>>,
+    pub surface_mips: Vec<Vec<u8>>,
+}
+
+/// One placement of a mesh in the world.
+#[derive(Clone, Copy, Debug)]
+pub struct Instance {
+    pub mesh: u32,
+    pub material: u32,
+    pub transform: Mat4,
+}
+
+/// A complete, self-contained scene.
+#[derive(Clone, Debug, Default)]
+pub struct SceneAsset {
+    pub meshes: Vec<VirtualMesh>,
+    pub materials: Vec<Material>,
+    pub instances: Vec<Instance>,
+    pub lights: Vec<Light>,
+    /// Edge length of the square textures in `textures`.
+    pub texture_size: u32,
+    pub textures: Vec<TextureLayer>,
+}
+
+impl SceneAsset {
+    /// Triangles drawn if every instance rendered its finest LOD.
+    pub fn total_source_triangles(&self) -> u64 {
+        self.instances
+            .iter()
+            .map(|i| self.meshes[i.mesh as usize].source_triangles)
+            .sum()
+    }
+
+    /// Triangles stored once per mesh, regardless of instancing.
+    pub fn unique_source_triangles(&self) -> u64 {
+        self.meshes.iter().map(|m| m.source_triangles).sum()
+    }
+}

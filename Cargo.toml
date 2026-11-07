@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+solstice-asset = { path = "crates/solstice-asset" }
+solstice-builder = { path = "crates/solstice-builder" }
+solstice-render = { path = "crates/solstice-render" }
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+log = "0.4"
+naga = { version = "30", features = ["wgsl-in"] }
+pollster = "0.4"
+rayon = "1"
+rustc-hash = "2"
+wgpu = "30"
+
+# Geometry processing is unusably slow unoptimised, even while debugging the renderer.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"

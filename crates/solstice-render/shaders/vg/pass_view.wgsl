@@ -1,0 +1,57 @@
+// One view through the culling and rasterization passes: the main camera in either
+// occlusion phase, a shadow cascade, or a voxelization volume. Twin of `PassView`
+// in vg/culling.rs.
+
+struct PassView {
+    raster_view_proj: mat4x4f,
+    occlusion_view: mat4x4f,
+    planes: array<vec4f, 6>,
+    camera_position: vec3f,
+    // Largest allowed projected error, in pixels.
+    lod_threshold: f32,
+    viewport: vec2f,
+    // Projection scale of the view used for the occlusion test.
+    proj_scale: vec2f,
+    hzb_size: vec2f,
+    near: f32,
+    // Pixels per world unit: at unit distance if perspective, everywhere if not.
+    lod_scale: f32,
+    is_ortho: u32,
+    // 0 tests the previous frame's depth; 1 tests this frame's.
+    phase: u32,
+    occlusion_enabled: u32,
+    // 0: hardware only. 1: small clusters go to software. 2: every cluster does.
+    allow_software: u32,
+}
+
+// Written by the cull passes. Atomic view of `CullStateRead`.
+struct CullState {
+    read_begin: u32,
+    read_end: u32,
+    write_head: atomic<u32>,
+    retry_count: atomic<u32>,
+    sw_count: atomic<u32>,
+    hw_count: atomic<u32>,
+    sw_base: u32,
+    hw_base: u32,
+    triangle_count: atomic<u32>,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+// Read by the raster passes, after culling has finished.
+struct CullStateRead {
+    read_begin: u32,
+    read_end: u32,
+    write_head: u32,
+    retry_count: u32,
+    sw_count: u32,
+    hw_count: u32,
+    sw_base: u32,
+    hw_base: u32,
+    triangle_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
