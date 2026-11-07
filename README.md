@@ -42,10 +42,15 @@ Then open <http://localhost:8765> in Chrome or Edge.
 
 ### Publishing the site's scenes
 
-The site does not bake its scenes: they take minutes to bake and hundreds of megabytes to serve.
-Bake them on a PC and publish them as GitHub releases. `scenes/releases.txt` records which
-release holds each scene and its checksum; publishing uploads only the scenes whose content has
-changed and updates their lines. Commit that file, and the Pages workflow serves the result.
+The site does not bake or deploy its scenes: they take minutes to bake and hundreds of megabytes
+to move. Each scene has its own repository and Pages site, such as
+[solstice-scene-forest](https://github.com/SamG-Coder/solstice-scene-forest), served on the same
+domain as the viewer, so the browser can stream it, which it cannot from a GitHub release.
+Publishing one scene never redeploys the viewer or the others.
+
+Bake on a PC and publish: the script compares each scene with the checksum its site records,
+and for each one that changed, uploads it as a release of that scene's repository and updates
+its `scene.txt`, which deploys it. `--check` reports what would be published.
 
 ```bash
 python scripts/publish-scenes.py --bake forest

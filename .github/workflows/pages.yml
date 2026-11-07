@@ -23,20 +23,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      # Scenes are baked on a PC and published as releases (scripts/publish-scenes.py), since
-      # baking them here takes long. Each comes from the release scenes/releases.txt names for
-      # it, and must match the checksum recorded there.
-      - name: Download the baked scenes
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p assets
-          grep -v '^#' scenes/releases.txt | while read -r name tag digest; do
-            [ -n "$name" ] || continue
-            gh release download "$tag" --pattern "$name" --dir assets
-            echo "$digest  assets/$name" | sha256sum --check
-          done
-          ls -l assets
+      # The viewer only: each scene is served by its own Pages site (SamG-Coder/solstice-scene-*),
+      # published from a PC with scripts/publish-scenes.py, so this never moves scenes.
       - name: Build the site
         run: bash scripts/build-web.sh
       - uses: actions/upload-pages-artifact@v3
@@ -52,6 +40,3 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
-        with:
-          # Hundreds of megabytes of scenes take longer to sync than the default ten minutes.
-          timeout: 1800000
