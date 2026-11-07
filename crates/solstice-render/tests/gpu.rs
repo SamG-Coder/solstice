@@ -1,8 +1,10 @@
 //! End-to-end tests on a real GPU. They pass trivially, with a note, if none is available.
 
 use glam::{Mat4, Vec2, Vec3};
-use solstice_asset::{Instance, Material, SceneAsset};
-use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh, Vertex};
+use solstice_asset::{Instance, Material, SceneAsset, TextureLayer};
+use solstice_builder::{
+    build_virtual_mesh, compress_textures, mip_chain, BuildOptions, Mesh, Vertex,
+};
 use solstice_render::{Camera, DebugView, Environment, Gpu, Renderer, RendererSettings};
 use std::sync::{Arc, Mutex};
 
@@ -365,4 +367,88 @@ fn tiny_outputs_render_without_errors() {
     for size in [1, 2, 3, 17, 33] {
         render(&gpu, &scene, &camera, RendererSettings::default(), size);
     }
+}
+
+/// The same flat texture must look the same stored raw, as blocks the GPU samples directly,
+/// and as blocks unpacked for a GPU without BC. 1024 is large enough that unpacking also
+/// drops the largest mip.
+#[test]
+fn every_texture_path_renders_the_same_colour() {
+    let Some(mut gpu) = request_gpu() else { return };
+    const EDGE: u32 = 1024;
+    let n = EDGE as usize * EDGE as usize;
+    let layer = TextureLayer {
+        color_mips: mip_chain([200, 100, 50, 255].repeat(n), EDGE, 4),
+        normal_mips: mip_chain([128, 128].repeat(n), EDGE, 2),
+        material_mips: mip_chain([128, 255].repeat(n), EDGE, 2),
+    };
+    let mesh = build_virtual_mesh(&sphere(4), &BuildOptions::default());
+    let mut scene = SceneAsset {
+        meshes: vec![mesh],
+        materials: vec![Material {
+            base_color: [1.0; 4],
+            texture_layer: 0,
+            ..Default::default()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        texture_size: EDGE,
+        textures: vec![layer],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 3.0),
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let centre = |run: &Run| {
+        let at = ((run.size / 2 * run.size + run.size / 2) * 4) as usize;
+        run.pixels[at..at + 3].to_vec()
+    };
+
+    let raw = centre(&render(&gpu, &scene, &camera, settings, 64));
+    assert!(
+        raw[0] > raw[1] && raw[1] > raw[2],
+        "texture missing: {raw:?}"
+    );
+
+    compress_textures(&mut scene);
+    let paths = [("blocks", true), ("unpacked", false)];
+    let supported = gpu.block_compressed_textures;
+    for (name, keep_blocks) in paths {
+        if keep_blocks && !supported {
+            continue;
+        }
+        gpu.block_compressed_textures = keep_blocks;
+        let result = centre(&render(&gpu, &scene, &camera, settings, 64));
+        for (channel, (a, b)) in raw.iter().zip(&result).enumerate() {
+            assert!(
+                a.abs_diff(*b) <= 2,
+                "{name}: channel {channel} is {b}, raw is {a}"
+            );
+        }
+    }
+}
+
+/// Baking compresses every scene, including those with no textures to compress.
+#[test]
+fn compressed_scene_without_textures_renders() {
+    let Some(gpu) = request_gpu() else { return };
+    let mut scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&sphere(3), &BuildOptions::default())],
+        materials: vec![white_material()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        texture_size: 1024,
+        ..Default::default()
+    };
+    compress_textures(&mut scene);
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 3.0),
+        ..Default::default()
+    };
+    let run = render(&gpu, &scene, &camera, RendererSettings::default(), 64);
+    assert!(run.clusters > 0);
 }

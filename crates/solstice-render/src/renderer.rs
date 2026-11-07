@@ -241,6 +241,11 @@ impl Renderer {
         }
     }
 
+    /// How the scene's textures ended up on the GPU, for logs and on-screen readouts.
+    pub fn texture_summary(&self) -> &str {
+        &self.scene.texture_summary
+    }
+
     pub fn settings_mut(&mut self) -> &mut RendererSettings {
         &mut self.settings
     }

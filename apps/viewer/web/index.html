@@ -59,6 +59,7 @@
     <dt>Clusters</dt><dd id="clusters">-</dd>
     <dt>In software raster</dt><dd id="software">-</dd>
     <dt>Instances</dt><dd id="instances">-</dd>
+    <dt>Textures</dt><dd id="textures">-</dd>
     <dt>GPU errors</dt><dd id="errors">0</dd>
   </dl>
 </aside>
@@ -184,7 +185,7 @@ async function main() {
   el("message").textContent = "Preparing the GPU…";
 
   [canvas.width, canvas.height] = canvasSize();
-  const viewer = await WebViewer.create(canvas, bytes);
+  const viewer = await WebViewer.create(canvas, bytes, params.has("unpack-textures"));
 
   const camera = params.get("camera")?.split(",").map(Number);
   if (camera?.length === 5) viewer.set_camera(...camera);
@@ -265,6 +266,7 @@ async function main() {
 
   el("source").textContent = compact(viewer.source_triangles());
   el("instances").textContent = viewer.instances().toLocaleString();
+  el("textures").textContent = viewer.texture_summary();
 
   let previous = performance.now();
   let frames = 0;

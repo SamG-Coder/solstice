@@ -33,7 +33,8 @@ fn build_layer(
         .collect();
 
     let mut color = Vec::with_capacity(n * n * 4);
-    let mut surface = Vec::with_capacity(n * n * 4);
+    let mut normals = Vec::with_capacity(n * n * 2);
+    let mut material = Vec::with_capacity(n * n * 2);
     let to_byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     for y in 0..n {
         for x in 0..n {
@@ -57,9 +58,9 @@ fn build_layer(
                 to_byte(srgb.z),
                 to_byte(texel.cavity),
             ]);
-            surface.extend_from_slice(&[
-                to_byte(normal.x * 0.5 + 0.5),
-                to_byte(normal.y * 0.5 + 0.5),
+            normals
+                .extend_from_slice(&[to_byte(normal.x * 0.5 + 0.5), to_byte(normal.y * 0.5 + 0.5)]);
+            material.extend_from_slice(&[
                 to_byte(texel.roughness * 0.5),
                 255, // Metallic multiplier: these materials set metalness by factor alone.
             ]);
@@ -67,8 +68,9 @@ fn build_layer(
     }
 
     TextureLayer {
-        color_mips: mip_chain(color, size),
-        surface_mips: mip_chain(surface, size),
+        color_mips: mip_chain(color, size, 4),
+        normal_mips: mip_chain(normals, size, 2),
+        material_mips: mip_chain(material, size, 2),
     }
 }
 
@@ -172,9 +174,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layer_has_matching_color_and_surface_chains() {
+    fn layer_has_matching_chains() {
         let layer = sandstone(16);
-        assert_eq!(layer.color_mips.len(), layer.surface_mips.len());
+        assert_eq!(layer.color_mips.len(), layer.normal_mips.len());
+        assert_eq!(layer.color_mips.len(), layer.material_mips.len());
         assert_eq!(layer.color_mips[0].len(), 16 * 16 * 4);
     }
 }

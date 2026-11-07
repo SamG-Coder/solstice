@@ -376,10 +376,8 @@ fn textured_layer_texel(pixel_name: &str, pixel: [u8; 4], material: &str) -> (Ve
         3,
         "a 4x4 texture has three mip levels"
     );
-    (
-        layer.color_mips[0][..4].to_vec(),
-        layer.surface_mips[0][..4].to_vec(),
-    )
+    let surface = [&layer.normal_mips[0][..2], &layer.material_mips[0][..2]].concat();
+    (layer.color_mips[0][..4].to_vec(), surface)
 }
 
 #[test]

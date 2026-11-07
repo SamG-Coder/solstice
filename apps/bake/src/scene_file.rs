@@ -316,7 +316,7 @@ fn placements_of<'a>(
 }
 
 /// Builds the scene described by the file at `path`. Returns it with any import warnings.
-pub fn build(path: &Path) -> Result<(SceneAsset, Vec<String>), String> {
+pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let base = path.parent().unwrap_or(Path::new("."));
 
@@ -386,6 +386,9 @@ pub fn build(path: &Path) -> Result<(SceneAsset, Vec<String>), String> {
         }
     }
 
+    if let Some(size) = texture_size {
+        scene.texture_size = size;
+    }
     let options = ImportOptions {
         texture_size: scene.texture_size,
         ..Default::default()

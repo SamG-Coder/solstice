@@ -6,7 +6,9 @@
 use crate::gpu::Gpu;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
-use solstice_asset::{Material, PackedCluster, PackedNode, PackedVertex, SceneAsset};
+use solstice_asset::{
+    Material, PackedCluster, PackedNode, PackedVertex, SceneAsset, TextureEncoding,
+};
 
 /// Twin of `Instance` in `common/scene.wgsl`.
 #[repr(C)]
@@ -42,7 +44,9 @@ pub struct GpuScene {
     pub materials: wgpu::Buffer,
     pub lights: wgpu::Buffer,
     pub color_textures: wgpu::TextureView,
-    pub surface_textures: wgpu::TextureView,
+    pub normal_textures: wgpu::TextureView,
+    pub material_textures: wgpu::TextureView,
+    pub texture_summary: String,
     pub material_sampler: wgpu::Sampler,
     pub instance_count: u32,
     pub light_count: u32,
@@ -62,7 +66,7 @@ impl GpuScene {
         } else {
             &asset.materials
         };
-        let (color_textures, surface_textures) = upload_textures(gpu, asset);
+        let textures = upload_textures(gpu, asset);
 
         let material_sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("material"),
@@ -83,8 +87,10 @@ impl GpuScene {
             triangles: gpu.storage_buffer_init("triangles", &pool.triangles),
             materials: gpu.storage_buffer_init("materials", materials),
             lights: gpu.storage_buffer_init("lights", &asset.lights),
-            color_textures,
-            surface_textures,
+            color_textures: textures.color,
+            normal_textures: textures.normal,
+            material_textures: textures.material,
+            texture_summary: textures.summary,
             material_sampler,
             instance_count: pool.instances.len() as u32,
             light_count: asset.lights.len() as u32,
@@ -175,15 +181,43 @@ impl GeometryPool {
     }
 }
 
-/// Creates the two texture arrays, or 1x1 stand-ins if the scene has no textures.
-fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> (wgpu::TextureView, wgpu::TextureView) {
+/// The largest edge kept when textures must be unpacked, because the GPU can't sample BC.
+/// Unpacked textures take 8 bytes per texel rather than 3, so this keeps a scene baked at a
+/// larger size from taking far more memory on the devices least able to spare it.
+const UNPACKED_MAX_EDGE: u32 = 512;
+
+struct UploadedTextures {
+    color: wgpu::TextureView,
+    normal: wgpu::TextureView,
+    material: wgpu::TextureView,
+    summary: String,
+}
+
+/// Creates the three texture arrays, or 1x1 stand-ins if the scene has no textures.
+fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> UploadedTextures {
     let has_textures = !asset.textures.is_empty();
-    let size = if has_textures { asset.texture_size } else { 1 };
+    // The stand-ins for a scene without textures are never blocks, whatever it says it holds.
+    let stored_as_blocks = has_textures && asset.texture_encoding == TextureEncoding::Block;
+    let block = stored_as_blocks && gpu.block_compressed_textures;
+    let unpack = stored_as_blocks && !gpu.block_compressed_textures;
+
+    // Unpacking can drop a chain's largest levels, so it no longer starts at `texture_size`.
+    let mut skip = 0;
+    if unpack {
+        while asset.texture_size >> skip > UNPACKED_MAX_EDGE {
+            skip += 1;
+        }
+    }
+    let size = if has_textures {
+        asset.texture_size >> skip
+    } else {
+        1
+    };
     let layers = asset.textures.len().max(1) as u32;
     let mips = asset
         .textures
         .first()
-        .map_or(1, |t| t.color_mips.len())
+        .map_or(1, |t| t.color_mips.len() - skip)
         .max(1) as u32;
 
     let create = |label: &str, format: wgpu::TextureFormat| {
@@ -202,31 +236,53 @@ fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> (wgpu::TextureView, wgpu::T
             view_formats: &[],
         })
     };
-    let color = create("material color", wgpu::TextureFormat::Rgba8UnormSrgb);
-    let surface = create("material surface", wgpu::TextureFormat::Rgba8Unorm);
+    let (color_format, data_format) = if block {
+        (
+            wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+            wgpu::TextureFormat::Bc5RgUnorm,
+        )
+    } else {
+        (
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rg8Unorm,
+        )
+    };
+    let color = create("material color", color_format);
+    let normal = create("material normal", data_format);
+    let material = create("material data", data_format);
 
-    let write = |texture: &wgpu::Texture, layer: u32, mip: u32, data: &[u8]| {
+    let mut bytes = 0u64;
+    let mut write = |texture: &wgpu::Texture, layer: usize, mip: usize, data: &[u8]| {
+        bytes += data.len() as u64;
         let edge = (size >> mip).max(1);
+        // Copies of block formats cover whole blocks, even when the mip itself is smaller.
+        let (copy_edge, rows, bytes_per_row) = if block {
+            let blocks = edge.div_ceil(4);
+            (blocks * 4, blocks, blocks * 16)
+        } else {
+            let texel_bytes = data.len() as u32 / (edge * edge);
+            (edge, edge, edge * texel_bytes)
+        };
         gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
-                mip_level: mip,
+                mip_level: mip as u32,
                 origin: wgpu::Origin3d {
                     x: 0,
                     y: 0,
-                    z: layer,
+                    z: layer as u32,
                 },
                 aspect: wgpu::TextureAspect::All,
             },
             data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(edge * 4),
-                rows_per_image: Some(edge),
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(rows),
             },
             wgpu::Extent3d {
-                width: edge,
-                height: edge,
+                width: copy_edge,
+                height: copy_edge,
                 depth_or_array_layers: 1,
             },
         );
@@ -234,16 +290,27 @@ fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> (wgpu::TextureView, wgpu::T
 
     if has_textures {
         for (layer, set) in asset.textures.iter().enumerate() {
-            for (mip, data) in set.color_mips.iter().enumerate() {
-                write(&color, layer as u32, mip as u32, data);
+            for (mip, data) in set.color_mips[skip..].iter().enumerate() {
+                if unpack {
+                    write(&color, layer, mip, &unpack_bc7((size >> mip).max(1), data));
+                } else {
+                    write(&color, layer, mip, data);
+                }
             }
-            for (mip, data) in set.surface_mips.iter().enumerate() {
-                write(&surface, layer as u32, mip as u32, data);
+            for (texture, chain) in [(&normal, &set.normal_mips), (&material, &set.material_mips)] {
+                for (mip, data) in chain[skip..].iter().enumerate() {
+                    if unpack {
+                        write(texture, layer, mip, &unpack_bc5((size >> mip).max(1), data));
+                    } else {
+                        write(texture, layer, mip, data);
+                    }
+                }
             }
         }
     } else {
         write(&color, 0, 0, &[255; 4]);
-        write(&surface, 0, 0, &[128; 4]);
+        write(&normal, 0, 0, &[128; 2]);
+        write(&material, 0, 0, &[128; 2]);
     }
 
     let view = |texture: &wgpu::Texture| {
@@ -252,5 +319,82 @@ fn upload_textures(gpu: &Gpu, asset: &SceneAsset) -> (wgpu::TextureView, wgpu::T
             ..Default::default()
         })
     };
-    (view(&color), view(&surface))
+    let form = if block {
+        "BC7 + BC5"
+    } else if unpack {
+        "RGBA8 + RG8 unpacked from BC"
+    } else {
+        "RGBA8 + RG8"
+    };
+    let summary = format!("{layers} x {size}, {form}, {:.0} MB", bytes as f64 / 1.0e6);
+    log::info!("textures: {summary}");
+    UploadedTextures {
+        color: view(&color),
+        normal: view(&normal),
+        material: view(&material),
+        summary,
+    }
+}
+
+/// Unpacks a BC7 mip level to RGBA8.
+fn unpack_bc7(edge: u32, blocks: &[u8]) -> Vec<u8> {
+    unpack_blocks::<4>(edge, blocks, block_compression::decode::decode_block_bc7)
+}
+
+/// Unpacks a BC5 mip level to RG8.
+fn unpack_bc5(edge: u32, blocks: &[u8]) -> Vec<u8> {
+    unpack_blocks::<2>(edge, blocks, block_compression::decode::decode_block_bc5)
+}
+
+/// Runs a 16-byte block decoder over a whole mip level, cropping the blocks that a mip
+/// smaller than 4x4 only partly uses.
+fn unpack_blocks<const TEXEL_BYTES: usize>(
+    edge: u32,
+    blocks: &[u8],
+    decode: impl Fn(&[u8], &mut [u8], usize),
+) -> Vec<u8> {
+    let edge = edge as usize;
+    let blocks_wide = edge.div_ceil(4);
+    let pitch = edge * TEXEL_BYTES;
+    let mut out = vec![0; edge * pitch];
+    let mut texels = [0u8; 64];
+    for (index, block) in blocks.chunks_exact(16).enumerate() {
+        let (x, y) = (index % blocks_wide * 4, index / blocks_wide * 4);
+        decode(block, &mut texels, 4 * TEXEL_BYTES);
+        let row_bytes = (edge - x).min(4) * TEXEL_BYTES;
+        for row in 0..(edge - y).min(4) {
+            let at = (y + row) * pitch + x * TEXEL_BYTES;
+            let from = row * 4 * TEXEL_BYTES;
+            out[at..at + row_bytes].copy_from_slice(&texels[from..from + row_bytes]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A BC5 block whose two channels are constant: both endpoints equal, all indices zero.
+    fn flat_bc5_block(red: u8, green: u8) -> [u8; 16] {
+        let mut block = [0; 16];
+        block[0] = red;
+        block[1] = red;
+        block[8] = green;
+        block[9] = green;
+        block
+    }
+
+    #[test]
+    fn unpacking_places_blocks_and_crops_small_mips() {
+        let row = [flat_bc5_block(10, 20), flat_bc5_block(30, 40)].concat();
+        let unpacked = unpack_bc5(8, &[row.clone(), row].concat());
+        assert_eq!(unpacked.len(), 8 * 8 * 2);
+        assert_eq!(&unpacked[..2], &[10, 20]);
+        assert_eq!(&unpacked[4 * 2..4 * 2 + 2], &[30, 40]);
+        assert_eq!(&unpacked[(7 * 8 + 7) * 2..], &[30, 40]);
+
+        let cropped = unpack_bc5(2, &flat_bc5_block(50, 60));
+        assert_eq!(cropped, [50, 60, 50, 60, 50, 60, 50, 60]);
+    }
 }

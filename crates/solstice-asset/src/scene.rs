@@ -81,15 +81,48 @@ pub struct Light {
     pub _pad: u32,
 }
 
-/// One texture set: colour and surface data, with a full mip chain.
+/// One texture set, with a full mip chain for each map. Their byte layout depends on the
+/// scene's [`TextureEncoding`].
 ///
 /// * `color`: RGB base colour (sRGB), A cavity.
-/// * `surface`: RG tangent-space normal XY, B roughness multiplier (0.5 is neutral),
-///   A metallic multiplier.
+/// * `normal`: RG tangent-space normal XY.
+/// * `material`: R roughness multiplier (0.5 is neutral), G metallic multiplier.
 #[derive(Clone, Debug, Default)]
 pub struct TextureLayer {
     pub color_mips: Vec<Vec<u8>>,
-    pub surface_mips: Vec<Vec<u8>>,
+    pub normal_mips: Vec<Vec<u8>>,
+    pub material_mips: Vec<Vec<u8>>,
+}
+
+/// How a scene's texture maps are stored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureEncoding {
+    /// Colour is RGBA8, normal and material are RG8.
+    #[default]
+    Raw,
+    /// Colour is BC7, normal and material are BC5.
+    Block,
+}
+
+impl TextureEncoding {
+    /// Bytes in a mip level of a colour map, whose edge is `edge` texels.
+    pub fn color_mip_bytes(self, edge: u32) -> usize {
+        self.mip_bytes(edge, 4)
+    }
+
+    /// Bytes in a mip level of a normal or material map, whose edge is `edge` texels.
+    pub fn data_mip_bytes(self, edge: u32) -> usize {
+        self.mip_bytes(edge, 2)
+    }
+
+    fn mip_bytes(self, edge: u32, raw_texel_bytes: usize) -> usize {
+        let edge = edge as usize;
+        match self {
+            Self::Raw => edge * edge * raw_texel_bytes,
+            // Both block formats take 16 bytes per 4x4 block, and a small mip still fills one.
+            Self::Block => edge.div_ceil(4).pow(2) * 16,
+        }
+    }
 }
 
 /// One placement of a mesh in the world.
@@ -120,6 +153,7 @@ pub struct SceneAsset {
     pub lights: Vec<Light>,
     /// Edge length of the square textures in `textures`.
     pub texture_size: u32,
+    pub texture_encoding: TextureEncoding,
     pub textures: Vec<TextureLayer>,
     pub viewpoint: Option<Viewpoint>,
 }

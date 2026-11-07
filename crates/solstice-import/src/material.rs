@@ -2,7 +2,8 @@
 //!
 //! The renderer's layers hold, per texel:
 //! * colour: RGB base colour (sRGB), A cavity, from the occlusion map.
-//! * surface: RG tangent-space normal, B roughness multiplier, A metallic multiplier.
+//! * normal: RG tangent-space normal.
+//! * material: R roughness multiplier, G metallic multiplier.
 
 use glam::Vec2;
 use gltf::image::{Data as ImageData, Format};
@@ -226,7 +227,7 @@ fn compose_layer(images: &[ImageData], key: LayerKey, size: u32) -> TextureLayer
         image(key.occlusion),
     );
     let n = size as usize;
-    let texels: Vec<([u8; 4], [u8; 4])> = (0..n * n)
+    let texels: Vec<([u8; 4], [u8; 2], [u8; 2])> = (0..n * n)
         .into_par_iter()
         .map(|i| {
             let (u, v) = (
@@ -243,20 +244,24 @@ fn compose_layer(images: &[ImageData], key: LayerKey, size: u32) -> TextureLayer
                 [base[0], base[1], base[2], cavity],
                 // glTF's green points towards decreasing V, and the renderer's derives its
                 // frame from the direction of increasing V.
-                [normal[0], 255 - normal[1], orm[1].div_ceil(2), orm[2]],
+                [normal[0], 255 - normal[1]],
+                [orm[1].div_ceil(2), orm[2]],
             )
         })
         .collect();
 
     let mut color = Vec::with_capacity(n * n * 4);
-    let mut surface = Vec::with_capacity(n * n * 4);
-    for (c, s) in &texels {
+    let mut normals = Vec::with_capacity(n * n * 2);
+    let mut material = Vec::with_capacity(n * n * 2);
+    for (c, nor, mat) in &texels {
         color.extend_from_slice(c);
-        surface.extend_from_slice(s);
+        normals.extend_from_slice(nor);
+        material.extend_from_slice(mat);
     }
     TextureLayer {
-        color_mips: mip_chain(color, size),
-        surface_mips: mip_chain(surface, size),
+        color_mips: mip_chain(color, size, 4),
+        normal_mips: mip_chain(normals, size, 2),
+        material_mips: mip_chain(material, size, 2),
     }
 }
 

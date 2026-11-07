@@ -25,8 +25,9 @@
 @group(1) @binding(3) var out_motion: texture_storage_2d<rg32float, write>;
 @group(1) @binding(4) var out_depth: texture_storage_2d<r32float, write>;
 @group(1) @binding(5) var color_textures: texture_2d_array<f32>;
-@group(1) @binding(6) var surface_textures: texture_2d_array<f32>;
-@group(1) @binding(7) var material_sampler: sampler;
+@group(1) @binding(6) var normal_textures: texture_2d_array<f32>;
+@group(1) @binding(7) var material_textures: texture_2d_array<f32>;
+@group(1) @binding(8) var material_sampler: sampler;
 
 // Perspective-correct barycentrics of a pixel inside a triangle.
 fn barycentrics(clip: array<vec4f, 3>, ndc: vec2f) -> vec3f {
@@ -165,19 +166,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let sample_dx = duv_dx * frame.mip_scale;
         let sample_dy = duv_dy * frame.mip_scale;
         let color = textureSampleGrad(color_textures, material_sampler, uv, layer, sample_dx, sample_dy);
-        let surface = textureSampleGrad(surface_textures, material_sampler, uv, layer, sample_dx, sample_dy);
+        let normal_map = textureSampleGrad(normal_textures, material_sampler, uv, layer, sample_dx, sample_dy).rg;
+        let material_map = textureSampleGrad(material_textures, material_sampler, uv, layer, sample_dx, sample_dy).rg;
         if material.macro_variation > 0.0 {
             albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, layer, material.macro_variation);
         } else {
             albedo *= color.rgb;
         }
         cavity = color.a;
-        roughness = clamp(roughness * surface.b * 2.0, 0.04, 1.0);
-        metallic *= surface.a;
+        roughness = clamp(roughness * material_map.r * 2.0, 0.04, 1.0);
+        metallic *= material_map.g;
 
         // Normal mapping without stored tangents (Mikkelsen 2010): the tangent frame
         // comes from the same analytic derivatives used for texture filtering.
-        let tangent_xy = (surface.xy * 2.0 - vec2f(1.0)) * material.normal_strength;
+        let tangent_xy = (normal_map * 2.0 - vec2f(1.0)) * material.normal_strength;
         let tangent_z = sqrt(max(1.0 - dot(tangent_xy, tangent_xy), 0.0));
         let perp_y = cross(dp_dy, normal);
         let perp_x = cross(normal, dp_dx);

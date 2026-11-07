@@ -7,7 +7,7 @@ A real-time renderer in Rust and WebGPU, built on the same core ideas as Unreal 
 Nanite and Lumen: virtualized geometry and dynamic global illumination, running in the browser.
 
 **[Try the live demo](https://samg-coder.github.io/solstice/)** in a WebGPU browser such as Chrome
-or Edge. It downloads a 39 MB scene, and picks a quality level to suit your GPU.
+or Edge. It downloads a 37 MB scene, and picks a quality level to suit your GPU.
 
 ![A ruined temple at dusk, firelight glowing from its doorway](docs/dusk.png)
 
@@ -68,7 +68,8 @@ with the command above. The scan is not included in this repository.*
 GI system works in fixed world-space sizes, so use it for models in other units or at unusual
 scales. The ground is at Y = 0 when that lies in the lower half of the model, as it does for most
 scans, and otherwise at the model's lowest point. `--ground` adds a floor, and `--texture-size` sets the resolution all textures are resampled
-to (default 1024, must be a power of two). To see it in the browser, run `scripts/build-web.sh` and
+to (default 1024, must be a power of two). Textures are block compressed unless you pass
+`--raw-textures`. To see it in the browser, run `scripts/build-web.sh` and
 open `http://localhost:8765/?scene=model`.
 
 **Imported:** node hierarchies, instancing, mirrored transforms, multiple materials, base colour,
@@ -94,7 +95,8 @@ part fort/fort.gltf tower_round 22 0 22 0 1   # one named piece, by its own orig
 
 [`scenes/cove.txt`](scenes/cove.txt) is a complete example: a fort assembled piece by piece from a
 modular kit, overlooking a bay with a ship at anchor, using 12 Poly Haven scans (CC0). It holds
-22 million instanced triangles, and renders in about 3.5 ms on an RTX 5080. To build it:
+22 million instanced triangles, and renders in about 3.5 ms on an RTX 5080. To build it, adding
+`--texture-size 1024` for the smaller version used in the browser:
 
 ```bash
 python scripts/fetch-scans.py scenes/cove.txt 2k
@@ -173,7 +175,7 @@ buffer, which a final pass resolves to a G-buffer with analytic derivatives.
 ## Measurements
 
 The full scene has 26,945 instances and 8.76 billion instanced triangles, 4.5 million of them unique,
-in a 203 MB scene file baked in about 9 seconds on a desktop CPU. Native, Vulkan, RTX 5080, 1600x900,
+in a 179 MB scene file baked in about 30 seconds on a desktop CPU. Native, Vulkan, RTX 5080, 1600x900,
 at High quality:
 
 | View | Frame time | Triangles drawn |
@@ -182,7 +184,7 @@ at High quality:
 | Exterior, camera moving | 6.2 ms | 6.9 M |
 | Inside the chamber | 5.9 ms | 9.9 M |
 
-The web scene has 1.22 billion instanced triangles and downloads as 39 MB. Native on the AMD
+The web scene has 1.22 billion instanced triangles and downloads as 37 MB. Native on the AMD
 integrated GPU of the same machine, with the camera moving, since a still camera hides shadow costs:
 
 | Resolution, quality | Frame time, moving | Worst frame |
@@ -208,6 +210,49 @@ errors in any, and frame rates at each display's limit where it could be measure
 Safari, phones, Mac and Linux GPUs, and any browser running on integrated graphics. The GI volume
 takes about 150 MB of GPU memory regardless of quality level, which may rule out the smallest GPUs.
 
+### Texture compression
+
+Scene files hold GPU block-compressed textures, at 3 bytes per texel where they used to take 8.
+For the cove, with 23 texture layers, measured on the RTX 5080. GPU memory is the whole viewer's
+and most of it is not textures, which is why it falls by less than the file does:
+
+| Scene | File | Gzipped download | Textures on the GPU | GPU memory, native | GPU memory, browser |
+|---|---|---|---|---|---|
+| Cove at 2048, uncompressed | 1,227 MB | 697 MB | 1,029 MB | 2,532 MiB | |
+| **Cove at 2048, BC** | **584 MB** | **451 MB** | **386 MB** | **1,809 MiB** | |
+| Browser cove at 512, uncompressed | 263 MB | 163 MB | 64 MB | 1,551 MiB | 1,134 MiB |
+| **Browser cove at 1024, BC** | **295 MB** | **209 MB** | **96 MB** | **1,553 MiB** | **1,133 MiB** |
+
+So the browser cove gets four times the texels for the same GPU memory and a 28% larger download.
+At 2048, renders differ from the uncompressed version by 43 to 48 dB, and side by side at 3x
+zoom the fort walls show no blocks or lost relief:
+
+![Fort wall at 3x. Top: 512 uncompressed, then 1024 BC. Bottom: 2048 uncompressed, then 2048 BC](docs/textures.png)
+
+**Formats.** The old surface layer packed normal XY, roughness and metallic together, and no single
+format holds that well, so it is now two maps. On the scanned fort wall, at 2048:
+
+| Normals stored as | Mean error | 99th percentile | Roughness |
+|---|---|---|---|
+| BC7, packed with roughness and metallic | 1.81 degrees | 6.4 degrees | 38.8 dB |
+| BC5, on their own (roughness and metallic in a second BC5) | 1.11 degrees | 4.3 degrees | 52.2 dB |
+
+Colour and cavity are BC7 with the sRGB format, which measured about 42 dB on the same wall against
+36 dB for BC1 at half the size.
+
+**Encoders.** BC7 comes from [`block_compression`](https://crates.io/crates/block_compression), a pure
+Rust port of Intel's ISPC compressor, at its "basic" setting: "slow" took three times as long and
+gained under 0.05 dB. BC5 comes from an endpoint search in
+[`texture.rs`](crates/solstice-builder/src/texture.rs), as that crate's BC5 scored 1 dB lower on normals.
+Compressing the cove takes about a minute on 16 threads.
+
+**Other GPUs.** WebGPU exposes `texture-compression-bc` on desktop GPUs, while phones generally expose
+`texture-compression-etc2` and `texture-compression-astc` instead. The crates that encode ASTC or ETC2
+well wrap C++, not Rust, so files hold BC only, and a GPU without it gets the textures unpacked while
+loading, at no more than 512 per side. That matches the old uncompressed browser scene in look and GPU
+memory. Add `?unpack-textures` to the page, or `--unpack-textures` to the viewer, to force that path. It
+has only been tested that way, on the RTX 5080: no phone has been tried.
+
 ## Status: what this is and is not
 
 The goal is Unreal-quality rendering in the browser. The core architecture is real and working.
@@ -215,7 +260,7 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
 
 1. **Demo content.** Unreal's best images come from photoscanned assets. Real models can now be
    imported and look far better, but the built-in web demo is still entirely procedural and looks
-   it, because the scanned cove is currently too large a download at 165 MB.
+   it, because the scanned cove is currently too large a download at 209 MB, most of it geometry.
 2. **Shadow resolution.** Cascaded shadow maps stand in for Virtual Shadow Maps, so shadows lack
    the per-pixel sharpness that makes dense geometry read properly.
 3. **No geometry streaming.** All geometry stays resident in GPU memory, so scene size is limited
@@ -226,9 +271,8 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
    no translucency, no masked foliage, no subsurface scattering, no volumetric fog, no material graph.
 6. **GI limits.** Voxels mean thin walls can leak light, and the finest voxels are 20 cm, so small
    details get their indirect shadowing only from screen-space passes.
-7. **Texture memory.** Textures are uncompressed, and all are resampled to one size, so models with
-   many materials use a lot of memory: textures are over half of the 453 MB cove. Block compression
-   is the obvious fix.
+7. **Texture memory.** All textures are resampled to one size, so models with many materials use a
+   lot of memory even when compressed, and phones must unpack them, as nothing bakes ASTC yet.
 8. **Far reflections.** Beyond the reach of screen-space tracing, reflections come from voxels, which
    turn thin objects such as a ship's rigging into solid dark masses on water.
 9. **Alpha.** Masked and transparent surfaces draw solid, so torn sails have no holes.
