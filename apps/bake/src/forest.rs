@@ -19,7 +19,7 @@ const MEADOW_SIZE: f32 = 70.0;
 /// Different grass patches, laid out at random so no repeat shows.
 const PATCH_VARIANTS: u32 = 4;
 /// Different trees of each species.
-const TREE_VARIANTS: u32 = 3;
+const TREE_VARIANTS: u32 = 2;
 const BUSH_VARIANTS: u32 = 2;
 
 mod material {

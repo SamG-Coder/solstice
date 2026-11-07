@@ -291,7 +291,8 @@ The goal is Unreal-quality rendering in the browser. The core architecture is re
 The image is not yet at Unreal's level, and these are the main reasons, roughly in order of impact:
 
 1. **Demo content.** Unreal's best images come from photoscanned assets. The live demo's cove uses
-   scanned models, on procedural sand, while its temple is entirely procedural and looks it.
+   scanned models, on procedural sand, while its temple is entirely procedural and looks it. Its
+   forest is procedural too: a meadow and wood of geometric grass, trees and bushes.
 2. **Shadow resolution.** Cascaded shadow maps stand in for Virtual Shadow Maps, so shadows lack
    the per-pixel sharpness that makes dense geometry read properly.
 3. **Streaming's limits.** Cluster records stay resident at 48 bytes each, about 0.7 GB for a
