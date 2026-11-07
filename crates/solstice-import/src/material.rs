@@ -140,11 +140,6 @@ impl<'a> MaterialTable<'a> {
                 "material '{name}': alpha mode {mode:?} is drawn as opaque"
             )),
         }
-        if source.double_sided() {
-            warnings.push(format!(
-                "material '{name}' is double-sided: back faces are culled, so thin surfaces may look open from behind"
-            ));
-        }
         if source.emissive_texture().is_some() {
             warnings.push(format!(
                 "material '{name}': emissive texture is ignored, only its factor is used"
@@ -196,7 +191,12 @@ impl<'a> MaterialTable<'a> {
         let [er, eg, eb] = source.emissive_factor();
         Material {
             base_color: pbr.base_color_factor(),
-            emissive: [er, eg, eb, 0.0],
+            emissive: [er, eg, eb],
+            flags: if source.double_sided() {
+                Material::TWO_SIDED
+            } else {
+                0
+            },
             roughness: pbr.roughness_factor(),
             metallic: pbr.metallic_factor(),
             uv_scale: 1.0,

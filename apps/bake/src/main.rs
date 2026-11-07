@@ -5,10 +5,12 @@
 //! bake --gltf MODEL.glb [--fit METRES] [--ground] [--texture-size N] [--output FILE]
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
 //! bake --gallery [--texture-size N] [--output FILE]
+//! bake --forest [--texture-size N] [--output FILE]
 //! ```
 //!
 //! Textures are block compressed unless `--raw-textures` is given.
 
+mod forest;
 mod gallery;
 mod meshes;
 mod scene;
@@ -31,6 +33,8 @@ struct Options {
     raw_textures: bool,
     /// Shows every procedural surface, instead of the demo scene.
     gallery: bool,
+    /// The procedural meadow and wood, instead of the demo scene.
+    forest: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -43,6 +47,7 @@ fn parse_args() -> Result<Options, String> {
         scene_texture_size: None,
         raw_textures: false,
         gallery: false,
+        forest: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -73,6 +78,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--raw-textures" => options.raw_textures = true,
             "--gallery" => options.gallery = true,
+            "--forest" => options.forest = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -80,6 +86,9 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn load_scene(options: &Options) -> Result<SceneAsset, String> {
+    if options.forest {
+        return Ok(forest::build(options.scene_texture_size.unwrap_or(1024)));
+    }
     if options.gallery {
         return Ok(gallery::build(options.scene_texture_size.unwrap_or(1024)));
     }

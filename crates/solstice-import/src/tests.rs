@@ -355,7 +355,7 @@ fn material_factors_carry_over() {
     assert_eq!(material.base_color, [0.1, 0.2, 0.3, 1.0]);
     assert_eq!(material.metallic, 0.4);
     assert_eq!(material.roughness, 0.6);
-    assert_eq!(material.emissive, [1.0, 0.5, 0.25, 0.0]);
+    assert_eq!(material.emissive, [1.0, 0.5, 0.25]);
     assert_eq!(material.texture_layer, -1, "no textures means no layer");
     assert!(scene.textures.is_empty());
 }
@@ -446,7 +446,15 @@ fn unsupported_features_are_reported_not_hidden() {
     let path = write_model(&dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, materials);
     let warnings = import(&path).warnings.join("\n");
     assert!(warnings.contains("Blend"), "{warnings}");
-    assert!(warnings.contains("double-sided"), "{warnings}");
+}
+
+#[test]
+fn double_sided_materials_are_drawn_from_both_sides() {
+    let dir = TempDir::new();
+    let materials = r#", "materials": [{"doubleSided": true}, {}]"#;
+    let path = write_model(&dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, materials);
+    let scene = import(&path).scene;
+    assert_eq!(scene.materials[0].flags, Material::TWO_SIDED);
 }
 
 #[test]

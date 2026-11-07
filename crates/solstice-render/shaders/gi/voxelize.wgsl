@@ -164,7 +164,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let entry = visible[id.x];
     let cluster = clusters[entry.cluster];
     let instance = instances[entry.instance];
-    let material = materials[instance.material];
+    let material = materials[instance_material(instance)];
     let inv_voxel = 1.0 / params.voxel_size;
 
     let triangle_count = cluster_triangle_count(cluster);
@@ -190,7 +190,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let data = VoxelData(
             pack4x8unorm(vec4f(albedo, 1.0)),
             pack2x16snorm(oct_encode(face / face_length)),
-            encode_emissive(material.emissive.rgb),
+            encode_emissive(material.emissive),
         );
         voxelize_triangle(
             (world0 - params.origin) * inv_voxel,

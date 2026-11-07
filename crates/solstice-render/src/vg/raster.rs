@@ -127,7 +127,8 @@ impl Rasterizer {
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
+                    // Facing is decided per instance in `raster_hw.wgsl`.
+                    cull_mode: None,
                     ..Default::default()
                 },
                 depth_stencil: None,

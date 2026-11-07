@@ -25,6 +25,7 @@ mod mesh;
 mod partition;
 mod simplify;
 mod texture;
+mod thin;
 
 mod paging;
 

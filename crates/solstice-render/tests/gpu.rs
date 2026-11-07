@@ -698,6 +698,85 @@ fn every_texture_path_renders_the_same_colour() {
     }
 }
 
+/// The centre pixel of a square whose triangles face away from the camera, `distance` away, in
+/// the normals view, and whether software rasterization drew any of it.
+fn facing_away(gpu: &Gpu, flags: u32, distance: f32) -> ([u8; 3], bool) {
+    const CELLS: u32 = 8;
+    let mut mesh = Mesh::default();
+    for j in 0..=CELLS {
+        for i in 0..=CELLS {
+            let (x, y) = (i as f32 / CELLS as f32 - 0.5, j as f32 / CELLS as f32 - 0.5);
+            mesh.vertices.push(Vertex {
+                position: Vec3::new(x, y, 0.0),
+                normal: Vec3::NEG_Z,
+                uv: Vec2::new(x, y),
+            });
+        }
+    }
+    for j in 0..CELLS {
+        for i in 0..CELLS {
+            let a = j * (CELLS + 1) + i;
+            let (b, c, d) = (a + 1, a + CELLS + 1, a + CELLS + 2);
+            // Clockwise as seen from +Z, where the camera is.
+            mesh.indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&mesh, &BuildOptions::default())],
+        materials: vec![Material {
+            flags,
+            ..white_material()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, distance),
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Normals,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let run = render(gpu, &scene, &camera, settings, 128);
+    let at = ((run.size / 2 * run.size + run.size / 2) * 4) as usize;
+    (
+        [run.pixels[at], run.pixels[at + 1], run.pixels[at + 2]],
+        run.software_clusters > 0,
+    )
+}
+
+/// Back faces are culled, unless the material is two-sided, when they are drawn with their normal
+/// turned to the viewer. Checked close up, where hardware rasterizes, and far away, where software
+/// does.
+#[test]
+fn two_sided_materials_draw_their_back_faces() {
+    let Some(gpu) = request_gpu() else { return };
+    for (distance, software) in [(1.0, false), (20.0, true)] {
+        let (one_sided, used_software) = facing_away(&gpu, 0, distance);
+        assert_eq!(
+            used_software, software,
+            "at {distance} m the wrong rasterizer ran"
+        );
+        assert_eq!(
+            one_sided,
+            [0, 0, 0],
+            "a back face was drawn at {distance} m"
+        );
+
+        let (two_sided, _) = facing_away(&gpu, Material::TWO_SIDED, distance);
+        // Encoded as n * 0.5 + 0.5 and then sRGB, so a normal towards the camera, +Z, is
+        // (187, 187, 255).
+        assert!(
+            two_sided[2] > 240
+                && two_sided[0].abs_diff(187) < 20
+                && two_sided[1].abs_diff(187) < 20,
+            "at {distance} m the back face shows {two_sided:?}, not a normal facing the camera"
+        );
+    }
+}
+
 /// The world normal at the centre of a flat, camera-facing tile, encoded as red and green.
 fn tile_normal(gpu: &Gpu, uv: impl Fn(f32, f32) -> Vec2, stored: [u8; 2]) -> (i32, i32) {
     const CELLS: u32 = 8;

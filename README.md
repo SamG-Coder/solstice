@@ -72,11 +72,11 @@ to (default 1024, must be a power of two). Textures are block compressed unless 
 `--raw-textures`. To see it in the browser, run `scripts/build-web.sh` and
 open `http://localhost:8765/?scene=model`.
 
-**Imported:** node hierarchies, instancing, mirrored transforms, multiple materials, base colour,
+**Imported:** node hierarchies, instancing, mirrored transforms, multiple materials, double-sided materials, base colour,
 normal, metallic-roughness and occlusion maps, material factors and emissive factors.
 
 **Not yet, and the bake prints a warning when a file uses them:** transparency and alpha masks (drawn
-opaque), double-sided materials (back faces are culled), emissive textures, texture transforms, a
+opaque), emissive textures, texture transforms, a
 second UV set, punctual lights, animation and skinning (imported in their rest pose). Files that
 require compressed texture or geometry extensions, such as Basis or Draco, are rejected.
 

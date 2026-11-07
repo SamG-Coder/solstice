@@ -26,11 +26,22 @@ fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
 
     let instance = instances[entry.instance];
     let packed_triangle = triangles[cluster.triangle_offset + triangle];
-    let local = local_vertex(packed_triangle, vertex_index % 3u);
-    let vertex = vertices[cluster.vertex_offset + local];
-    let world = transform_point(instance, decode_position(instance, vertex));
+    var clip: array<vec4f, 3>;
+    for (var corner = 0u; corner < 3u; corner++) {
+        let vertex = vertices[cluster.vertex_offset + local_vertex(packed_triangle, corner)];
+        let world = transform_point(instance, decode_position(instance, vertex));
+        clip[corner] = view.raster_view_proj * vec4f(world, 1.0);
+    }
 
-    out.position = view.raster_view_proj * vec4f(world, 1.0);
+    // The pipeline draws both faces, since one draw holds both kinds of material. Front faces
+    // are counter-clockwise, which makes this determinant positive. Working in homogeneous
+    // coordinates keeps it right for triangles that cross behind the camera (Olano and Greer 1997).
+    let facing = determinant(mat3x3f(clip[0].xyw, clip[1].xyw, clip[2].xyw));
+    if facing <= 0.0 && !instance_two_sided(instance) {
+        return out;
+    }
+
+    out.position = clip[vertex_index % 3u];
     out.id = encode_id(visible_index, triangle);
     return out;
 }

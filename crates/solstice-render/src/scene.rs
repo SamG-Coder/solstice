@@ -30,6 +30,9 @@ pub struct GpuInstance {
 
 const _: () = assert!(std::mem::size_of::<GpuInstance>() == 192);
 
+/// Marks [`GpuInstance::material`] as two-sided. Twin of the same constant in `common/scene.wgsl`.
+const INSTANCE_TWO_SIDED: u32 = 1 << 31;
+
 /// Stores the top three rows of an affine matrix.
 fn affine_rows(m: Mat4) -> [Vec4; 3] {
     [m.row(0), m.row(1), m.row(2)]
@@ -160,7 +163,16 @@ fn gpu_instances(scene: &PagedScene) -> Vec<GpuInstance> {
             uv_origin: Vec2::from_array(mesh.uv_origin),
             uv_step: Vec2::from_array(mesh.uv_step),
             root_node,
-            material: instance.material,
+            material: instance.material
+                | if scene
+                    .materials
+                    .get(instance.material as usize)
+                    .is_some_and(|m| m.flags & Material::TWO_SIDED != 0)
+                {
+                    INSTANCE_TWO_SIDED
+                } else {
+                    0
+                },
             max_scale,
             texture_info: texture_info(scene.materials.get(instance.material as usize)),
         });

@@ -43,6 +43,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         );
     }
 
+    let two_sided = instance_two_sided(instance);
     let triangle_count = cluster_triangle_count(cluster);
     for (var t = 0u; t < triangle_count; t++) {
         let packed = triangles[cluster.triangle_offset + t];
@@ -51,8 +52,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             screen[local_vertex(packed, 1u)],
             screen[local_vertex(packed, 2u)],
             encode_id(visible_index, t),
+            two_sided,
         );
     }
+}
+
+fn edge_f(a: vec2f, b: vec2f, p: vec2f) -> f32 {
+    return (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
 }
 
 fn edge(a: vec2i, b: vec2i, p: vec2i) -> i32 {
@@ -68,7 +74,14 @@ fn fill_bias(a: vec2i, b: vec2i) -> i32 {
     return select(-1, 0, is_top || is_left);
 }
 
-fn rasterize_triangle(a_in: vec3f, b_in: vec3f, c_in: vec3f, id: u32) {
+fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_sided: bool) {
+    var b_in = b_given;
+    var c_in = c_given;
+    // A back face of a two-sided material is drawn as the front face it is from behind.
+    if two_sided && edge_f(a_in.xy, b_in.xy, c_in.xy) > 0.0 {
+        b_in = c_given;
+        c_in = b_given;
+    }
     let bounds_min = floor(min(min(a_in.xy, b_in.xy), c_in.xy));
     let bounds_max = ceil(max(max(a_in.xy, b_in.xy), c_in.xy));
     let extent = bounds_max - bounds_min;

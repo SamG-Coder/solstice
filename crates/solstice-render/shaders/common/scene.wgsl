@@ -47,6 +47,7 @@ struct Instance {
     uv_origin: vec2f,
     uv_step: vec2f,
     root_node: u32,
+    // Material index, with INSTANCE_TWO_SIDED in the top bit so rasterizers need not look it up.
     material: u32,
     max_scale: f32,
     // Texture layer << 16 | (log2(uv scale) + 128) * 256, or NO_TEXTURE.
@@ -55,7 +56,8 @@ struct Instance {
 
 struct Material {
     base_color: vec4f,
-    emissive: vec4f,
+    emissive: vec3f,
+    flags: u32, // MATERIAL_TWO_SIDED | MATERIAL_FOLIAGE
     roughness: f32,
     metallic: f32,
     uv_scale: f32,
@@ -78,6 +80,20 @@ struct Light {
 struct VisibleCluster {
     instance: u32,
     cluster: u32,
+}
+
+// Twins of Material::TWO_SIDED and Material::FOLIAGE.
+const MATERIAL_TWO_SIDED: u32 = 1u;
+const MATERIAL_FOLIAGE: u32 = 2u;
+// Twin of INSTANCE_TWO_SIDED in scene.rs.
+const INSTANCE_TWO_SIDED: u32 = 0x80000000u;
+
+fn instance_material(i: Instance) -> u32 {
+    return i.material & ~INSTANCE_TWO_SIDED;
+}
+
+fn instance_two_sided(i: Instance) -> bool {
+    return (i.material & INSTANCE_TWO_SIDED) != 0u;
 }
 
 fn cluster_triangle_count(c: Cluster) -> u32 {
