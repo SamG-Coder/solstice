@@ -10,8 +10,6 @@ use solstice_procgen::surfaces;
 const COLUMNS: usize = 5;
 const TILE: f32 = 8.0;
 const SPACING: f32 = 9.0;
-/// Each texture covers this many metres, so a tile shows it repeating.
-const METRES_PER_REPEAT: f32 = 4.0;
 
 /// A flat tile and a ball for each surface, laid out in rows.
 pub fn build(texture_size: u32) -> SceneAsset {
@@ -35,10 +33,11 @@ pub fn build(texture_size: u32) -> SceneAsset {
         println!("generating {name}...");
         let surface = surfaces::by_name(name, 0).expect("listed surface exists");
         scene.textures.push(surface.bake(texture_size));
+        let surface = &surface;
         scene.materials.push(Material {
             base_color: [1.0; 4],
             roughness: 1.0,
-            uv_scale: 1.0 / METRES_PER_REPEAT,
+            uv_scale: 1.0 / surface.tile_metres(),
             normal_strength: 1.0,
             texture_layer: index as i32,
             ..Default::default()

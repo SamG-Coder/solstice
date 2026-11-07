@@ -6,13 +6,18 @@
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
 //! bake --gallery [--texture-size N] [--output FILE]
 //! bake --forest [--texture-size N] [--output FILE]
+//! bake --plants [--species FILE.species]... [--grass FILE.grass]... [--texture-size N] [--output FILE]
 //! ```
+//!
+//! `--plants` grows every built-in species and breed of grass, then each species and grass file
+//! given, so either can be edited and looked at without touching code.
 //!
 //! Textures are block compressed unless `--raw-textures` is given.
 
 mod forest;
 mod gallery;
 mod meshes;
+mod plants;
 mod scene;
 mod scene_file;
 
@@ -35,6 +40,12 @@ struct Options {
     gallery: bool,
     /// The procedural meadow and wood, instead of the demo scene.
     forest: bool,
+    /// A row of every species, instead of the demo scene.
+    plants: bool,
+    /// Species files to add to the row of plants.
+    species: Vec<PathBuf>,
+    /// Grass files to add to the row of grass.
+    grass: Vec<PathBuf>,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -48,6 +59,9 @@ fn parse_args() -> Result<Options, String> {
         raw_textures: false,
         gallery: false,
         forest: false,
+        plants: false,
+        species: Vec::new(),
+        grass: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -79,6 +93,15 @@ fn parse_args() -> Result<Options, String> {
             "--raw-textures" => options.raw_textures = true,
             "--gallery" => options.gallery = true,
             "--forest" => options.forest = true,
+            "--plants" => options.plants = true,
+            "--species" => {
+                options.plants = true;
+                options.species.push(PathBuf::from(value()?));
+            }
+            "--grass" => {
+                options.plants = true;
+                options.grass.push(PathBuf::from(value()?));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -88,6 +111,13 @@ fn parse_args() -> Result<Options, String> {
 fn load_scene(options: &Options) -> Result<SceneAsset, String> {
     if options.forest {
         return Ok(forest::build(options.scene_texture_size.unwrap_or(1024)));
+    }
+    if options.plants {
+        return plants::build(
+            options.scene_texture_size.unwrap_or(1024),
+            &options.species,
+            &options.grass,
+        );
     }
     if options.gallery {
         return Ok(gallery::build(options.scene_texture_size.unwrap_or(1024)));
