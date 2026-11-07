@@ -201,6 +201,7 @@ pub fn import_gltf(
             instances,
             lights: Vec::new(),
             texture_size: options.texture_size,
+            texture_encoding: Default::default(),
             textures,
             viewpoint: Some(frame_bounds(&world_bounds)),
         },

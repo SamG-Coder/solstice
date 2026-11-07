@@ -5,13 +5,15 @@
 //! can go straight to the GPU.
 
 use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
-use crate::scene::{Instance, Light, Material, SceneAsset, TextureLayer, Viewpoint, VirtualMesh};
+use crate::scene::{
+    Instance, Light, Material, SceneAsset, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::fmt;
 
 const MAGIC: [u8; 8] = *b"SOLSTICE";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +22,7 @@ pub enum DecodeError {
     UnsupportedVersion(u32),
     Truncated,
     BadInstanceReference,
+    BadTextures,
 }
 
 impl fmt::Display for DecodeError {
@@ -36,6 +39,7 @@ impl fmt::Display for DecodeError {
                     "an instance refers to a mesh or material that does not exist"
                 )
             }
+            Self::BadTextures => write!(f, "the texture data does not match its stated format"),
         }
     }
 }
@@ -89,10 +93,19 @@ pub fn encode(scene: &SceneAsset) -> Vec<u8> {
     w.slice(&instances);
 
     w.pod(&scene.texture_size);
+    w.pod(&match scene.texture_encoding {
+        TextureEncoding::Raw => 0u32,
+        TextureEncoding::Block => 1u32,
+    });
     w.pod(&(scene.textures.len() as u32));
     for layer in &scene.textures {
         w.pod(&(layer.color_mips.len() as u32));
-        for mip in layer.color_mips.iter().chain(&layer.surface_mips) {
+        for mip in layer
+            .color_mips
+            .iter()
+            .chain(&layer.normal_mips)
+            .chain(&layer.material_mips)
+        {
             w.slice(mip);
         }
     }
@@ -158,6 +171,11 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
     }
 
     let texture_size: u32 = r.pod()?;
+    let texture_encoding = match r.pod::<u32>()? {
+        0 => TextureEncoding::Raw,
+        1 => TextureEncoding::Block,
+        _ => return Err(DecodeError::BadTextures),
+    };
     let layer_count: u32 = r.pod()?;
     let mut textures = Vec::new();
     for _ in 0..layer_count {
@@ -167,7 +185,13 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
             layer.color_mips.push(r.slice()?);
         }
         for _ in 0..mip_count {
-            layer.surface_mips.push(r.slice()?);
+            layer.normal_mips.push(r.slice()?);
+        }
+        for _ in 0..mip_count {
+            layer.material_mips.push(r.slice()?);
+        }
+        if !layer_is_well_formed(&layer, texture_size, texture_encoding) {
+            return Err(DecodeError::BadTextures);
         }
         textures.push(layer);
     }
@@ -181,9 +205,26 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
         instances,
         lights,
         texture_size,
+        texture_encoding,
         textures,
         viewpoint: (has_viewpoint != 0).then_some(viewpoint),
     })
+}
+
+/// Checks that every mip is the size the GPU will expect, which a bad file could otherwise
+/// turn into a validation error much later.
+fn layer_is_well_formed(layer: &TextureLayer, size: u32, encoding: TextureEncoding) -> bool {
+    if !size.is_power_of_two() || (encoding == TextureEncoding::Block && size < 4) {
+        return false;
+    }
+    let levels = size.ilog2() as usize + 1;
+    let edge = |level: usize| size >> level;
+    layer.color_mips.len() == levels
+        && (0..levels).all(|level| {
+            layer.color_mips[level].len() == encoding.color_mip_bytes(edge(level))
+                && layer.normal_mips[level].len() == encoding.data_mip_bytes(edge(level))
+                && layer.material_mips[level].len() == encoding.data_mip_bytes(edge(level))
+        })
 }
 
 #[derive(Default)]
@@ -273,9 +314,11 @@ mod tests {
                 transform: Mat4::from_translation(Vec3::X),
             }],
             texture_size: 1,
+            texture_encoding: TextureEncoding::Raw,
             textures: vec![TextureLayer {
                 color_mips: vec![vec![1, 2, 3, 4]],
-                surface_mips: vec![vec![5, 6, 7, 8]],
+                normal_mips: vec![vec![5, 6]],
+                material_mips: vec![vec![7, 8]],
             }],
             viewpoint: Some(Viewpoint {
                 position: [1.0, 2.0, 3.0],
@@ -296,10 +339,8 @@ mod tests {
         assert_eq!(decoded.lights, scene.lights);
         assert_eq!(decoded.viewpoint, scene.viewpoint);
         assert_eq!(decoded.instances[0].transform, scene.instances[0].transform);
-        assert_eq!(
-            decoded.textures[0].surface_mips,
-            scene.textures[0].surface_mips
-        );
+        assert_eq!(decoded.textures[0].normal_mips, vec![vec![5, 6]]);
+        assert_eq!(decoded.textures[0].material_mips, vec![vec![7, 8]]);
     }
 
     #[test]
@@ -309,6 +350,32 @@ mod tests {
         assert_eq!(
             decode(&bytes[..bytes.len() - 1]).unwrap_err(),
             DecodeError::Truncated
+        );
+    }
+
+    #[test]
+    fn block_encoding_round_trips_with_small_mips_filling_a_block() {
+        let mut scene = sample_scene();
+        scene.texture_size = 4;
+        scene.texture_encoding = TextureEncoding::Block;
+        let chain = vec![vec![9; 16]; 3];
+        scene.textures = vec![TextureLayer {
+            color_mips: chain.clone(),
+            normal_mips: chain.clone(),
+            material_mips: chain,
+        }];
+        let decoded = decode(&encode(&scene)).unwrap();
+        assert_eq!(decoded.texture_encoding, TextureEncoding::Block);
+        assert_eq!(decoded.textures[0].color_mips[2], vec![9; 16]);
+    }
+
+    #[test]
+    fn rejects_textures_of_the_wrong_size() {
+        let mut scene = sample_scene();
+        scene.textures[0].normal_mips[0].pop();
+        assert_eq!(
+            decode(&encode(&scene)).unwrap_err(),
+            DecodeError::BadTextures
         );
     }
 

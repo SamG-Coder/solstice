@@ -628,6 +628,7 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
         instances,
         lights,
         texture_size,
+        texture_encoding: Default::default(),
         textures,
         viewpoint: Some(Viewpoint {
             position: [20.0, 4.2, 34.0],

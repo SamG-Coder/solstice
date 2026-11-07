@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
-//!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z]
+//!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
 //! ```
 
@@ -45,6 +45,8 @@ mod native {
         environment: Environment,
         settings: RendererSettings,
         power: wgpu::PowerPreference,
+        /// Acts as if the GPU had no block compression, to test that path.
+        unpack_textures: bool,
         /// Metres per frame the capture camera slides sideways, for moving-view benchmarks.
         capture_motion: f32,
         /// A camera path to fly, with results written to `flyover_out`.
@@ -64,6 +66,7 @@ mod native {
             environment: default_environment(),
             settings: RendererSettings::default(),
             power: wgpu::PowerPreference::HighPerformance,
+            unpack_textures: false,
             capture_motion: 0.0,
             flyover: None,
             flyover_out: PathBuf::from("screenshots/flyover"),
@@ -129,6 +132,7 @@ mod native {
                     options.settings.apply_quality(quality);
                 }
                 "--low-power" => options.power = wgpu::PowerPreference::LowPower,
+                "--unpack-textures" => options.unpack_textures = true,
                 "--scale" => {
                     options.settings.render_scale =
                         value()?.parse().map_err(|e| format!("--scale: {e}"))?;
@@ -196,7 +200,8 @@ mod native {
             .capture
             .as_ref()
             .expect("capture mode requires a path");
-        let gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        let mut gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        gpu.block_compressed_textures &= !options.unpack_textures;
 
         let errors: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let sink = errors.clone();
@@ -302,7 +307,8 @@ mod native {
         let path = solstice_viewer::camera_path::CameraPath::parse(&text)?;
         std::fs::create_dir_all(&options.flyover_out)?;
 
-        let gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        let mut gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        gpu.block_compressed_textures &= !options.unpack_textures;
         let errors: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let sink = errors.clone();
         gpu.device

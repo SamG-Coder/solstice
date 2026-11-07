@@ -37,9 +37,11 @@ pub struct WebViewer {
 impl WebViewer {
     /// Creates a viewer from the bytes of a scene file. Rejects if WebGPU is unavailable or
     /// the GPU lacks required capabilities, with a message suitable for showing to the user.
+    /// `unpack_textures` acts as if the GPU had no block compression, to test that path.
     pub async fn create(
         canvas: HtmlCanvasElement,
         scene_bytes: Vec<u8>,
+        unpack_textures: bool,
     ) -> Result<WebViewer, JsValue> {
         let scene = solstice_asset::file::decode(&scene_bytes).map_err(error_string)?;
         drop(scene_bytes);
@@ -52,13 +54,14 @@ impl WebViewer {
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(error_string)?;
-        let gpu = Gpu::request(
+        let mut gpu = Gpu::request(
             &instance,
             Some(&surface),
             wgpu::PowerPreference::HighPerformance,
         )
         .await
         .map_err(error_string)?;
+        gpu.block_compressed_textures &= !unpack_textures;
 
         let gpu_errors = Arc::new(AtomicU32::new(0));
         let counter = gpu_errors.clone();
@@ -195,6 +198,11 @@ impl WebViewer {
     /// Triangles if every instance rendered its finest LOD. A double, since it can exceed 32 bits.
     pub fn source_triangles(&self) -> f64 {
         self.renderer.stats().source_triangles as f64
+    }
+
+    /// How the scene's textures are held on the GPU.
+    pub fn texture_summary(&self) -> String {
+        self.renderer.texture_summary().to_owned()
     }
 
     pub fn gpu_error_count(&self) -> u32 {

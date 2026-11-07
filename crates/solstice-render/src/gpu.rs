@@ -35,6 +35,8 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
     pub limits: wgpu::Limits,
+    /// Whether scene textures may stay in BC formats. Without this they are unpacked on load.
+    pub block_compressed_textures: bool,
 }
 
 impl Gpu {
@@ -74,16 +76,21 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("solstice"),
-                // Optional: lets the profiler time passes where the platform allows it.
+                // All optional. Timestamps let the profiler time passes where the platform
+                // allows it, and BC textures save most of the memory that scenes' textures use.
                 required_features: adapter.features()
                     & (wgpu::Features::TIMESTAMP_QUERY
-                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                        | wgpu::Features::TEXTURE_COMPRESSION_BC),
                 required_limits: limits.clone(),
                 ..Default::default()
             })
             .await
             .map_err(GpuError::Device)?;
 
+        let block_compressed_textures = device
+            .features()
+            .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let adapter_info = adapter.get_info();
         log::info!("using {} ({:?})", adapter_info.name, adapter_info.backend);
         Ok(Self {
@@ -92,6 +99,7 @@ impl Gpu {
             queue,
             adapter_info,
             limits,
+            block_compressed_textures,
         })
     }
 

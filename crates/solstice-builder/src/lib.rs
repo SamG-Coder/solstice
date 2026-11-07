@@ -29,4 +29,4 @@ mod texture;
 pub use bounds::Sphere;
 pub use dag::{build_virtual_mesh, BuildOptions};
 pub use mesh::{Mesh, Vertex};
-pub use texture::mip_chain;
+pub use texture::{compress_textures, mip_chain};

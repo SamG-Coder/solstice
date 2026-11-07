@@ -239,6 +239,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block_compression"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5ca8c67a97492f3c8263ce18d307053f8aa657e8ecbf191484676bb25ae5f4a"
+dependencies = [
+ "bytemuck",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2092,6 +2101,7 @@ dependencies = [
 name = "solstice-builder"
 version = "0.2.0"
 dependencies = [
+ "block_compression",
  "glam",
  "rayon",
  "rustc-hash 2.1.3",
@@ -2114,6 +2124,7 @@ dependencies = [
 name = "solstice-render"
 version = "0.2.0"
 dependencies = [
+ "block_compression",
  "bytemuck",
  "glam",
  "log",

@@ -72,6 +72,7 @@ impl Resolve {
             .storage_texture(DEPTH_FORMAT)
             .texture_array()
             .texture_array()
+            .texture_array()
             .sampler()
             .build(gpu, "resolve output");
         let module = shaders::module(&gpu.device, "vg/resolve.wgsl");
@@ -122,7 +123,8 @@ impl Resolve {
                     wgpu::BindingResource::TextureView(&gbuffer.motion.view),
                     wgpu::BindingResource::TextureView(&gbuffer.depth.view),
                     wgpu::BindingResource::TextureView(&scene.color_textures),
-                    wgpu::BindingResource::TextureView(&scene.surface_textures),
+                    wgpu::BindingResource::TextureView(&scene.normal_textures),
+                    wgpu::BindingResource::TextureView(&scene.material_textures),
                     wgpu::BindingResource::Sampler(&scene.material_sampler),
                 ],
             ),
