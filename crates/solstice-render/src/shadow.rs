@@ -1,7 +1,9 @@
 //! Cascaded sun shadow maps, drawn through the same cluster culling as the main view.
 //!
-//! Only the nearest cascade updates every frame. The rest take turns, which is invisible
-//! because each cascade's position is snapped to whole texels and so does not shimmer.
+//! Shadow maps are the most expensive pass on small GPUs, and the scene is static, so a
+//! cascade is only redrawn when its view changes. Views move in coarse steps to make that
+//! rare: each cascade covers slightly more than it must, so it can stay put while the
+//! camera moves. When several cascades are stale, the far ones take turns.
 
 use crate::frame::Camera;
 use crate::gpu::{Gpu, LayoutBuilder};
@@ -19,6 +21,12 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SPLITS: [f32; CASCADE_COUNT] = [12.0, 38.0, 120.0, 420.0];
 /// How far casters may lie towards the sun beyond a cascade's bounds.
 const DEPTH_REACH: f32 = 900.0;
+/// Cascades move in steps of this many texels. A whole number keeps shadow edges from
+/// crawling as they move, and a large one means they rarely need to move at all.
+const SNAP_TEXELS: f32 = 64.0;
+/// Extra radius that covers the furthest a slice can be from its snapped centre, which is
+/// half a snap step on each of three axes. The bounds test in this module checks that it is enough.
+const SNAP_PADDING: f32 = 1.07;
 
 /// Twin of `Shadows` in `lighting/deferred.wgsl`.
 #[repr(C)]
@@ -37,6 +45,8 @@ pub struct ShadowMaps {
     layer_views: Vec<wgpu::TextureView>,
     pipeline: wgpu::RenderPipeline,
     data: ShadowUniform,
+    /// What each cascade last drew, to tell when it has gone stale.
+    drawn: [Option<(Mat4, f32)>; CASCADE_COUNT],
     next_far_cascade: usize,
 }
 
@@ -129,12 +139,13 @@ impl ShadowMaps {
                 splits: Vec4::from_array(SPLITS),
                 texel_size: Vec4::ONE,
             },
+            drawn: [None; CASCADE_COUNT],
             next_far_cascade: 1,
         }
     }
 
-    /// Picks the cascades to refresh and writes their views to slots from `first_slot`.
-    /// Returns which cascades are due. On the first frame, that is all of them.
+    /// Finds the stale cascades and writes the views of those to redraw to slots from
+    /// `first_slot`. Returns which cascades are due.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
@@ -144,35 +155,34 @@ impl ShadowMaps {
         camera: &Camera,
         aspect: f32,
         sun_direction: Vec3,
-        first_frame: bool,
+        lod_threshold: f32,
     ) -> [bool; CASCADE_COUNT] {
-        let mut due = [first_frame; CASCADE_COUNT];
-        due[0] = true;
-        if !first_frame {
-            due[self.next_far_cascade] = true;
-            self.next_far_cascade = self.next_far_cascade % (CASCADE_COUNT - 1) + 1;
-        }
-
-        for cascade in 0..CASCADE_COUNT {
-            if !due[cascade] {
-                continue;
-            }
+        let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] = std::array::from_fn(|cascade| {
             let near = if cascade == 0 {
                 camera.near
             } else {
                 SPLITS[cascade - 1]
             };
-            let far = SPLITS[cascade];
-            let (view_proj, center, radius) = fit_cascade(camera, aspect, sun_direction, near, far);
+            fit_cascade(camera, aspect, sun_direction, near, SPLITS[cascade])
+        });
+        let stale: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
+            self.drawn[cascade] != Some((fits[cascade].0, lod_threshold))
+        });
+        let never_drawn: [bool; CASCADE_COUNT] =
+            std::array::from_fn(|cascade| self.drawn[cascade].is_none());
+        let due = choose_due(stale, never_drawn, &mut self.next_far_cascade);
+
+        for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
+            let (view_proj, center, radius) = fits[cascade];
+            self.drawn[cascade] = Some((view_proj, lod_threshold));
             self.data.view_proj[cascade] = view_proj;
             self.data.texel_size[cascade] = 2.0 * radius / RESOLUTION as f32;
-
             let view = PassView::orthographic(
                 view_proj,
                 center,
                 Vec2::splat(RESOLUTION as f32),
                 RESOLUTION as f32 / (2.0 * radius),
-                1.0,
+                lod_threshold,
             );
             slots.write(gpu, first_slot + cascade as u32, &view);
         }
@@ -223,6 +233,28 @@ impl ShadowMaps {
     }
 }
 
+/// Picks what to redraw. Anything never drawn goes now, since it has no usable contents.
+/// Otherwise the nearest cascade goes whenever stale, as errors there are the most visible,
+/// and at most one stale far cascade joins it, which bounds the cost of a frame.
+fn choose_due(
+    stale: [bool; CASCADE_COUNT],
+    never_drawn: [bool; CASCADE_COUNT],
+    next_far: &mut usize,
+) -> [bool; CASCADE_COUNT] {
+    let mut due = never_drawn;
+    due[0] |= stale[0];
+    let far_count = CASCADE_COUNT - 1;
+    for offset in 0..far_count {
+        let cascade = (*next_far - 1 + offset) % far_count + 1;
+        if stale[cascade] {
+            due[cascade] = true;
+            *next_far = cascade % far_count + 1;
+            break;
+        }
+    }
+    due
+}
+
 /// Fits an orthographic view around a slice of the camera frustum.
 ///
 /// Bounding the slice with a sphere keeps the projection's size constant as the camera
@@ -236,18 +268,20 @@ fn fit_cascade(camera: &Camera, aspect: f32, sun: Vec3, near: f32, far: f32) -> 
     let radius = (((far - center_distance).powi(2) + far * far * k)
         .max((center_distance - near).powi(2) + near * near * k))
     .sqrt()
-        * 1.02;
+        * SNAP_PADDING;
     let center = camera.position + camera.forward() * center_distance;
 
     let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
     let light_view = Mat4::look_to_rh(Vec3::ZERO, -sun, up);
 
-    let texel = 2.0 * radius / RESOLUTION as f32;
+    let step = 2.0 * radius / RESOLUTION as f32 * SNAP_TEXELS;
     let in_light = light_view.transform_point3(center);
     let snapped = Vec3::new(
-        (in_light.x / texel).round() * texel,
-        (in_light.y / texel).round() * texel,
-        in_light.z,
+        (in_light.x / step).round() * step,
+        (in_light.y / step).round() * step,
+        // Along the light too: otherwise any camera motion changes the view, and every
+        // frame counts as stale even though the map's contents would be the same.
+        (in_light.z / step).round() * step,
     );
     let snapped_center = light_view.inverse().transform_point3(snapped);
 
@@ -306,6 +340,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn small_moves_leave_the_cascade_where_it_is() {
+        let aspect = 1.5;
+        let mut camera = test_camera();
+        let (first, _, _) = fit_cascade(&camera, aspect, sun(), 5.0, 30.0);
+        let mut unchanged = 0;
+        for _ in 0..50 {
+            camera.position.x += 0.001;
+            let (next, _, _) = fit_cascade(&camera, aspect, sun(), 5.0, 30.0);
+            unchanged += u32::from(next == first);
+        }
+        assert!(
+            unchanged >= 40,
+            "only {unchanged} of 50 small moves kept the cascade"
+        );
+    }
+
+    #[test]
+    fn nothing_is_redrawn_when_nothing_is_stale() {
+        let mut next = 1;
+        assert_eq!(choose_due([false; 4], [false; 4], &mut next), [false; 4]);
+    }
+
+    #[test]
+    fn never_drawn_cascades_all_go_at_once() {
+        let mut next = 1;
+        assert_eq!(choose_due([true; 4], [true; 4], &mut next), [true; 4]);
+    }
+
+    #[test]
+    fn stale_far_cascades_take_turns() {
+        let mut next = 1;
+        let never = [false; 4];
+        assert_eq!(
+            choose_due([true; 4], never, &mut next),
+            [true, true, false, false]
+        );
+        assert_eq!(
+            choose_due([true; 4], never, &mut next),
+            [true, false, true, false]
+        );
+        assert_eq!(
+            choose_due([true; 4], never, &mut next),
+            [true, false, false, true]
+        );
+        assert_eq!(
+            choose_due([true; 4], never, &mut next),
+            [true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn a_single_stale_far_cascade_is_found_whatever_the_turn() {
+        let mut next = 2;
+        let stale = [false, true, false, false];
+        assert_eq!(choose_due(stale, [false; 4], &mut next), stale);
     }
 
     #[test]

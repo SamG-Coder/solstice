@@ -7,6 +7,7 @@ use crate::gi::{GiVolume, ScreenGi, ScreenGiBindings, LEVEL_COUNT};
 use crate::gpu::{Gpu, Target};
 use crate::lighting::{environment_group, environment_layout, DeferredLighting};
 use crate::post::{PostBindings, PostProcess};
+use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT};
 use crate::sky::Sky;
@@ -33,11 +34,36 @@ const SLOT_SHADOW: u32 = 2;
 const SLOT_VOXEL: u32 = SLOT_SHADOW + CASCADE_COUNT as u32;
 const SLOT_COUNT: u32 = SLOT_VOXEL + LEVEL_COUNT as u32;
 
+/// A named balance between image quality and GPU cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Quality {
+    /// Integrated graphics: fewer pixels and triangles, reconstructed by temporal upscaling.
+    Low,
+    Medium,
+    /// Discrete desktop GPUs.
+    #[default]
+    High,
+}
+
+impl Quality {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            _ => return None,
+        })
+    }
+}
+
 /// User-tunable quality settings.
 #[derive(Clone, Copy, Debug)]
 pub struct RendererSettings {
     /// Largest allowed geometric error on screen, in pixels.
     pub lod_threshold: f32,
+    /// The same, in shadow map texels. Shadow maps are the costliest pass on small GPUs, and
+    /// a shadow's outline hides far more error than a directly visible surface does.
+    pub shadow_lod_threshold: f32,
     /// Internal resolution relative to the output. Temporal upscaling fills in the rest.
     pub render_scale: f32,
     pub debug_view: DebugView,
@@ -50,10 +76,26 @@ impl Default for RendererSettings {
     fn default() -> Self {
         Self {
             lod_threshold: 1.0,
+            shadow_lod_threshold: 1.0,
             render_scale: 1.0,
             debug_view: DebugView::Lit,
             temporal_accumulation: true,
         }
+    }
+}
+
+impl RendererSettings {
+    /// Applies a quality preset, leaving diagnostic options alone.
+    pub fn apply_quality(&mut self, quality: Quality) {
+        (
+            self.render_scale,
+            self.lod_threshold,
+            self.shadow_lod_threshold,
+        ) = match quality {
+            Quality::Low => (0.6, 2.0, 4.0),
+            Quality::Medium => (0.8, 1.5, 2.0),
+            Quality::High => (1.0, 1.0, 1.0),
+        };
     }
 }
 
@@ -112,6 +154,7 @@ pub struct Renderer {
     environment: wgpu::BindGroup,
     deferred: DeferredLighting,
     post: PostProcess,
+    profiler: Option<Profiler>,
     sized: Option<SizedResources>,
     history: Option<History>,
     frame_index: u32,
@@ -172,6 +215,7 @@ impl Renderer {
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
             post: PostProcess::new(gpu, output_format),
+            profiler: Profiler::new(gpu),
             scene,
             frame_uniform,
             view_slots,
@@ -209,6 +253,11 @@ impl Renderer {
         }
     }
 
+    /// GPU milliseconds per entry of [`SECTIONS`], where the platform can measure them.
+    pub fn section_times(&self) -> Option<[f32; SECTIONS.len()]> {
+        self.profiler.as_ref().and_then(Profiler::latest_ms)
+    }
+
     /// Renders one frame to `output`, a view of a texture of the size given.
     pub fn render(
         &mut self,
@@ -229,7 +278,6 @@ impl Renderer {
 
         let aspect = render_size.0 as f32 / render_size.1 as f32;
         let parity = (self.frame_index & 1) as usize;
-        let first_frame = self.history.is_none();
 
         self.write_frame_data(gpu, camera, environment, render_size);
         let due_cascades = self.shadows.prepare(
@@ -239,7 +287,7 @@ impl Renderer {
             camera,
             aspect,
             environment.sun_direction,
-            first_frame,
+            self.settings.shadow_lod_threshold,
         );
         let volume_work = self
             .volume
@@ -251,6 +299,7 @@ impl Renderer {
                 label: Some("frame"),
             });
 
+        mark(&self.profiler, &mut encoder, section::SKY);
         self.sky.record(
             gpu,
             &mut encoder,
@@ -258,6 +307,7 @@ impl Renderer {
             camera.position.y,
         );
 
+        mark(&self.profiler, &mut encoder, section::SHADOWS);
         self.shadows.record(
             &mut encoder,
             &self.cull,
@@ -278,10 +328,12 @@ impl Renderer {
             &self.environment,
             SLOT_VOXEL,
             &volume_work,
+            self.profiler.as_ref(),
         );
 
         let sized = self.sized.as_ref().expect("resources were just created");
 
+        mark(&self.profiler, &mut encoder, section::GEOMETRY);
         // Geometry: two occlusion phases into one visibility buffer, then its G-buffer.
         sized.visibility.clear(&mut encoder);
         for (phase, slot) in [
@@ -309,8 +361,10 @@ impl Renderer {
             .record(&mut encoder, &sized.resolve, render_size);
 
         // Lighting.
+        mark(&self.profiler, &mut encoder, section::SCREEN_GI);
         self.screen_gi
             .record(&mut encoder, &sized.screen_gi, &self.environment, parity);
+        mark(&self.profiler, &mut encoder, section::LIGHTING);
         self.deferred.record(
             &mut encoder,
             &sized.deferred[parity],
@@ -319,6 +373,7 @@ impl Renderer {
         );
 
         // From the lit scene to the display.
+        mark(&self.profiler, &mut encoder, section::POST);
         let debug = self.settings.debug_view;
         let passthrough = !matches!(
             debug,
@@ -335,9 +390,16 @@ impl Renderer {
             passthrough,
         );
 
+        mark(&self.profiler, &mut encoder, section::END);
+        if let Some(profiler) = &mut self.profiler {
+            profiler.resolve(&mut encoder);
+        }
         self.main_work.capture_stats(&mut encoder);
         gpu.queue.submit([encoder.finish()]);
         self.main_work.map_stats();
+        if let Some(profiler) = &mut self.profiler {
+            profiler.request_map();
+        }
         let _ = gpu.device.poll(wgpu::PollType::Poll);
         self.frame_index = self.frame_index.wrapping_add(1);
     }
@@ -497,5 +559,11 @@ impl Renderer {
             .write(gpu, SLOT_MAIN_SECOND, &main_view(&current, 1, true));
 
         self.history = Some(current);
+    }
+}
+
+fn mark(profiler: &Option<Profiler>, encoder: &mut wgpu::CommandEncoder, section: usize) {
+    if let Some(profiler) = profiler {
+        profiler.mark(encoder, section);
     }
 }

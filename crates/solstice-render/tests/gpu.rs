@@ -13,7 +13,11 @@ fn request_gpu() -> Option<Gpu> {
         backends: wgpu::Backends::PRIMARY,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    match pollster::block_on(Gpu::request(&instance, None)) {
+    match pollster::block_on(Gpu::request(
+        &instance,
+        None,
+        wgpu::PowerPreference::HighPerformance,
+    )) {
         Ok(gpu) => Some(gpu),
         Err(error) => {
             eprintln!("skipping GPU test: {error}");
@@ -339,4 +343,26 @@ fn occlusion_culling_skips_hidden_geometry() {
         blocked.triangles,
         open.triangles
     );
+}
+
+/// Collapsed layouts and hidden frames give canvases of a pixel or two. Nothing useful can be
+/// drawn, but every pass must still be valid, or the errors never stop.
+#[test]
+fn tiny_outputs_render_without_errors() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(2), &BuildOptions::default());
+    let scene = SceneAsset {
+        meshes: vec![mesh],
+        materials: vec![white_material()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 5.0),
+        ..Default::default()
+    };
+    // `render` itself fails the test on any validation error.
+    for size in [1, 2, 3, 17, 33] {
+        render(&gpu, &scene, &camera, RendererSettings::default(), size);
+    }
 }

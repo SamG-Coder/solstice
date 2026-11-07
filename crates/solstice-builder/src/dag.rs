@@ -264,10 +264,34 @@ fn split_into_clusters(
     limits: ClusterLimits,
 ) -> Vec<Vec<Triangle>> {
     let by_position: Vec<[u32; 3]> = triangles.iter().map(|t| t.map(|c| c.position)).collect();
-    partition_triangles(&by_position, positions, limits)
-        .into_iter()
-        .map(|members| members.iter().map(|&t| triangles[t as usize]).collect())
-        .collect()
+    let mut clusters = Vec::new();
+    for members in partition_triangles(&by_position, positions, limits) {
+        let cluster: Vec<Triangle> = members.iter().map(|&t| triangles[t as usize]).collect();
+        split_until_indexable(cluster, limits.max_vertices, &mut clusters);
+    }
+    clusters
+}
+
+/// Partitioning counts welded positions, but a cluster stores one vertex for each distinct
+/// position and attribute pair. A model with many UV seams or hard edges can therefore stay
+/// within the position limit and still exceed what 8-bit indices can address. Halving keeps
+/// neighbouring triangles together, because partitioning emits them in the order they grew.
+fn split_until_indexable(
+    cluster: Vec<Triangle>,
+    max_vertices: usize,
+    out: &mut Vec<Vec<Triangle>>,
+) {
+    let mut corners: Vec<Corner> = cluster.iter().flatten().copied().collect();
+    corners.sort_unstable_by_key(|c| (c.position, c.attribute));
+    corners.dedup();
+    if corners.len() <= max_vertices {
+        out.push(cluster);
+        return;
+    }
+    let mut first = cluster;
+    let second = first.split_off(first.len() / 2);
+    split_until_indexable(first, max_vertices, out);
+    split_until_indexable(second, max_vertices, out);
 }
 
 fn triangle_bounds(triangles: &[Triangle], positions: &[Vec3]) -> Sphere {
@@ -786,6 +810,34 @@ mod tests {
         let mesh = build_virtual_mesh(&Mesh::default(), &BuildOptions::default());
         assert!(mesh.clusters.is_empty());
         assert!(mesh.nodes.is_empty());
+    }
+
+    /// Every triangle has its own attributes, as on a flat-shaded or heavily seamed model,
+    /// so a full cluster holds three vertices per triangle: more than 8 bits can index.
+    #[test]
+    fn models_made_of_seams_build_and_stay_watertight() {
+        let source = bumpy_sphere(5);
+        let mut mesh = Mesh::default();
+        for (face, triangle) in source.indices.chunks_exact(3).enumerate() {
+            for &index in triangle {
+                let mut vertex = source.vertices[index as usize];
+                vertex.uv = Vec2::new(face as f32, (face % 7) as f32);
+                mesh.indices.push(mesh.vertices.len() as u32);
+                mesh.vertices.push(vertex);
+            }
+        }
+        let built = build_virtual_mesh(&mesh, &BuildOptions::default());
+        for cluster in &built.clusters {
+            assert!(cluster.vertex_count() as usize <= MAX_CLUSTER_VERTICES);
+        }
+        for threshold in [0.0, 0.01, 0.1, 10.0] {
+            let cut = select_cut(&built, &|_, error| error, threshold);
+            assert_eq!(
+                open_edges(&built, &cut),
+                0,
+                "cracks at threshold {threshold}"
+            );
+        }
     }
 
     #[test]

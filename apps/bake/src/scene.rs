@@ -5,7 +5,7 @@ use crate::noise::{fbm, random};
 use crate::textures;
 use glam::{Mat4, Quat, Vec3};
 use rayon::prelude::*;
-use solstice_asset::{Instance, Light, Material, SceneAsset};
+use solstice_asset::{Instance, Light, Material, SceneAsset, Viewpoint};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 
 /// How much geometry to generate.
@@ -106,6 +106,7 @@ fn materials() -> Vec<Material> {
         roughness,
         normal_strength,
         base_color: [1.0; 4],
+        macro_variation: 1.0,
         ..Default::default()
     };
     vec![
@@ -628,5 +629,10 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
         lights,
         texture_size,
         textures,
+        viewpoint: Some(Viewpoint {
+            position: [20.0, 4.2, 34.0],
+            yaw: 0.6,
+            pitch: -0.04,
+        }),
     }
 }

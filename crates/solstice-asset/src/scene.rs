@@ -47,7 +47,10 @@ pub struct Material {
     pub normal_strength: f32,
     /// Index into the texture array, or -1 for an untextured material.
     pub texture_layer: i32,
-    pub _pad: [u32; 3],
+    /// How strongly to hide repetition, for textures that tile. Leave at 0 for textures made
+    /// for one object, such as scans, whose colour would otherwise be stained.
+    pub macro_variation: f32,
+    pub _pad: [u32; 2],
 }
 
 impl Default for Material {
@@ -60,7 +63,8 @@ impl Default for Material {
             uv_scale: 1.0,
             normal_strength: 1.0,
             texture_layer: -1,
-            _pad: [0; 3],
+            macro_variation: 0.0,
+            _pad: [0; 2],
         }
     }
 }
@@ -80,7 +84,8 @@ pub struct Light {
 /// One texture set: colour and surface data, with a full mip chain.
 ///
 /// * `color`: RGB base colour (sRGB), A cavity.
-/// * `surface`: RG tangent-space normal XY, B roughness multiplier, A height.
+/// * `surface`: RG tangent-space normal XY, B roughness multiplier (0.5 is neutral),
+///   A metallic multiplier.
 #[derive(Clone, Debug, Default)]
 pub struct TextureLayer {
     pub color_mips: Vec<Vec<u8>>,
@@ -95,6 +100,17 @@ pub struct Instance {
     pub transform: Mat4,
 }
 
+/// Where a viewer should start.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Viewpoint {
+    pub position: [f32; 3],
+    /// Rotation around +Y, in radians. Zero looks along -Z.
+    pub yaw: f32,
+    /// Rotation above the horizon, in radians.
+    pub pitch: f32,
+}
+
 /// A complete, self-contained scene.
 #[derive(Clone, Debug, Default)]
 pub struct SceneAsset {
@@ -105,6 +121,7 @@ pub struct SceneAsset {
     /// Edge length of the square textures in `textures`.
     pub texture_size: u32,
     pub textures: Vec<TextureLayer>,
+    pub viewpoint: Option<Viewpoint>,
 }
 
 impl SceneAsset {

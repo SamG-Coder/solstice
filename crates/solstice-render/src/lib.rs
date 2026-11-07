@@ -16,6 +16,7 @@ pub mod gi;
 pub mod gpu;
 pub mod lighting;
 pub mod post;
+pub mod profiler;
 pub mod renderer;
 pub mod scene;
 pub mod shaders;
@@ -25,4 +26,4 @@ pub mod vg;
 
 pub use frame::{Camera, DebugView, Environment};
 pub use gpu::{Gpu, GpuError};
-pub use renderer::{FrameStats, Renderer, RendererSettings};
+pub use renderer::{FrameStats, Quality, Renderer, RendererSettings};

@@ -3,13 +3,14 @@ resolver = "2"
 members = ["crates/*", "apps/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
 solstice-asset = { path = "crates/solstice-asset" }
 solstice-builder = { path = "crates/solstice-builder" }
+solstice-import = { path = "crates/solstice-import" }
 solstice-render = { path = "crates/solstice-render" }
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }

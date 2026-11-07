@@ -24,7 +24,9 @@ mod hierarchy;
 mod mesh;
 mod partition;
 mod simplify;
+mod texture;
 
 pub use bounds::Sphere;
 pub use dag::{build_virtual_mesh, BuildOptions};
 pub use mesh::{Mesh, Vertex};
+pub use texture::mip_chain;

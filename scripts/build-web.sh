@@ -24,6 +24,9 @@ mkdir -p dist/assets
   --out-dir dist/pkg \
   target/wasm32-unknown-unknown/release/solstice_viewer.wasm
 cp apps/viewer/web/index.html dist/
-cp assets/*.solstice dist/assets/
+# Compressed for the download. Browsers can unpack gzip natively, so no extra code ships.
+for scene in assets/*.solstice; do
+  gzip -9 --no-name --stdout "$scene" > "dist/assets/$(basename "$scene").gz"
+done
 
 echo "built dist/"

@@ -3,6 +3,7 @@
 //! ```text
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z]
+//! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--size WxH] [--quality Q] [--low-power]
 //! ```
 
 #[cfg(target_arch = "wasm32")]
@@ -17,8 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod native {
     use glam::Vec3;
     use solstice_asset::SceneAsset;
-    use solstice_render::{Camera, DebugView, Environment, Gpu, Renderer, RendererSettings};
-    use solstice_viewer::{default_camera, default_environment, CameraInput, FlyCamera};
+    use solstice_render::{
+        Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings,
+    };
+    use solstice_viewer::{default_environment, initial_camera, CameraInput, FlyCamera};
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -37,9 +40,18 @@ mod native {
         capture: Option<PathBuf>,
         frames: u32,
         size: (u32, u32),
-        camera: Camera,
+        /// Overrides the scene's own viewpoint.
+        camera: Option<Camera>,
         environment: Environment,
         settings: RendererSettings,
+        power: wgpu::PowerPreference,
+        /// Metres per frame the capture camera slides sideways, for moving-view benchmarks.
+        capture_motion: f32,
+        /// A camera path to fly, with results written to `flyover_out`.
+        flyover: Option<PathBuf>,
+        flyover_out: PathBuf,
+        /// Measure frame-to-frame change during a flyover. Slows the flight, so not for timing.
+        stability: bool,
     }
 
     fn parse_args() -> Result<Options, String> {
@@ -48,9 +60,14 @@ mod native {
             capture: None,
             frames: 60,
             size: (1600, 900),
-            camera: default_camera(),
+            camera: None,
             environment: default_environment(),
             settings: RendererSettings::default(),
+            power: wgpu::PowerPreference::HighPerformance,
+            capture_motion: 0.0,
+            flyover: None,
+            flyover_out: PathBuf::from("screenshots/flyover"),
+            stability: false,
         };
         let floats = |text: &str| -> Result<Vec<f32>, String> {
             text.split(',')
@@ -78,9 +95,12 @@ mod native {
                     let [x, y, z, yaw, pitch] = v[..] else {
                         return Err("--camera expects x,y,z,yaw,pitch".into());
                     };
-                    options.camera.position = Vec3::new(x, y, z);
-                    options.camera.yaw = yaw;
-                    options.camera.pitch = pitch;
+                    options.camera = Some(Camera {
+                        position: Vec3::new(x, y, z),
+                        yaw,
+                        pitch,
+                        ..Default::default()
+                    });
                 }
                 "--sun" => {
                     let v = floats(&value()?)?;
@@ -93,6 +113,24 @@ mod native {
                     let name = value()?;
                     options.settings.debug_view = DebugView::from_name(&name)
                         .ok_or_else(|| format!("unknown debug view: {name}"))?;
+                }
+                "--stability" => options.stability = true,
+                "--flyover" => options.flyover = Some(PathBuf::from(value()?)),
+                "--out" => options.flyover_out = PathBuf::from(value()?),
+                "--move" => {
+                    options.capture_motion =
+                        value()?.parse().map_err(|e| format!("--move: {e}"))?;
+                }
+                "--quality" => {
+                    let name = value()?;
+                    let quality = Quality::from_name(&name)
+                        .ok_or_else(|| format!("unknown quality: {name}"))?;
+                    options.settings.apply_quality(quality);
+                }
+                "--low-power" => options.power = wgpu::PowerPreference::LowPower,
+                "--scale" => {
+                    options.settings.render_scale =
+                        value()?.parse().map_err(|e| format!("--scale: {e}"))?;
                 }
                 "--lod" => {
                     options.settings.lod_threshold =
@@ -125,7 +163,9 @@ mod native {
         .init();
         let options = parse_args()?;
         let scene = load_scene(&options.scene)?;
-        if options.capture.is_some() {
+        if options.flyover.is_some() {
+            flyover(&options, &scene)
+        } else if options.capture.is_some() {
             capture(&options, &scene)
         } else {
             let event_loop = EventLoop::new()?;
@@ -155,7 +195,7 @@ mod native {
             .capture
             .as_ref()
             .expect("capture mode requires a path");
-        let gpu = pollster::block_on(Gpu::request(&create_instance(), None))?;
+        let gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
 
         let errors: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let sink = errors.clone();
@@ -187,10 +227,14 @@ mod native {
         let start = Instant::now();
         let mut slowest = 0.0_f32;
         let mut last_time = Instant::now();
+        let mut camera = options
+            .camera
+            .unwrap_or_else(|| initial_camera(scene.viewpoint));
         for frame in 0..options.frames {
+            camera.position += camera.right() * options.capture_motion;
             renderer.render(
                 &gpu,
-                &options.camera,
+                &camera,
                 &options.environment,
                 &view,
                 options.size,
@@ -219,6 +263,19 @@ mod native {
             stats.instances,
         );
 
+        if let Some(times) = renderer.section_times() {
+            let parts: Vec<String> = solstice_render::profiler::SECTIONS
+                .iter()
+                .zip(times)
+                .map(|(name, ms)| format!("{name} {ms:.2}"))
+                .collect();
+            println!(
+                "gpu ms: {} | total {:.2}",
+                parts.join(", "),
+                times.iter().sum::<f32>()
+            );
+        }
+
         let errors = errors.lock().expect("error sink");
         if errors.is_empty() {
             println!("saved {} with no GPU errors", path.display());
@@ -228,12 +285,232 @@ mod native {
         }
     }
 
-    fn save_png(
+    /// Flies a camera path at a fixed 60 steps per second. Writes an image for each second, plus
+    /// `frames.csv` with the time of every frame. Each frame waits for the GPU to finish, so its
+    /// time is real GPU work, not hidden by queuing, and image saving is left out of the timing.
+    fn flyover(options: &Options, scene: &SceneAsset) -> Result<(), Box<dyn std::error::Error>> {
+        const STEP: f32 = 1.0 / 60.0;
+        use solstice_render::profiler::SECTIONS;
+
+        let text = std::fs::read_to_string(
+            options
+                .flyover
+                .as_ref()
+                .expect("flyover mode requires a path"),
+        )?;
+        let path = solstice_viewer::camera_path::CameraPath::parse(&text)?;
+        std::fs::create_dir_all(&options.flyover_out)?;
+
+        let gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        let errors: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = errors.clone();
+        gpu.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                sink.lock().expect("error sink").push(error.to_string());
+            }));
+        log::info!("flying on {}", gpu.adapter_info.name);
+
+        let mut renderer = Renderer::new(&gpu, scene, CAPTURE_FORMAT, options.settings);
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("flyover"),
+            size: wgpu::Extent3d {
+                width: options.size.0,
+                height: options.size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: CAPTURE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+
+        let frames = (path.duration() / STEP) as u32;
+        let mut records: Vec<(f32, f32, u32, [f32; SECTIONS.len()])> =
+            Vec::with_capacity(frames as usize);
+        let mut previous_grid: Option<Vec<f32>> = None;
+        let mut changes: Vec<(f32, GridChange)> = Vec::new();
+        for frame in 0..=frames {
+            let time = frame as f32 * STEP;
+            let start = Instant::now();
+            renderer.render(
+                &gpu,
+                &path.sample(time),
+                &options.environment,
+                &view,
+                options.size,
+                STEP,
+            );
+            gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+            let elapsed = start.elapsed().as_secs_f32() * 1000.0;
+            let sections = renderer.section_times().unwrap_or_default();
+            records.push((time, elapsed, renderer.stats().triangles, sections));
+            if options.stability {
+                let pixels = read_pixels(&gpu, &target, options.size)?;
+                let grid = luma_grid(&pixels, options.size);
+                if let Some(previous) = &previous_grid {
+                    changes.push((time, grid_change(previous, &grid)));
+                }
+                previous_grid = Some(grid);
+            }
+            if frame % 60 == 0 {
+                let second = frame / 60;
+                save_png(
+                    &gpu,
+                    &target,
+                    options.size,
+                    &options.flyover_out.join(format!("{second:03}.png")),
+                )?;
+            }
+        }
+
+        let mut csv = format!("time,ms,triangles,{}\n", SECTIONS.join(","));
+        for (time, ms, triangles, sections) in &records {
+            let parts: Vec<String> = sections.iter().map(|s| format!("{s:.3}")).collect();
+            csv += &format!("{time:.3},{ms:.3},{triangles},{}\n", parts.join(","));
+        }
+        std::fs::write(options.flyover_out.join("frames.csv"), csv)?;
+
+        // The first frames build everything from nothing, which is loading, not stutter.
+        let flight = &records[records.len().min(30)..];
+        let mut sorted: Vec<f32> = flight.iter().map(|r| r.1).collect();
+        sorted.sort_by(f32::total_cmp);
+        let percentile = |p: f32| sorted[((sorted.len() - 1) as f32 * p) as usize];
+        let count_over = |limit: f32| flight.iter().filter(|r| r.1 > limit).count();
+        println!(
+            "{} frames | avg {:.2} ms | p50 {:.2} p95 {:.2} p99 {:.2} max {:.2} | over 16.7 ms: {}, over 33 ms: {} | startup {:.0} ms",
+            flight.len(),
+            sorted.iter().sum::<f32>() / sorted.len() as f32,
+            percentile(0.5),
+            percentile(0.95),
+            percentile(0.99),
+            sorted[sorted.len() - 1],
+            count_over(16.7),
+            count_over(33.3),
+            records[0].1,
+        );
+        for (index, name) in SECTIONS.iter().enumerate() {
+            let (sum, max) = flight.iter().fold((0.0, 0.0_f32), |(sum, max), r| {
+                (sum + r.3[index], max.max(r.3[index]))
+            });
+            println!(
+                "  {name:10} avg {:7.2} ms   max {:7.2} ms",
+                sum / flight.len() as f32,
+                max
+            );
+        }
+        let mut worst: Vec<_> = flight.iter().collect();
+        worst.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for record in worst.iter().take(4) {
+            println!(
+                "  slow frame at {:5.2}s: {:6.2} ms, {} triangles",
+                record.0, record.1, record.2
+            );
+        }
+        if options.stability {
+            report_stability(&changes);
+        }
+
+        let errors = errors.lock().expect("error sink");
+        if errors.is_empty() {
+            println!("no GPU errors");
+            Ok(())
+        } else {
+            Err(format!("{} GPU errors, first:\n{}", errors.len(), errors[0]).into())
+        }
+    }
+
+    /// How much a frame differs from the one before, on a coarse grid of average brightness.
+    #[derive(Clone, Copy)]
+    struct GridChange {
+        mean: f32,
+        worst_tile: f32,
+        worst_at: (usize, usize),
+    }
+
+    const GRID: (usize, usize) = (48, 27);
+
+    fn luma_grid(pixels: &[u8], size: (u32, u32)) -> Vec<f32> {
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let mut sums = vec![0.0_f32; GRID.0 * GRID.1];
+        let mut counts = vec![0u32; GRID.0 * GRID.1];
+        for y in 0..height {
+            for x in 0..width {
+                let p = &pixels[(y * width + x) * 4..][..3];
+                let tile = (y * GRID.1 / height) * GRID.0 + x * GRID.0 / width;
+                sums[tile] += 0.3 * f32::from(p[0]) + 0.6 * f32::from(p[1]) + 0.1 * f32::from(p[2]);
+                counts[tile] += 1;
+            }
+        }
+        sums.iter()
+            .zip(&counts)
+            .map(|(s, &c)| s / c.max(1) as f32)
+            .collect()
+    }
+
+    fn grid_change(a: &[f32], b: &[f32]) -> GridChange {
+        let mut sum = 0.0;
+        let mut worst = 0.0_f32;
+        let mut worst_at = (0, 0);
+        for (index, (x, y)) in a.iter().zip(b).enumerate() {
+            let d = (x - y).abs();
+            sum += d;
+            if d > worst {
+                worst = d;
+                worst_at = (index % GRID.0, index / GRID.0);
+            }
+        }
+        GridChange {
+            mean: sum / a.len() as f32,
+            worst_tile: worst,
+            worst_at,
+        }
+    }
+
+    /// Camera motion changes every frame steadily. A flicker or pop is a jump well above the
+    /// frames around it, so each frame is compared with the median of its neighbours.
+    fn report_stability(changes: &[(f32, GridChange)]) {
+        const WINDOW: usize = 15;
+        const POP_RATIO: f32 = 3.0;
+        const POP_MINIMUM: f32 = 3.0;
+        let flight = &changes[changes.len().min(30)..];
+        let mut pops: Vec<(f32, f32, f32, (usize, usize))> = Vec::new();
+        for index in 0..flight.len() {
+            let start = index.saturating_sub(WINDOW);
+            let end = (index + WINDOW + 1).min(flight.len());
+            let mut around: Vec<f32> = flight[start..end].iter().map(|c| c.1.worst_tile).collect();
+            around.sort_by(f32::total_cmp);
+            let median = around[around.len() / 2];
+            let here = flight[index].1.worst_tile;
+            if here > median * POP_RATIO && here > POP_MINIMUM {
+                pops.push((flight[index].0, here, median, flight[index].1.worst_at));
+            }
+        }
+        let mean = flight.iter().map(|c| c.1.mean).sum::<f32>() / flight.len().max(1) as f32;
+        let worst = flight.iter().map(|c| c.1.worst_tile).fold(0.0, f32::max);
+        let worst_time = flight
+            .iter()
+            .find(|c| c.1.worst_tile == worst)
+            .map_or(0.0, |c| c.0);
+        println!(
+            "stability: mean change {mean:.2}/255 per frame, worst tile {worst:.1}/255 at {worst_time:.2}s, {} sudden jumps",
+            pops.len()
+        );
+        pops.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (time, here, median, at) in pops.iter().take(12) {
+            println!(
+                "  jump at {time:5.2}s: tile {at:?} of {GRID:?} changed {here:.1}, typical there {median:.1}"
+            );
+        }
+    }
+
+    fn read_pixels(
         gpu: &Gpu,
         texture: &wgpu::Texture,
         size: (u32, u32),
-        path: &PathBuf,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let row_bytes = size.0 * 4;
         let aligned = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -270,6 +547,17 @@ mod native {
         for row in data.chunks_exact(aligned as usize) {
             pixels.extend_from_slice(&row[..row_bytes as usize]);
         }
+        drop(data);
+        Ok(pixels)
+    }
+
+    fn save_png(
+        gpu: &Gpu,
+        texture: &wgpu::Texture,
+        size: (u32, u32),
+        path: &PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let pixels = read_pixels(gpu, texture, size)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -319,7 +607,8 @@ mod native {
             );
             let instance = create_instance();
             let surface = instance.create_surface(window.clone())?;
-            let gpu = pollster::block_on(Gpu::request(&instance, Some(&surface)))?;
+            let gpu =
+                pollster::block_on(Gpu::request(&instance, Some(&surface), self.options.power))?;
 
             let size = window.inner_size();
             let mut config = surface
@@ -336,7 +625,11 @@ mod native {
                 config,
                 gpu,
                 renderer,
-                camera: FlyCamera::new(self.options.camera),
+                camera: FlyCamera::new(
+                    self.options
+                        .camera
+                        .unwrap_or_else(|| initial_camera(self.scene.viewpoint)),
+                ),
                 last_frame: Instant::now(),
                 title_timer: 0.0,
                 frames_since_title: 0,

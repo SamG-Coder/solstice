@@ -9,4 +9,4 @@ pub mod gpu;
 pub mod scene;
 
 pub use gpu::{PackedCluster, PackedNode, PackedVertex};
-pub use scene::{Instance, Light, Material, SceneAsset, TextureLayer, VirtualMesh};
+pub use scene::{Instance, Light, Material, SceneAsset, TextureLayer, Viewpoint, VirtualMesh};

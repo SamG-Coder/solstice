@@ -5,13 +5,13 @@
 //! can go straight to the GPU.
 
 use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
-use crate::scene::{Instance, Light, Material, SceneAsset, TextureLayer, VirtualMesh};
+use crate::scene::{Instance, Light, Material, SceneAsset, TextureLayer, Viewpoint, VirtualMesh};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::fmt;
 
 const MAGIC: [u8; 8] = *b"SOLSTICE";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +97,9 @@ pub fn encode(scene: &SceneAsset) -> Vec<u8> {
         }
     }
 
+    w.pod(&u32::from(scene.viewpoint.is_some()));
+    w.pod(&scene.viewpoint.unwrap_or_default());
+
     w.finish()
 }
 
@@ -169,6 +172,9 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
         textures.push(layer);
     }
 
+    let has_viewpoint: u32 = r.pod()?;
+    let viewpoint: Viewpoint = r.pod()?;
+
     Ok(SceneAsset {
         meshes,
         materials,
@@ -176,6 +182,7 @@ pub fn decode(bytes: &[u8]) -> Result<SceneAsset, DecodeError> {
         lights,
         texture_size,
         textures,
+        viewpoint: (has_viewpoint != 0).then_some(viewpoint),
     })
 }
 
@@ -270,6 +277,11 @@ mod tests {
                 color_mips: vec![vec![1, 2, 3, 4]],
                 surface_mips: vec![vec![5, 6, 7, 8]],
             }],
+            viewpoint: Some(Viewpoint {
+                position: [1.0, 2.0, 3.0],
+                yaw: 0.5,
+                pitch: -0.25,
+            }),
         }
     }
 
@@ -282,6 +294,7 @@ mod tests {
         assert_eq!(decoded.meshes[0].triangles, scene.meshes[0].triangles);
         assert_eq!(decoded.materials, scene.materials);
         assert_eq!(decoded.lights, scene.lights);
+        assert_eq!(decoded.viewpoint, scene.viewpoint);
         assert_eq!(decoded.instances[0].transform, scene.instances[0].transform);
         assert_eq!(
             decoded.textures[0].surface_mips,
