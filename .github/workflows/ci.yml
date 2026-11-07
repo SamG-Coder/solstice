@@ -1,9 +1,18 @@
 name: CI
 
+# Changes to documentation alone build nothing, so they skip the build and tests.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
 
 jobs:
   check:
