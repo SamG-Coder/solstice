@@ -23,14 +23,17 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Bake the temple
-        run: cargo run --release -p bake -- --quality web --output assets/web.solstice
-      - name: Fetch the cove's scans
-        run: python3 scripts/fetch-scans.py scenes/cove.txt 2k
-      - name: Bake the cove
-        run: cargo run --release -p bake -- --scene scenes/cove.txt --texture-size 1024 --output assets/cove.solstice
-      - name: Bake the forest
-        run: cargo run --release -p bake -- --forest --output assets/forest.solstice
+      # Scenes are baked on a PC and published as a release (scripts/publish-scenes.py), since
+      # baking them here takes long and serving them took too long to sync. This fetches the
+      # release that scenes/release.txt names.
+      - name: Download the baked scenes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(tr -d '[:space:]' < scenes/release.txt)
+          mkdir -p assets
+          gh release download "$tag" --pattern '*.solstice' --dir assets
+          ls -l assets
       - name: Build the site
         run: bash scripts/build-web.sh
       - uses: actions/upload-pages-artifact@v3
@@ -46,3 +49,6 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          # Hundreds of megabytes of scenes take longer to sync than the default ten minutes.
+          timeout: 1800000
