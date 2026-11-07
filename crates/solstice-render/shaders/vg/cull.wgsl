@@ -8,6 +8,11 @@
 // depth, which is mostly right, and defers everything it rejects to a retry list.
 // After that result is rasterized and a fresh depth pyramid built, phase 1 re-tests
 // the retry list and draws whatever had been wrongly rejected.
+//
+// Not all of a scene need be on the GPU. Leaf nodes say whether their page is installed, and
+// every view records which pages it reached, so the CPU can load them. A cluster draws, however
+// coarse it is, while the set simplified into it isn't installed. So a parent keeps drawing
+// until its children arrive, and since the CPU installs parents first, the cut stays watertight.
 
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
@@ -19,6 +24,20 @@ struct QueueEntry {
 }
 
 const CLUSTER_BIT: u32 = 0x80000000u;
+// Bits of `Node.is_leaf`. Twins of the constants in solstice-asset's `gpu` module.
+const NODE_INSTALLED: u32 = 0x40000000u;
+const NODE_PAGE_MASK: u32 = 0x3fffffffu;
+const CLUSTER_CHILDREN_MISSING: u32 = 0x10000u;
+// A request that only says "seen, but occluded": keep the page, but don't load it for this.
+const REQUEST_KEEP: u32 = 1u;
+const REQUEST_LOWEST_LOAD: u32 = 2u;
+// Requests per pixel of error. Fine enough to order pages, coarse enough never to overflow.
+const REQUEST_PER_PIXEL: f32 = 16.0;
+const REQUEST_MAX_PIXELS: f32 = 100000.0;
+// Shadow and voxel views only affect the image indirectly, so they yield to the main camera.
+const REQUEST_ORTHO_WEIGHT: f32 = 0.125;
+// `Instance.texture_info` of a material with no texture.
+const NO_TEXTURE: u32 = 0xffffffffu;
 // Clusters projecting smaller than this are rasterized in the compute shader.
 const SOFTWARE_MAX_DIAMETER_PX: f32 = 40.0;
 
@@ -32,6 +51,9 @@ const SOFTWARE_MAX_DIAMETER_PX: f32 = 40.0;
 @group(1) @binding(1) var<storage, read_write> queue: array<QueueEntry>;
 @group(1) @binding(2) var<storage, read_write> retry: array<QueueEntry>;
 @group(1) @binding(3) var<storage, read_write> visible: array<VisibleCluster>;
+// Per page: 0 if not reached this frame, else how much it is wanted. See `residency.rs`.
+// From the end, per texture layer: the edge a texture must have to look sharp in this frame.
+@group(1) @binding(4) var<storage, read_write> page_requests: array<atomic<u32>>;
 
 fn push_queue(entry: QueueEntry) {
     let slot = atomicAdd(&state.write_head, 1u);
@@ -126,6 +148,22 @@ fn passes_occlusion(center: vec3f, radius: f32) -> bool {
     return nearest_depth >= farthest;
 }
 
+// Works out how many texels across its texture this cluster could show: its pixels per object
+// unit, divided by the texture repeats per object unit.
+fn request_texture_detail(cluster: Cluster, instance: Instance, distance: f32) {
+    let density_code = cluster.counts >> 24u;
+    if view.is_ortho != 0u || instance.texture_info == NO_TEXTURE || density_code == 0u {
+        return;
+    }
+    let layer = instance.texture_info >> 16u;
+    let log2_uv_scale = f32(instance.texture_info & 0xffffu) / 256.0 - 128.0;
+    let log2_density = f32(density_code) / 8.0 - 16.0;
+    let pixels_per_unit = view.lod_scale * instance.max_scale / max(distance, view.near);
+    let edge = pixels_per_unit * exp2(-log2_density - log2_uv_scale);
+    let slot = arrayLength(&page_requests) - 1u - layer;
+    atomicMax(&page_requests[slot], u32(min(edge, 65536.0)));
+}
+
 fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     let cluster = clusters[cluster_index];
     let center = transform_point(instance, cluster.center);
@@ -149,6 +187,7 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
         }
     }
     emit_cluster(entry.instance, cluster_index, software);
+    request_texture_detail(cluster, instance, length(center - view.camera_position) - radius);
     atomicAdd(&state.triangle_count, cluster_triangle_count(cluster));
 }
 
@@ -175,13 +214,15 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let node = nodes[entry.item];
+    let page = node.is_leaf & NODE_PAGE_MASK;
 
     // If even the coarsest parent below is good enough, everything below is finer
     // than required and this subtree cannot contribute to the cut.
     let lod_center = transform_point(instance, node.lod_center);
     let lod_radius = node.lod_radius * instance.max_scale;
     let scaled_error = node.max_parent_error * instance.max_scale;
-    if projected_error(lod_center, lod_radius, scaled_error) <= view.lod_threshold {
+    let parent_pixels = projected_error(lod_center, lod_radius, scaled_error);
+    if parent_pixels <= view.lod_threshold {
         return;
     }
 
@@ -194,6 +235,9 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
         if view.phase == 0u {
             push_retry(entry);
         }
+        if node.is_leaf != 0u {
+            atomicMax(&page_requests[page], REQUEST_KEEP);
+        }
         return;
     }
 
@@ -204,15 +248,24 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
 
-    // Leaf: the parent is too coarse for all these siblings, so each one is in the
-    // cut exactly when it is itself fine enough.
+    // Leaf: this set could improve the image, so its page is wanted.
+    let weight = select(1.0, REQUEST_ORTHO_WEIGHT, view.is_ortho != 0u);
+    let wanted = min(parent_pixels, REQUEST_MAX_PIXELS) * weight * REQUEST_PER_PIXEL;
+    atomicMax(&page_requests[page], REQUEST_LOWEST_LOAD + u32(wanted));
+    if (node.is_leaf & NODE_INSTALLED) == 0u {
+        return;
+    }
+
+    // The parent is too coarse for all these siblings, so each one is in the cut when it is
+    // itself fine enough, or nothing finer is here to replace it.
     for (var i = 0u; i < node.count; i++) {
         let cluster_index = node.first + i;
         let cluster = clusters[cluster_index];
         let own_center = transform_point(instance, cluster.lod_center);
         let own_radius = cluster.lod_radius * instance.max_scale;
         let own_error = cluster.lod_error * instance.max_scale;
-        if projected_error(own_center, own_radius, own_error) <= view.lod_threshold {
+        if projected_error(own_center, own_radius, own_error) <= view.lod_threshold
+            || (cluster.counts & CLUSTER_CHILDREN_MISSING) != 0u {
             try_emit(entry, cluster_index, instance);
         }
     }

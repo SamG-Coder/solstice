@@ -24,10 +24,53 @@
 @group(1) @binding(2) var out_emissive: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(3) var out_motion: texture_storage_2d<rg32float, write>;
 @group(1) @binding(4) var out_depth: texture_storage_2d<r32float, write>;
-@group(1) @binding(5) var color_textures: texture_2d_array<f32>;
-@group(1) @binding(6) var normal_textures: texture_2d_array<f32>;
-@group(1) @binding(7) var material_textures: texture_2d_array<f32>;
-@group(1) @binding(8) var material_sampler: sampler;
+// Each texture lives in one of three arrays, per `Material.texture_tier`.
+@group(1) @binding(5) var material_sampler: sampler;
+@group(1) @binding(6) var base_color: texture_2d_array<f32>;
+@group(1) @binding(7) var base_normal: texture_2d_array<f32>;
+@group(1) @binding(8) var base_material: texture_2d_array<f32>;
+@group(1) @binding(9) var middle_color: texture_2d_array<f32>;
+@group(1) @binding(10) var middle_normal: texture_2d_array<f32>;
+@group(1) @binding(11) var middle_material: texture_2d_array<f32>;
+@group(1) @binding(12) var top_color: texture_2d_array<f32>;
+@group(1) @binding(13) var top_normal: texture_2d_array<f32>;
+@group(1) @binding(14) var top_material: texture_2d_array<f32>;
+
+const TIER_MIDDLE: u32 = 1u;
+const TIER_TOP: u32 = 2u;
+
+fn sample_color(tier: u32, uv: vec2f, layer: i32, dx: vec2f, dy: vec2f) -> vec4f {
+    switch tier {
+        case TIER_TOP: { return textureSampleGrad(top_color, material_sampler, uv, layer, dx, dy); }
+        case TIER_MIDDLE: { return textureSampleGrad(middle_color, material_sampler, uv, layer, dx, dy); }
+        default: { return textureSampleGrad(base_color, material_sampler, uv, layer, dx, dy); }
+    }
+}
+
+// The texture's average colour, from its highest mip.
+fn average_color(tier: u32, uv: vec2f, layer: i32) -> vec3f {
+    switch tier {
+        case TIER_TOP: { return textureSampleLevel(top_color, material_sampler, uv, layer, 16.0).rgb; }
+        case TIER_MIDDLE: { return textureSampleLevel(middle_color, material_sampler, uv, layer, 16.0).rgb; }
+        default: { return textureSampleLevel(base_color, material_sampler, uv, layer, 16.0).rgb; }
+    }
+}
+
+fn sample_normal(tier: u32, uv: vec2f, layer: i32, dx: vec2f, dy: vec2f) -> vec2f {
+    switch tier {
+        case TIER_TOP: { return textureSampleGrad(top_normal, material_sampler, uv, layer, dx, dy).rg; }
+        case TIER_MIDDLE: { return textureSampleGrad(middle_normal, material_sampler, uv, layer, dx, dy).rg; }
+        default: { return textureSampleGrad(base_normal, material_sampler, uv, layer, dx, dy).rg; }
+    }
+}
+
+fn sample_material(tier: u32, uv: vec2f, layer: i32, dx: vec2f, dy: vec2f) -> vec2f {
+    switch tier {
+        case TIER_TOP: { return textureSampleGrad(top_material, material_sampler, uv, layer, dx, dy).rg; }
+        case TIER_MIDDLE: { return textureSampleGrad(middle_material, material_sampler, uv, layer, dx, dy).rg; }
+        default: { return textureSampleGrad(base_material, material_sampler, uv, layer, dx, dy).rg; }
+    }
+}
 
 // Perspective-correct barycentrics of a pixel inside a triangle.
 fn barycentrics(clip: array<vec4f, 3>, ndc: vec2f) -> vec3f {
@@ -57,16 +100,15 @@ fn interp3(b: vec3f, a0: vec3f, a1: vec3f, a2: vec3f) -> vec3f {
 // Hides the repetition of a tiling texture, using only that texture. A second copy, rotated and
 // at a different scale, is mixed in so that its grid never lines up with the first. Then two far
 // larger copies vary the brightness, which breaks up the pattern seen from a distance.
-fn hide_tiling(tint: vec3f, color: vec4f, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f, layer: i32, strength: f32) -> vec3f {
+fn hide_tiling(tint: vec3f, color: vec4f, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f, tier: u32, layer: i32, strength: f32) -> vec3f {
     const ROTATION: mat2x2f = mat2x2f(0.799, 0.602, -0.602, 0.799);
     const SECOND_SCALE: f32 = 0.73;
     const LARGE_SCALE_A: f32 = 0.083;
     const LARGE_SCALE_B: f32 = 0.0137;
 
     let second_transform = ROTATION * SECOND_SCALE;
-    let second = textureSampleGrad(
-        color_textures,
-        material_sampler,
+    let second = sample_color(
+        tier,
         second_transform * uv,
         layer,
         second_transform * duv_dx,
@@ -75,9 +117,9 @@ fn hide_tiling(tint: vec3f, color: vec4f, uv: vec2f, duv_dx: vec2f, duv_dy: vec2
     let mixed = mix(color.rgb, second, 0.5 * strength);
 
     // The highest mip is the texture's average, which makes these ratios centre on one.
-    let average = max(luminance(textureSampleLevel(color_textures, material_sampler, uv, layer, 16.0).rgb), 0.01);
-    let large_a = textureSampleGrad(color_textures, material_sampler, uv * LARGE_SCALE_A, layer, duv_dx * LARGE_SCALE_A, duv_dy * LARGE_SCALE_A).rgb;
-    let large_b = textureSampleGrad(color_textures, material_sampler, ROTATION * uv * LARGE_SCALE_B, layer, ROTATION * duv_dx * LARGE_SCALE_B, ROTATION * duv_dy * LARGE_SCALE_B).rgb;
+    let average = max(luminance(average_color(tier, uv, layer)), 0.01);
+    let large_a = sample_color(tier, uv * LARGE_SCALE_A, layer, duv_dx * LARGE_SCALE_A, duv_dy * LARGE_SCALE_A).rgb;
+    let large_b = sample_color(tier, ROTATION * uv * LARGE_SCALE_B, layer, ROTATION * duv_dx * LARGE_SCALE_B, ROTATION * duv_dy * LARGE_SCALE_B).rgb;
     let variation = clamp(luminance(large_a) * luminance(large_b) / (average * average), 0.6, 1.45);
     return tint * mixed * mix(1.0, variation, strength);
 }
@@ -162,14 +204,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var cavity = 1.0;
     var metallic = material.metallic;
     if material.texture_layer >= 0 {
-        let layer = material.texture_layer;
+        let tier = material.texture_tier;
+        let layer = i32(material.texture_slot);
         let sample_dx = duv_dx * frame.mip_scale;
         let sample_dy = duv_dy * frame.mip_scale;
-        let color = textureSampleGrad(color_textures, material_sampler, uv, layer, sample_dx, sample_dy);
-        let normal_map = textureSampleGrad(normal_textures, material_sampler, uv, layer, sample_dx, sample_dy).rg;
-        let material_map = textureSampleGrad(material_textures, material_sampler, uv, layer, sample_dx, sample_dy).rg;
+        let color = sample_color(tier, uv, layer, sample_dx, sample_dy);
+        let normal_map = sample_normal(tier, uv, layer, sample_dx, sample_dy);
+        let material_map = sample_material(tier, uv, layer, sample_dx, sample_dy);
         if material.macro_variation > 0.0 {
-            albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, layer, material.macro_variation);
+            albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, tier, layer, material.macro_variation);
         } else {
             albedo *= color.rgb;
         }

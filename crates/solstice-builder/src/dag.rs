@@ -10,9 +10,12 @@ use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use solstice_asset::gpu::{
-    pack_triangle, MAX_CLUSTER_TRIANGLES, MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
+    encode_uv_density, pack_triangle, CLUSTER_UV_DENSITY_SHIFT, MAX_CLUSTER_TRIANGLES,
+    MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
 };
+use solstice_asset::paged::{ClusterSet, ROOT_ROUND};
 use solstice_asset::{PackedCluster, PackedVertex, VirtualMesh};
+use std::ops::Range;
 
 /// Tuning parameters for [`build_virtual_mesh`].
 #[derive(Clone, Copy, Debug)]
@@ -49,11 +52,24 @@ struct BuildCluster {
     has_parent: bool,
 }
 
+/// Clusters that swap for the same parents, on their way to becoming one hierarchy leaf.
+struct SiblingSet {
+    members: Vec<u32>,
+    parent_bounds: Sphere,
+    parent_error: f32,
+    round: u32,
+    generated: Range<u32>,
+}
+
 /// A group of clusters that was successfully simplified.
 struct BuiltGroup {
     lod_bounds: Sphere,
     error: f32,
     children: Vec<u32>,
+    /// Which pass of simplification made this group.
+    round: u32,
+    /// The clusters simplified from this group.
+    generated: Range<u32>,
 }
 
 /// Mesh data after welding onto the 16-bit grid.
@@ -215,10 +231,13 @@ fn build_level(
         for &member in &result.members {
             clusters[member as usize].has_parent = true;
         }
+        let first_generated = clusters.len() as u32;
         groups.push(BuiltGroup {
             lod_bounds: result.lod_bounds,
             error: result.error,
             children: result.members,
+            round: level,
+            generated: first_generated..first_generated + result.clusters.len() as u32,
         });
         for triangles in result.clusters {
             let bounds = triangle_bounds(&triangles, &welded.positions);
@@ -427,22 +446,35 @@ fn pack(
     }
 
     // Sibling sets: children of one group, then parentless clusters in small runs.
-    let mut sibling_sets: Vec<(Vec<u32>, Sphere, f32)> = groups
+    let mut sibling_sets: Vec<SiblingSet> = groups
         .iter()
-        .map(|group| (group.children.clone(), group.lod_bounds, group.error))
+        .map(|group| SiblingSet {
+            members: group.children.clone(),
+            parent_bounds: group.lod_bounds,
+            parent_error: group.error,
+            round: group.round,
+            generated: group.generated.clone(),
+        })
         .collect();
     let roots: Vec<u32> = (0..clusters.len() as u32)
         .filter(|&c| !clusters[c as usize].has_parent)
         .collect();
     for run in roots.chunks(16) {
-        let bounds = Sphere::merged_all(run.iter().map(|&c| clusters[c as usize].lod_bounds));
-        sibling_sets.push((run.to_vec(), bounds, ROOT_PARENT_ERROR));
+        sibling_sets.push(SiblingSet {
+            members: run.to_vec(),
+            parent_bounds: Sphere::merged_all(run.iter().map(|&c| clusters[c as usize].lod_bounds)),
+            parent_error: ROOT_PARENT_ERROR,
+            round: ROOT_ROUND,
+            generated: 0..0,
+        });
     }
 
+    let mut packed_index = vec![0u32; clusters.len()];
     let mut leaves = Vec::with_capacity(sibling_sets.len());
-    for (members, parent_lod_bounds, parent_error) in sibling_sets {
+    for set in &sibling_sets {
         let first_cluster = out.clusters.len() as u32;
-        for &member in &members {
+        for &member in &set.members {
+            packed_index[member as usize] = out.clusters.len() as u32;
             let packed = pack_cluster(
                 welded,
                 &clusters[member as usize],
@@ -452,12 +484,27 @@ fn pack(
             out.clusters.push(packed);
         }
         leaves.push(Leaf {
-            level: clusters[members[0] as usize].level,
+            level: clusters[set.members[0] as usize].level,
             first_cluster,
-            cluster_count: members.len() as u32,
-            bounds: Sphere::merged_all(members.iter().map(|&m| clusters[m as usize].bounds)),
-            parent_lod_bounds,
-            parent_error,
+            cluster_count: set.members.len() as u32,
+            bounds: Sphere::merged_all(set.members.iter().map(|&m| clusters[m as usize].bounds)),
+            parent_lod_bounds: set.parent_bounds,
+            parent_error: set.parent_error,
+        });
+    }
+
+    // Now that clusters have their final positions, record which ones replace each set.
+    for (set, leaf) in sibling_sets.iter().zip(&leaves) {
+        let first_generated = out.generated.len() as u32;
+        out.generated
+            .extend(set.generated.clone().map(|c| packed_index[c as usize]));
+        out.sets.push(ClusterSet {
+            first_cluster: leaf.first_cluster,
+            cluster_count: leaf.cluster_count,
+            first_generated,
+            generated_count: set.generated.len() as u32,
+            round: set.round,
+            ..Default::default()
         });
     }
 
@@ -501,8 +548,23 @@ fn pack_cluster(
         lod_error: cluster.lod_error,
         vertex_offset,
         triangle_offset,
-        counts: local.len() as u32 | (cluster.triangles.len() as u32) << 8,
+        counts: local.len() as u32
+            | (cluster.triangles.len() as u32) << 8
+            | encode_uv_density(uv_density(welded, &cluster.triangles)) << CLUSTER_UV_DENSITY_SHIFT,
     }
+}
+
+/// Texture repeats per object-space unit across some triangles. It's an area ratio, so seams
+/// and slivers with wild UVs count only as much as their small area.
+fn uv_density(welded: &WeldedMesh, triangles: &[Triangle]) -> f32 {
+    let (mut uv_area, mut area) = (0.0, 0.0);
+    for triangle in triangles {
+        let p = triangle.map(|corner| welded.positions[corner.position as usize]);
+        let uv = triangle.map(|corner| welded.attributes[corner.attribute as usize].uv);
+        area += (p[1] - p[0]).cross(p[2] - p[0]).length();
+        uv_area += (uv[1] - uv[0]).perp_dot(uv[2] - uv[0]).abs();
+    }
+    (uv_area / area.max(1.0e-12)).sqrt()
 }
 
 fn pack_vertex(welded: &WeldedMesh, corner: Corner) -> PackedVertex {
@@ -530,14 +592,14 @@ fn pack_vertex(welded: &WeldedMesh, corner: Corner) -> PackedVertex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mesh::Vertex;
     use solstice_asset::gpu::unpack_triangle;
 
     /// A closed subdivided icosphere with bumps, so simplification has real
     /// geometric error to measure.
-    fn bumpy_sphere(subdivisions: u32) -> Mesh {
+    pub(crate) fn bumpy_sphere(subdivisions: u32) -> Mesh {
         let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
         let mut positions: Vec<Vec3> = [
             [-1.0, t, 0.0],
@@ -649,7 +711,7 @@ mod tests {
     }
 
     /// Counts edges in the cut that are not shared by exactly two triangles.
-    fn open_edges(mesh: &VirtualMesh, selected: &[u32]) -> usize {
+    pub(crate) fn open_edges(mesh: &VirtualMesh, selected: &[u32]) -> usize {
         let mut uses: FxHashMap<([u16; 3], [u16; 3]), u32> = FxHashMap::default();
         for &index in selected {
             let cluster = mesh.clusters[index as usize];
@@ -677,6 +739,39 @@ mod tests {
 
     fn built(subdivisions: u32) -> VirtualMesh {
         build_virtual_mesh(&bumpy_sphere(subdivisions), &BuildOptions::default())
+    }
+
+    /// A flat 2 by 2 quad with UVs running 0 to 1 repeats once per 2 units.
+    #[test]
+    fn uv_density_measures_repeats_per_unit() {
+        let welded = WeldedMesh {
+            positions: vec![Vec3::ZERO, Vec3::X * 2.0, Vec3::Y * 2.0],
+            attributes: vec![
+                Attribute {
+                    normal: Vec3::Z,
+                    uv: Vec2::ZERO,
+                },
+                Attribute {
+                    normal: Vec3::Z,
+                    uv: Vec2::X,
+                },
+                Attribute {
+                    normal: Vec3::Z,
+                    uv: Vec2::Y,
+                },
+            ],
+            triangles: Vec::new(),
+            origin: Vec3::ZERO,
+            step: 1.0,
+            uv_origin: Vec2::ZERO,
+            uv_step: Vec2::ONE,
+        };
+        let corner = |index| Corner {
+            position: index,
+            attribute: index,
+        };
+        let density = uv_density(&welded, &[[corner(0), corner(1), corner(2)]]);
+        assert!((density - 0.5).abs() < 1.0e-5, "{density}");
     }
 
     #[test]

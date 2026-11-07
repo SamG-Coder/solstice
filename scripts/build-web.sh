@@ -24,9 +24,10 @@ mkdir -p dist/assets
   --out-dir dist/pkg \
   target/wasm32-unknown-unknown/release/solstice_viewer.wasm
 cp apps/viewer/web/index.html dist/
-# Compressed for the download. Browsers can unpack gzip natively, so no extra code ships.
+# Scene files are already compressed where it helps, part by part, so that the page can fetch
+# any part alone. Hard links keep big scenes from taking disk space twice.
 for scene in assets/*.solstice; do
-  gzip -9 --no-name --stdout "$scene" > "dist/assets/$(basename "$scene").gz"
+  ln -f "$scene" "dist/assets/$(basename "$scene")" 2>/dev/null || cp "$scene" "dist/assets/"
 done
 
-echo "built dist/"
+echo "built dist/. To try it: python scripts/serve.py"

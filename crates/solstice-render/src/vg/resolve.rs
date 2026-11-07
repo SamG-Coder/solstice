@@ -70,10 +70,16 @@ impl Resolve {
             .storage_texture(EMISSIVE_FORMAT)
             .storage_texture(MOTION_FORMAT)
             .storage_texture(DEPTH_FORMAT)
-            .texture_array()
-            .texture_array()
-            .texture_array()
             .sampler()
+            .texture_array()
+            .texture_array()
+            .texture_array()
+            .texture_array()
+            .texture_array()
+            .texture_array()
+            .texture_array()
+            .texture_array()
+            .texture_array()
             .build(gpu, "resolve output");
         let module = shaders::module(&gpu.device, "vg/resolve.wgsl");
         Self {
@@ -122,10 +128,16 @@ impl Resolve {
                     wgpu::BindingResource::TextureView(&gbuffer.emissive.view),
                     wgpu::BindingResource::TextureView(&gbuffer.motion.view),
                     wgpu::BindingResource::TextureView(&gbuffer.depth.view),
-                    wgpu::BindingResource::TextureView(&scene.color_textures),
-                    wgpu::BindingResource::TextureView(&scene.normal_textures),
-                    wgpu::BindingResource::TextureView(&scene.material_textures),
                     wgpu::BindingResource::Sampler(&scene.material_sampler),
+                    wgpu::BindingResource::TextureView(&scene.textures.base.color_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.base.normal_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.base.material_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.middle.color_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.middle.normal_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.middle.material_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.top.color_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.top.normal_view),
+                    wgpu::BindingResource::TextureView(&scene.textures.top.material_view),
                 ],
             ),
         }

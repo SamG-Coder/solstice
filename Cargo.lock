@@ -2096,6 +2096,7 @@ version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "miniz_oxide 0.8.9",
 ]
 
 [[package]]
@@ -2103,6 +2104,7 @@ name = "solstice-builder"
 version = "0.2.0"
 dependencies = [
  "block_compression",
+ "bytemuck",
  "glam",
  "rayon",
  "rustc-hash 2.1.3",

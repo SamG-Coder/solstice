@@ -48,6 +48,8 @@ pub struct ShadowMaps {
     /// What each cascade last drew, to tell when it has gone stale.
     drawn: [Option<(Mat4, f32)>; CASCADE_COUNT],
     next_far_cascade: usize,
+    /// Cascades that must redraw because the geometry on the GPU has improved.
+    outdated: [bool; CASCADE_COUNT],
 }
 
 impl ShadowMaps {
@@ -141,7 +143,13 @@ impl ShadowMaps {
             },
             drawn: [None; CASCADE_COUNT],
             next_far_cascade: 1,
+            outdated: [false; CASCADE_COUNT],
         }
+    }
+
+    /// Makes every cascade redraw in turn, as finer geometry has arrived.
+    pub fn mark_stale(&mut self) {
+        self.outdated = [true; CASCADE_COUNT];
     }
 
     /// Finds the stale cascades and writes the views of those to redraw to slots from
@@ -166,13 +174,14 @@ impl ShadowMaps {
             fit_cascade(camera, aspect, sun_direction, near, SPLITS[cascade])
         });
         let stale: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
-            self.drawn[cascade] != Some((fits[cascade].0, lod_threshold))
+            self.outdated[cascade] || self.drawn[cascade] != Some((fits[cascade].0, lod_threshold))
         });
         let never_drawn: [bool; CASCADE_COUNT] =
             std::array::from_fn(|cascade| self.drawn[cascade].is_none());
         let due = choose_due(stale, never_drawn, &mut self.next_far_cascade);
 
         for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
+            self.outdated[cascade] = false;
             let (view_proj, center, radius) = fits[cascade];
             self.drawn[cascade] = Some((view_proj, lod_threshold));
             self.data.view_proj[cascade] = view_proj;

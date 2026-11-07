@@ -1,11 +1,13 @@
 //! End-to-end tests on a real GPU. They pass trivially, with a note, if none is available.
 
 use glam::{Mat4, Vec2, Vec3};
-use solstice_asset::{Instance, Material, SceneAsset, TextureLayer};
+use solstice_asset::{Instance, LoadedScene, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
-    build_virtual_mesh, compress_textures, mip_chain, BuildOptions, Mesh, Vertex,
+    build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
-use solstice_render::{Camera, DebugView, Environment, Gpu, Renderer, RendererSettings};
+use solstice_render::{
+    Camera, DebugView, Environment, Gpu, Renderer, RendererSettings, StreamRequest, StreamingBudget,
+};
 use std::sync::{Arc, Mutex};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -129,12 +131,6 @@ struct Run {
     software_clusters: u32,
 }
 
-impl Run {
-    fn red(&self, x: u32, y: u32) -> u8 {
-        self.pixels[((y * self.size + x) * 4) as usize]
-    }
-}
-
 /// Renders a few frames, fails on any validation error, and reads back the result.
 fn render(
     gpu: &Gpu,
@@ -150,8 +146,33 @@ fn render(
             sink.lock().unwrap().push(error.to_string());
         }));
 
-    let mut renderer = Renderer::new(gpu, scene, FORMAT, settings);
-    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+    let mut renderer = Renderer::new(gpu, &paginate(scene), FORMAT, settings);
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+
+    // Enough frames for the depth history to exist and the stats readback to cycle.
+    for _ in 0..8 {
+        renderer.render(gpu, camera, &darkness(), &view, (size, size), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+
+    let pixels = read_pixels(gpu, &target, size);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    let stats = renderer.stats();
+    Run {
+        pixels,
+        size,
+        triangles: stats.triangles,
+        clusters: stats.clusters,
+        software_clusters: stats.software_clusters,
+    }
+}
+
+fn test_target(gpu: &Gpu, size: u32) -> wgpu::Texture {
+    gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test target"),
         size: wgpu::Extent3d {
             width: size,
@@ -164,17 +185,10 @@ fn render(
         format: FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
-    });
-    let view = target.create_view(&Default::default());
+    })
+}
 
-    // Enough frames for the depth history to exist and the stats readback to cycle.
-    for _ in 0..8 {
-        renderer.render(gpu, camera, &darkness(), &view, (size, size), 1.0 / 60.0);
-        gpu.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
-    }
-
+fn read_pixels(gpu: &Gpu, target: &wgpu::Texture, size: u32) -> Vec<u8> {
     let row = (size * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test readback"),
@@ -212,17 +226,26 @@ fn render(
     for line in data.chunks_exact(row as usize) {
         pixels.extend_from_slice(&line[..(size * 4) as usize]);
     }
+    pixels
+}
 
-    let errors = errors.lock().unwrap();
-    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
-    let stats = renderer.stats();
-    Run {
-        pixels,
-        size,
-        triangles: stats.triangles,
-        clusters: stats.clusters,
-        software_clusters: stats.software_clusters,
+/// Uncovered pixels inside the silhouette of a unit sphere `distance` away, in a white-on-black
+/// image of a sphere centred on the view.
+fn holes_in_sphere(pixels: &[u8], size: u32, distance: f32, fov_y: f32) -> u32 {
+    let angular = (1.0 / distance).asin();
+    let half = size as f32 * 0.5;
+    let radius = angular.tan() / (fov_y * 0.5).tan() * half;
+    let inner = (radius * 0.95).min(half - 2.0);
+    let mut holes = 0;
+    for y in 0..size {
+        for x in 0..size {
+            let (dx, dy) = (x as f32 + 0.5 - half, y as f32 + 0.5 - half);
+            if dx * dx + dy * dy < inner * inner && pixels[((y * size + x) * 4) as usize] < 200 {
+                holes += 1;
+            }
+        }
     }
+    holes
 }
 
 /// The sphere fills most of the view, mixing LOD levels, and both rasterizers draw parts of
@@ -260,21 +283,7 @@ fn closed_surface_has_no_holes() {
         used_software |= run.software_clusters > 0;
         used_hardware |= run.clusters > run.software_clusters;
 
-        // Silhouette radius in pixels, for a sphere of radius 1 under perspective.
-        let angular = (1.0 / distance).asin();
-        let half = SIZE as f32 * 0.5;
-        let radius = angular.tan() / (camera.fov_y * 0.5).tan() * half;
-        let inner = (radius * 0.95).min(half - 2.0);
-
-        let mut holes = 0;
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let (dx, dy) = (x as f32 + 0.5 - half, y as f32 + 0.5 - half);
-                if dx * dx + dy * dy < inner * inner && run.red(x, y) < 200 {
-                    holes += 1;
-                }
-            }
-        }
+        let holes = holes_in_sphere(&run.pixels, SIZE, distance, camera.fov_y);
         assert_eq!(holes, 0, "{holes} uncovered pixels at distance {distance}");
     }
     assert!(
@@ -285,6 +294,262 @@ fn closed_surface_has_no_holes() {
         used_hardware,
         "this test should have exercised the hardware rasterizer"
     );
+}
+
+fn generous_budget() -> StreamingBudget {
+    StreamingBudget {
+        geometry_bytes: 1 << 40,
+        texture_bytes: 1 << 40,
+    }
+}
+
+/// One step of a streaming host: hands over a few pages and starts what's wanted, like a slow
+/// network with pages arriving out of order.
+fn pump(
+    renderer: &mut Renderer,
+    loaded: &LoadedScene,
+    queue: &mut Vec<StreamRequest>,
+    per_frame: usize,
+) {
+    queue.extend(renderer.stream_requests(16));
+    for _ in 0..per_frame.min(queue.len()) {
+        // Popping the newest first delivers children before their parents.
+        let request = queue.pop().unwrap();
+        renderer.deliver(request.id, requested_bytes(loaded, &request));
+    }
+}
+
+/// What a request's bytes come to once unpacked, from a scene in memory.
+fn requested_bytes(loaded: &LoadedScene, request: &StreamRequest) -> Vec<u8> {
+    if request.deflated {
+        return loaded.page(request.id).to_vec();
+    }
+    let layer = ((request.id & 0x7fff_ffff) >> 8) as usize;
+    let mip = (request.id & 0xff) as usize;
+    let upper = &loaded.upper_textures[layer];
+    [
+        upper.color_mips[mip].as_slice(),
+        upper.normal_mips[mip].as_slice(),
+        upper.material_mips[mip].as_slice(),
+    ]
+    .concat()
+}
+
+/// The scene starts with only its coarsest pages and fills in slowly. Every frame along the way
+/// must cover the whole sphere, with detail only ever being added.
+#[test]
+fn a_loading_scene_never_shows_a_hole() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(7), &BuildOptions::default());
+    let scene = SceneAsset {
+        meshes: vec![mesh],
+        materials: vec![white_material()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    assert!(loaded.scene.pages.len() > 8);
+    const SIZE: u32 = 512;
+    const DISTANCE: f32 = 1.6;
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, DISTANCE),
+        fov_y: 50.0_f32.to_radians(),
+        near: 0.05,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer =
+        Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, generous_budget());
+    let target = test_target(&gpu, SIZE);
+    let view = target.create_view(&Default::default());
+
+    let mut queue = Vec::new();
+    let mut first_triangles = None;
+    let mut last_stats = renderer.stats();
+    for frame in 0..240 {
+        pump(&mut renderer, &loaded, &mut queue, 1);
+        renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        last_stats = renderer.stats();
+        if frame % 4 == 0 {
+            let pixels = read_pixels(&gpu, &target, SIZE);
+            let holes = holes_in_sphere(&pixels, SIZE, DISTANCE, camera.fov_y);
+            assert_eq!(
+                holes, 0,
+                "{holes} uncovered pixels at frame {frame}, with {} pages in",
+                last_stats.streaming.installed
+            );
+        }
+        if frame == 6 {
+            first_triangles = Some(last_stats.triangles);
+        }
+    }
+    let streaming = last_stats.streaming;
+    assert!(streaming.installed > loaded.scene.pinned_pages);
+    assert!(
+        (streaming.installed as usize) < loaded.scene.pages.len(),
+        "a view of one side shouldn't need every page"
+    );
+    assert!(last_stats.triangles > first_triangles.unwrap());
+}
+
+/// A pool too small for the scene: visiting one sphere then another must evict the first, stay
+/// within the pool and leave both whole.
+#[test]
+fn a_small_pool_evicts_what_is_out_of_view_and_shows_no_holes() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(7), &BuildOptions::default());
+    const APART: f32 = 100.0;
+    let scene = SceneAsset {
+        meshes: vec![mesh.clone(), mesh],
+        materials: vec![white_material()],
+        instances: vec![
+            instance(0, Mat4::IDENTITY),
+            instance(1, Mat4::from_translation(Vec3::X * APART)),
+        ],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    const SIZE: u32 = 256;
+    const DISTANCE: f32 = 1.6;
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+
+    // Room for the coarsest pages and a part of what one close view needs.
+    let pinned = loaded.scene.pinned_pages;
+    let slots = pinned + 10;
+    assert!(slots < loaded.scene.pages.len() as u32);
+    let budget = StreamingBudget {
+        geometry_bytes: u64::from(slots) * solstice_asset::paged::PAGE_BYTES as u64,
+        ..generous_budget()
+    };
+    let mut renderer = Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, budget);
+    let target = test_target(&gpu, SIZE);
+    let view = target.create_view(&Default::default());
+
+    let mut queue = Vec::new();
+    for (visit, x) in [0.0, APART, 0.0, APART].into_iter().enumerate() {
+        let camera = Camera {
+            position: Vec3::new(x, 0.0, DISTANCE),
+            fov_y: 50.0_f32.to_radians(),
+            near: 0.05,
+            ..Default::default()
+        };
+        for frame in 0..90 {
+            pump(&mut renderer, &loaded, &mut queue, 4);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            let streaming = renderer.stats().streaming;
+            assert!(streaming.installed <= slots, "the pool overflowed");
+            if frame % 8 == 0 {
+                let pixels = read_pixels(&gpu, &target, SIZE);
+                let holes = holes_in_sphere(&pixels, SIZE, DISTANCE, camera.fov_y);
+                assert_eq!(holes, 0, "visit {visit}, frame {frame}");
+            }
+        }
+    }
+    assert!(
+        renderer.stats().streaming.evictions > 0,
+        "the second sphere should have pushed out the first"
+    );
+}
+
+/// A close view of a texture whose largest level alone is green. It must start out using the
+/// red levels in the manifest, then fetch the green one, by itself.
+#[test]
+fn a_texture_sharpens_once_a_view_needs_it() {
+    let Some(gpu) = request_gpu() else { return };
+    const EDGE: u32 = 1024;
+    let level = |edge: u32, texel: [u8; 4]| -> Vec<u8> {
+        texel
+            .iter()
+            .copied()
+            .cycle()
+            .take((edge * edge) as usize * 4)
+            .collect()
+    };
+    let flat = |edge: u32, value: u8| vec![value; (edge * edge) as usize * 2];
+    let chain = (0..=EDGE.ilog2()).map(|m| EDGE >> m);
+    let layer = TextureLayer {
+        color_mips: chain
+            .clone()
+            .map(|edge| {
+                let texel = if edge == EDGE {
+                    [0, 255, 0, 255]
+                } else {
+                    [255, 0, 0, 255]
+                };
+                level(edge, texel)
+            })
+            .collect(),
+        normal_mips: chain.clone().map(|edge| flat(edge, 128)).collect(),
+        material_mips: chain.map(|edge| flat(edge, 128)).collect(),
+    };
+    let scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&sphere(5), &BuildOptions::default())],
+        materials: vec![Material {
+            texture_layer: 0,
+            uv_scale: 8.0,
+            ..white_material()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        texture_size: EDGE,
+        textures: vec![layer],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    const SIZE: u32 = 256;
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 1.05),
+        fov_y: 50.0_f32.to_radians(),
+        near: 0.01,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer =
+        Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, generous_budget());
+    let target = test_target(&gpu, SIZE);
+    let view = target.create_view(&Default::default());
+
+    let center = |pixels: &[u8]| {
+        let at = ((SIZE / 2 * SIZE + SIZE / 2) * 4) as usize;
+        [pixels[at], pixels[at + 1]]
+    };
+    renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    let [red, green] = center(&read_pixels(&gpu, &target, SIZE));
+    assert!(red > 200 && green < 50, "starts red, not {red}, {green}");
+
+    let mut queue = Vec::new();
+    for _ in 0..60 {
+        pump(&mut renderer, &loaded, &mut queue, 8);
+        renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let stats = renderer.stats().streaming;
+    assert_eq!(stats.middle_layers, 1);
+    assert_eq!(stats.top_layers, 1);
+    let [red, green] = center(&read_pixels(&gpu, &target, SIZE));
+    assert!(green > 200 && red < 50, "ends green, not {red}, {green}");
 }
 
 /// A wall hides a crowd of spheres. Occlusion culling must skip them, leaving far fewer

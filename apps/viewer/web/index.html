@@ -60,6 +60,8 @@
     <dt>In software raster</dt><dd id="software">-</dd>
     <dt>Instances</dt><dd id="instances">-</dd>
     <dt>Textures</dt><dd id="textures">-</dd>
+    <dt>Geometry pages</dt><dd id="pages">-</dd>
+    <dt>Downloaded</dt><dd id="fetched">-</dd>
     <dt>GPU errors</dt><dd id="errors">0</dd>
   </dl>
 </aside>
@@ -103,12 +105,16 @@
 </div>
 
 <script type="module">
-import init, { WebViewer } from "./pkg/solstice_viewer.js";
+import init, { WebViewer, header_bytes, read_header } from "./pkg/solstice_viewer.js";
 
 const params = new URLSearchParams(location.search);
 const sceneName = params.get("scene") ?? "web";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
-const sceneUrl = `assets/${sceneName}.solstice.gz`;
+const sceneUrl = `assets/${sceneName}.solstice`;
+// GPU memory the scene may use. Add ?geometry-mb=64 or ?texture-mb=32 to try other budgets.
+const budgetBytes = (name, megabytes) => (Number(params.get(name)) || megabytes) * 1048576;
+const geometryBudget = budgetBytes("geometry-mb", 128);
+const textureBudget = budgetBytes("texture-mb", 64);
 
 const el = (id) => document.getElementById(id);
 const canvas = el("view");
@@ -120,12 +126,39 @@ function fail(text) {
   el("message").className = "error";
 }
 
-/// Downloads with progress, since scene files are large.
-async function download(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Could not load ${url} (HTTP ${response.status}).`);
+/// Reads parts of a scene file by HTTP Range. If the server doesn't do ranges, the whole file
+/// comes down once, and ranges are served from memory, so any static host works.
+class SceneFile {
+  bytesFetched = 0;
+  #whole = null;
+  #etag = null;
+
+  async read(start, end) {
+    if (this.#whole) return this.#whole.subarray(start, end);
+    const response = await fetch(sceneUrl, { headers: { Range: `bytes=${start}-${end - 1}` } });
+    if (!response.ok) {
+      throw new Error(`Could not load ${sceneUrl} (HTTP ${response.status}).`);
+    }
+    if (response.status === 200) {
+      this.#whole = await downloadWhole(response);
+      this.bytesFetched = this.#whole.length;
+      return this.#whole.subarray(start, end);
+    }
+    // A scene replaced while it's being read would mix two files, so start again from the top.
+    const etag = response.headers.get("etag");
+    if (this.#etag && etag && etag !== this.#etag) {
+      location.reload();
+      return new Promise(() => {});
+    }
+    this.#etag = etag;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    this.bytesFetched += bytes.length;
+    return bytes;
   }
+}
+
+/// Downloads a whole file with progress, for servers without Range support.
+async function downloadWhole(response) {
   const total = Number(response.headers.get("content-length")) || 0;
   const reader = response.body.getReader();
   const chunks = [];
@@ -146,12 +179,44 @@ async function download(url) {
     offset += chunk.length;
   }
   el("progress").hidden = true;
+  return bytes;
+}
 
-  // Some servers already undo the compression in transit, so check rather than assume.
-  if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return bytes;
-  el("message").textContent = "Unpacking scene…";
-  const unpacked = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+async function inflate(bytes) {
+  const unpacked = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
   return new Uint8Array(await new Response(unpacked).arrayBuffer());
+}
+
+/// Fetches what the viewer asks for, keeping the page responsive while it does.
+class Streamer {
+  // Browsers run about six connections per host over HTTP/1.1, and more over HTTP/2.
+  static MAX_FETCHING = 16;
+  static RETRY_MS = 1000;
+  #viewer;
+  #file;
+
+  constructor(viewer, file) {
+    this.#viewer = viewer;
+    this.#file = file;
+  }
+
+  /// Call once per frame.
+  pump() {
+    const requests = this.#viewer.stream_requests(Streamer.MAX_FETCHING);
+    for (let i = 0; i < requests.length; i += 4) {
+      this.#fetchOne(requests[i], requests[i + 1], requests[i + 2], requests[i + 3] !== 0);
+    }
+  }
+
+  async #fetchOne(id, start, end, deflated) {
+    try {
+      const stored = await this.#file.read(start, end);
+      this.#viewer.deliver(id, deflated ? await inflate(stored) : stored);
+    } catch (error) {
+      console.warn(`Could not fetch part of the scene, and will retry: ${error.message ?? error}`);
+      setTimeout(() => this.#viewer.request_failed(id), Streamer.RETRY_MS);
+    }
+  }
 }
 
 const canvasSize = () => {
@@ -181,11 +246,23 @@ async function main() {
     return;
   }
   await init();
-  const bytes = await download(sceneUrl);
+  el("message").textContent = "Loading scene…";
+  const file = new SceneFile();
+  const [manifestOffset, manifestBytes] = read_header(await file.read(0, header_bytes()));
+  const manifestEnd = manifestOffset + manifestBytes;
+  const manifest = await inflate(await file.read(manifestOffset, manifestEnd));
   el("message").textContent = "Preparing the GPU…";
 
   [canvas.width, canvas.height] = canvasSize();
-  const viewer = await WebViewer.create(canvas, bytes, params.has("unpack-textures"));
+  const viewer = await WebViewer.create(
+    canvas,
+    manifest,
+    manifestEnd,
+    geometryBudget,
+    textureBudget,
+    params.has("unpack-textures"),
+  );
+  const streamer = new Streamer(viewer, file);
 
   const camera = params.get("camera")?.split(",").map(Number);
   if (camera?.length === 5) viewer.set_camera(...camera);
@@ -274,12 +351,19 @@ async function main() {
   let fps = 0;
 
   // Exposed for scripted checks.
-  window.solstice = { viewer, get frames() { return frames; }, get fps() { return fps; } };
+  window.solstice = {
+    viewer,
+    file,
+    get frames() { return frames; },
+    get fps() { return fps; },
+    history: [],
+  };
 
   function tick(now) {
     const delta = Math.min((now - previous) / 1000, 0.1);
     previous = now;
 
+    streamer.pump();
     viewer.frame(
       delta,
       axis("KeyW", "KeyS"),
@@ -292,6 +376,11 @@ async function main() {
     lookYaw = 0;
     lookPitch = 0;
 
+    // The moments the first image was submitted, and what it took, for measuring load times.
+    if (frames === 0) {
+      performance.mark("first-frame");
+      window.solstice.firstFrameBytes = file.bytesFetched;
+    }
     frames += 1;
     sinceReport += delta;
     if (sinceReport >= 0.5) {
@@ -303,6 +392,15 @@ async function main() {
       el("clusters").textContent = compact(viewer.clusters());
       el("software").textContent = compact(viewer.software_clusters());
       el("errors").textContent = viewer.gpu_error_count();
+      el("pages").textContent = `${viewer.pages_installed()} of ${viewer.pages_total()}`;
+      el("fetched").textContent = `${(file.bytesFetched / 1e6).toFixed(0)} MB`;
+      window.solstice.history.push({
+        time: now,
+        pages: viewer.pages_installed(),
+        fetched: file.bytesFetched,
+        triangles: viewer.triangles(),
+        sharp: viewer.texture_layers_sharp(),
+      });
       adaptQuality(fps);
     }
     requestAnimationFrame(tick);
