@@ -6,7 +6,7 @@ use crate::hierarchy::{build_hierarchy, Leaf};
 use crate::mesh::Mesh;
 use crate::partition::{partition_triangles, ClusterLimits};
 use crate::simplify::{simplify, Attribute, Corner, Triangle};
-use crate::thin::{find_pieces, thin, NEW_POSITION};
+use crate::thin::{find_pieces, set_aside_wide_pieces, thin, NEW_POSITION};
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -193,7 +193,8 @@ fn build_level(
 
             // Separate pieces, such as blades and leaves, are thinned out. Connected surfaces
             // are simplified by edge collapse.
-            let found = find_pieces(&triangles, |v| shared[v as usize]);
+            let mut found = find_pieces(&triangles, |v| shared[v as usize]);
+            set_aside_wide_pieces(&triangles, &mut found, &welded_view.positions);
             let mut new_positions = Vec::new();
             let mut thinning_error = 0.0f32;
             let mut reduced = Vec::with_capacity(triangles.len());
@@ -203,6 +204,7 @@ fn build_level(
                     &triangles,
                     &found.pieces,
                     &welded_view.positions,
+                    &welded_view.attributes,
                     target(piece_triangles),
                 );
                 reduced.extend(thinned.triangles);
@@ -216,13 +218,34 @@ fn build_level(
             };
             let mut simplified_error = 0.0f32;
             if !rest.is_empty() {
-                let simplified = simplify(
-                    &rest,
-                    &welded_view.positions,
-                    &welded_view.attributes,
-                    target(rest.len()),
-                    |v| shared[v as usize],
-                );
+                let simplify_to = |count: usize| {
+                    simplify(
+                        &rest,
+                        &welded_view.positions,
+                        &welded_view.attributes,
+                        count,
+                        |v| shared[v as usize],
+                    )
+                };
+                let mut simplified = simplify_to(target(rest.len()));
+                // A group's error is the largest of its parts'. Where thinning carries the
+                // reduction, the rest, such as a branch among twigs, goes only as far as it can
+                // without being the coarser part, so it never holds the twigs' detail back.
+                if !found.pieces.is_empty() {
+                    let budget = thinning_error.max(welded_view.step);
+                    for ratio in [0.75, 0.9] {
+                        if simplified.error <= budget {
+                            break;
+                        }
+                        simplified = simplify_to(((rest.len() as f32 * ratio) as usize).max(1));
+                    }
+                    if simplified.error > budget {
+                        simplified = crate::simplify::Simplified {
+                            triangles: rest.clone(),
+                            error: 0.0,
+                        };
+                    }
+                }
                 reduced.extend(simplified.triangles);
                 simplified_error = simplified.error;
             }
