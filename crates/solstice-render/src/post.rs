@@ -10,6 +10,12 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Matches `BLOOM_LEVELS` in `post/tonemap.wgsl`.
 const BLOOM_LEVELS: u32 = 6;
 
+/// The brightest average luminance exposure adapts to, per unit of sun. Without a limit, exposure
+/// maps anything that fills the frame to middle grey, as a camera turns snow grey. Sunlit snow
+/// measures about 0.08 per unit of sun. This sits just above the demo's pale desert, so that only
+/// scenes truly brighter than any bare ground stay bright. Any lower and that desert brightens too.
+const BRIGHTEST_AVERAGE_PER_SUN: f32 = 0.06;
+
 /// Twin of `Params` in `post/exposure.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -17,7 +23,7 @@ struct ExposureParams {
     delta_seconds: f32,
     first_frame: u32,
     compensation: f32,
-    _pad: u32,
+    brightest_average: f32,
 }
 
 /// Twin of `Params` in `post/bloom.wgsl`.
@@ -403,6 +409,7 @@ impl PostProcess {
         parity: usize,
         frame_index: u32,
         delta_seconds: f32,
+        sun_illuminance: f32,
         debug_passthrough: bool,
     ) {
         gpu.queue.write_buffer(
@@ -412,7 +419,7 @@ impl PostProcess {
                 delta_seconds,
                 first_frame: u32::from(frame_index == 0),
                 compensation: 1.2,
-                _pad: 0,
+                brightest_average: sun_illuminance * BRIGHTEST_AVERAGE_PER_SUN,
             }),
         );
         gpu.queue.write_buffer(

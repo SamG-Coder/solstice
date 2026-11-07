@@ -4,15 +4,15 @@
 //! bake [--quality draft|web|high] [--output FILE]
 //! bake --gltf MODEL.glb [--fit METRES] [--ground] [--texture-size N] [--output FILE]
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
+//! bake --gallery [--texture-size N] [--output FILE]
 //! ```
 //!
 //! Textures are block compressed unless `--raw-textures` is given.
 
+mod gallery;
 mod meshes;
-mod noise;
 mod scene;
 mod scene_file;
-mod textures;
 
 use scene::Quality;
 use solstice_asset::SceneAsset;
@@ -29,6 +29,8 @@ struct Options {
     /// Replaces the size a scene file asks for.
     scene_texture_size: Option<u32>,
     raw_textures: bool,
+    /// Shows every procedural surface, instead of the demo scene.
+    gallery: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -40,6 +42,7 @@ fn parse_args() -> Result<Options, String> {
         import: ImportOptions::default(),
         scene_texture_size: None,
         raw_textures: false,
+        gallery: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -69,6 +72,7 @@ fn parse_args() -> Result<Options, String> {
                 options.scene_texture_size = Some(size);
             }
             "--raw-textures" => options.raw_textures = true,
+            "--gallery" => options.gallery = true,
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -76,6 +80,9 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn load_scene(options: &Options) -> Result<SceneAsset, String> {
+    if options.gallery {
+        return Ok(gallery::build(options.scene_texture_size.unwrap_or(1024)));
+    }
     if let Some(path) = &options.scene_file {
         let (scene, mut warnings) = scene_file::build(path, options.scene_texture_size)?;
         warnings.sort();

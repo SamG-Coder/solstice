@@ -185,6 +185,7 @@ dependencies = [
  "solstice-asset",
  "solstice-builder",
  "solstice-import",
+ "solstice-procgen",
 ]
 
 [[package]]
@@ -2117,6 +2118,16 @@ dependencies = [
  "glam",
  "gltf",
  "png 0.17.16",
+ "rayon",
+ "solstice-asset",
+ "solstice-builder",
+]
+
+[[package]]
+name = "solstice-procgen"
+version = "0.2.0"
+dependencies = [
+ "glam",
  "rayon",
  "solstice-asset",
  "solstice-builder",

@@ -290,9 +290,8 @@ has only been tested that way, on the RTX 5080: no phone has been tried. See
 The goal is Unreal-quality rendering in the browser. The core architecture is real and working.
 The image is not yet at Unreal's level, and these are the main reasons, roughly in order of impact:
 
-1. **Demo content.** Unreal's best images come from photoscanned assets. Real models can now be
-   imported and look far better, but the live demo is still entirely procedural and looks it. The
-   scanned cove now starts from a 6 MB download, but the site's build doesn't bake it yet.
+1. **Demo content.** Unreal's best images come from photoscanned assets. The live demo's cove uses
+   scanned models, on procedural sand, while its temple is entirely procedural and looks it.
 2. **Shadow resolution.** Cascaded shadow maps stand in for Virtual Shadow Maps, so shadows lack
    the per-pixel sharpness that makes dense geometry read properly.
 3. **Streaming's limits.** Cluster records stay resident at 48 bytes each, about 0.7 GB for a

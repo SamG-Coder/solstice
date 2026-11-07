@@ -110,6 +110,39 @@ pub fn tiling_fbm(u: f32, v: f32, base_period: i32, octaves: u32, seed: u32) -> 
     sum / total * 1.6
 }
 
+/// Ridged fractal noise on a torus, in `0..1`: tiles over `0..1` in X and Y.
+pub fn tiling_ridged(u: f32, v: f32, base_period: i32, octaves: u32, seed: u32) -> f32 {
+    let (mut sum, mut amplitude, mut period, mut total) = (0.0, 0.5, base_period, 0.0);
+    for octave in 0..octaves {
+        let p = Vec3::new(u * period as f32, v * period as f32, 0.37);
+        let n = 1.0 - (perlin(p, seed.wrapping_add(octave), Some(period)) * 1.8).abs();
+        sum += amplitude * n * n;
+        total += amplitude;
+        amplitude *= 0.5;
+        period *= 2;
+    }
+    sum / total
+}
+
+/// Billowing fractal noise on a torus, in `0..1`: puffy lumps with sharp creases between them, the
+/// inverse of ridged noise. Tiles over `0..1` in X and Y.
+pub fn tiling_billow(u: f32, v: f32, base_period: i32, octaves: u32, seed: u32) -> f32 {
+    let (mut sum, mut amplitude, mut period, mut total) = (0.0, 0.5, base_period, 0.0);
+    for octave in 0..octaves {
+        let p = Vec3::new(u * period as f32, v * period as f32, 0.37);
+        sum += amplitude * (perlin(p, seed.wrapping_add(octave), Some(period)) * 1.8).abs();
+        total += amplitude;
+        amplitude *= 0.5;
+        period *= 2;
+    }
+    sum / total
+}
+
+/// A deterministic float in `0..1` for a lattice cell, one per `channel`.
+pub fn lattice_random(x: i32, y: i32, seed: u32, channel: u32) -> f32 {
+    (hash(IVec3::new(x, y, channel as i32), seed) >> 8) as f32 / 16_777_216.0
+}
+
 /// A deterministic float in `0..1` from an integer stream.
 pub fn random(index: u32, stream: u32) -> f32 {
     (hash(IVec3::new(index as i32, stream as i32, 17), 12345) >> 8) as f32 / 16_777_216.0
@@ -126,6 +159,15 @@ mod tests {
             let value = perlin(p, 3, None);
             assert_eq!(value, perlin(p, 3, None));
             assert!(value.abs() < 1.5);
+        }
+    }
+
+    #[test]
+    fn lattice_random_is_repeatable_and_varies() {
+        assert_eq!(lattice_random(3, 4, 5, 6), lattice_random(3, 4, 5, 6));
+        assert_ne!(lattice_random(3, 4, 5, 6), lattice_random(3, 4, 5, 7));
+        for i in 0..1000 {
+            assert!((0.0..1.0).contains(&lattice_random(i, -i, 2, 1)));
         }
     }
 

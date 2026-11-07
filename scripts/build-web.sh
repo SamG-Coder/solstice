@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the browser viewer into dist/, a self-contained static site. Bake a scene first:
+# Builds the browser viewer into dist/, a self-contained static site. Bake the scenes first:
 #   cargo run --release -p bake -- --quality web --output assets/web.solstice
 #
 # The wasm-bindgen tool must match the wasm-bindgen library exactly, so the matching

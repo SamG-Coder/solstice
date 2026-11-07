@@ -32,6 +32,11 @@
   #controls select { background: #1c1712; color: var(--ink); border: 1px solid var(--line);
     border-radius: 5px; padding: 5px 6px; font: inherit; }
 
+    #scenes { top: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 4px; padding: 4px; z-index: 1; }
+  #scenes a { color: var(--muted); text-decoration: none; padding: 5px 12px; border-radius: 5px; font-weight: 600; }
+  #scenes a:hover { color: var(--ink); }
+  #scenes a[aria-current] { background: var(--accent); color: #1c1712; }
+
   #help { left: 12px; bottom: 12px; color: var(--muted); padding: 8px 12px; }
   #help b { color: var(--ink); font-weight: 600; }
 
@@ -43,12 +48,19 @@
 
   @media (max-width: 620px) {
     #controls { top: auto; bottom: 12px; right: 12px; left: 12px; width: auto; }
-    #help { display: none; }
+        #help { display: none; }
+    #scenes { top: 8px; }
+    #hud { top: 56px; }
   }
 </style>
 </head>
 <body>
 <canvas id="view" tabindex="0"></canvas>
+
+<nav class="panel" id="scenes" aria-label="Scene">
+  <a href="?scene=cove" data-scene="cove">Cove</a>
+  <a href="?scene=web" data-scene="web">Temple</a>
+</nav>
 
 <aside class="panel" id="hud" hidden>
   <h1>Solstice</h1>
@@ -108,9 +120,10 @@
 import init, { WebViewer, header_bytes, read_header } from "./pkg/solstice_viewer.js";
 
 const params = new URLSearchParams(location.search);
-const sceneName = params.get("scene") ?? "web";
+const sceneName = params.get("scene") ?? "cove";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
 const sceneUrl = `assets/${sceneName}.solstice`;
+document.querySelector(`#scenes [data-scene="${sceneName}"]`)?.setAttribute("aria-current", "page");
 // GPU memory the scene may use. Add ?geometry-mb=64 or ?texture-mb=32 to try other budgets.
 const budgetBytes = (name, megabytes) => (Number(params.get(name)) || megabytes) * 1048576;
 const geometryBudget = budgetBytes("geometry-mb", 128);

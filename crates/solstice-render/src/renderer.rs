@@ -526,6 +526,7 @@ impl Renderer {
             parity,
             self.frame_index,
             delta_seconds,
+            environment.sun_illuminance,
             passthrough,
         );
 
