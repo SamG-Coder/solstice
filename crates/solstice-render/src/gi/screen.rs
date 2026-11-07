@@ -1,5 +1,6 @@
 //! Screen-space passes of the GI system: probes and reflections.
 
+use super::depth_pyramid::{DepthPyramid, DepthPyramidBuilder};
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
 use crate::shaders;
 use crate::vg::GBuffer;
@@ -22,6 +23,7 @@ pub struct ScreenGi {
     filter: wgpu::ComputePipeline,
     integrate: wgpu::ComputePipeline,
     reflect: wgpu::ComputePipeline,
+    depth_pyramid: DepthPyramidBuilder,
 }
 
 /// Size-dependent targets and bind groups. Index 0 or 1 of each pair is chosen by frame
@@ -34,6 +36,7 @@ pub struct ScreenGiBindings {
     filter_group: wgpu::BindGroup,
     integrate_groups: [wgpu::BindGroup; 2],
     reflect_groups: [wgpu::BindGroup; 2],
+    depth_pyramid: DepthPyramid,
     atlas_size: (u32, u32),
     grid_size: (u32, u32),
     size: (u32, u32),
@@ -47,6 +50,8 @@ impl ScreenGi {
             .texture_unfilterable()
             .texture()
             .storage_texture(FORMAT)
+            .texture_unfilterable()
+            .texture_unfilterable()
             .build(gpu, "probe trace");
         let project_layout = LayoutBuilder::new()
             .texture()
@@ -70,6 +75,7 @@ impl ScreenGi {
             .texture()
             .texture()
             .storage_texture(FORMAT)
+            .texture_unfilterable()
             .build(gpu, "reflections");
 
         let trace_module = shaders::module(&gpu.device, "gi/probe_trace.wgsl");
@@ -108,6 +114,7 @@ impl ScreenGi {
                 "main",
                 &[&reflect_layout, environment_layout],
             ),
+            depth_pyramid: DepthPyramidBuilder::new(gpu),
             trace_layout,
             project_layout,
             integrate_layout,
@@ -146,6 +153,8 @@ impl ScreenGi {
             Target::new(gpu, "gi reflections 1", half_size, FORMAT, none),
         ];
 
+        let depth_pyramid = self.depth_pyramid.pyramid(gpu, &gbuffer.depth.view, size);
+
         let tex = |view| wgpu::BindingResource::TextureView(view);
         let trace_group = |parity: usize| {
             gpu.bind_group(
@@ -156,6 +165,8 @@ impl ScreenGi {
                     tex(&gbuffer.depth.view),
                     tex(scene_history[parity]),
                     tex(&atlas.view),
+                    tex(&gbuffer.motion.view),
+                    tex(&depth_pyramid.view),
                 ],
             )
         };
@@ -197,6 +208,7 @@ impl ScreenGi {
                     tex(scene_history[parity]),
                     tex(&reflections[1 - parity].view),
                     tex(&reflections[parity].view),
+                    tex(&depth_pyramid.view),
                 ],
             )
         };
@@ -207,6 +219,7 @@ impl ScreenGi {
             filter_group: project_bindings(&probes_raw, &probes),
             integrate_groups: [integrate_group(0), integrate_group(1)],
             reflect_groups: [reflect_group(0), reflect_group(1)],
+            depth_pyramid,
             diffuse,
             reflections,
             atlas_size,
@@ -228,8 +241,10 @@ impl ScreenGi {
             label: Some("screen gi"),
             timestamp_writes: None,
         });
-        pass.set_bind_group(1, environment, &[]);
+        self.depth_pyramid
+            .record(&mut pass, &bindings.depth_pyramid);
 
+        pass.set_bind_group(1, environment, &[]);
         pass.set_pipeline(&self.trace);
         pass.set_bind_group(0, &bindings.trace_groups[parity], &[]);
         pass.dispatch_workgroups(

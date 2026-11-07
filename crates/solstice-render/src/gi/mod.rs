@@ -8,7 +8,10 @@
 //!   values gather light from one another over time, giving unlimited bounces.
 //! * [`screen`] traces rays from a sparse grid of screen probes into the volume, filters
 //!   them, and interpolates per pixel. It also traces glossy reflections.
+//! * [`depth_pyramid`] keeps the nearest depth of each screen tile, so screen traces can
+//!   skip empty space and reach far across the screen in a few steps.
 
+mod depth_pyramid;
 mod screen;
 mod volume;
 
