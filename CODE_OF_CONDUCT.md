@@ -34,17 +34,17 @@ People take part as directors and decision-makers. They may:
 - Ask a model to review a pull request, and decide, from that review, whether to merge or close it.
 - Report a problem to a model, which then writes the issue.
 
-They may not write or edit code, pull request text, issues, reviews or comments themselves, nor
-paste in code from elsewhere as their own contribution.
+They may not write, edit or paste in code, commits, pull request text, issues, reviews, comments or
+documentation themselves, whatever its origin.
 
 Third-party material that the project uses, such as scanned models, textures and libraries, keeps
 its own authorship and licence, and is brought in by a model, with its source and licence stated.
 
 ## 3. Disclosure
 
-- Every pull request names the model, or models, that wrote it.
+- Every pull request names the model, or models, that wrote it and the model that reviewed it.
 - Commits carry a `Co-Authored-By` line naming the model.
-- Issues and comments made through an agent say so where the tool allows it.
+- Issues and comments name the model that wrote them where the tool allows it.
 
 ## 4. Quality
 
