@@ -2,11 +2,11 @@
 //!
 //! JavaScript owns the page: the animation loop, input and UI. Rust owns the renderer.
 
-use crate::{default_environment, initial_camera, CameraInput, FlyCamera};
+use crate::{initial_camera, CameraInput, DayClock, FlyCamera, DEFAULT_DAY_SECONDS};
 use glam::Vec3;
 use solstice_asset::file;
 use solstice_render::{
-    DebugView, Environment, Gpu, Observation, Quality, Renderer, RendererSettings, StreamingBudget,
+    DebugView, Gpu, Observation, Quality, Renderer, RendererSettings, StreamingBudget, TimeOfDay,
     Weather,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -33,7 +33,8 @@ pub struct WebViewer {
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
     camera: FlyCamera,
-    environment: Environment,
+    /// The time of day, which places the sun and moon.
+    clock: DayClock,
     gpu_errors: Arc<AtomicU32>,
 }
 
@@ -103,7 +104,7 @@ impl WebViewer {
             config,
             renderer,
             camera: FlyCamera::new(initial_camera(scene.viewpoint)),
-            environment: default_environment(),
+            clock: DayClock::new(TimeOfDay::default(), DEFAULT_DAY_SECONDS),
             gpu_errors,
         })
     }
@@ -217,10 +218,11 @@ impl WebViewer {
             _ => return,
         };
         let view = texture.texture.create_view(&Default::default());
+        let environment = self.clock.tick(delta_seconds);
         self.renderer.render(
             &self.gpu,
             &self.camera.camera,
-            &self.environment,
+            &environment,
             &view,
             (self.config.width, self.config.height),
             delta_seconds,
@@ -250,13 +252,25 @@ impl WebViewer {
         }
     }
 
-    /// Places the sun by compass direction and height above the horizon, in radians.
-    pub fn set_sun(&mut self, azimuth: f32, elevation: f32) {
-        self.environment.sun_direction = Vec3::new(
-            azimuth.cos() * elevation.cos(),
-            elevation.sin(),
-            azimuth.sin() * elevation.cos(),
-        );
+    /// Sets the time of day, in hours from 0 to 24: noon is 12.
+    pub fn set_time(&mut self, hours: f32) {
+        self.clock.time.hours = hours.rem_euclid(24.0);
+    }
+
+    /// The time of day now, in hours, for the page to show as it passes.
+    pub fn time_of_day(&self) -> f32 {
+        self.clock.time.hours
+    }
+
+    /// How many real seconds a whole day takes to pass, or 0 to hold the time still.
+    pub fn set_day_length(&mut self, seconds: f32) {
+        self.clock.day_seconds = seconds.max(0.0);
+    }
+
+    /// Turns the scene to face north at `degrees` clockwise from its -Z axis, which moves the
+    /// sun, moon and stars around it together.
+    pub fn set_north(&mut self, degrees: f32) {
+        self.clock.place.north = -degrees.to_radians();
     }
 
     /// Names of the built-in weather, separated by commas.

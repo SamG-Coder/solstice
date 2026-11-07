@@ -81,6 +81,7 @@
     <dt>Downloaded</dt><dd id="fetched">-</dd>
     <dt>GPU errors</dt><dd id="errors">0</dd>
     <dt>Weather</dt><dd id="weather-now">-</dd>
+    <dt>Time</dt><dd id="time-now">-</dd>
   </dl>
 </aside>
 
@@ -110,8 +111,17 @@
       <option value="cirrus">Cirrus</option>
     </select>
   </label>
-  <label>Sun height<input id="sun-elevation" type="range" min="1" max="80" value="25"></label>
-  <label>Sun direction<input id="sun-azimuth" type="range" min="0" max="360" value="39"></label>
+  <label>Time of day <output id="clock">09:00</output>
+    <input id="time" type="range" min="0" max="24" step="0.05" value="9"></label>
+  <label>Time passes
+    <select id="day-length">
+      <option value="1200">A day in 20 minutes</option>
+      <option value="120">A day in 2 minutes</option>
+      <option value="86400">As in real life</option>
+      <option value="0">Not at all</option>
+    </select>
+  </label>
+  <label>North<input id="north" type="range" min="0" max="360" value="0"></label>
   <label>Quality
     <select id="quality">
       <option value="auto">Automatic</option>
@@ -315,14 +325,31 @@ async function main() {
   const camera = params.get("camera")?.split(",").map(Number);
   if (camera?.length === 5) viewer.set_camera(...camera);
 
-  const applySun = () => {
-    const azimuth = el("sun-azimuth").valueAsNumber * Math.PI / 180;
-    const elevation = el("sun-elevation").valueAsNumber * Math.PI / 180;
-    viewer.set_sun(azimuth, elevation);
+  // Time of day: passing by default, with a slider that follows it and can set it, ?time=HH:MM
+  // to start at, and ?day-length=SECONDS for how fast it passes (0 holds it still).
+  const clockText = (hours) => {
+    const minutes = Math.floor(hours * 60) % (24 * 60);
+    return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
   };
-  el("sun-azimuth").addEventListener("input", applySun);
-  el("sun-elevation").addEventListener("input", applySun);
-  applySun();
+  const startTime = params.get("time")?.split(":").map(Number);
+  if (startTime?.every(Number.isFinite)) viewer.set_time(startTime[0] + (startTime[1] ?? 0) / 60);
+  if (params.has("day-length")) el("day-length").value = params.get("day-length");
+  const applyDayLength = () => viewer.set_day_length(Number(el("day-length").value));
+  el("day-length").addEventListener("change", applyDayLength);
+  applyDayLength();
+  let draggingTime = false;
+  el("time").addEventListener("input", (e) => {
+    draggingTime = true;
+    viewer.set_time(e.target.valueAsNumber);
+  });
+  el("time").addEventListener("change", () => { draggingTime = false; });
+  el("north").addEventListener("input", (e) => viewer.set_north(e.target.valueAsNumber));
+  const showTime = () => {
+    const hours = viewer.time_of_day();
+    if (!draggingTime) el("time").value = hours;
+    el("clock").textContent = clockText(hours);
+    el("time-now").textContent = clockText(hours);
+  };
 
   // Weather: by default the sky changes by itself, drifting through fair, broken, overcast
   // and stormy weather and clearing again. The menu fixes one weather instead. Under Extras,
@@ -522,6 +549,7 @@ async function main() {
       el("software").textContent = compact(viewer.software_clusters());
       el("errors").textContent = viewer.gpu_error_count();
       el("weather-now").textContent = `${viewer.weather_summary()} (${weather.source})`;
+      showTime();
       el("pages").textContent = `${viewer.pages_installed()} of ${viewer.pages_total()}`;
       el("fetched").textContent = `${(file.bytesFetched / 1e6).toFixed(0)} MB`;
       window.solstice.history.push({

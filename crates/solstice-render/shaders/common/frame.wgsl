@@ -24,8 +24,21 @@ struct Frame {
     temporal_accumulation: u32,
     // Scales texture gradients, for upscaling and temporal filtering.
     mip_scale: f32,
+    // Radiance of the night sky's own glow and of the brightest stars.
+    night_sky: f32,
+    stars: f32,
+    // Radiance of the moon's sunlit highlands; 0 draws no moon.
+    moon_radiance: f32,
+    // The celestial sphere: its north pole, and the March equinox where right ascension starts.
+    star_pole: vec3f,
+    // The sun's illuminance at noon, which night is measured against.
+    daylight_illuminance: f32,
+    star_equinox: vec3f,
     _pad0: f32,
+    // Where the sun and moon are drawn: the true sun, whatever lights the scene, and the moon.
+    sun_disc: vec3f,
     _pad1: f32,
+    moon_disc: vec3f,
     _pad2: f32,
 }
 

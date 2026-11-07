@@ -6,8 +6,8 @@ use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Environment, Gpu, Renderer, RendererSettings, StreamRequest,
-    StreamingBudget, Weather,
+    Camera, DebugView, Environment, Gpu, Place, Renderer, RendererSettings, StreamRequest,
+    StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
 
@@ -924,13 +924,32 @@ fn ball_on_floor() -> SceneAsset {
     }
 }
 
-/// Renders `scene` under `weather`, after `seconds` of it, and reads back the image.
+/// Renders the ball on its floor under `weather`, after `seconds` of it, lit by a sun from +X,
+/// and reads back the image.
 fn render_weather(
     gpu: &Gpu,
     camera: &Camera,
     weather: Weather,
     seconds: f32,
     size: u32,
+) -> Vec<u8> {
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        ..Default::default()
+    };
+    render_lit(gpu, camera, weather, seconds, &environment, size, 60)
+}
+
+/// Renders the ball on its floor under `weather` and `environment` for `frames` frames, and
+/// reads back the last.
+fn render_lit(
+    gpu: &Gpu,
+    camera: &Camera,
+    weather: Weather,
+    seconds: f32,
+    environment: &Environment,
+    size: u32,
+    frames: u32,
 ) -> Vec<u8> {
     let errors: Arc<Mutex<Vec<String>>> = Default::default();
     let sink = errors.clone();
@@ -949,15 +968,11 @@ fn render_weather(
     let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
     renderer.set_weather(weather, 0.0);
     renderer.advance_weather(seconds);
-    let environment = Environment {
-        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
-        ..Default::default()
-    };
     let target = test_target(gpu, size);
     let view = target.create_view(&Default::default());
     // Enough frames for the clouds' history and the exposure to settle.
-    for _ in 0..60 {
-        renderer.render(gpu, camera, &environment, &view, (size, size), 1.0 / 60.0);
+    for _ in 0..frames {
+        renderer.render(gpu, camera, environment, &view, (size, size), 1.0 / 60.0);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
@@ -1071,5 +1086,141 @@ fn the_wind_carries_the_clouds_along() {
     assert!(
         share > 0.1,
         "only {share} of the sky changed in five minutes of wind"
+    );
+}
+
+/// A camera at the ball's floor looking along `direction`, `fov_degrees` high.
+fn looking_at(direction: Vec3, fov_degrees: f32) -> Camera {
+    Camera {
+        position: Vec3::new(0.0, 2.0, 0.0),
+        yaw: (-direction.x).atan2(-direction.z),
+        pitch: direction.y.asin(),
+        fov_y: fov_degrees.to_radians(),
+        ..Default::default()
+    }
+}
+
+fn mean_brightness(pixels: &[u8]) -> f32 {
+    let sum: f32 = pixels
+        .chunks_exact(4)
+        .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
+        .sum();
+    sum / (pixels.len() / 4) as f32
+}
+
+#[test]
+fn twilight_fades_steadily_into_night() {
+    let Some(gpu) = request_gpu() else { return };
+    // Towards the sunset over a summer evening, from just before sunset into full night. The
+    // scene may only ever grow darker: once it dipped below night in civil twilight.
+    let place = Place::default();
+    let daylight = Environment::default();
+    let start = TimeOfDay {
+        day: 172.0,
+        hours: 19.0,
+    };
+    let camera = looking_at(
+        start.sky(&place).sun * Vec3::new(1.0, 0.0, 1.0) + Vec3::Y * 0.1,
+        60.0,
+    );
+    let clear = Weather::by_name("clear").unwrap();
+    let mut previous = f32::MAX;
+    for step in 0..12 {
+        let time = TimeOfDay {
+            hours: 19.0 + step as f32 * 0.25,
+            ..start
+        };
+        let environment = time.environment(&place, &daylight);
+        let pixels = render_lit(&gpu, &camera, clear, 0.0, &environment, 64, 240);
+        let mean = mean_brightness(&pixels);
+        assert!(
+            mean <= previous * 1.04 + 1.0,
+            "brightened from {previous} to {mean} at {:.2} h",
+            time.hours
+        );
+        previous = mean;
+    }
+}
+
+#[test]
+fn the_moon_is_drawn_without_a_dark_halo() {
+    let Some(gpu) = request_gpu() else { return };
+    // A waxing gibbous moon at midnight in June, filling the middle of a narrow view.
+    let place = Place::default();
+    let time = TimeOfDay {
+        day: 172.0,
+        hours: 0.0,
+    };
+    let camera = looking_at(time.sky(&place).moon, 10.0);
+    let environment = time.environment(&place, &Environment::default());
+    let size = 192;
+    let pixels = render_lit(
+        &gpu,
+        &camera,
+        Weather::by_name("clear").unwrap(),
+        0.0,
+        &environment,
+        size,
+        120,
+    );
+    let at = |x: f32, y: f32| brightness(patch(&pixels, size, x as u32, y as u32, 0));
+    let centre = size as f32 / 2.0;
+    let moon = brightness(patch(&pixels, size, size / 2, size / 2, 2));
+    // Pixels just outside the disc, which is about 8 pixels across its radius, and open sky
+    // further out, all the way round.
+    let (mut rim, mut sky) = (f32::MAX, 0.0_f32);
+    for i in 0..32 {
+        let angle = i as f32 / 32.0 * std::f32::consts::TAU;
+        let (s, c) = angle.sin_cos();
+        rim = rim.min(at(centre + c * 10.0, centre + s * 10.0));
+        sky = sky.max(at(centre + c * 20.0, centre + s * 20.0));
+    }
+    assert!(
+        moon > sky * 2.0,
+        "the moon {moon} hardly stands out from the sky {sky}"
+    );
+    assert!(
+        rim >= sky * 0.85 - 2.0,
+        "a dark ring round the moon: {rim} against sky {sky}"
+    );
+}
+
+#[test]
+fn a_moonless_night_is_full_of_stars() {
+    let Some(gpu) = request_gpu() else { return };
+    // Early June, after the crescent moon has set: looking high into the southern sky.
+    let place = Place::default();
+    let time = TimeOfDay {
+        day: 157.0,
+        hours: 1.0,
+    };
+    let camera = looking_at(Vec3::new(0.0, 0.8, 0.6).normalize(), 55.0);
+    let environment = time.environment(&place, &Environment::default());
+    let size = 256;
+    let pixels = render_lit(
+        &gpu,
+        &camera,
+        Weather::by_name("clear").unwrap(),
+        0.0,
+        &environment,
+        size,
+        120,
+    );
+    let mut levels: Vec<f32> = pixels
+        .chunks_exact(4)
+        .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
+        .collect();
+    let stars = levels.iter().filter(|&&v| v > 0.0).count();
+    levels.sort_by(f32::total_cmp);
+    let background = levels[levels.len() / 2];
+    let bright = levels.iter().filter(|&&v| v > background + 30.0).count();
+    assert!(stars > 0);
+    assert!(
+        bright > 40,
+        "only {bright} star pixels stand out from a sky of {background}"
+    );
+    assert!(
+        background < 60.0,
+        "the night sky is too bright for stars to show: {background}"
     );
 }

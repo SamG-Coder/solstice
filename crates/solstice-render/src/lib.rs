@@ -9,6 +9,7 @@
 //! * [`shadow`]: cascaded sun shadows.
 //! * [`sky`]: the physically based atmosphere.
 //! * [`clouds`]: volumetric clouds, driven by the weather.
+//! * [`time_of_day`]: where the sun and moon are, and how they light the scene.
 //! * [`gi`]: indirect lighting and reflections.
 //! * [`lighting`]: combining everything into HDR colour.
 //! * [`post`]: temporal resolve, exposure, bloom and tone mapping.
@@ -26,6 +27,7 @@ pub mod shaders;
 pub mod shadow;
 pub mod sky;
 pub mod streaming;
+pub mod time_of_day;
 pub mod vg;
 
 pub use clouds::{Observation, Weather, WeatherCycle};
@@ -33,3 +35,4 @@ pub use frame::{Camera, DebugView, Environment};
 pub use gpu::{Gpu, GpuError};
 pub use renderer::{FrameStats, Quality, Renderer, RendererSettings, SceneMemory, StreamingBudget};
 pub use streaming::{StreamRequest, StreamingStats};
+pub use time_of_day::{Place, TimeOfDay};

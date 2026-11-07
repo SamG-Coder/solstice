@@ -36,10 +36,27 @@ fn viewer_radius() -> f32 {
     return GROUND_RADIUS + max(frame.camera_position.y, 1.0) * 0.001;
 }
 
-// Radiance of the cloudless sky towards `direction`, excluding the sun disc.
+// The colour of the night sky's own glow, from airglow and scattered starlight: deep blue
+// overhead, paler towards the horizon.
+const NIGHT_GLOW_ZENITH: vec3f = vec3f(0.3, 0.45, 1.0);
+const NIGHT_GLOW_HORIZON: vec3f = vec3f(0.62, 0.7, 0.9);
+
+// Radiance of the cloudless sky towards `direction`, excluding the sun disc and the stars.
 fn clear_sky_radiance(direction: vec3f) -> vec3f {
     let color = textureSampleLevel(sky_view_lut, repeat_sampler, sky_view_uv(direction), 0.0).rgb;
-    return color * frame.sun_illuminance * frame.sky_intensity;
+    // The night glow is several times brighter towards the horizon, where the line of sight
+    // crosses more of the glowing air, and dark overhead, where the stars stand out.
+    let horizon = exp(-clamp(direction.y, 0.0, 1.0) * 5.0);
+    let glow = mix(NIGHT_GLOW_ZENITH, NIGHT_GLOW_HORIZON, horizon) * frame.night_sky * (0.4 + 2.0 * horizon);
+    return color * frame.sun_illuminance * frame.sky_intensity + glow * frame.sky_intensity;
+}
+
+// `direction`, raised to just above the horizon if it points below it. Far beyond the scene,
+// land and sea fade into the air until they match the sky just above them, as the sky at the
+// horizon is itself the glow of a long path of air: so anything seen or reflected past the edge
+// of the scene takes the horizon's colour, and sea and sky meet without a seam.
+fn toward_horizon(direction: vec3f) -> vec3f {
+    return normalize(vec3f(direction.x, max(direction.y, 0.003), direction.z));
 }
 
 // Radiance of the sky towards `direction`, clouds included, excluding the sun disc.
@@ -48,11 +65,22 @@ fn sky_radiance(direction: vec3f) -> vec3f {
     return clear_sky_radiance(direction) * cloud.a + cloud.rgb;
 }
 
+// How much of the sun is above the horizon seen from `radius` (km from the planet's centre):
+// the horizon dips the higher one is, so clouds and peaks keep the sun after the ground loses it.
+// The transmittance table does not know the ground is there, so this blocks the light instead.
+fn above_horizon(radius: f32, mu: f32) -> f32 {
+    let dip = -sqrt(max(1.0 - (GROUND_RADIUS / radius) * (GROUND_RADIUS / radius), 0.0));
+    // Across the sun's own width, so that it sets gradually rather than switching off.
+    return smoothstep(dip - 0.006, dip + 0.006, mu);
+}
+
 // Sunlight above the clouds, after the atmosphere has filtered it.
 fn sun_irradiance() -> vec3f {
-    let uv = transmittance_uv(viewer_radius(), frame.sun_direction.y);
+    let r = viewer_radius();
+    let uv = transmittance_uv(r, frame.sun_direction.y);
     let transmittance = textureSampleLevel(transmittance_lut, clamp_sampler, uv, 0.0).rgb;
-    return transmittance * frame.sun_color * frame.sun_illuminance;
+    return transmittance * frame.sun_color * frame.sun_illuminance
+        * above_horizon(r, frame.sun_direction.y);
 }
 
 // How much sunlight the clouds let through to `p`: 1 in the open, less in a cloud's shadow.

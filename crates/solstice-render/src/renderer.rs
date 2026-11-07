@@ -17,7 +17,7 @@ use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, PassView, RasterBindings, Rasterizer,
     Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
 };
-use glam::{Mat4, Vec2};
+use glam::{Mat4, Vec2, Vec3};
 use solstice_asset::paged::{PagedScene, PAGE_BYTES};
 use solstice_asset::LoadedScene;
 
@@ -597,7 +597,7 @@ impl Renderer {
             parity,
             self.frame_index,
             delta_seconds,
-            environment.sun_illuminance,
+            environment.daylight(),
             passthrough,
         );
 
@@ -742,7 +742,21 @@ impl Renderer {
             gi_intensity: environment.gi_intensity,
             temporal_accumulation: u32::from(self.settings.temporal_accumulation),
             mip_scale: self.settings.render_scale * TEXTURE_DETAIL,
-            _pad: [0.0; 3],
+            night_sky: environment.night_sky,
+            stars: environment.stars,
+            moon_radiance: if environment.moon_disc.is_some() {
+                environment.moon_radiance
+            } else {
+                0.0
+            },
+            star_pole: environment.star_pole,
+            star_equinox: environment.star_equinox,
+            _pad0: 0.0,
+            sun_disc: environment.sun_disc.unwrap_or(environment.sun_direction),
+            _pad1: 0.0,
+            moon_disc: environment.moon_disc.unwrap_or(Vec3::NEG_Y),
+            _pad2: 0.0,
+            daylight_illuminance: environment.daylight(),
         };
         gpu.queue
             .write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));

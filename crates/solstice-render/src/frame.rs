@@ -62,6 +62,37 @@ pub struct Environment {
     pub sky_intensity: f32,
     /// Multiplier on indirect lighting. 1.0 is physically consistent.
     pub gi_intensity: f32,
+    /// The sun's illuminance in full daylight, which exposure is held to, so that night stays
+    /// dark rather than being brightened to grey. 0 means `sun_illuminance`.
+    pub daylight_illuminance: f32,
+    /// Radiance of the night sky's own faint glow, airglow and starlight, added to the sky. It
+    /// shines by day too, lost in the sunlit sky.
+    pub night_sky: f32,
+    /// Radiance of the brightest stars, before cloud hides them. 0 by day.
+    pub stars: f32,
+    /// The celestial sphere: the north celestial pole, and the March equinox on the celestial
+    /// equator, where right ascension starts. Together they place every star.
+    pub star_pole: Vec3,
+    pub star_equinox: Vec3,
+    /// Where the sun and the moon stand in the sky, to draw them. The scene is lit from
+    /// `sun_direction`, which by night is the moon. `None` draws the sun at `sun_direction`, and
+    /// no moon.
+    pub sun_disc: Option<Vec3>,
+    pub moon_disc: Option<Vec3>,
+    /// Radiance of the moon's sunlit highlands, seen face on.
+    pub moon_radiance: f32,
+}
+
+impl Environment {
+    /// The sun's illuminance in full daylight: `daylight_illuminance`, or the sun's own when
+    /// that is unset.
+    pub fn daylight(&self) -> f32 {
+        if self.daylight_illuminance > 0.0 {
+            self.daylight_illuminance
+        } else {
+            self.sun_illuminance
+        }
+    }
 }
 
 impl Default for Environment {
@@ -72,6 +103,14 @@ impl Default for Environment {
             sun_color: Vec3::ONE,
             sky_intensity: 1.0,
             gi_intensity: 1.0,
+            daylight_illuminance: 0.0,
+            night_sky: 0.0,
+            stars: 0.0,
+            star_pole: Vec3::Y,
+            star_equinox: Vec3::X,
+            sun_disc: None,
+            moon_disc: None,
+            moon_radiance: 0.0,
         }
     }
 }
@@ -139,7 +178,20 @@ pub struct FrameUniform {
     /// Scales texture gradients: internal over output resolution, so that upscaling
     /// keeps the detail of the output resolution, times a detail bias for temporal filtering.
     pub mip_scale: f32,
-    pub _pad: [f32; 3],
+    pub night_sky: f32,
+    pub stars: f32,
+    /// Radiance of the moon's sunlit highlands; 0 draws no moon.
+    pub moon_radiance: f32,
+    pub star_pole: Vec3,
+    /// The sun's illuminance at noon, which night is measured against.
+    pub daylight_illuminance: f32,
+    pub star_equinox: Vec3,
+    pub _pad0: f32,
+    /// Where the sun and moon are drawn: the true sun, whatever lights the scene.
+    pub sun_disc: Vec3,
+    pub _pad1: f32,
+    pub moon_disc: Vec3,
+    pub _pad2: f32,
 }
 
 /// Sub-pixel offset for frame `index`, from the Halton (2, 3) sequence, in `-0.5..0.5`.
@@ -169,6 +221,69 @@ pub fn jitter_projection(projection: Mat4, jitter_ndc: Vec2) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WGSL `Frame` must match `FrameUniform` byte for byte, or every value after the first
+    /// difference is read from the wrong place. Naga lays out the WGSL; Rust reports its own.
+    #[test]
+    fn the_uniform_lays_out_as_its_shader_twin() {
+        let source = include_str!("../shaders/common/frame.wgsl");
+        let module = naga::front::wgsl::parse_str(source).expect("frame.wgsl parses");
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let (handle, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("Frame"))
+            .expect("a Frame struct");
+        let naga::TypeInner::Struct { members, span } = &ty.inner else {
+            panic!("Frame is a struct");
+        };
+        assert_eq!(*span as usize, std::mem::size_of::<FrameUniform>(), "size");
+        assert_eq!(layouter[handle].size, *span);
+        macro_rules! offsets {
+            ($($field:ident),*) => {
+                vec![$((stringify!($field), std::mem::offset_of!(FrameUniform, $field))),*]
+            };
+        }
+        let rust = offsets!(
+            view_proj,
+            inv_view_proj,
+            unjittered_view_proj,
+            prev_view_proj,
+            view,
+            camera_position,
+            frame_index,
+            viewport,
+            inv_viewport,
+            jitter_ndc,
+            near,
+            debug_mode,
+            sun_direction,
+            sun_illuminance,
+            sun_color,
+            sky_intensity,
+            light_count,
+            time,
+            gi_intensity,
+            temporal_accumulation,
+            mip_scale,
+            night_sky,
+            stars,
+            star_pole,
+            daylight_illuminance,
+            star_equinox,
+            moon_radiance,
+            sun_disc,
+            moon_disc
+        );
+        for (name, offset) in rust {
+            let member = members
+                .iter()
+                .find(|m| m.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("{name} is missing from the WGSL"));
+            assert_eq!(member.offset as usize, offset, "{name}");
+        }
+    }
 
     #[test]
     fn forward_matches_the_view_matrix() {
