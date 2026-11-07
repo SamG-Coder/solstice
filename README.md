@@ -251,7 +251,8 @@ Compressing the cove takes about a minute on 16 threads.
 well wrap C++, not Rust, so files hold BC only, and a GPU without it gets the textures unpacked while
 loading, at no more than 512 per side. That matches the old uncompressed browser scene in look and GPU
 memory. Add `?unpack-textures` to the page, or `--unpack-textures` to the viewer, to force that path. It
-has only been tested that way, on the RTX 5080: no phone has been tried.
+has only been tested that way, on the RTX 5080: no phone has been tried. See
+[testing without BC](docs/testing-without-bc.md) for what to check on one.
 
 ## Status: what this is and is not
 

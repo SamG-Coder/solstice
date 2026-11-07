@@ -45,8 +45,8 @@ model ../target/scan/gothic_statue/gothic_statue.gltf -7 0 0 90 2.4
 model ../target/scan/horse_statue_01/horse_statue_01.gltf -2 0 9 200 9
 model ../target/scan/marble_bust_01/marble_bust_01.gltf -2 0 -9 -20 3.2
 # Stores stacked against the wall, just inside the gate.
-model ../target/scan/wooden_barrels_01/wooden_barrels_01.gltf 13 0 -14 30 1
-model ../target/scan/brass_vase_01/brass_vase_01.gltf 16 0 -17 0 1.2
+model ../target/scan/wooden_barrels_01/wooden_barrels_01.gltf 13 ground -14 30 1
+model ../target/scan/brass_vase_01/brass_vase_01.gltf 15.5 ground -12 0 1.2
 
 # ---- Cliffs: behind the fort, and curving forward on both sides until they reach the sea.
 model ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf -68 0 0 90 2.4
