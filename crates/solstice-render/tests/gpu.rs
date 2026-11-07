@@ -6,7 +6,8 @@ use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Environment, Gpu, Renderer, RendererSettings, StreamRequest, StreamingBudget,
+    Camera, DebugView, Environment, Gpu, Renderer, RendererSettings, StreamRequest,
+    StreamingBudget, Weather,
 };
 use std::sync::{Arc, Mutex};
 
@@ -895,4 +896,180 @@ fn compressed_scene_without_textures_renders() {
     };
     let run = render(&gpu, &scene, &camera, RendererSettings::default(), 64);
     assert!(run.clusters > 0);
+}
+
+/// A white ball on a wide floor, lit by the sun from +X, for judging how clouds light a scene.
+fn ball_on_floor() -> SceneAsset {
+    let mut floor = Mesh::default();
+    for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        floor.vertices.push(Vertex {
+            position: Vec3::new(x * 400.0, 0.0, z * 400.0),
+            normal: Vec3::Y,
+            uv: Vec2::new(x, z),
+        });
+    }
+    floor.indices = vec![0, 2, 1, 0, 3, 2];
+    let options = BuildOptions::default();
+    SceneAsset {
+        meshes: vec![
+            build_virtual_mesh(&sphere(4), &options),
+            build_virtual_mesh(&floor, &options),
+        ],
+        materials: vec![white_material()],
+        instances: vec![
+            instance(0, Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0))),
+            instance(1, Mat4::IDENTITY),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Renders `scene` under `weather`, after `seconds` of it, and reads back the image.
+fn render_weather(
+    gpu: &Gpu,
+    camera: &Camera,
+    weather: Weather,
+    seconds: f32,
+    size: u32,
+) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    // SOLSTICE_TEST_DEBUG=NAME shows a debug view instead, to see where a fault comes from.
+    let mut settings = RendererSettings::default();
+    if let Ok(name) = std::env::var("SOLSTICE_TEST_DEBUG") {
+        settings.debug_view = DebugView::from_name(&name).expect("a debug view");
+    }
+    if std::env::var("SOLSTICE_TEST_NO_TAA").is_ok() {
+        settings.temporal_accumulation = false;
+    }
+    let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
+    renderer.set_weather(weather, 0.0);
+    renderer.advance_weather(seconds);
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        ..Default::default()
+    };
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+    // Enough frames for the clouds' history and the exposure to settle.
+    for _ in 0..60 {
+        renderer.render(gpu, camera, &environment, &view, (size, size), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, size);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    // SOLSTICE_TEST_IMAGES=DIR keeps each image, to see what a failing test saw.
+    if let Ok(dir) = std::env::var("SOLSTICE_TEST_IMAGES") {
+        let name = format!(
+            "{dir}/weather_{:.0}_{:.0}_{:.0}_{:.0}.ppm",
+            camera.pitch * 100.0,
+            camera.position.z,
+            weather.coverage * 100.0,
+            seconds
+        );
+        let mut ppm = format!("P6\n{size} {size}\n255\n").into_bytes();
+        ppm.extend(pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+        std::fs::write(name, ppm).unwrap();
+    }
+    pixels
+}
+
+/// Mean colour of a square of pixels centred at (x, y), `half` pixels either side.
+fn patch(pixels: &[u8], size: u32, x: u32, y: u32, half: u32) -> [f32; 3] {
+    let mut sum = [0.0; 3];
+    let mut count = 0.0;
+    for py in y - half..=y + half {
+        for px in x - half..=x + half {
+            let i = ((py * size + px) * 4) as usize;
+            for c in 0..3 {
+                sum[c] += pixels[i + c] as f32;
+            }
+            count += 1.0;
+        }
+    }
+    sum.map(|s| s / count)
+}
+
+fn brightness(c: [f32; 3]) -> f32 {
+    (c[0] + c[1] + c[2]) / 3.0
+}
+
+#[test]
+fn clouds_fill_the_sky_and_grey_it() {
+    let Some(gpu) = request_gpu() else { return };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 0.0),
+        pitch: 1.2,
+        ..Default::default()
+    };
+    let sky = |name: &str| {
+        let pixels = render_weather(&gpu, &camera, Weather::by_name(name).unwrap(), 0.0, 96);
+        patch(&pixels, 96, 48, 30, 20)
+    };
+    let clear = sky("clear");
+    let overcast = sky("overcast");
+    // A clear sky is blue; an overcast one is grey.
+    assert!(clear[2] > clear[0] * 1.3, "clear sky {clear:?}");
+    assert!(
+        overcast[2] < overcast[0] * 1.15,
+        "overcast sky {overcast:?}"
+    );
+}
+
+#[test]
+fn overcast_light_is_soft_and_direct_sun_is_not() {
+    let Some(gpu) = request_gpu() else { return };
+    // Looking at the ball from the side, with the sun on its right: its shadow falls to the
+    // left across the floor. Exposure adapts to each image, so compare the floor in the ball's
+    // shadow with open floor, not either alone.
+    let camera = Camera {
+        position: Vec3::new(0.0, 1.0, 5.0),
+        ..Default::default()
+    };
+    let contrast = |name: &str| {
+        let pixels = render_weather(&gpu, &camera, Weather::by_name(name).unwrap(), 0.0, 128);
+        let open = brightness(patch(&pixels, 128, 104, 87, 2));
+        let shadow = brightness(patch(&pixels, 128, 22, 87, 2));
+        open / shadow.max(1.0)
+    };
+    let clear = contrast("clear");
+    let overcast = contrast("overcast");
+    assert!(
+        clear > 1.6,
+        "open floor against the ball's shadow in clear weather: {clear}"
+    );
+    assert!(
+        overcast < 1.25,
+        "under overcast the shadow should all but vanish: {overcast}"
+    );
+}
+
+#[test]
+fn the_wind_carries_the_clouds_along() {
+    let Some(gpu) = request_gpu() else { return };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 0.0),
+        pitch: 1.0,
+        ..Default::default()
+    };
+    let weather = Weather::by_name("broken").unwrap();
+    let before = render_weather(&gpu, &camera, weather, 0.0, 96);
+    let after = render_weather(&gpu, &camera, weather, 300.0, 96);
+    let changed = before
+        .chunks_exact(4)
+        .zip(after.chunks_exact(4))
+        .filter(|(a, b)| (0..3).any(|c| a[c].abs_diff(b[c]) > 12))
+        .count();
+    let share = changed as f32 / (96.0 * 96.0);
+    assert!(
+        share > 0.1,
+        "only {share} of the sky changed in five minutes of wind"
+    );
 }

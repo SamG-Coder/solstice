@@ -20,7 +20,9 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "common/frame.wgsl",
     "common/brdf.wgsl",
     "common/atmosphere.wgsl",
+    "clouds/params.wgsl",
     "common/environment.wgsl",
+    "clouds/common.wgsl",
     "vg/pass_view.wgsl",
     "vg/vis_write.wgsl",
     "vg/raster_common.wgsl",
@@ -36,6 +38,11 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "vg/hzb_down.wgsl",
     "vg/resolve.wgsl",
     "sky/luts.wgsl",
+    "clouds/noise.wgsl",
+    "clouds/coverage.wgsl",
+    "clouds/shadow.wgsl",
+    "clouds/panorama.wgsl",
+    "clouds/screen.wgsl",
     "gi/voxelize.wgsl",
     "gi/jump_flood.wgsl",
     "gi/voxel_light.wgsl",
@@ -64,6 +71,11 @@ pub const ENTRY_POINTS: &[&str] = &[
     "vg/hzb_down.wgsl",
     "vg/resolve.wgsl",
     "sky/luts.wgsl",
+    "clouds/noise.wgsl",
+    "clouds/coverage.wgsl",
+    "clouds/shadow.wgsl",
+    "clouds/panorama.wgsl",
+    "clouds/screen.wgsl",
     "gi/voxelize.wgsl",
     "gi/jump_flood.wgsl",
     "gi/voxel_light.wgsl",
@@ -153,6 +165,74 @@ mod tests {
             .filter_map(|path| validate(path).err())
             .collect();
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Operators WGSL will not mix without parentheses: a bitwise operator with any other
+    /// binary operator, or two different bitwise operators. Some compilers, naga among them,
+    /// accept the mix anyway, so validation alone misses it, but browsers reject the shader.
+    fn unparenthesised_mixes(source: &str) -> Vec<String> {
+        const BITWISE: [&str; 3] = [" ^ ", " | ", " & "];
+        const OTHER: [&str; 7] = [" * ", " / ", " % ", " + ", " - ", " << ", " >> "];
+        let mut found = Vec::new();
+        for (number, line) in source.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            // Text at each depth of parentheses, with nested groups left out.
+            let mut levels: Vec<String> = vec![String::new()];
+            for c in code.chars() {
+                match c {
+                    '(' | '[' => {
+                        levels.last_mut().unwrap().push(' ');
+                        levels.push(String::new());
+                    }
+                    ')' | ']' => {
+                        let inner = levels.pop().unwrap_or_default();
+                        check(&inner, number, line, &mut found);
+                        if levels.is_empty() {
+                            levels.push(String::new());
+                        }
+                    }
+                    _ => levels.last_mut().unwrap().push(c),
+                }
+            }
+            for level in &levels {
+                check(level, number, line, &mut found);
+            }
+        }
+        fn check(text: &str, number: usize, line: &str, found: &mut Vec<String>) {
+            let text = text.replace("&&", "  ").replace("||", "  ");
+            let bitwise: Vec<_> = BITWISE.iter().filter(|op| text.contains(**op)).collect();
+            if bitwise.is_empty() {
+                return;
+            }
+            if bitwise.len() > 1 || OTHER.iter().any(|op| text.contains(op)) {
+                found.push(format!("line {}: {}", number + 1, line.trim()));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_shader_mixes_operators_that_browsers_reject() {
+        let problems: Vec<String> = ENTRY_POINTS
+            .iter()
+            .flat_map(|path| {
+                unparenthesised_mixes(&expand(path))
+                    .into_iter()
+                    .map(move |p| format!("{path}: {p}"))
+            })
+            .collect();
+        assert!(
+            problems.is_empty(),
+            "
+{}",
+            problems.join(
+                "
+"
+            )
+        );
+        // And it does catch the mistake that once left the browser's sky black.
+        assert_eq!(unparenthesised_mixes("let h = a * 3u ^ b * 5u;").len(), 1);
+        assert!(unparenthesised_mixes("let h = (a * 3u) ^ (b * 5u);").is_empty());
     }
 
     #[test]

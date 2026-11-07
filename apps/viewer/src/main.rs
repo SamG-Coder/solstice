@@ -22,7 +22,7 @@ mod native {
     use solstice_asset::LoadedScene;
     use solstice_render::{
         Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamRequest,
-        StreamingBudget,
+        StreamingBudget, Weather,
     };
     use solstice_viewer::{default_environment, initial_camera, CameraInput, FlyCamera};
     use std::collections::HashSet;
@@ -140,7 +140,7 @@ mod native {
             format: wgpu::TextureFormat,
             options: &Options,
         ) -> (Renderer, Option<PageReader>) {
-            match self {
+            let (mut renderer, reader) = match self {
                 Self::Loaded(loaded) => {
                     (Renderer::new(gpu, loaded, format, options.settings), None)
                 }
@@ -148,7 +148,9 @@ mod native {
                     Renderer::streaming(gpu, paged, format, options.settings, options.budget),
                     Some(PageReader::new(&options.scene)),
                 ),
-            }
+            };
+            renderer.set_weather(options.weather, 0.0);
+            (renderer, reader)
         }
     }
 
@@ -175,6 +177,8 @@ mod native {
         flyover_out: PathBuf,
         /// Measure frame-to-frame change during a flyover. Slows the flight, so not for timing.
         stability: bool,
+        /// The weather to start with: a built-in state's name, or a weather file.
+        weather: Weather,
     }
 
     fn parse_args() -> Result<Options, String> {
@@ -194,6 +198,7 @@ mod native {
             flyover: None,
             flyover_out: PathBuf::from("screenshots/flyover"),
             stability: false,
+            weather: Weather::default(),
         };
         let floats = |text: &str| -> Result<Vec<f32>, String> {
             text.split(',')
@@ -242,6 +247,23 @@ mod native {
                 }
                 "--stability" => options.stability = true,
                 "--no-taa" => options.settings.temporal_accumulation = false,
+                "--no-clouds" => options.settings.clouds = false,
+                "--weather" => {
+                    let name = value()?;
+                    options.weather = match Weather::by_name(&name) {
+                        Some(weather) => weather,
+                        None => {
+                            let text = std::fs::read_to_string(&name).map_err(|e| {
+                                let names: Vec<_> = Weather::names().collect();
+                                format!(
+                                    "--weather: {name} is neither {} nor a file: {e}",
+                                    names.join(", ")
+                                )
+                            })?;
+                            Weather::parse(&text).map_err(|e| format!("{name}: {e}"))?
+                        }
+                    };
+                }
                 "--stream" => options.stream = true,
                 "--geometry-budget-mb" => {
                     let megabytes: u64 = value()?
@@ -324,6 +346,7 @@ mod native {
                 input: CameraInput::default(),
                 keys: HashSet::new(),
                 captured_mouse: false,
+                weather_index: 0,
             };
             event_loop.run_app(&mut app)?;
             Ok(())
@@ -539,6 +562,7 @@ mod native {
         log::info!("flying on {}", gpu.adapter_info.name);
 
         let mut renderer = Renderer::new(&gpu, scene, CAPTURE_FORMAT, options.settings);
+        renderer.set_weather(options.weather, 0.0);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),
             size: wgpu::Extent3d {
@@ -817,6 +841,8 @@ mod native {
         input: CameraInput,
         keys: HashSet<KeyCode>,
         captured_mouse: bool,
+        /// Which built-in weather the C key moved to last.
+        weather_index: usize,
     }
 
     impl App {
@@ -972,6 +998,10 @@ mod native {
                                 if code == KeyCode::Escape {
                                     self.set_mouse_capture(false);
                                 }
+                                // Cycles through the built-in weather, easing into each.
+                                if code == KeyCode::KeyC {
+                                    self.next_weather();
+                                }
                             }
                             ElementState::Released => {
                                 self.keys.remove(&code);
@@ -1003,6 +1033,20 @@ mod native {
     }
 
     impl App {
+        /// Eases into the next built-in weather, over half a minute, as a front would bring it.
+        fn next_weather(&mut self) {
+            let Some(state) = &mut self.state else {
+                return;
+            };
+            let names: Vec<&str> = Weather::names().collect();
+            self.weather_index = (self.weather_index + 1) % names.len();
+            let name = names[self.weather_index];
+            log::info!("weather: {name}");
+            state
+                .renderer
+                .set_weather(Weather::by_name(name).expect("listed weather"), 30.0);
+        }
+
         fn set_mouse_capture(&mut self, capture: bool) {
             let Some(state) = &self.state else { return };
             let mode = if capture {

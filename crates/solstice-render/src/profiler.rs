@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 15] = [
+pub const SECTIONS: [&str; 17] = [
     "sky",
+    "clouds",
     "shadows",
     "gi cull",
     "gi voxelize",
@@ -23,6 +24,7 @@ pub const SECTIONS: [&str; 15] = [
     "cull 2",
     "raster 2",
     "resolve",
+    "clouds on screen",
     "screen gi",
     "lighting",
     "post",
@@ -30,23 +32,25 @@ pub const SECTIONS: [&str; 15] = [
 /// Indices into [`SECTIONS`], for the marks that begin each one.
 pub mod section {
     pub const SKY: usize = 0;
-    pub const SHADOWS: usize = 1;
-    pub const GI_CULL: usize = 2;
-    pub const GI_VOXELIZE: usize = 3;
-    pub const GI_FLOOD: usize = 4;
-    pub const GI_WRITE: usize = 5;
-    pub const GI_LIGHT: usize = 6;
+    pub const CLOUDS: usize = 1;
+    pub const SHADOWS: usize = 2;
+    pub const GI_CULL: usize = 3;
+    pub const GI_VOXELIZE: usize = 4;
+    pub const GI_FLOOD: usize = 5;
+    pub const GI_WRITE: usize = 6;
+    pub const GI_LIGHT: usize = 7;
     /// Culling and rasterizing what was visible last frame, then the occlusion pyramid.
-    pub const CULL_FIRST: usize = 7;
-    pub const RASTER_FIRST: usize = 8;
+    pub const CULL_FIRST: usize = 8;
+    pub const RASTER_FIRST: usize = 9;
     /// Culling and rasterizing what that revealed.
-    pub const CULL_SECOND: usize = 9;
-    pub const RASTER_SECOND: usize = 10;
-    pub const RESOLVE: usize = 11;
-    pub const SCREEN_GI: usize = 12;
-    pub const LIGHTING: usize = 13;
-    pub const POST: usize = 14;
-    pub const END: usize = 15;
+    pub const CULL_SECOND: usize = 10;
+    pub const RASTER_SECOND: usize = 11;
+    pub const RESOLVE: usize = 12;
+    pub const CLOUDS_ON_SCREEN: usize = 13;
+    pub const SCREEN_GI: usize = 14;
+    pub const LIGHTING: usize = 15;
+    pub const POST: usize = 16;
+    pub const END: usize = 17;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;

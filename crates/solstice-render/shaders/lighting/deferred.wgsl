@@ -26,6 +26,9 @@ struct Shadows {
 @group(0) @binding(8) var shadow_maps: texture_depth_2d_array;
 @group(0) @binding(9) var shadow_sampler: sampler_comparison;
 @group(0) @binding(10) var<storage, read> lights: array<Light>;
+// The clouds drawn for this view, at half resolution: their light in RGB and the sky showing
+// through them in A.
+@group(0) @binding(11) var cloud_tex: texture_2d<f32>;
 
 // Distance over which distant objects dissolve into the air, as extinction per metre.
 const HAZE: f32 = 0.0011;
@@ -179,10 +182,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let ndc = pixel_to_ndc(center, frame.inv_viewport);
         let far_point = frame.inv_view_proj * vec4f(ndc, 1.0e-6, 1.0);
         let direction = normalize(far_point.xyz / far_point.w - frame.camera_position);
-        var sky = sky_radiance(direction);
+        // The clear sky, seen through the clouds drawn for this view, with the sun behind them.
+        var cloud = textureSampleLevel(cloud_tex, clamp_sampler, center * frame.inv_viewport, 0.0);
+        // Texels hidden behind geometry hold -1, and are never next to a sky pixel; keep any
+        // trace of them out regardless.
+        cloud.a = clamp(cloud.a, 0.0, 1.0);
+        var sky = clear_sky_radiance(direction);
         if frame.debug_mode == DEBUG_NONE {
             sky += sun_disc(direction);
         }
+        sky = sky * cloud.a + cloud.rgb;
         textureStore(output, pixel, vec4f(sky, 1.0));
         return;
     }
@@ -214,12 +223,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         if shadow > 0.0 && distance < 40.0 {
             shadow *= contact_shadow(world, normal, view, distance, noise);
         }
-        color += shade_light(surface, view, frame.sun_direction) * sun_irradiance() * shadow;
+        color += shade_light(surface, view, frame.sun_direction) * sun_irradiance_at(world) * shadow;
     } else if foliage {
         // Sunlight through a leaf from behind. The shadow is looked up for the lit side.
         let shadow = sun_shadow(world, -normal, distance, noise);
         let transmitted = surface.diffuse * FOLIAGE_TRANSMITTANCE / PI * -sun_facing;
-        color += transmitted * sun_irradiance() * shadow;
+        color += transmitted * sun_irradiance_at(world) * shadow;
     }
 
     // Local lights.
@@ -256,13 +265,16 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // Sampled above the horizon and partly desaturated: the air between here and a distant
     // object scatters light from all around, not only the long path to the horizon line.
     let haze_direction = normalize(vec3f(-view.x, max(-view.y, 0.2), -view.z));
-    let haze_sky = sky_radiance(haze_direction);
+    // Haze is the air's own glow, so it comes from the clear sky, not the clouds in it. Where
+    // clouds shade the air between here and the surface, less sunlight scatters into it.
+    let shade = mix(0.35, 1.0, cloud_shadow((world + frame.camera_position) * 0.5));
+    let haze_sky = clear_sky_radiance(haze_direction) * shade;
     var haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
     // That direction can land on the glow around the sun even when looking down at nearby ground,
     // whose radiance is so high that this small share of it shows as smoke across shadows. So the
     // haze is limited relative to the open sky on the side away from the sun.
     let away_from_sun = normalize(vec3f(-frame.sun_direction.x, 0.2, -frame.sun_direction.z));
-    let haze_limit = luminance(sky_radiance(away_from_sun)) * 2.0;
+    let haze_limit = luminance(clear_sky_radiance(away_from_sun)) * shade * 2.0;
     haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
     color = mix(haze_color, color, transmittance);
 

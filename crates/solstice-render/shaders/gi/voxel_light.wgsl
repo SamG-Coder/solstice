@@ -64,7 +64,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let sun_cos = dot(normal, frame.sun_direction);
     if sun_cos > 0.0 {
         let visible = volume_visibility(origin, frame.sun_direction, voxel, 400.0, 48u);
-        irradiance += sun_irradiance() * sun_cos * visible;
+        irradiance += sun_irradiance_at(center) * sun_cos * visible;
     }
 
     // Local lights, with visibility so that walls contain them.

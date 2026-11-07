@@ -8,10 +8,12 @@
 //! * [`streaming`]: moving pages of geometry onto and off the GPU.
 //! * [`shadow`]: cascaded sun shadows.
 //! * [`sky`]: the physically based atmosphere.
+//! * [`clouds`]: volumetric clouds, driven by the weather.
 //! * [`gi`]: indirect lighting and reflections.
 //! * [`lighting`]: combining everything into HDR colour.
 //! * [`post`]: temporal resolve, exposure, bloom and tone mapping.
 
+pub mod clouds;
 pub mod frame;
 pub mod gi;
 pub mod gpu;
@@ -26,6 +28,7 @@ pub mod sky;
 pub mod streaming;
 pub mod vg;
 
+pub use clouds::{Observation, Weather, WeatherCycle};
 pub use frame::{Camera, DebugView, Environment};
 pub use gpu::{Gpu, GpuError};
 pub use renderer::{FrameStats, Quality, Renderer, RendererSettings, SceneMemory, StreamingBudget};
