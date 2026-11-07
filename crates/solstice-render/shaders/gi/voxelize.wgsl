@@ -155,20 +155,38 @@ fn clip_span(span: vec2f, slope: f32, offset: f32) -> vec2f {
     return select(vec2f(1.0, 0.0), span, offset >= 0.0);
 }
 
-// Matches SOFTWARE_GROUP_SIZE in cull_control.wgsl: this pass consumes the "software" list.
-@compute @workgroup_size(16)
-fn main(@builtin(global_invocation_id) id: vec3u) {
-    if id.x >= state.sw_count {
+// Consumes the "software" list like the software rasterizer: one workgroup per cluster, striding
+// over the rest, and one thread per triangle. Matches MAX_CLUSTER_TRIANGLES.
+const GROUP_SIZE: u32 = 128u;
+
+var<workgroup> cluster_count: u32;
+
+@compute @workgroup_size(GROUP_SIZE)
+fn main(
+    @builtin(workgroup_id) group: vec3u,
+    @builtin(num_workgroups) groups: vec3u,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    if lane == 0u {
+        cluster_count = state.sw_count;
+    }
+    let count = workgroupUniformLoad(&cluster_count);
+    for (var item = group.x; item < count; item += groups.x) {
+        voxelize_cluster_triangle(item, lane);
+    }
+}
+
+fn voxelize_cluster_triangle(item: u32, t: u32) {
+    let entry = visible[item];
+    let cluster = clusters[entry.cluster];
+    if t >= cluster_triangle_count(cluster) {
         return;
     }
-    let entry = visible[id.x];
-    let cluster = clusters[entry.cluster];
     let instance = instances[entry.instance];
     let material = materials[instance_material(instance)];
     let inv_voxel = 1.0 / params.voxel_size;
 
-    let triangle_count = cluster_triangle_count(cluster);
-    for (var t = 0u; t < triangle_count; t++) {
+    {
         let packed = triangles[cluster.triangle_offset + t];
         let vertex0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
         let vertex1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
@@ -185,7 +203,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let face = cross(world1 - world0, world2 - world0);
         let face_length = length(face);
         if face_length <= 0.0 {
-            continue;
+            return;
         }
         let data = VoxelData(
             pack4x8unorm(vec4f(albedo, 1.0)),

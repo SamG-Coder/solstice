@@ -3,9 +3,11 @@
 
 #include "vg/pass_view.wgsl"
 
-// Must match the workgroup sizes of `process` and of the software rasterizer.
+// Must match the workgroup size of `process`.
 const PROCESS_GROUP_SIZE: u32 = 32u;
-const SOFTWARE_GROUP_SIZE: u32 = 16u;
+// The most workgroups one dispatch dimension may hold. Consumers of the software list take
+// one workgroup per cluster and stride over the rest when there are more.
+const MAX_GROUPS: u32 = 65535u;
 
 struct Args {
     // Dispatch: traversal of the next queue level.
@@ -45,7 +47,7 @@ fn advance() {
 // Publishes the clusters selected since the last call for rasterization.
 @compute @workgroup_size(1)
 fn finish() {
-    args.software_x = groups_for(atomicLoad(&state.sw_count) - state.sw_base, SOFTWARE_GROUP_SIZE);
+    args.software_x = min(atomicLoad(&state.sw_count) - state.sw_base, MAX_GROUPS);
     args.software_y = 1u;
     args.software_z = 1u;
     args.draw_vertex_count = MAX_CLUSTER_TRIANGLES * 3u;

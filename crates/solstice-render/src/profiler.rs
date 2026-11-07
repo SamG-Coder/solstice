@@ -5,11 +5,12 @@
 //! slightly behind the frame they describe.
 
 use crate::gpu::Gpu;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 11] = [
+pub const SECTIONS: [&str; 15] = [
     "sky",
     "shadows",
     "gi cull",
@@ -17,7 +18,11 @@ pub const SECTIONS: [&str; 11] = [
     "gi flood",
     "gi write",
     "gi light",
-    "geometry",
+    "cull 1",
+    "raster 1",
+    "cull 2",
+    "raster 2",
+    "resolve",
     "screen gi",
     "lighting",
     "post",
@@ -31,11 +36,17 @@ pub mod section {
     pub const GI_FLOOD: usize = 4;
     pub const GI_WRITE: usize = 5;
     pub const GI_LIGHT: usize = 6;
-    pub const GEOMETRY: usize = 7;
-    pub const SCREEN_GI: usize = 8;
-    pub const LIGHTING: usize = 9;
-    pub const POST: usize = 10;
-    pub const END: usize = 11;
+    /// Culling and rasterizing what was visible last frame, then the occlusion pyramid.
+    pub const CULL_FIRST: usize = 7;
+    pub const RASTER_FIRST: usize = 8;
+    /// Culling and rasterizing what that revealed.
+    pub const CULL_SECOND: usize = 9;
+    pub const RASTER_SECOND: usize = 10;
+    pub const RESOLVE: usize = 11;
+    pub const SCREEN_GI: usize = 12;
+    pub const LIGHTING: usize = 13;
+    pub const POST: usize = 14;
+    pub const END: usize = 15;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;
@@ -50,6 +61,8 @@ pub struct Profiler {
     busy: bool,
     mapped: Arc<AtomicBool>,
     latest_ms: Option<[f32; SECTIONS.len()]>,
+    /// The last mark written this frame.
+    last_mark: Cell<Option<usize>>,
 }
 
 impl Profiler {
@@ -83,12 +96,24 @@ impl Profiler {
             busy: false,
             mapped: Default::default(),
             latest_ms: None,
+            last_mark: Cell::new(None),
         })
     }
 
     /// Marks the boundary before section `index`. Pass `SECTIONS.len()` to end the frame.
+    ///
+    /// Sections that did not run this frame, such as GI on a frame it is not due, are marked
+    /// here too, so they read as zero and the time since the last mark goes to the section that
+    /// really spent it, rather than being lost against a timestamp left over from another frame.
     pub fn mark(&self, encoder: &mut wgpu::CommandEncoder, index: usize) {
-        encoder.write_timestamp(&self.queries, index as u32);
+        let first = match self.last_mark.get() {
+            Some(last) if last < index && index != 0 => last + 1,
+            _ => index,
+        };
+        for skipped in first..=index {
+            encoder.write_timestamp(&self.queries, skipped as u32);
+        }
+        self.last_mark.set(if index == section::END { None } else { Some(index) });
     }
 
     /// Consumes any finished readback and queues the next. Call at the end of encoding.
