@@ -5,8 +5,10 @@
 // and voxelization cost stays nearly independent of source triangle counts.
 //
 // Each triangle is scanned over the two axes its normal is least aligned with, marking
-// the depth range it covers per column. This leaves no holes, and it bounds the work per
-// triangle by the area of a grid face rather than the volume of its bounding box.
+// the depth range it covers per column. This leaves no holes. Each row visits only the columns
+// between the triangle's edges, so work follows the area it really covers. Testing its whole
+// bounding box instead is far slower for the long, thin triangles that flat surfaces simplify
+// into, whose boxes can span the grid while they touch only a sliver of it.
 
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
@@ -86,8 +88,17 @@ fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
     let b = vec2f(v1[u_axis], v1[v_axis]);
     let c = vec2f(v2[u_axis], v2[v_axis]);
     let limit = f32(params.resolution);
-    let lo = clamp(floor(min(min(a, b), c)), vec2f(0.0), vec2f(limit - 1.0));
-    let hi = clamp(floor(max(max(a, b), c)), vec2f(0.0), vec2f(limit - 1.0));
+
+    // Triangles wholly outside the grid need no scan at all.
+    let box_min = min(min(a, b), c);
+    let box_max = max(max(a, b), c);
+    let w_min = min(min(v0[w_axis], v1[w_axis]), v2[w_axis]);
+    let w_max = max(max(v0[w_axis], v1[w_axis]), v2[w_axis]);
+    if any(box_max < vec2f(-1.0)) || any(box_min > vec2f(limit + 1.0)) || w_max < -1.0 || w_min > limit + 1.0 {
+        return;
+    }
+    let lo = clamp(floor(box_min), vec2f(0.0), vec2f(limit - 1.0));
+    let hi = clamp(floor(box_max), vec2f(0.0), vec2f(limit - 1.0));
 
     // Orient edges so the inside is positive, and widen them to cover any touched column.
     let orientation = select(-1.0, 1.0, (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) >= 0.0);
@@ -106,12 +117,19 @@ fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
     let spread = 0.5 * (abs(dw_du) + abs(dw_dv));
 
     for (var y = lo.y; y <= hi.y; y += 1.0) {
-        for (var x = lo.x; x <= hi.x; x += 1.0) {
-            let p = vec2f(x + 0.5, y + 0.5);
-            if dot(e0.xy, p) + bias0 < 0.0 || dot(e1.xy, p) + bias1 < 0.0 || dot(e2.xy, p) + bias2 < 0.0 {
-                continue;
-            }
-            let w = w0 + dw_du * p.x + dw_dv * p.y;
+        let py = y + 0.5;
+        // Each edge limits the column centres on this row to one side of a crossing point.
+        var span = vec2f(lo.x + 0.5, hi.x + 0.5);
+        span = clip_span(span, e0.x, e0.y * py + bias0);
+        span = clip_span(span, e1.x, e1.y * py + bias1);
+        span = clip_span(span, e2.x, e2.y * py + bias2);
+        if span.x > span.y {
+            continue;
+        }
+        let first_column = ceil(span.x - 0.5);
+        let last_column = floor(span.y - 0.5);
+        for (var x = first_column; x <= last_column; x += 1.0) {
+            let w = w0 + dw_du * (x + 0.5) + dw_dv * py;
             let first = i32(floor(w - spread));
             let last = i32(floor(w + spread));
             for (var z = first; z <= last; z++) {
@@ -123,6 +141,18 @@ fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
             }
         }
     }
+}
+
+// Narrows the span of X values that satisfy `slope * x + offset >= 0`.
+fn clip_span(span: vec2f, slope: f32, offset: f32) -> vec2f {
+    if slope > 0.0 {
+        return vec2f(max(span.x, -offset / slope), span.y);
+    }
+    if slope < 0.0 {
+        return vec2f(span.x, min(span.y, -offset / slope));
+    }
+    // A horizontal edge: the whole row is either inside or out.
+    return select(vec2f(1.0, 0.0), span, offset >= 0.0);
 }
 
 // Matches SOFTWARE_GROUP_SIZE in cull_control.wgsl: this pass consumes the "software" list.

@@ -136,6 +136,10 @@ pub struct FrameUniform {
     pub time: f32,
     pub gi_intensity: f32,
     pub temporal_accumulation: u32,
+    /// Scales texture gradients: internal over output resolution, so that upscaling
+    /// keeps the detail of the output resolution, times a detail bias for temporal filtering.
+    pub mip_scale: f32,
+    pub _pad: [f32; 3],
 }
 
 /// Sub-pixel offset for frame `index`, from the Halton (2, 3) sequence, in `-0.5..0.5`.

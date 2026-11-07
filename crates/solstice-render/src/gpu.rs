@@ -45,10 +45,11 @@ impl Gpu {
     pub async fn request(
         instance: &wgpu::Instance,
         surface: Option<&wgpu::Surface<'_>>,
+        power_preference: wgpu::PowerPreference,
     ) -> Result<Self, GpuError> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference,
                 force_fallback_adapter: false,
                 compatible_surface: surface,
                 apply_limit_buckets: false,
@@ -73,7 +74,10 @@ impl Gpu {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("solstice"),
-                required_features: wgpu::Features::empty(),
+                // Optional: lets the profiler time passes where the platform allows it.
+                required_features: adapter.features()
+                    & (wgpu::Features::TIMESTAMP_QUERY
+                        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
                 required_limits: limits.clone(),
                 ..Default::default()
             })

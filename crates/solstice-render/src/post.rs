@@ -287,7 +287,13 @@ impl PostProcess {
         );
 
         // Bloom: the source of the first down step depends on which history was written.
-        let half = ((output_size.0 / 2).max(1), (output_size.1 / 2).max(1));
+        // A full chain needs a minimum size. Below that it is simply wider than the output,
+        // which is harmless, since these passes resample by UV rather than by texel.
+        let min_edge = 1 << (BLOOM_LEVELS - 1);
+        let half = (
+            (output_size.0 / 2).max(min_edge),
+            (output_size.1 / 2).max(min_edge),
+        );
         let down = MipChain::new(gpu, "bloom down", half, BLOOM_LEVELS);
         let up = MipChain::new(gpu, "bloom up", half, BLOOM_LEVELS - 1);
         let bloom_params = |source_size: (u32, u32), is_first: bool| {
@@ -414,7 +420,7 @@ impl PostProcess {
             0,
             bytemuck::bytes_of(&TonemapParams {
                 bloom_strength: 0.045,
-                sharpen: 0.55,
+                sharpen: 0.9,
                 vignette: 0.18,
                 grain: 0.012,
                 frame_index,

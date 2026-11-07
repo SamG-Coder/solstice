@@ -60,9 +60,9 @@ struct Material {
     uv_scale: f32,
     normal_strength: f32,
     texture_layer: i32,
+    macro_variation: f32,
     _pad0: u32,
     _pad1: u32,
-    _pad2: u32,
 }
 
 struct Light {

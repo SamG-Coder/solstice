@@ -1,0 +1,140 @@
+//! GPU time per section of the frame, where the device can measure it.
+//!
+//! Timestamps between passes need a native-only feature, so browsers simply report nothing.
+//! Readback follows the same never-block cycle as culling statistics, so results lag
+//! slightly behind the frame they describe.
+
+use crate::gpu::Gpu;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// The sections of a frame, in the order they run.
+pub const SECTIONS: [&str; 11] = [
+    "sky",
+    "shadows",
+    "gi cull",
+    "gi voxelize",
+    "gi flood",
+    "gi write",
+    "gi light",
+    "geometry",
+    "screen gi",
+    "lighting",
+    "post",
+];
+/// Indices into [`SECTIONS`], for the marks that begin each one.
+pub mod section {
+    pub const SKY: usize = 0;
+    pub const SHADOWS: usize = 1;
+    pub const GI_CULL: usize = 2;
+    pub const GI_VOXELIZE: usize = 3;
+    pub const GI_FLOOD: usize = 4;
+    pub const GI_WRITE: usize = 5;
+    pub const GI_LIGHT: usize = 6;
+    pub const GEOMETRY: usize = 7;
+    pub const SCREEN_GI: usize = 8;
+    pub const LIGHTING: usize = 9;
+    pub const POST: usize = 10;
+    pub const END: usize = 11;
+}
+const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
+const BYTES: u64 = QUERY_COUNT as u64 * 8;
+
+/// Records timestamps and reads them back.
+pub struct Profiler {
+    queries: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    period_ns: f32,
+    copied: bool,
+    busy: bool,
+    mapped: Arc<AtomicBool>,
+    latest_ms: Option<[f32; SECTIONS.len()]>,
+}
+
+impl Profiler {
+    /// Returns `None` if the device cannot take timestamps between passes.
+    pub fn new(gpu: &Gpu) -> Option<Self> {
+        let needed =
+            wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        if !gpu.device.features().contains(needed) {
+            return None;
+        }
+        Some(Self {
+            queries: gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("frame timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: QUERY_COUNT,
+            }),
+            resolve: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp resolve"),
+                size: BYTES,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            staging: gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp staging"),
+                size: BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            period_ns: gpu.queue.get_timestamp_period(),
+            copied: false,
+            busy: false,
+            mapped: Default::default(),
+            latest_ms: None,
+        })
+    }
+
+    /// Marks the boundary before section `index`. Pass `SECTIONS.len()` to end the frame.
+    pub fn mark(&self, encoder: &mut wgpu::CommandEncoder, index: usize) {
+        encoder.write_timestamp(&self.queries, index as u32);
+    }
+
+    /// Consumes any finished readback and queues the next. Call at the end of encoding.
+    pub fn resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.mapped.swap(false, Ordering::AcqRel) {
+            {
+                let data = self
+                    .staging
+                    .slice(..)
+                    .get_mapped_range()
+                    .expect("the map has completed");
+                let ticks: &[u64] = bytemuck::cast_slice(&data);
+                let mut result = [0.0; SECTIONS.len()];
+                for (section, slot) in result.iter_mut().enumerate() {
+                    let elapsed = ticks[section + 1].saturating_sub(ticks[section]);
+                    *slot = elapsed as f32 * self.period_ns / 1.0e6;
+                }
+                self.latest_ms = Some(result);
+            }
+            self.staging.unmap();
+            self.busy = false;
+        }
+        encoder.resolve_query_set(&self.queries, 0..QUERY_COUNT, &self.resolve, 0);
+        if !self.busy {
+            encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.staging, 0, BYTES);
+            self.copied = true;
+        }
+    }
+
+    /// Starts reading back timestamps copied this frame. Call after submitting.
+    pub fn request_map(&mut self) {
+        if std::mem::take(&mut self.copied) {
+            self.busy = true;
+            let mapped = self.mapped.clone();
+            self.staging
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    if result.is_ok() {
+                        mapped.store(true, Ordering::Release);
+                    }
+                });
+        }
+    }
+
+    /// Milliseconds per entry of [`SECTIONS`], from a recent frame.
+    pub fn latest_ms(&self) -> Option<[f32; SECTIONS.len()]> {
+        self.latest_ms
+    }
+}

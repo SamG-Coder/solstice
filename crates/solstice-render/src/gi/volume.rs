@@ -1,6 +1,7 @@
 //! The world-space scene representation that indirect rays trace.
 
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
+use crate::profiler::{section, Profiler};
 use crate::scene::GpuScene;
 use crate::shaders;
 use crate::vg::{CullPhase, CullPipelines, CullWork, PassView, ViewSlots};
@@ -21,6 +22,9 @@ const ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const FLOOD_STEPS: [i32; 6] = [48, 24, 12, 6, 3, 1];
 /// Finer levels get refreshed more often, since they sit closest to the viewer.
 const LIGHT_SCHEDULE: [u32; 8] = [0, 1, 0, 2, 0, 3, 0, 4];
+/// How much of a rebuild's distance field to compute per frame. Spreading it keeps one level's
+/// move from becoming one long frame. It takes three frames, too short to see.
+const FLOOD_PASSES_PER_FRAME: usize = 6;
 
 /// Twin of `VolumeParams` in `common/environment.wgsl`.
 #[repr(C)]
@@ -111,12 +115,35 @@ pub struct GiVolume {
     flood_groups: Vec<wgpu::BindGroup>,
     light_count: u32,
     schedule_index: usize,
+    pending: Option<PendingRebuild>,
 }
 
 /// What [`GiVolume::prepare`] decided should happen this frame.
 pub struct VolumeWork {
+    /// Levels rebuilt completely this frame, which only happens when nothing exists yet.
     rebuild: Vec<usize>,
+    /// The part of a spread-out rebuild that falls in this frame.
+    slice: Option<RebuildSlice>,
     relight: usize,
+}
+
+/// A level being rebuilt across several frames. Until it finishes, shaders keep using the
+/// level's old contents and position, so nothing is ever seen half built.
+#[derive(Clone, Copy, Debug)]
+struct PendingRebuild {
+    level: usize,
+    origin: IVec3,
+    next_pass: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RebuildSlice {
+    level: usize,
+    /// True in the first frame, which voxelizes and seeds the flood.
+    begin: bool,
+    passes: std::ops::Range<usize>,
+    /// True in the last frame, which publishes the finished level.
+    commit: bool,
 }
 
 impl GiVolume {
@@ -356,6 +383,7 @@ impl GiVolume {
             flood_groups,
             light_count: scene.light_count,
             schedule_index: 0,
+            pending: None,
         }
     }
 
@@ -370,10 +398,10 @@ impl GiVolume {
     ) -> VolumeWork {
         let first_build = self.levels[0].origin_voxels.is_none();
         let mut rebuild = Vec::new();
-        for (index, level) in self.levels.iter_mut().enumerate() {
-            let wanted = snapped_origin(camera_position, level.voxel_size);
-            // Moving is costly, so at most one level moves per frame after the first.
-            if level.origin_voxels != Some(wanted) && (first_build || rebuild.is_empty()) {
+        let mut slice = None;
+        if first_build {
+            for (index, level) in self.levels.iter_mut().enumerate() {
+                let wanted = snapped_origin(camera_position, level.voxel_size);
                 level.origin_voxels = Some(wanted);
                 rebuild.push(index);
                 write_level_view(
@@ -384,10 +412,49 @@ impl GiVolume {
                     level.voxel_size,
                 );
             }
+        } else {
+            if self.pending.is_none() {
+                self.pending = choose_rebuild(&self.levels, camera_position);
+                if let Some(pending) = self.pending {
+                    let level = &self.levels[pending.level];
+                    write_level_view(
+                        gpu,
+                        slots,
+                        first_slot + pending.level as u32,
+                        pending.origin,
+                        level.voxel_size,
+                    );
+                }
+            }
+            if let Some(pending) = &mut self.pending {
+                let end = (pending.next_pass + FLOOD_PASSES_PER_FRAME).min(flood_pass_count());
+                let commit = end == flood_pass_count();
+                slice = Some(RebuildSlice {
+                    level: pending.level,
+                    begin: pending.next_pass == 0,
+                    passes: pending.next_pass..end,
+                    commit,
+                });
+                pending.next_pass = end;
+                if commit {
+                    self.levels[pending.level].origin_voxels = Some(pending.origin);
+                }
+            }
         }
+        let committed = slice.as_ref().is_some_and(|s: &RebuildSlice| s.commit);
+        let being_rebuilt = self.pending.filter(|_| !committed).map(|p| p.level);
 
-        let relight = LIGHT_SCHEDULE[self.schedule_index] as usize;
+        // A level being rebuilt has new voxels but its old position, so it must not relight
+        // until it is finished. The others take its turn.
+        let mut relight = LIGHT_SCHEDULE[self.schedule_index] as usize;
         self.schedule_index = (self.schedule_index + 1) % LIGHT_SCHEDULE.len();
+        if being_rebuilt == Some(relight) {
+            relight = LIGHT_SCHEDULE[self.schedule_index] as usize;
+            self.schedule_index = (self.schedule_index + 1) % LIGHT_SCHEDULE.len();
+            if being_rebuilt == Some(relight) {
+                relight = (relight + 1) % LEVEL_COUNT;
+            }
+        }
         self.levels[relight].light_updates = self.levels[relight].light_updates.wrapping_add(1);
 
         let mut uniform = VolumeUniform {
@@ -399,11 +466,15 @@ impl GiVolume {
         for (index, level) in self.levels.iter().enumerate() {
             let origin = level.origin_voxels.unwrap_or(IVec3::ZERO);
             uniform.levels[index] = (origin.as_vec3() * level.voxel_size).extend(level.voxel_size);
+            let voxelize_origin = self
+                .pending
+                .filter(|pending| pending.level == index)
+                .map_or(origin, |pending| pending.origin);
             gpu.queue.write_buffer(
                 &level.voxelize_params,
                 0,
                 bytemuck::bytes_of(&VoxelizeParams {
-                    origin: origin.as_vec3() * level.voxel_size,
+                    origin: voxelize_origin.as_vec3() * level.voxel_size,
                     voxel_size: level.voxel_size,
                     resolution: RESOLUTION,
                     level_offset: (index as u64 * VOXELS_PER_LEVEL) as u32,
@@ -438,7 +509,14 @@ impl GiVolume {
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
 
-        VolumeWork { rebuild, relight }
+        if committed {
+            self.pending = None;
+        }
+        VolumeWork {
+            rebuild,
+            slice,
+            relight,
+        }
     }
 
     /// Records rebuilds of moved levels, then a lighting update.
@@ -453,19 +531,42 @@ impl GiVolume {
         environment: &wgpu::BindGroup,
         first_slot: u32,
         work: &VolumeWork,
+        profiler: Option<&Profiler>,
     ) {
+        let mark = |encoder: &mut wgpu::CommandEncoder, section: usize| {
+            if let Some(profiler) = profiler {
+                profiler.mark(encoder, section);
+            }
+        };
+        mark(encoder, section::GI_CULL);
         for &index in &work.rebuild {
-            cull.record(
+            self.record_slice(
                 encoder,
+                cull,
                 scene,
                 cull_scene,
-                first_slot + index as u32,
                 cull_work,
-                CullPhase::First,
+                first_slot,
+                &RebuildSlice {
+                    level: index,
+                    begin: true,
+                    passes: 0..flood_pass_count(),
+                    commit: true,
+                },
+                &mark,
             );
-            self.record_rebuild(encoder, index, cull_work);
-            self.record_write(encoder, index);
         }
+        if let Some(slice) = &work.slice {
+            self.record_slice(
+                encoder, cull, scene, cull_scene, cull_work, first_slot, slice, &mark,
+            );
+        }
+        if work.rebuild.is_empty() && work.slice.is_none() {
+            mark(encoder, section::GI_VOXELIZE);
+            mark(encoder, section::GI_FLOOD);
+            mark(encoder, section::GI_WRITE);
+        }
+        mark(encoder, section::GI_LIGHT);
 
         let groups = groups_for(RESOLUTION, 4);
         {
@@ -481,7 +582,49 @@ impl GiVolume {
         self.record_write(encoder, work.relight);
     }
 
-    fn record_rebuild(
+    #[allow(clippy::too_many_arguments)]
+    fn record_slice(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        cull: &CullPipelines,
+        scene: &GpuScene,
+        cull_scene: &wgpu::BindGroup,
+        cull_work: &CullWork,
+        first_slot: u32,
+        slice: &RebuildSlice,
+        mark: &dyn Fn(&mut wgpu::CommandEncoder, usize),
+    ) {
+        if slice.begin {
+            cull.record(
+                encoder,
+                scene,
+                cull_scene,
+                first_slot + slice.level as u32,
+                cull_work,
+                CullPhase::First,
+            );
+        }
+        mark(encoder, section::GI_VOXELIZE);
+        if slice.begin {
+            self.record_voxelize(encoder, slice.level, cull_work);
+        }
+        mark(encoder, section::GI_FLOOD);
+        self.record_flood(encoder, slice);
+        mark(encoder, section::GI_WRITE);
+        if slice.commit {
+            let level_offset = slice.level as u64 * VOXELS_PER_LEVEL;
+            encoder.copy_buffer_to_buffer(
+                &self.flood_a,
+                0,
+                &self.seeds,
+                level_offset * 4,
+                VOXELS_PER_LEVEL * 4,
+            );
+            self.record_write(encoder, slice.level);
+        }
+    }
+
+    fn record_voxelize(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         index: usize,
@@ -498,29 +641,24 @@ impl GiVolume {
             pass.set_bind_group(0, &self.levels[index].voxelize_group, &[]);
             pass.dispatch_workgroups_indirect(cull_work.args(), CullWork::software_args_offset());
         }
-        {
-            let groups = groups_for(RESOLUTION, 4);
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("gi jump flood"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.seed_pipeline);
-            pass.set_bind_group(0, &self.levels[index].seed_group, &[]);
-            pass.dispatch_workgroups(groups, groups, groups);
+    }
 
-            pass.set_pipeline(&self.flood_pipeline);
-            for group in &self.flood_groups {
-                pass.set_bind_group(0, group, &[]);
-                pass.dispatch_workgroups(groups, groups, groups);
-            }
+    fn record_flood(&self, encoder: &mut wgpu::CommandEncoder, slice: &RebuildSlice) {
+        let groups = groups_for(RESOLUTION, 4);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("gi jump flood"),
+            timestamp_writes: None,
+        });
+        if slice.begin {
+            pass.set_pipeline(&self.seed_pipeline);
+            pass.set_bind_group(0, &self.levels[slice.level].seed_group, &[]);
+            pass.dispatch_workgroups(groups, groups, groups);
         }
-        encoder.copy_buffer_to_buffer(
-            &self.flood_a,
-            0,
-            &self.seeds,
-            level_offset * 4,
-            VOXELS_PER_LEVEL * 4,
-        );
+        pass.set_pipeline(&self.flood_pipeline);
+        for group in &self.flood_groups[slice.passes.clone()] {
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(groups, groups, groups);
+        }
     }
 
     fn record_write(&self, encoder: &mut wgpu::CommandEncoder, index: usize) {
@@ -533,6 +671,29 @@ impl GiVolume {
         pass.set_bind_group(0, &self.levels[index].write_group, &[]);
         pass.dispatch_workgroups(groups, groups, groups);
     }
+}
+
+/// One pass per axis per step.
+const fn flood_pass_count() -> usize {
+    FLOOD_STEPS.len() * 3
+}
+
+/// Picks the level that has fallen furthest behind the camera, measured in its own voxels.
+/// Always taking the finest instead would starve the coarser levels during fast flight.
+fn choose_rebuild(levels: &[Level], camera_position: Vec3) -> Option<PendingRebuild> {
+    let offsets = levels.iter().map(|level| {
+        let wanted = snapped_origin(camera_position, level.voxel_size);
+        let current = level.origin_voxels.unwrap_or(wanted);
+        (wanted, (wanted - current).abs().max_element())
+    });
+    let (index, (origin, offset)) = offsets
+        .enumerate()
+        .max_by_key(|&(index, (_, offset))| (offset, std::cmp::Reverse(index)))?;
+    (offset > 0).then_some(PendingRebuild {
+        level: index,
+        origin,
+        next_pass: 0,
+    })
 }
 
 /// The grid corner for a level centred near `position`, in whole voxels.

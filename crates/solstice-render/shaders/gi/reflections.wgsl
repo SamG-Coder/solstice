@@ -14,6 +14,8 @@
 const MAX_TRACED_ROUGHNESS: f32 = 0.65;
 const SCREEN_STEPS: u32 = 24u;
 const SCREEN_DISTANCE: f32 = 40.0;
+const SCREEN_EDGE_FADE: f32 = 0.08;
+const REFINE_ATTEMPTS: u32 = 6u;
 
 fn project(world: vec3f) -> vec3f {
     let clip = frame.unjittered_view_proj * vec4f(world, 1.0);
@@ -37,9 +39,10 @@ fn sample_vndf(view_local: vec3f, a: f32, u: vec2f) -> vec3f {
 }
 
 struct Trace {
-    hit: bool,
+    // How much of the result to use: 0 for a miss, and falling off towards the screen edges,
+    // where this data is about to run out.
+    weight: f32,
     radiance: vec3f,
-    t: f32,
 }
 
 fn trace_screen(origin: vec3f, direction: vec3f, jitter: f32) -> Trace {
@@ -58,17 +61,60 @@ fn trace_screen(origin: vec3f, direction: vec3f, jitter: f32) -> Trace {
             let scene_distance = frame.near / scene_depth;
             let ray_distance = frame.near / p.z;
             if ray_distance - scene_distance < max(t - previous_t, 0.05) + 0.2 {
-                // Fade near the screen edges, where this data is about to run out.
-                let edge = min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y));
-                if edge > 0.02 {
+                // A ray can only strike the front of a surface. Without this, a ray leaving a
+                // surface seen at a grazing angle "hits" that same surface: one pixel there spans
+                // metres of depth, so the neighbouring pixel can read as nearer than the ray.
+                let surface = oct_decode(textureLoad(normal_tex, pixel, 0).xy);
+                if dot(surface, direction) < 0.0 {
+                    let edge = min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y));
                     let history_pixel = vec2i(p.xy * vec2f(textureDimensions(scene_history)));
-                    return Trace(true, textureLoad(scene_history, history_pixel, 0).rgb, t);
+                    return Trace(smoothstep(0.0, SCREEN_EDGE_FADE, edge), textureLoad(scene_history, history_pixel, 0).rgb);
                 }
             }
         }
         previous_t = t;
     }
-    return Trace(false, vec3f(0.0), 0.0);
+    return Trace(0.0, vec3f(0.0));
+}
+
+// Traces the volume, then checks each hit against what the camera can see. Voxels are coarse, so
+// thin geometry such as rigging swells into solid blobs. Where the camera sees past a hit point,
+// that point is really empty, and the ray carries on. Where the camera sees a surface there, its
+// colour replaces the voxel's, since it is sharper and fully shaded.
+fn trace_refined(origin: vec3f, direction: vec3f, start: f32) -> VolumeHit {
+    var from_t = start;
+    for (var attempt = 0u; attempt < REFINE_ATTEMPTS; attempt++) {
+        let hit = trace_volume_with(origin, direction, from_t, 320.0, 48u, 0.55);
+        if !hit.hit {
+            return hit;
+        }
+        let point = origin + direction * hit.t;
+        let p = project(point);
+        if any(p.xy < vec2f(0.0)) || any(p.xy >= vec2f(1.0)) || p.z <= 0.0 {
+            return hit;
+        }
+        let level = min(volume_level_at(point, 0u), VOLUME_LEVELS - 1u);
+        let margin = volume_params.levels[level].w * 1.5;
+        let pixel = min(vec2i(p.xy * frame.viewport), vec2i(frame.viewport) - vec2i(1));
+        let scene_depth = textureLoad(depth_tex, pixel, 0).r;
+        let ray_distance = frame.near / p.z;
+        if scene_depth <= 0.0 || frame.near / scene_depth > ray_distance + margin {
+            from_t = hit.t + margin * 0.33;
+            continue;
+        }
+        if frame.near / scene_depth < ray_distance - margin {
+            return hit; // Something nearer hides this point, so the voxel is all there is.
+        }
+        let surface = oct_decode(textureLoad(normal_tex, pixel, 0).xy);
+        if dot(surface, direction) >= 0.0 {
+            return hit;
+        }
+        let edge = min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y));
+        let history_pixel = vec2i(p.xy * vec2f(textureDimensions(scene_history)));
+        let seen = textureLoad(scene_history, history_pixel, 0).rgb;
+        return VolumeHit(true, hit.t, mix(hit.radiance, seen, smoothstep(0.0, SCREEN_EDGE_FADE, edge)));
+    }
+    return VolumeHit(false, from_t, vec3f(0.0));
 }
 
 @compute @workgroup_size(8, 8)
@@ -109,15 +155,19 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         direction = reflect(-view, normal);
     }
 
-    var radiance: vec3f;
     let screen = trace_screen(world + normal * 0.02, direction, noise.x);
-    if screen.hit {
-        radiance = screen.radiance;
-    } else {
+    var radiance = screen.radiance;
+    if screen.weight < 1.0 {
         let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
         let voxel = volume_params.levels[level].w;
-        let hit = trace_volume(world + normal * voxel * 1.5, direction, voxel * 0.5, 320.0, 48u);
-        radiance = select(sky_radiance(direction), hit.radiance, hit.hit);
+        let hit = trace_refined(world + normal * voxel * 1.5, direction, voxel * 0.5);
+        let sky = sky_radiance(direction);
+        // Fade by where the ray ended up. A ray leaving the volume before reaching something sees
+        // only sky, so hits near the edge must already be blending towards that, or the edge shows
+        // as a hard line across glossy surfaces.
+        let hit_point = world + direction * hit.t;
+        let far = mix(sky, select(sky, hit.radiance, hit.hit), volume_edge_fade(hit_point) * volume_edge_fade(world));
+        radiance = mix(far, screen.radiance, screen.weight);
     }
 
     // Fireflies would otherwise persist through the temporal filter.

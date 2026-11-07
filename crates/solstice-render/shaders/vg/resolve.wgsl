@@ -53,6 +53,34 @@ fn interp3(b: vec3f, a0: vec3f, a1: vec3f, a2: vec3f) -> vec3f {
     return a0 * b.x + a1 * b.y + a2 * b.z;
 }
 
+// Hides the repetition of a tiling texture, using only that texture. A second copy, rotated and
+// at a different scale, is mixed in so that its grid never lines up with the first. Then two far
+// larger copies vary the brightness, which breaks up the pattern seen from a distance.
+fn hide_tiling(tint: vec3f, color: vec4f, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f, layer: i32, strength: f32) -> vec3f {
+    const ROTATION: mat2x2f = mat2x2f(0.799, 0.602, -0.602, 0.799);
+    const SECOND_SCALE: f32 = 0.73;
+    const LARGE_SCALE_A: f32 = 0.083;
+    const LARGE_SCALE_B: f32 = 0.0137;
+
+    let second_transform = ROTATION * SECOND_SCALE;
+    let second = textureSampleGrad(
+        color_textures,
+        material_sampler,
+        second_transform * uv,
+        layer,
+        second_transform * duv_dx,
+        second_transform * duv_dy,
+    ).rgb;
+    let mixed = mix(color.rgb, second, 0.5 * strength);
+
+    // The highest mip is the texture's average, which makes these ratios centre on one.
+    let average = max(luminance(textureSampleLevel(color_textures, material_sampler, uv, layer, 16.0).rgb), 0.01);
+    let large_a = textureSampleGrad(color_textures, material_sampler, uv * LARGE_SCALE_A, layer, duv_dx * LARGE_SCALE_A, duv_dy * LARGE_SCALE_A).rgb;
+    let large_b = textureSampleGrad(color_textures, material_sampler, ROTATION * uv * LARGE_SCALE_B, layer, ROTATION * duv_dx * LARGE_SCALE_B, ROTATION * duv_dy * LARGE_SCALE_B).rgb;
+    let variation = clamp(luminance(large_a) * luminance(large_b) / (average * average), 0.6, 1.45);
+    return tint * mixed * mix(1.0, variation, strength);
+}
+
 fn hash_color(value: u32) -> vec3f {
     let h = pcg(value);
     return vec3f(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0 * 0.8 + 0.2;
@@ -131,24 +159,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var albedo = material.base_color.rgb;
     var roughness = material.roughness;
     var cavity = 1.0;
+    var metallic = material.metallic;
     if material.texture_layer >= 0 {
         let layer = material.texture_layer;
-        let color = textureSampleGrad(color_textures, material_sampler, uv, layer, duv_dx, duv_dy);
-        let surface = textureSampleGrad(surface_textures, material_sampler, uv, layer, duv_dx, duv_dy);
-        // A far larger second sampling of the same texture breaks up visible tiling.
-        const MACRO_SCALE: f32 = 0.083;
-        let macro_color = textureSampleGrad(
-            color_textures,
-            material_sampler,
-            uv * MACRO_SCALE,
-            layer,
-            duv_dx * MACRO_SCALE,
-            duv_dy * MACRO_SCALE,
-        );
-        let variation = 0.72 + luminance(macro_color.rgb) * 1.1;
-        albedo *= color.rgb * variation;
+        let sample_dx = duv_dx * frame.mip_scale;
+        let sample_dy = duv_dy * frame.mip_scale;
+        let color = textureSampleGrad(color_textures, material_sampler, uv, layer, sample_dx, sample_dy);
+        let surface = textureSampleGrad(surface_textures, material_sampler, uv, layer, sample_dx, sample_dy);
+        if material.macro_variation > 0.0 {
+            albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, layer, material.macro_variation);
+        } else {
+            albedo *= color.rgb;
+        }
         cavity = color.a;
         roughness = clamp(roughness * surface.b * 2.0, 0.04, 1.0);
+        metallic *= surface.a;
 
         // Normal mapping without stored tangents (Mikkelsen 2010): the tangent frame
         // comes from the same analytic derivatives used for texture filtering.
@@ -201,7 +226,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
 
     textureStore(out_albedo, pixel, vec4f(albedo, cavity));
-    textureStore(out_normal, pixel, vec4f(oct_encode(normal), roughness, material.metallic));
+    textureStore(out_normal, pixel, vec4f(oct_encode(normal), roughness, metallic));
     textureStore(out_emissive, pixel, vec4f(emissive, 0.0));
     textureStore(out_motion, pixel, vec4f(motion, 0.0, 0.0));
 }

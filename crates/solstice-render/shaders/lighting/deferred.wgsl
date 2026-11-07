@@ -35,7 +35,12 @@ const DISK_SAMPLES: u32 = 12u;
 
 fn sample_cascade(cascade: u32, world: vec3f, normal: vec3f, angle: f32) -> f32 {
     let texel = shadows.texel_size[cascade];
-    let offset_world = world + normal * texel * 1.6;
+    // Offset towards the surface normal, by more as the sun grazes the surface: a texel then
+    // spans a long stretch of it, and the surface would otherwise shadow itself. This matters
+    // most in the far cascades, whose texels are large.
+    let n_dot_l = clamp(dot(normal, frame.sun_direction), 0.05, 1.0);
+    let slope = min(sqrt(1.0 - n_dot_l * n_dot_l) / n_dot_l, 8.0);
+    let offset_world = world + normal * texel * (1.2 + slope * 0.8);
     let clip = shadows.view_proj[cascade] * vec4f(offset_world, 1.0);
     let uv = vec2f(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
     if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || clip.z > 1.0 {
@@ -75,14 +80,29 @@ fn sun_shadow(world: vec3f, normal: vec3f, distance: f32, noise: f32) -> f32 {
             cascade += 1u;
         }
     }
-    return sample_cascade(cascade, world, normal, noise * TAU);
+    var shadow = sample_cascade(cascade, world, normal, noise * TAU);
+    // Fade out towards the end of the last cascade, so that shadows have no visible edge.
+    if cascade + 1u == CASCADE_COUNT {
+        shadow = mix(shadow, 1.0, smoothstep(split * 0.8, split, distance));
+    }
+    return shadow;
 }
 
 // A short ray through the depth buffer towards the sun. Catches the small-scale shadowing
 // of dense geometry, which is finer than any shadow map texel.
-fn contact_shadow(pixel: vec2f, world: vec3f, normal: vec3f, noise: f32) -> f32 {
+fn contact_shadow(world: vec3f, normal: vec3f, view: vec3f, distance: f32, noise: f32) -> f32 {
     const STEPS: u32 = 10u;
     const LENGTH: f32 = 0.35;
+    const MAX_GAP: f32 = 0.12;
+    // The depth that one pixel of this surface spans: small when facing the camera, large at
+    // grazing angles. A closer depth than that may just be the neighbouring pixel of the same
+    // surface, so it proves nothing. Where this exceeds MAX_GAP, the test cannot tell the two
+    // apart, and it is right to do nothing.
+    let pixel_angle = 1.04 * frame.inv_viewport.y;
+    let tolerance = max(0.002, 2.0 * distance * pixel_angle / max(abs(dot(normal, view)), 0.02));
+    if tolerance >= MAX_GAP {
+        return 1.0;
+    }
     let start = world + normal * 0.01;
     let size = vec2i(frame.viewport);
     for (var i = 0u; i < STEPS; i++) {
@@ -96,7 +116,7 @@ fn contact_shadow(pixel: vec2f, world: vec3f, normal: vec3f, noise: f32) -> f32 
         let scene_depth = textureLoad(depth_tex, min(vec2i(uv * frame.viewport), size - vec2i(1)), 0).r;
         if scene_depth > ndc.z {
             let gap = frame.near / ndc.z - frame.near / scene_depth;
-            if gap > 0.002 && gap < 0.12 {
+            if gap > tolerance && gap < MAX_GAP {
                 return 1.0 - clamp(1.0 - t / LENGTH, 0.0, 1.0) * 0.85;
             }
         }
@@ -185,7 +205,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if sun_facing > 0.0 {
         var shadow = sun_shadow(world, normal, distance, noise);
         if shadow > 0.0 && distance < 40.0 {
-            shadow *= contact_shadow(center, world, normal, noise);
+            shadow *= contact_shadow(world, normal, view, distance, noise);
         }
         color += shade_light(surface, view, frame.sun_direction) * sun_irradiance() * shadow;
     }
@@ -220,7 +240,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // object scatters light from all around, not only the long path to the horizon line.
     let haze_direction = normalize(vec3f(-view.x, max(-view.y, 0.2), -view.z));
     let haze_sky = sky_radiance(haze_direction);
-    let haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
+    var haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
+    // That direction can land on the glow around the sun even when looking down at nearby ground,
+    // whose radiance is so high that this small share of it shows as smoke across shadows. So the
+    // haze is limited relative to the open sky on the side away from the sun.
+    let away_from_sun = normalize(vec3f(-frame.sun_direction.x, 0.2, -frame.sun_direction.z));
+    let haze_limit = luminance(sky_radiance(away_from_sun)) * 2.0;
+    haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
     color = mix(haze_color, color, transmittance);
 
     switch frame.debug_mode {

@@ -22,6 +22,11 @@ struct Frame {
     gi_intensity: f32,
     // Zero makes the final image use only the current frame, with no history.
     temporal_accumulation: u32,
+    // Scales texture gradients, for upscaling and temporal filtering.
+    mip_scale: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 const DEBUG_NONE: u32 = 0u;

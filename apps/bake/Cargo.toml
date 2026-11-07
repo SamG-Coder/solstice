@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 solstice-asset.workspace = true
 solstice-builder.workspace = true
+solstice-import.workspace = true
 glam.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true

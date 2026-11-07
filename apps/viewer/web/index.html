@@ -80,11 +80,12 @@
   </label>
   <label>Sun height<input id="sun-elevation" type="range" min="1" max="80" value="25"></label>
   <label>Sun direction<input id="sun-azimuth" type="range" min="0" max="360" value="39"></label>
-  <label>Render scale
-    <select id="scale">
-      <option value="1">100%</option>
-      <option value="0.75">75% (upscaled)</option>
-      <option value="0.5">50% (upscaled)</option>
+  <label>Quality
+    <select id="quality">
+      <option value="auto">Automatic</option>
+      <option value="high">High</option>
+      <option value="medium">Medium</option>
+      <option value="low">Low</option>
     </select>
   </label>
 </aside>
@@ -106,7 +107,7 @@ import init, { WebViewer } from "./pkg/solstice_viewer.js";
 const params = new URLSearchParams(location.search);
 const sceneName = params.get("scene") ?? "web";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
-const sceneUrl = `assets/${sceneName}.solstice`;
+const sceneUrl = `assets/${sceneName}.solstice.gz`;
 
 const el = (id) => document.getElementById(id);
 const canvas = el("view");
@@ -122,7 +123,7 @@ function fail(text) {
 async function download(url) {
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`Could not load ${url} (HTTP ${response.status}). Run the bake tool first.`);
+    throw new Error(`Could not load ${url} (HTTP ${response.status}).`);
   }
   const total = Number(response.headers.get("content-length")) || 0;
   const reader = response.body.getReader();
@@ -144,7 +145,12 @@ async function download(url) {
     offset += chunk.length;
   }
   el("progress").hidden = true;
-  return bytes;
+
+  // Some servers already undo the compression in transit, so check rather than assume.
+  if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return bytes;
+  el("message").textContent = "Unpacking scene…";
+  const unpacked = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Uint8Array(await new Response(unpacked).arrayBuffer());
 }
 
 const canvasSize = () => {
@@ -165,6 +171,12 @@ function compact(n) {
 async function main() {
   if (!navigator.gpu) {
     fail("This browser does not support WebGPU. Try a recent version of Chrome or Edge.");
+    return;
+  }
+  // Checked up front, so nobody downloads a whole scene to learn their GPU can't show it.
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    fail("WebGPU is available in this browser, but not for this GPU or driver. Try updating your graphics driver, or a different browser.");
     return;
   }
   await init();
@@ -191,7 +203,38 @@ async function main() {
     el("debug").value = params.get("debug");
     viewer.set_debug_view(params.get("debug"));
   }
-  el("scale").addEventListener("change", (e) => viewer.set_render_scale(Number(e.target.value)));
+
+  // Automatic quality starts high and steps down while the frame rate stays below target.
+  // It never steps back up: oscillating between presets is worse than either one.
+  const LEVELS = ["high", "medium", "low"];
+  const TARGET_FPS = 28;
+  let autoLevel = 0;
+  let slowReports = 0;
+  let ignoreReports = 4;
+  const autoOption = el("quality").querySelector('[value="auto"]');
+  const adaptQuality = (fps) => {
+    if (el("quality").value !== "auto" || autoLevel === LEVELS.length - 1) return;
+    if (ignoreReports > 0) {
+      ignoreReports -= 1;
+      return;
+    }
+    slowReports = fps < TARGET_FPS ? slowReports + 1 : 0;
+    if (slowReports >= 3) {
+      autoLevel += 1;
+      slowReports = 0;
+      ignoreReports = 4;
+      viewer.set_quality(LEVELS[autoLevel]);
+      autoOption.textContent = `Automatic (${LEVELS[autoLevel]})`;
+    }
+  };
+  el("quality").addEventListener("change", (e) => {
+    viewer.set_quality(e.target.value === "auto" ? LEVELS[autoLevel] : e.target.value);
+  });
+  const requestedQuality = params.get("quality");
+  if (LEVELS.includes(requestedQuality)) {
+    el("quality").value = requestedQuality;
+    viewer.set_quality(requestedQuality);
+  }
 
   const keys = new Set();
   let lookYaw = 0;
@@ -258,6 +301,7 @@ async function main() {
       el("clusters").textContent = compact(viewer.clusters());
       el("software").textContent = compact(viewer.software_clusters());
       el("errors").textContent = viewer.gpu_error_count();
+      adaptQuality(fps);
     }
     requestAnimationFrame(tick);
   }

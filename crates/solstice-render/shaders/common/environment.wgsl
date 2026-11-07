@@ -76,8 +76,16 @@ struct VolumeHit {
 
 // Sphere traces the GI volume. `start` skips self-intersection near the ray's origin.
 fn trace_volume(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32) -> VolumeHit {
+    return trace_volume_with(origin, direction, start, max_t, max_steps, 0.85);
+}
+
+// `hit_voxels` is how close counts as a hit, in voxels. Lighting uses a generous value, so that
+// thin walls stop light. Reflections can use less, so that thin objects look thin.
+fn trace_volume_with(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32, hit_voxels: f32) -> VolumeHit {
     var t = start;
     var level = 0u;
+    var measured_level = VOLUME_LEVELS;
+    var previous_distance = 0.0;
     for (var step = 0u; step < max_steps && t < max_t; step++) {
         let p = origin + direction * t;
         level = volume_level_at(p, level);
@@ -86,12 +94,28 @@ fn trace_volume(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_ste
         }
         let voxel = volume_params.levels[level].w;
         let s = sample_volume(p, level);
-        if s.a < voxel * 0.85 {
+        // A hit needs the ray to be closing in on a surface, measured within a single level:
+        // distances from different levels are not comparable. Without this, a ray skimming away
+        // from flat ground falsely hits it on entering a coarser level, where the threshold
+        // doubles, which draws the boundaries of the levels onto glossy surfaces as lines.
+        let approaching = level == measured_level && s.a <= previous_distance;
+        measured_level = level;
+        previous_distance = s.a;
+        if s.a < voxel * hit_voxels && approaching {
             return VolumeHit(true, t, s.rgb);
         }
         t += max(s.a - voxel * 0.5, voxel * 0.6);
     }
     return VolumeHit(false, t, vec3f(0.0));
+}
+
+// How far inside the outermost level `p` is: 0 at its edge, reaching 1 well inside. Rays from
+// beyond the edge see only sky, so anything that blends by this avoids a visible boundary there.
+fn volume_edge_fade(p: vec3f) -> f32 {
+    let grid = volume_params.levels[VOLUME_LEVELS - 1u];
+    let local = (p - grid.xyz) / grid.w * volume_params.inv_resolution;
+    let edge = min(min(local.x, 1.0 - local.x), min(local.z, 1.0 - local.z));
+    return smoothstep(0.02, 0.2, edge);
 }
 
 // True if nothing in the volume blocks the path towards `direction`.

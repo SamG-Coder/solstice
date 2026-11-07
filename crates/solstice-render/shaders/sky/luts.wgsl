@@ -175,5 +175,12 @@ fn build_sky_view(@builtin(global_invocation_id) id: vec3u) {
         radiance += through * (single * in_sun + multi) * integrate;
         through *= step_transmittance;
     }
+    // Below the horizon the ray ends on the planet, which should look like lit ground and
+    // not black. This is what shows past the edge of a scene that has no terrain of its own.
+    if ground_t > 0.0 {
+        let p = origin + direction * t_max;
+        let lit = max(dot(normalize(p), sun), 0.0);
+        radiance += through * sample_transmittance(p, sun) * lit * GROUND_ALBEDO / PI;
+    }
     textureStore(output, id.xy, vec4f(radiance, 1.0));
 }

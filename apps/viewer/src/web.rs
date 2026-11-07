@@ -2,9 +2,9 @@
 //!
 //! JavaScript owns the page: the animation loop, input and UI. Rust owns the renderer.
 
-use crate::{default_camera, default_environment, CameraInput, FlyCamera};
+use crate::{default_environment, initial_camera, CameraInput, FlyCamera};
 use glam::Vec3;
-use solstice_render::{DebugView, Environment, Gpu, Renderer, RendererSettings};
+use solstice_render::{DebugView, Environment, Gpu, Quality, Renderer, RendererSettings};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -52,9 +52,13 @@ impl WebViewer {
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(error_string)?;
-        let gpu = Gpu::request(&instance, Some(&surface))
-            .await
-            .map_err(error_string)?;
+        let gpu = Gpu::request(
+            &instance,
+            Some(&surface),
+            wgpu::PowerPreference::HighPerformance,
+        )
+        .await
+        .map_err(error_string)?;
 
         let gpu_errors = Arc::new(AtomicU32::new(0));
         let counter = gpu_errors.clone();
@@ -76,7 +80,7 @@ impl WebViewer {
             surface,
             config,
             renderer,
-            camera: FlyCamera::new(default_camera()),
+            camera: FlyCamera::new(initial_camera(scene.viewpoint)),
             environment: default_environment(),
             gpu_errors,
         })
@@ -146,12 +150,15 @@ impl WebViewer {
         }
     }
 
-    pub fn set_render_scale(&mut self, scale: f32) {
-        self.renderer.settings_mut().render_scale = scale.clamp(0.25, 2.0);
-    }
-
-    pub fn set_lod_threshold(&mut self, pixels: f32) {
-        self.renderer.settings_mut().lod_threshold = pixels.clamp(0.25, 16.0);
+    /// Applies a quality preset by name. Returns false if there is no such preset.
+    pub fn set_quality(&mut self, name: &str) -> bool {
+        match Quality::from_name(name) {
+            Some(quality) => {
+                self.renderer.settings_mut().apply_quality(quality);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Places the sun by compass direction and height above the horizon, in radians.
