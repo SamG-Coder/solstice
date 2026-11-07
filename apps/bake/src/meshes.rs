@@ -2,10 +2,10 @@
 //! normal maps wherever possible, since dense source geometry is what virtualized
 //! geometry exists to make affordable.
 
-use crate::noise::{fbm, random, ridged};
 use glam::{Vec2, Vec3};
 use rustc_hash::FxHashMap;
 use solstice_builder::{Mesh, Vertex};
+use solstice_procgen::noise::{fbm, random, ridged};
 use std::f32::consts::TAU;
 
 /// An indexed surface before UVs are assigned.

@@ -5,7 +5,8 @@ struct Params {
     delta_seconds: f32,
     first_frame: u32,
     compensation: f32,
-    _pad: u32,
+    // Exposure stops adapting above this average, so that a bright scene stays bright.
+    brightest_average: f32,
 }
 
 struct Exposure {
@@ -75,5 +76,5 @@ fn resolve() {
     }
     exposure.average_luminance = average;
     // Maps the average to middle grey.
-    exposure.exposure = params.compensation * 0.18 / max(average, 1.0e-4);
+    exposure.exposure = params.compensation * 0.18 / clamp(average, 1.0e-4, params.brightest_average);
 }

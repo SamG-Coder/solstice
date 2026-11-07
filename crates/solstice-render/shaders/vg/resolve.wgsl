@@ -183,8 +183,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let tangent_z = sqrt(max(1.0 - dot(tangent_xy, tangent_xy), 0.0));
         let perp_y = cross(dp_dy, normal);
         let perp_x = cross(normal, dp_dx);
-        let tangent = perp_y * duv_dx.x + perp_x * duv_dy.x;
-        let bitangent = perp_y * duv_dx.y + perp_x * duv_dy.y;
+        // These come out scaled by the signed area of a pixel on the surface. Pixel rows count
+        // downwards, which makes that negative on any surface facing the camera, and left as it
+        // is that would turn every bump into a dent.
+        let pixel_area = select(-1.0, 1.0, dot(cross(dp_dx, dp_dy), normal) >= 0.0);
+        let tangent = (perp_y * duv_dx.x + perp_x * duv_dy.x) * pixel_area;
+        let bitangent = (perp_y * duv_dx.y + perp_x * duv_dy.y) * pixel_area;
         let scale = max(dot(tangent, tangent), dot(bitangent, bitangent));
         if scale > 1.0e-20 {
             let inv = 1.0 / sqrt(scale);

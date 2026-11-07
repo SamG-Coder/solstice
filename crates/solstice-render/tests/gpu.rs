@@ -433,6 +433,106 @@ fn every_texture_path_renders_the_same_colour() {
     }
 }
 
+/// The world normal at the centre of a flat, camera-facing tile, encoded as red and green.
+fn tile_normal(gpu: &Gpu, uv: impl Fn(f32, f32) -> Vec2, stored: [u8; 2]) -> (i32, i32) {
+    const CELLS: u32 = 8;
+    const EDGE: u32 = 16;
+    let n = (EDGE * EDGE) as usize;
+    let mut mesh = Mesh::default();
+    for j in 0..=CELLS {
+        for i in 0..=CELLS {
+            let (x, y) = (
+                i as f32 / CELLS as f32 * 4.0 - 2.0,
+                j as f32 / CELLS as f32 * 4.0 - 2.0,
+            );
+            mesh.vertices.push(Vertex {
+                position: Vec3::new(x, y, 0.0),
+                normal: Vec3::Z,
+                uv: uv(x, y),
+            });
+        }
+    }
+    for j in 0..CELLS {
+        for i in 0..CELLS {
+            let a = j * (CELLS + 1) + i;
+            let (b, c, d) = (a + 1, a + CELLS + 1, a + CELLS + 2);
+            mesh.indices.extend_from_slice(&[a, b, c, b, d, c]);
+        }
+    }
+    let scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&mesh, &BuildOptions::default())],
+        materials: vec![Material {
+            base_color: [1.0; 4],
+            texture_layer: 0,
+            ..Default::default()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        texture_size: EDGE,
+        textures: vec![TextureLayer {
+            color_mips: mip_chain([200, 200, 200, 255].repeat(n), EDGE, 4),
+            normal_mips: mip_chain(stored.repeat(n), EDGE, 2),
+            material_mips: mip_chain([128, 255].repeat(n), EDGE, 2),
+        }],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 3.0),
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Normals,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let run = render(gpu, &scene, &camera, settings, 64);
+    let at = ((run.size / 2 * run.size + run.size / 2) * 4) as usize;
+    (i32::from(run.pixels[at]), i32::from(run.pixels[at + 1]))
+}
+
+/// A stored normal leaning towards increasing U must lean that way in the world, or every bump in
+/// every texture lights as a dent. Tested with UVs in both handednesses, which models use freely.
+#[test]
+fn normal_maps_lean_the_way_their_texture_says() {
+    let Some(gpu) = request_gpu() else { return };
+    const TOWARDS_U: [u8; 2] = [220, 128];
+    const TOWARDS_V: [u8; 2] = [128, 220];
+    const FLAT: [u8; 2] = [128, 128];
+
+    let plain = |x: f32, y: f32| Vec2::new(x, y);
+    let (flat_x, flat_y) = tile_normal(&gpu, plain, FLAT);
+    let (x, y) = tile_normal(&gpu, plain, TOWARDS_U);
+    assert!(
+        x > flat_x + 20,
+        "+U should lean +X: {x} against flat {flat_x}"
+    );
+    assert!(
+        y.abs_diff(flat_y) < 20,
+        "+U should not lean in Y: {y} against {flat_y}"
+    );
+    let (x, y) = tile_normal(&gpu, plain, TOWARDS_V);
+    assert!(
+        y > flat_y + 20,
+        "+V should lean +Y: {y} against flat {flat_y}"
+    );
+    assert!(
+        x.abs_diff(flat_x) < 20,
+        "+V should not lean in X: {x} against {flat_x}"
+    );
+
+    // Mirrored, as a model's far side often is: increasing U now runs towards -X.
+    let mirrored = |x: f32, y: f32| Vec2::new(-x, y);
+    let (x, _) = tile_normal(&gpu, mirrored, TOWARDS_U);
+    assert!(
+        x < flat_x - 20,
+        "mirrored +U should lean -X: {x} against flat {flat_x}"
+    );
+    let (_, y) = tile_normal(&gpu, mirrored, TOWARDS_V);
+    assert!(
+        y > flat_y + 20,
+        "mirrored +V should still lean +Y: {y} against flat {flat_y}"
+    );
+}
+
 /// Baking compresses every scene, including those with no textures to compress.
 #[test]
 fn compressed_scene_without_textures_renders() {

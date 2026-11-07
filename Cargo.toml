@@ -11,6 +11,7 @@ license = "MIT"
 solstice-asset = { path = "crates/solstice-asset" }
 solstice-builder = { path = "crates/solstice-builder" }
 solstice-import = { path = "crates/solstice-import" }
+solstice-procgen = { path = "crates/solstice-procgen" }
 solstice-render = { path = "crates/solstice-render" }
 # Pure Rust, MIT. The GPU compressor and its wgpu dependency are left out.
 block_compression = { version = "0.11", default-features = false, features = ["bc15", "bc7"] }

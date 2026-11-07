@@ -16,13 +16,13 @@
 //! A model placed several times is imported once and shared, so repeats cost almost nothing.
 
 use crate::meshes;
-use crate::noise::fbm;
-use crate::textures;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Light, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
+use solstice_procgen::noise::fbm;
+use solstice_procgen::surfaces;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -232,7 +232,9 @@ fn terrain_height(x: f32, z: f32, amplitude: f32, shore_x: f32) -> f32 {
 fn add_terrain(scene: &mut SceneAsset, size: f32, cells: u32, height: f32, shore_x: f32) -> i32 {
     let mesh = meshes::terrain(size, cells, |x, z| terrain_height(x, z, height, shore_x));
     let layer = scene.textures.len() as i32;
-    scene.textures.push(textures::ground(scene.texture_size));
+    scene
+        .textures
+        .push(surfaces::ground(0).bake(scene.texture_size));
     scene.materials.push(Material {
         // The texture is a bright desert. Darkened to real sand, about 0.35 albedo, so that
         // it sits correctly next to scanned materials and does not skew auto exposure.

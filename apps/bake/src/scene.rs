@@ -1,12 +1,12 @@
 //! Lays out the demo scene: a ruined temple in a desert canyon.
 
 use crate::meshes;
-use crate::noise::{fbm, random};
-use crate::textures;
 use glam::{Mat4, Quat, Vec3};
 use rayon::prelude::*;
 use solstice_asset::{Instance, Light, Material, SceneAsset, Viewpoint};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
+use solstice_procgen::noise::{fbm, random};
+use solstice_procgen::surfaces;
 
 /// How much geometry to generate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,10 +605,10 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
 
     println!("generating textures...");
     let textures = vec![
-        textures::sandstone(texture_size),
-        textures::marble(texture_size),
-        textures::ground(texture_size),
-        textures::basalt(texture_size),
+        surfaces::sandstone(0).bake(texture_size),
+        surfaces::marble(0).bake(texture_size),
+        surfaces::ground(0).bake(texture_size),
+        surfaces::basalt(0).bake(texture_size),
     ];
 
     let mut instances = vec![place(
