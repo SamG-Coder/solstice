@@ -15,6 +15,10 @@ const BLOOM_LEVELS: u32 = 6;
 /// measures about 0.08 per unit of sun. This sits just above the demo's pale desert, so that only
 /// scenes truly brighter than any bare ground stay bright. Any lower and that desert brightens too.
 const BRIGHTEST_AVERAGE_PER_SUN: f32 = 0.06;
+/// The darkest average luminance exposure adapts to, per unit of daylight sun. Below it, as at
+/// night, the image darkens rather than being brightened to grey, as an eye adapted to the dark
+/// still sees night as night: about seven stops below the brightest.
+const DARKEST_AVERAGE_PER_SUN: f32 = BRIGHTEST_AVERAGE_PER_SUN / 128.0;
 
 /// Twin of `Params` in `post/exposure.wgsl`.
 #[repr(C)]
@@ -24,6 +28,8 @@ struct ExposureParams {
     first_frame: u32,
     compensation: f32,
     brightest_average: f32,
+    darkest_average: f32,
+    _pad: [f32; 3],
 }
 
 /// Twin of `Params` in `post/bloom.wgsl`.
@@ -409,7 +415,7 @@ impl PostProcess {
         parity: usize,
         frame_index: u32,
         delta_seconds: f32,
-        sun_illuminance: f32,
+        daylight_illuminance: f32,
         debug_passthrough: bool,
     ) {
         gpu.queue.write_buffer(
@@ -419,7 +425,9 @@ impl PostProcess {
                 delta_seconds,
                 first_frame: u32::from(frame_index == 0),
                 compensation: 1.2,
-                brightest_average: sun_illuminance * BRIGHTEST_AVERAGE_PER_SUN,
+                brightest_average: daylight_illuminance * BRIGHTEST_AVERAGE_PER_SUN,
+                darkest_average: daylight_illuminance * DARKEST_AVERAGE_PER_SUN,
+                _pad: [0.0; 3],
             }),
         );
         gpu.queue.write_buffer(

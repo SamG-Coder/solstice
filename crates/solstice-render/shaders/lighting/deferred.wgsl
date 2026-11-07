@@ -4,6 +4,7 @@
 #include "common/environment.wgsl"
 #include "common/brdf.wgsl"
 #include "common/scene.wgsl"
+#include "sky/bodies.wgsl"
 
 const CASCADE_COUNT: u32 = 4u;
 
@@ -29,10 +30,11 @@ struct Shadows {
 // The clouds drawn for this view, at half resolution: their light in RGB and the sky showing
 // through them in A.
 @group(0) @binding(11) var cloud_tex: texture_2d<f32>;
+// The Milky Way over the celestial sphere, worked out once by sky/milky_way_bake.wgsl.
+@group(0) @binding(12) var milky_way_tex: texture_2d<f32>;
 
 // Distance over which distant objects dissolve into the air, as extinction per metre.
 const HAZE: f32 = 0.0011;
-const SUN_ANGULAR_RADIUS: f32 = 0.0065;
 
 const DISK_SAMPLES: u32 = 12u;
 
@@ -156,15 +158,6 @@ fn local_light(light: Light, s: Surface, view: vec3f, world: vec3f) -> vec3f {
     return shade_light(s, view, direction) * light.intensity * falloff * open;
 }
 
-fn sun_disc(direction: vec3f) -> vec3f {
-    let cos_angle = dot(direction, frame.sun_direction);
-    let edge = cos(SUN_ANGULAR_RADIUS);
-    let disc = smoothstep(edge - 0.00002, edge + 0.00002, cos_angle);
-    // The true disc would be vastly brighter. This keeps it in a range that still blooms,
-    // without one pixel's value dominating the exposure.
-    return sun_irradiance() * disc * 120.0;
-}
-
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     let size = vec2u(frame.viewport);
@@ -187,9 +180,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         // Texels hidden behind geometry hold -1, and are never next to a sky pixel; keep any
         // trace of them out regardless.
         cloud.a = clamp(cloud.a, 0.0, 1.0);
-        var sky = clear_sky_radiance(direction);
+        var sky = clear_sky_radiance(toward_horizon(direction));
         if frame.debug_mode == DEBUG_NONE {
-            sky += sun_disc(direction);
+            // The angle one pixel spans, so stars stay a pixel across.
+            let next = frame.inv_view_proj * vec4f(pixel_to_ndc(center + vec2f(1.0, 0.0), frame.inv_viewport), 1.0e-6, 1.0);
+            let pixel_angle = length(direction - normalize(next.xyz / next.w - frame.camera_position));
+            sky += sky_bodies(direction, pixel_angle);
         }
         sky = sky * cloud.a + cloud.rgb;
         textureStore(output, pixel, vec4f(sky, 1.0));
@@ -262,6 +258,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     // Aerial perspective: distant objects fade towards the sky colour behind them.
     let transmittance = exp(-distance * HAZE);
+    // How far into the haze this is: nearby haze glows with light from all around, but over a
+    // long path the air takes the colour of the sky at the horizon behind the object.
+    let far = sq(1.0 - transmittance);
     // Sampled above the horizon and partly desaturated: the air between here and a distant
     // object scatters light from all around, not only the long path to the horizon line.
     let haze_direction = normalize(vec3f(-view.x, max(-view.y, 0.2), -view.z));
@@ -276,6 +275,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let away_from_sun = normalize(vec3f(-frame.sun_direction.x, 0.2, -frame.sun_direction.z));
     let haze_limit = luminance(clear_sky_radiance(away_from_sun)) * shade * 2.0;
     haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
+    haze_color = mix(haze_color, clear_sky_radiance(toward_horizon(-view)) * shade, far);
     color = mix(haze_color, color, transmittance);
 
     switch frame.debug_mode {

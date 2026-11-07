@@ -120,7 +120,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
         let voxel = volume_params.levels[level].w;
         let hit = trace_refined(world + normal * voxel * 1.5, direction, voxel * 0.5);
-        let sky = sky_radiance(direction);
+        let sky = sky_radiance(toward_horizon(direction));
         // Fade by where the ray ended up. A ray leaving the volume before reaching something sees
         // only sky, so hits near the edge must already be blending towards that, or the edge shows
         // as a hard line across glossy surfaces.
@@ -129,9 +129,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         radiance = mix(far, radiance, screen.weight);
     }
 
-    // Fireflies would otherwise persist through the temporal filter.
+    // Fireflies would otherwise persist through the temporal filter. At night the limit stays
+    // where exposure stops brightening, or a dim or absent moon would black out the sky and
+    // lamps seen in reflections.
     let peak = max(radiance.x, max(radiance.y, radiance.z));
-    let limit = frame.sun_illuminance * 4.0;
+    let limit = max(frame.sun_illuminance, frame.daylight_illuminance / 128.0) * 4.0;
     if peak > limit {
         radiance *= limit / peak;
     }

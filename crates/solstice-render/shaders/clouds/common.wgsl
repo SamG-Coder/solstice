@@ -189,7 +189,8 @@ fn sun_at_height(height: f32) -> vec3f {
     let r = GROUND_RADIUS + height * 0.001;
     let uv = transmittance_uv(r, frame.sun_direction.y);
     let transmittance = textureSampleLevel(transmittance_lut, clamp_sampler, uv, 0.0).rgb;
-    return transmittance * frame.sun_color * frame.sun_illuminance;
+    return transmittance * frame.sun_color * frame.sun_illuminance
+        * above_horizon(r, frame.sun_direction.y);
 }
 
 // Optical depth of cloud between a point and the sun, from a few samples along the way that

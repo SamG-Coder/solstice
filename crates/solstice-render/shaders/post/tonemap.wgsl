@@ -67,6 +67,11 @@ fn hash(p: vec2f) -> f32 {
     return fract(sin(dot(p, vec2f(12.9898, 78.233))) * 43758.5453);
 }
 
+// `color` from the scene, after exposure (`scale`, with vignetting), bloom and the tone curve.
+fn toned(color: vec3f, bloom_color: vec3f, scale: f32) -> vec3f {
+    return aces(mix(color, bloom_color, params.bloom_strength) * scale);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let pixel = vec2i(in.position.xy);
@@ -76,26 +81,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(linear_to_srgb(clamp(center, vec3f(0.0), vec3f(1.0))), 1.0);
     }
 
-    // Contrast-adaptive sharpening: strong where the image is flat, gentle at high contrast,
-    // which restores the crispness that temporal filtering softens without halos.
-    let north = textureLoad(hdr, clamp(pixel + vec2i(0, -1), vec2i(0), last), 0).rgb;
-    let south = textureLoad(hdr, clamp(pixel + vec2i(0, 1), vec2i(0), last), 0).rgb;
-    let west = textureLoad(hdr, clamp(pixel + vec2i(-1, 0), vec2i(0), last), 0).rgb;
-    let east = textureLoad(hdr, clamp(pixel + vec2i(1, 0), vec2i(0), last), 0).rgb;
-    let low = min(center, min(north, min(south, min(west, east))));
-    let high = max(center, max(north, max(south, max(west, east))));
-    let amount = sqrt(clamp(min(low, vec3f(1.0) - min(high, vec3f(1.0))) / max(high, vec3f(1.0e-4)), vec3f(0.0), vec3f(1.0)));
-    let w = -amount * params.sharpen * 0.2;
-    let sharpened = max((center + (north + south + west + east) * w) / (1.0 + 4.0 * w), vec3f(0.0));
-
-    // The upsample chain adds one copy of the image per level; undo that gain here.
+    // Exposure, bloom and vignette, then the tone curve, for this pixel and its four neighbours.
+    // Bloom is smooth, so the neighbours share this pixel's.
     let bloom_color = textureSampleLevel(bloom, linear_sampler, in.uv, 0.0).rgb / BLOOM_LEVELS;
-    var color = mix(sharpened, bloom_color, params.bloom_strength) * exposure.exposure;
-
     let from_center = (in.uv - vec2f(0.5)) * vec2f(1.0, 0.8);
-    color *= 1.0 - params.vignette * dot(from_center, from_center) * 2.0;
+    let scale = exposure.exposure * (1.0 - params.vignette * dot(from_center, from_center) * 2.0);
+    let c = toned(center, bloom_color, scale);
+    let n = toned(textureLoad(hdr, clamp(pixel + vec2i(0, -1), vec2i(0), last), 0).rgb, bloom_color, scale);
+    let s = toned(textureLoad(hdr, clamp(pixel + vec2i(0, 1), vec2i(0), last), 0).rgb, bloom_color, scale);
+    let w = toned(textureLoad(hdr, clamp(pixel + vec2i(-1, 0), vec2i(0), last), 0).rgb, bloom_color, scale);
+    let e = toned(textureLoad(hdr, clamp(pixel + vec2i(1, 0), vec2i(0), last), 0).rgb, bloom_color, scale);
 
-    var display = linear_to_srgb(aces(color));
+    // Contrast-adaptive sharpening, which restores the crispness that temporal filtering
+    // softens. It works on the displayed values, from 0 to 1, as it is designed to: strong where
+    // the image is flat and gentle at high contrast. The result stays within its neighbours'
+    // range, so no edge, such as a roof against the sky or the moon's rim, gets a dark halo.
+    let low = min(c, min(n, min(s, min(w, e))));
+    let high = max(c, max(n, max(s, max(w, e))));
+    let amount = sqrt(clamp(min(low, vec3f(1.0) - high) / max(high, vec3f(1.0e-4)), vec3f(0.0), vec3f(1.0)));
+    let weight = -amount * params.sharpen * 0.2;
+    let toned_color = clamp((c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight), low, high);
+
+    var display = linear_to_srgb(toned_color);
     let noise = hash(in.position.xy + vec2f(f32(params.frame_index % 64u) * 3.17));
     display += (noise - 0.5) * params.grain;
     return vec4f(display, 1.0);
