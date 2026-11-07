@@ -496,6 +496,12 @@ cargo test --release
 - Every built-in tree, breed of grass and kind of weather is read and written back unchanged, and
   each procedural surface is checked for seams, plausible brightness and steepness.
 
+## Contributing
+
+Solstice is written entirely by frontier AI models: all code, pull requests, issues and comments.
+People direct the work, review it and decide what is merged, but write none of it. See the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 [MIT](LICENSE)
