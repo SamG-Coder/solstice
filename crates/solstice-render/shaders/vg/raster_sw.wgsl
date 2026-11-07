@@ -8,8 +8,10 @@
 #include "vg/raster_common.wgsl"
 #include "vg/vis_write.wgsl"
 
-// Matches SOFTWARE_GROUP_SIZE in cull_control.wgsl.
-const GROUP_SIZE: u32 = 16u;
+// One workgroup per cluster, one thread per triangle, as Nanite does: the cluster's vertices
+// are transformed once, in parallel, into workgroup memory, and every triangle is then
+// rasterized at the same time. Matches MAX_CLUSTER_TRIANGLES.
+const GROUP_SIZE: u32 = 128u;
 // Sub-pixel precision, matching the 8 bits typical of hardware so edges shared with
 // hardware-rasterized neighbours land on the same samples.
 const SUBPIXEL: f32 = 256.0;
@@ -17,43 +19,56 @@ const SUBPIXEL_I: i32 = 256;
 // A sanity bound on triangle extent. Anything larger would overflow the fixed-point
 // edge functions; the cluster-size limit in culling keeps real triangles far below it.
 const MAX_EXTENT_PX: f32 = 512.0;
+// Matches MAX_CLUSTER_VERTICES.
+const MAX_VERTICES: u32 = 256u;
 
-var<private> screen: array<vec3f, 256>;
+var<workgroup> screen: array<vec3f, MAX_VERTICES>;
+var<workgroup> cluster_count: u32;
 
-@compute @workgroup_size(16)
-fn main(@builtin(global_invocation_id) id: vec3u) {
-    let visible_index = state.sw_base + id.x;
-    if visible_index >= state.sw_count {
-        return;
+@compute @workgroup_size(GROUP_SIZE)
+fn main(
+    @builtin(workgroup_id) group: vec3u,
+    @builtin(num_workgroups) groups: vec3u,
+    @builtin(local_invocation_index) lane: u32,
+) {
+    if lane == 0u {
+        cluster_count = state.sw_count - state.sw_base;
     }
-    let entry = visible[visible_index];
-    let cluster = clusters[entry.cluster];
-    let instance = instances[entry.instance];
+    let count = workgroupUniformLoad(&cluster_count);
 
-    let vertex_count = cluster_vertex_count(cluster);
-    for (var v = 0u; v < vertex_count; v++) {
-        let packed = vertices[cluster.vertex_offset + v];
-        let world = transform_point(instance, decode_position(instance, packed));
-        let clip = view.raster_view_proj * vec4f(world, 1.0);
-        let ndc = clip.xyz / clip.w;
-        screen[v] = vec3f(
-            (ndc.x * 0.5 + 0.5) * view.viewport.x,
-            (0.5 - ndc.y * 0.5) * view.viewport.y,
-            ndc.z,
-        );
-    }
+    // A dispatch can hold at most 65535 workgroups, so each takes every so-many-th cluster.
+    for (var item = group.x; item < count; item += groups.x) {
+        let visible_index = state.sw_base + item;
+        let entry = visible[visible_index];
+        let cluster = clusters[entry.cluster];
+        let instance = instances[entry.instance];
 
-    let two_sided = instance_two_sided(instance);
-    let triangle_count = cluster_triangle_count(cluster);
-    for (var t = 0u; t < triangle_count; t++) {
-        let packed = triangles[cluster.triangle_offset + t];
-        rasterize_triangle(
-            screen[local_vertex(packed, 0u)],
-            screen[local_vertex(packed, 1u)],
-            screen[local_vertex(packed, 2u)],
-            encode_id(visible_index, t),
-            two_sided,
-        );
+        let vertex_count = cluster_vertex_count(cluster);
+        for (var v = lane; v < vertex_count; v += GROUP_SIZE) {
+            let packed = vertices[cluster.vertex_offset + v];
+            let world = transform_point(instance, decode_position(instance, packed));
+            let clip = view.raster_view_proj * vec4f(world, 1.0);
+            let ndc = clip.xyz / clip.w;
+            screen[v] = vec3f(
+                (ndc.x * 0.5 + 0.5) * view.viewport.x,
+                (0.5 - ndc.y * 0.5) * view.viewport.y,
+                ndc.z,
+            );
+        }
+        workgroupBarrier();
+
+        if lane < cluster_triangle_count(cluster) {
+            let packed = triangles[cluster.triangle_offset + lane];
+            rasterize_triangle(
+                screen[local_vertex(packed, 0u)],
+                screen[local_vertex(packed, 1u)],
+                screen[local_vertex(packed, 2u)],
+                encode_id(visible_index, lane),
+                instance_two_sided(instance),
+            );
+        }
+        // The next cluster reuses the vertex memory.
+        workgroupBarrier();
     }
 }
 
