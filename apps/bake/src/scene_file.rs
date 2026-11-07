@@ -570,14 +570,31 @@ mod tests {
         let water = -0.6;
         for i in 0..=200 {
             let along = -450.0 + 4.5 * i as f32;
-            for (x, z) in [(-445.0, along), (along, 445.0), (along, -445.0), (445.0, along)] {
+            for (x, z) in [
+                (-445.0, along),
+                (along, 445.0),
+                (along, -445.0),
+                (445.0, along),
+            ] {
                 let height = terrain_height(x, z, 0.3, 52.0);
-                assert!(height < water - 4.0, "({x}, {z}) is {height}, above the seabed");
+                assert!(
+                    height < water - 4.0,
+                    "({x}, {z}) is {height}, above the seabed"
+                );
             }
         }
         // The fort and the ground around it are untouched.
-        for (x, z) in [(0.0, 0.0), (-68.0, 0.0), (-30.0, 92.0), (-30.0, -92.0), (-150.0, 0.0)] {
-            assert!(terrain_height(x, z, 0.0, 52.0).abs() < 0.1, "({x}, {z}) moved");
+        for (x, z) in [
+            (0.0, 0.0),
+            (-68.0, 0.0),
+            (-30.0, 92.0),
+            (-30.0, -92.0),
+            (-150.0, 0.0),
+        ] {
+            assert!(
+                terrain_height(x, z, 0.0, 52.0).abs() < 0.1,
+                "({x}, {z}) moved"
+            );
         }
     }
 
