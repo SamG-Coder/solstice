@@ -6,6 +6,7 @@ use crate::hierarchy::{build_hierarchy, Leaf};
 use crate::mesh::Mesh;
 use crate::partition::{partition_triangles, ClusterLimits};
 use crate::simplify::{simplify, Attribute, Corner, Triangle};
+use crate::thin::{find_pieces, thin, NEW_POSITION};
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -39,6 +40,10 @@ impl Default for BuildOptions {
         }
     }
 }
+
+/// How far the grid of a mesh made of separate pieces extends beyond its bounds on each side, as a
+/// fraction of its largest dimension.
+const FOLIAGE_GRID_MARGIN: f32 = 0.25;
 
 /// A cluster during the build. LOD links are filled in as the DAG grows.
 struct BuildCluster {
@@ -85,7 +90,11 @@ struct WeldedMesh {
 
 /// Converts a triangle mesh to a cluster LOD DAG.
 pub fn build_virtual_mesh(mesh: &Mesh, options: &BuildOptions) -> VirtualMesh {
-    let welded = weld(mesh);
+    let mut welded = weld(mesh, 0.0);
+    // Thinned foliage grows, so give it room on the grid beyond its original bounds.
+    if !find_pieces(&welded.triangles, |_| false).pieces.is_empty() {
+        welded = weld(mesh, FOLIAGE_GRID_MARGIN);
+    }
     let source_triangles = welded.triangles.len() as u64;
     let limits = ClusterLimits {
         max_triangles: options.max_cluster_triangles,
@@ -100,7 +109,7 @@ pub fn build_virtual_mesh(mesh: &Mesh, options: &BuildOptions) -> VirtualMesh {
     while active.len() > 1 {
         level += 1;
         active = build_level(
-            &welded,
+            &mut welded,
             &mut clusters,
             &mut groups,
             active,
@@ -116,7 +125,7 @@ pub fn build_virtual_mesh(mesh: &Mesh, options: &BuildOptions) -> VirtualMesh {
 /// Runs one round of group, simplify, re-split. Returns the clusters that stay
 /// active for the next round, or an empty list if this round made no progress.
 fn build_level(
-    welded: &WeldedMesh,
+    welded: &mut WeldedMesh,
     clusters: &mut Vec<BuildCluster>,
     groups: &mut Vec<BuiltGroup>,
     active: Vec<u32>,
@@ -165,10 +174,13 @@ fn build_level(
         members: Vec<u32>,
         lod_bounds: Sphere,
         error: f32,
-        clusters: Vec<Vec<Triangle>>,
+        /// May refer to `new_positions` through `NEW_POSITION`.
+        triangles: Vec<Triangle>,
+        new_positions: Vec<Vec3>,
     }
 
     let clusters_view: &[BuildCluster] = clusters;
+    let welded_view: &WeldedMesh = welded;
     let results: Vec<Option<GroupResult>> = partition
         .par_iter()
         .map(|group| {
@@ -177,18 +189,46 @@ fn build_level(
                 .iter()
                 .flat_map(|&c| clusters_view[c as usize].triangles.iter().copied())
                 .collect();
-            let target = ((triangles.len() as f32 * options.target_ratio) as usize).max(1);
-            let simplified = simplify(
-                &triangles,
-                &welded.positions,
-                &welded.attributes,
-                target,
-                |v| shared[v as usize],
-            );
+            let target = |count: usize| ((count as f32 * options.target_ratio) as usize).max(1);
 
-            if simplified.triangles.is_empty()
-                || simplified.triangles.len() as f32
-                    > triangles.len() as f32 * options.min_reduction
+            // Separate pieces, such as blades and leaves, are thinned out. Connected surfaces
+            // are simplified by edge collapse.
+            let found = find_pieces(&triangles, |v| shared[v as usize]);
+            let mut new_positions = Vec::new();
+            let mut thinning_error = 0.0f32;
+            let mut reduced = Vec::with_capacity(triangles.len());
+            if !found.pieces.is_empty() {
+                let piece_triangles = found.pieces.iter().map(Vec::len).sum();
+                let thinned = thin(
+                    &triangles,
+                    &found.pieces,
+                    &welded_view.positions,
+                    target(piece_triangles),
+                );
+                reduced.extend(thinned.triangles);
+                new_positions = thinned.positions;
+                thinning_error = thinned.error;
+            }
+            let rest: Vec<Triangle> = if found.pieces.is_empty() {
+                triangles.clone()
+            } else {
+                found.rest.iter().map(|&t| triangles[t as usize]).collect()
+            };
+            let mut simplified_error = 0.0f32;
+            if !rest.is_empty() {
+                let simplified = simplify(
+                    &rest,
+                    &welded_view.positions,
+                    &welded_view.attributes,
+                    target(rest.len()),
+                    |v| shared[v as usize],
+                );
+                reduced.extend(simplified.triangles);
+                simplified_error = simplified.error;
+            }
+
+            if reduced.is_empty()
+                || reduced.len() as f32 > triangles.len() as f32 * options.min_reduction
             {
                 return None;
             }
@@ -206,23 +246,54 @@ fn build_level(
                 .fold(0.0, f32::max);
             // The small increment keeps parents strictly coarser than children
             // even when a collapse on a perfectly flat region costs nothing.
-            let error = child_error + simplified.error + welded.step * 0.5;
+            let error = child_error + simplified_error.max(thinning_error) + welded_view.step * 0.5;
 
-            let new_clusters =
-                split_into_clusters(&simplified.triangles, &welded.positions, limits);
             Some(GroupResult {
                 members,
                 lod_bounds,
                 error,
-                clusters: new_clusters,
+                triangles: reduced,
+                new_positions,
             })
+        })
+        .collect();
+
+    // Give thinned pieces' moved vertices real indices, on the mesh's grid.
+    let results: Vec<Option<GroupResult>> = results
+        .into_iter()
+        .map(|result| {
+            result.map(|mut result| {
+                if !result.new_positions.is_empty() {
+                    let base = welded.positions.len() as u32;
+                    for &p in &result.new_positions {
+                        welded.positions.push(welded.snap(p));
+                    }
+                    for triangle in &mut result.triangles {
+                        for corner in triangle {
+                            if corner.position & NEW_POSITION != 0 {
+                                corner.position = base + (corner.position & !NEW_POSITION);
+                            }
+                        }
+                    }
+                }
+                result
+            })
+        })
+        .collect();
+    let welded_view: &WeldedMesh = welded;
+    let split: Vec<Option<Vec<Vec<Triangle>>>> = results
+        .par_iter()
+        .map(|result| {
+            result
+                .as_ref()
+                .map(|r| split_into_clusters(&r.triangles, &welded_view.positions, limits))
         })
         .collect();
 
     let mut next_active = Vec::new();
     let mut progressed = false;
-    for (group, result) in partition.iter().zip(results) {
-        let Some(result) = result else {
+    for ((group, result), split) in partition.iter().zip(results).zip(split) {
+        let (Some(result), Some(new_clusters)) = (result, split) else {
             // Keep these clusters in play; next level they form different groups.
             next_active.extend(group.iter().map(|&m| active[m as usize]));
             continue;
@@ -237,9 +308,9 @@ fn build_level(
             error: result.error,
             children: result.members,
             round: level,
-            generated: first_generated..first_generated + result.clusters.len() as u32,
+            generated: first_generated..first_generated + new_clusters.len() as u32,
         });
-        for triangles in result.clusters {
+        for triangles in new_clusters {
             let bounds = triangle_bounds(&triangles, &welded.positions);
             next_active.push(clusters.len() as u32);
             clusters.push(BuildCluster {
@@ -322,11 +393,21 @@ fn triangle_bounds(triangles: &[Triangle], positions: &[Vec3]) -> Sphere {
     )
 }
 
+impl WeldedMesh {
+    /// The nearest point on the mesh's 16-bit grid, kept within it.
+    fn snap(&self, p: Vec3) -> Vec3 {
+        let grid = ((p - self.origin) / self.step)
+            .round()
+            .clamp(Vec3::ZERO, Vec3::splat(65535.0));
+        self.origin + grid * self.step
+    }
+}
+
 /// Snaps vertices to the mesh-wide 16-bit grid and welds them.
 ///
 /// Welding *after* snapping guarantees one grid position has one topological
 /// vertex. Triangles that collapse to a line under quantisation are dropped.
-fn weld(mesh: &Mesh) -> WeldedMesh {
+fn weld(mesh: &Mesh, margin: f32) -> WeldedMesh {
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let (mut uv_min, mut uv_max) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
     for vertex in &mesh.vertices {
@@ -339,6 +420,8 @@ fn weld(mesh: &Mesh) -> WeldedMesh {
         (min, max, uv_min, uv_max) = (Vec3::ZERO, Vec3::ZERO, Vec2::ZERO, Vec2::ZERO);
     }
 
+    let pad = Vec3::splat((max - min).max_element() * margin);
+    let (min, max) = (min - pad, max + pad);
     let step = ((max - min).max_element() / 65535.0).max(1.0e-9);
     let uv_step = ((uv_max - uv_min) / 65535.0).max(Vec2::splat(1.0e-9));
 
@@ -728,6 +811,89 @@ pub(crate) mod tests {
             }
         }
         uses.values().filter(|&&count| count != 2).count()
+    }
+
+    /// Surface area of the triangles in a cut.
+    fn cut_area(mesh: &VirtualMesh, selected: &[u32]) -> f32 {
+        let mut area = 0.0;
+        for &index in selected {
+            let cluster = mesh.clusters[index as usize];
+            for t in 0..cluster.triangle_count() {
+                let packed = mesh.triangles[(cluster.triangle_offset + t) as usize];
+                let [a, b, c] = unpack_triangle(packed).map(|local| {
+                    let data = mesh.vertices[cluster.vertex_offset as usize + local as usize].data;
+                    mesh.quant_origin
+                        + Vec3::new(data[0] as f32, data[1] as f32, data[2] as f32)
+                            * mesh.quant_step
+                });
+                area += (b - a).cross(c - a).length() * 0.5;
+            }
+        }
+        area
+    }
+
+    /// A 10 by 10 m meadow of separate, slightly leaning blades of grass, 4 triangles each.
+    fn meadow(per_side: u32) -> Mesh {
+        let mut mesh = Mesh::default();
+        let spacing = 10.0 / per_side as f32;
+        for z in 0..per_side {
+            for x in 0..per_side {
+                let hash = (x * 7919 + z * 104_729) % 1000;
+                let jitter = hash as f32 / 1000.0;
+                let root = Vec3::new(
+                    x as f32 * spacing + jitter * spacing * 0.5,
+                    0.0,
+                    z as f32 * spacing,
+                );
+                let lean = Vec3::new(jitter - 0.5, 0.0, 0.3) * 0.1;
+                let height = 0.25 + jitter * 0.15;
+                let base = mesh.vertices.len() as u32;
+                for (i, (side, up)) in [(0.0, 0.0), (1.0, 0.0), (0.0, 0.5), (1.0, 0.5), (0.5, 1.0)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let _ = i;
+                    let width = 0.012 * (1.0 - up);
+                    mesh.vertices.push(Vertex {
+                        position: root
+                            + Vec3::X * (side - 0.5) * width
+                            + Vec3::Y * up * height
+                            + lean * up * up,
+                        normal: Vec3::Z,
+                        uv: Vec2::new(side, up),
+                    });
+                }
+                mesh.indices
+                    .extend([0, 1, 2, 1, 3, 2, 2, 3, 4].map(|i| base + i));
+            }
+        }
+        mesh
+    }
+
+    #[test]
+    fn foliage_thins_with_distance_and_keeps_its_coverage() {
+        let mesh = build_virtual_mesh(&meadow(120), &BuildOptions::default());
+        let source = cut_area(&mesh, &select_cut(&mesh, &|_, error| error, 0.0));
+        let coarsest = select_cut(&mesh, &|_, error| error, 1.0e20);
+        assert!(
+            triangle_total(&mesh, &coarsest) < 2000,
+            "coarsest cut still has {} triangles of {}",
+            triangle_total(&mesh, &coarsest),
+            mesh.source_triangles
+        );
+
+        let mut previous = u32::MAX;
+        for threshold in [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 1.0e20] {
+            let cut = select_cut(&mesh, &|_, error| error, threshold);
+            let triangles = triangle_total(&mesh, &cut);
+            assert!(triangles <= previous, "a coarser cut has more triangles");
+            previous = triangles;
+            let area = cut_area(&mesh, &cut);
+            assert!(
+                (area / source - 1.0).abs() < 0.15,
+                "at error {threshold}, {triangles} triangles cover {area} m² against {source} m²"
+            );
+        }
     }
 
     fn triangle_total(mesh: &VirtualMesh, selected: &[u32]) -> u32 {

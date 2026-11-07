@@ -4,6 +4,10 @@
 //! the frontier triangle that keeps the cluster round and adds the fewest new
 //! vertices. Very small leftovers are then merged into neighbours, since a tiny
 //! cluster costs as much to cull as a full one.
+//!
+//! Foliage is made of many separate pieces, such as blades and leaves, that share no edges. When a
+//! cluster has no connected triangle left to take, it continues with the nearest unassigned piece,
+//! so that a meadow packs into full, compact clusters rather than one per blade.
 
 use glam::Vec3;
 use rustc_hash::FxHashMap;
@@ -17,6 +21,8 @@ pub struct ClusterLimits {
 
 /// Clusters smaller than this try to merge into a neighbour.
 const SMALL_CLUSTER: usize = 64;
+/// Rings of grid cells searched for a nearby separate piece before giving up.
+const MAX_SEARCH_RINGS: i32 = 6;
 
 /// Partitions `triangles` (indices into `positions`) and returns triangle indices
 /// per cluster. Every triangle appears in exactly one cluster.
@@ -105,7 +111,8 @@ fn grow_clusters(
     let mut clusters = Vec::new();
     let mut frontier: Vec<u32> = Vec::new();
 
-    for seed in seeds {
+    let pieces = PieceGrid::new(&local.centroids);
+    for &seed in &seeds {
         if assigned[seed as usize] {
             continue;
         }
@@ -166,11 +173,118 @@ fn grow_clusters(
                 }
                 slot += 1;
             }
-            next = best.map(|(_, slot)| frontier[slot]);
+            next = match best {
+                Some((_, slot)) => Some(frontier[slot]),
+                None => pieces.nearest(
+                    local,
+                    &assigned,
+                    &vertex_stamp,
+                    cluster_id,
+                    vertex_count,
+                    center,
+                    limits,
+                ),
+            };
         }
         clusters.push(cluster);
     }
     clusters
+}
+
+/// Triangle centroids bucketed on a uniform grid, for finding the nearest separate piece.
+struct PieceGrid {
+    origin: Vec3,
+    cell: f32,
+    cells: FxHashMap<[i32; 3], Vec<u32>>,
+}
+
+impl PieceGrid {
+    fn new(centroids: &[Vec3]) -> Self {
+        let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for &c in centroids {
+            min = min.min(c);
+            max = max.max(c);
+        }
+        // About eight triangles per occupied cell, assuming they spread over a surface.
+        let extent = (max - min).max(Vec3::splat(1.0e-6));
+        let area = extent.x * extent.y + extent.y * extent.z + extent.z * extent.x;
+        let cell = (area / (centroids.len() as f32 / 8.0).max(1.0))
+            .sqrt()
+            .max(1.0e-6);
+        let mut grid = Self {
+            origin: min,
+            cell,
+            cells: FxHashMap::default(),
+        };
+        for (index, &c) in centroids.iter().enumerate() {
+            grid.cells
+                .entry(grid.key(c))
+                .or_default()
+                .push(index as u32);
+        }
+        grid
+    }
+
+    fn key(&self, p: Vec3) -> [i32; 3] {
+        ((p - self.origin) / self.cell)
+            .floor()
+            .as_ivec3()
+            .to_array()
+    }
+
+    /// The unassigned triangle nearest `center` that fits in the cluster.
+    #[allow(clippy::too_many_arguments)]
+    fn nearest(
+        &self,
+        local: &LocalTriangles,
+        assigned: &[bool],
+        vertex_stamp: &[u32],
+        cluster_id: u32,
+        vertex_count: usize,
+        center: Vec3,
+        limits: ClusterLimits,
+    ) -> Option<u32> {
+        let home = self.key(center);
+        let mut best: Option<(f32, u32)> = None;
+        for ring in 0..=MAX_SEARCH_RINGS {
+            // Anything in this ring or beyond is at least this far away.
+            let floor = (ring - 1).max(0) as f32 * self.cell;
+            if best.is_some_and(|(d, _)| d <= floor * floor) {
+                break;
+            }
+            for dz in -ring..=ring {
+                for dy in -ring..=ring {
+                    for dx in -ring..=ring {
+                        if dx.abs().max(dy.abs()).max(dz.abs()) != ring {
+                            continue;
+                        }
+                        let key = [home[0] + dx, home[1] + dy, home[2] + dz];
+                        let Some(members) = self.cells.get(&key) else {
+                            continue;
+                        };
+                        for &candidate in members {
+                            if assigned[candidate as usize] {
+                                continue;
+                            }
+                            let new_vertices = local.triangles[candidate as usize]
+                                .iter()
+                                .filter(|&&v| vertex_stamp[v as usize] != cluster_id)
+                                .count();
+                            if vertex_count + new_vertices > limits.max_vertices {
+                                continue;
+                            }
+                            let distance =
+                                local.centroids[candidate as usize].distance_squared(center);
+                            if best.is_none_or(|(d, _)| distance < d) {
+                                best = Some((distance, candidate));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, candidate)| candidate)
+    }
 }
 
 fn merge_small_clusters(
@@ -334,6 +448,62 @@ mod tests {
         let clusters = partition_triangles(&triangles, &positions, LIMITS);
         let average = triangles.len() as f32 / clusters.len() as f32;
         assert!(average > 88.0, "average cluster size was only {average}");
+    }
+
+    /// A meadow of separate two-triangle blades, `count` by `count`.
+    fn blades(count: u32) -> (Vec<[u32; 3]>, Vec<Vec3>) {
+        let (mut triangles, mut positions) = (Vec::new(), Vec::new());
+        for z in 0..count {
+            for x in 0..count {
+                let base = positions.len() as u32;
+                let at = Vec3::new(x as f32 * 0.1, 0.0, z as f32 * 0.1);
+                positions.extend([
+                    at,
+                    at + Vec3::X * 0.01,
+                    at + Vec3::Y * 0.3,
+                    at + Vec3::new(0.01, 0.3, 0.0),
+                ]);
+                triangles.push([base, base + 1, base + 2]);
+                triangles.push([base + 1, base + 3, base + 2]);
+            }
+        }
+        (triangles, positions)
+    }
+
+    #[test]
+    fn separate_pieces_pack_into_full_compact_clusters() {
+        let (triangles, positions) = blades(64);
+        let clusters = partition_triangles(&triangles, &positions, LIMITS);
+        let average = triangles.len() as f32 / clusters.len() as f32;
+        assert!(average > 100.0, "average cluster size was only {average}");
+        // Each cluster should hold a patch of neighbouring blades, not a scattered selection. A full
+        // 128-triangle patch spans about 0.5 m from its centre. The last clusters gather
+        // stragglers, so only the typical one is held to that.
+        let mut spreads: Vec<f32> = clusters
+            .iter()
+            .map(|cluster| {
+                let centroids: Vec<Vec3> = cluster
+                    .iter()
+                    .map(|&t| {
+                        triangles[t as usize]
+                            .iter()
+                            .map(|&v| positions[v as usize])
+                            .sum::<Vec3>()
+                            / 3.0
+                    })
+                    .collect();
+                let center = centroids.iter().sum::<Vec3>() / centroids.len() as f32;
+                centroids
+                    .iter()
+                    .map(|c| c.distance(center))
+                    .fold(0.0, f32::max)
+            })
+            .collect();
+        spreads.sort_by(f32::total_cmp);
+        let median = spreads[spreads.len() / 2];
+        let worst = spreads[spreads.len() - 1];
+        assert!(median < 0.7, "a typical cluster spans {median} m");
+        assert!(worst < 2.0, "a cluster spans {worst} m of a 6.4 m meadow");
     }
 
     #[test]

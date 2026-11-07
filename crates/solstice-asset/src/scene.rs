@@ -42,8 +42,10 @@ pub struct VirtualMesh {
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct Material {
     pub base_color: [f32; 4],
-    /// RGB radiance, A unused.
-    pub emissive: [f32; 4],
+    /// RGB radiance.
+    pub emissive: [f32; 3],
+    /// [`Material::TWO_SIDED`] and [`Material::FOLIAGE`]. Older files hold zero here.
+    pub flags: u32,
     pub roughness: f32,
     pub metallic: f32,
     /// Texture repeats per world unit of UV.
@@ -61,11 +63,20 @@ pub struct Material {
     pub texture_slot: u32,
 }
 
+impl Material {
+    /// Drawn from both sides, with the normal turned towards the viewer.
+    pub const TWO_SIDED: u32 = 1;
+    /// Thin, translucent vegetation: light from behind shines through, tinted by its colour, as
+    /// Unreal's two-sided foliage shading model does. Foliage should also be two-sided.
+    pub const FOLIAGE: u32 = 2;
+}
+
 impl Default for Material {
     fn default() -> Self {
         Self {
             base_color: [0.8, 0.8, 0.8, 1.0],
-            emissive: [0.0; 4],
+            emissive: [0.0; 3],
+            flags: 0,
             roughness: 0.7,
             metallic: 0.0,
             uv_scale: 1.0,

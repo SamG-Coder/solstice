@@ -13,6 +13,7 @@
 
 pub mod cracks;
 pub mod field;
+pub mod foliage;
 pub mod noise;
 pub mod surface;
 pub mod surfaces;

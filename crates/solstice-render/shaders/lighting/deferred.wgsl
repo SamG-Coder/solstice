@@ -33,6 +33,11 @@ const SUN_ANGULAR_RADIUS: f32 = 0.0065;
 
 const DISK_SAMPLES: u32 = 12u;
 
+// Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.
+// Measured leaf spectra transmit about as much as they reflect across visible light (Jacquemoud
+// and Ustin 2019), slightly less towards blue.
+const FOLIAGE_TRANSMITTANCE: vec3f = vec3f(0.8, 0.8, 0.6);
+
 fn sample_cascade(cascade: u32, world: vec3f, normal: vec3f, angle: f32) -> f32 {
     let texel = shadows.texel_size[cascade];
     // Offset towards the surface normal, by more as the sun grazes the surface: a texel then
@@ -166,7 +171,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let pixel = vec2i(id.xy);
     let center = vec2f(id.xy) + vec2f(0.5);
     let depth = textureLoad(depth_tex, pixel, 0).r;
-    let emissive = textureLoad(emissive_tex, pixel, 0).rgb;
+    let emissive_model = textureLoad(emissive_tex, pixel, 0);
+    let emissive = emissive_model.rgb;
+    let foliage = emissive_model.a > 0.5;
 
     if depth <= 0.0 {
         let ndc = pixel_to_ndc(center, frame.inv_viewport);
@@ -208,6 +215,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             shadow *= contact_shadow(world, normal, view, distance, noise);
         }
         color += shade_light(surface, view, frame.sun_direction) * sun_irradiance() * shadow;
+    } else if foliage {
+        // Sunlight through a leaf from behind. The shadow is looked up for the lit side.
+        let shadow = sun_shadow(world, -normal, distance, noise);
+        let transmitted = surface.diffuse * FOLIAGE_TRANSMITTANCE / PI * -sun_facing;
+        color += transmitted * sun_irradiance() * shadow;
     }
 
     // Local lights.
@@ -220,6 +232,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let occlusion = gi.a * mix(1.0, albedo_cavity.a, 0.7);
     let irradiance = gi.rgb * frame.gi_intensity;
     color += surface.diffuse / PI * irradiance * occlusion;
+    if foliage {
+        // Skylight through the leaf. Probes only know the light arriving at its front, so the
+        // back is estimated from the same, as it is for most foliage in a canopy.
+        color += surface.diffuse * FOLIAGE_TRANSMITTANCE / PI * irradiance * occlusion * 0.5;
+    }
 
     // Indirect specular. Rough surfaces did not trace, and their blurry reflection is
     // reasonably well estimated from the same irradiance.

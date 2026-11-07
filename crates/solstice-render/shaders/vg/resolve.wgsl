@@ -154,7 +154,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let entry = visible[visible_index];
     let instance = instances[entry.instance];
     let cluster = clusters[entry.cluster];
-    let material = materials[instance.material];
+    let material = materials[instance_material(instance)];
 
     let packed = triangles[cluster.triangle_offset + triangle_index];
     let v0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
@@ -198,6 +198,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         transform_normal(instance, decode_normal(v1)),
         transform_normal(instance, decode_normal(v2)),
     ));
+    // Seen from behind, a two-sided surface is lit as its other side.
+    let face = cross(world1 - world0, world2 - world0);
+    if (material.flags & MATERIAL_TWO_SIDED) != 0u && dot(face, frame.camera_position - world0) < 0.0 {
+        normal = -normal;
+    }
 
     var albedo = material.base_color.rgb;
     var roughness = material.roughness;
@@ -248,7 +253,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let current_ndc = current_clip.xy / current_clip.w;
     let motion = (prev_ndc - current_ndc) * vec2f(0.5, -0.5);
 
-    var emissive = material.emissive.rgb;
+    var emissive = material.emissive;
 
     switch frame.debug_mode {
         case DEBUG_CLUSTERS: {
@@ -276,6 +281,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     textureStore(out_albedo, pixel, vec4f(albedo, cavity));
     textureStore(out_normal, pixel, vec4f(oct_encode(normal), roughness, metallic));
-    textureStore(out_emissive, pixel, vec4f(emissive, 0.0));
+    // Alpha holds the shading model for the lighting pass.
+    textureStore(out_emissive, pixel, vec4f(emissive, f32(material.flags & MATERIAL_FOLIAGE)));
     textureStore(out_motion, pixel, vec4f(motion, 0.0, 0.0));
 }

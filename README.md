@@ -72,11 +72,11 @@ to (default 1024, must be a power of two). Textures are block compressed unless 
 `--raw-textures`. To see it in the browser, run `scripts/build-web.sh` and
 open `http://localhost:8765/?scene=model`.
 
-**Imported:** node hierarchies, instancing, mirrored transforms, multiple materials, base colour,
+**Imported:** node hierarchies, instancing, mirrored transforms, multiple materials, double-sided materials, base colour,
 normal, metallic-roughness and occlusion maps, material factors and emissive factors.
 
 **Not yet, and the bake prints a warning when a file uses them:** transparency and alpha masks (drawn
-opaque), double-sided materials (back faces are culled), emissive textures, texture transforms, a
+opaque), emissive textures, texture transforms, a
 second UV set, punctual lights, animation and skinning (imported in their rest pose). Files that
 require compressed texture or geometry extensions, such as Basis or Draco, are rejected.
 
@@ -291,7 +291,8 @@ The goal is Unreal-quality rendering in the browser. The core architecture is re
 The image is not yet at Unreal's level, and these are the main reasons, roughly in order of impact:
 
 1. **Demo content.** Unreal's best images come from photoscanned assets. The live demo's cove uses
-   scanned models, on procedural sand, while its temple is entirely procedural and looks it.
+   scanned models, on procedural sand, while its temple is entirely procedural and looks it. Its
+   forest is procedural too: a meadow and wood of geometric grass, trees and bushes.
 2. **Shadow resolution.** Cascaded shadow maps stand in for Virtual Shadow Maps, so shadows lack
    the per-pixel sharpness that makes dense geometry read properly.
 3. **Streaming's limits.** Cluster records stay resident at 48 bytes each, about 0.7 GB for a

@@ -29,6 +29,8 @@ jobs:
         run: python3 scripts/fetch-scans.py scenes/cove.txt 2k
       - name: Bake the cove
         run: cargo run --release -p bake -- --scene scenes/cove.txt --texture-size 1024 --output assets/cove.solstice
+      - name: Bake the forest
+        run: cargo run --release -p bake -- --forest --output assets/forest.solstice
       - name: Build the site
         run: bash scripts/build-web.sh
       - uses: actions/upload-pages-artifact@v3

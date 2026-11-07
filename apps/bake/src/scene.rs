@@ -132,7 +132,7 @@ fn materials() -> Vec<Material> {
         textured(3, real_size, 1.0, 1.0),
         Material {
             base_color: [0.0, 0.0, 0.0, 1.0],
-            emissive: [60.0, 21.0, 4.5, 0.0],
+            emissive: [60.0, 21.0, 4.5],
             ..Default::default()
         },
         Material {
