@@ -37,12 +37,12 @@ Then open <http://localhost:8765> in Chrome or Edge.
 ### Publishing the site's scenes
 
 The site does not bake its scenes: they take minutes to bake and hundreds of megabytes to serve.
-Bake them on a PC and publish them as a GitHub release, then commit the line in
-`scenes/release.txt` that names it. The Pages workflow downloads that release's scenes and
-deploys them with the viewer.
+Bake them on a PC and publish them as GitHub releases. `scenes/releases.txt` records which
+release holds each scene and its checksum; publishing uploads only the scenes whose content has
+changed and updates their lines. Commit that file, and the Pages workflow serves the result.
 
 ```bash
-python scripts/publish-scenes.py scenes-2026-11-08 --bake
+python scripts/publish-scenes.py --bake forest
 ```
 
 For the native viewer, bake the full scene and run it:
