@@ -3,7 +3,7 @@
 //! ```text
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z]
-//! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--size WxH] [--quality Q] [--low-power]
+//! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
 //! ```
 
 #[cfg(target_arch = "wasm32")]
@@ -115,6 +115,7 @@ mod native {
                         .ok_or_else(|| format!("unknown debug view: {name}"))?;
                 }
                 "--stability" => options.stability = true,
+                "--no-taa" => options.settings.temporal_accumulation = false,
                 "--flyover" => options.flyover = Some(PathBuf::from(value()?)),
                 "--out" => options.flyover_out = PathBuf::from(value()?),
                 "--move" => {

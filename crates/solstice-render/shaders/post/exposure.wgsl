@@ -48,9 +48,10 @@ fn resolve() {
     for (var i = 0u; i < BINS; i++) {
         total += atomicLoad(&histogram[i]);
     }
-    // Average over the band between these percentiles.
-    let low_cut = f32(total) * 0.4;
-    let high_cut = f32(total) * 0.92;
+    // Average over the band between these percentiles. The top is well below the brightest pixels
+    // because open sky can fill half the frame, and metering it leaves the land underexposed.
+    let low_cut = f32(total) * 0.2;
+    let high_cut = f32(total) * 0.7;
     var running = 0.0;
     var sum = 0.0;
     var weight = 0.0;

@@ -88,6 +88,7 @@ terrain 900 1024 0.3 52                       # size, cells, height, X where the
 water -0.6 0.015 0.06 0.075                   # height, then colour
 camera 66 1.5 -41 2.31 0.03                   # x y z yaw pitch
 model rocks/rock.gltf 30 0 10 45 1.5          # path x y z yaw_degrees scale
+model rocks/rock.gltf 9 ground:0.2 4 45 1.5    # on the terrain, lowest 20% buried
 part fort/fort.gltf tower_round 22 0 22 0 1   # one named piece, by its own origin
 ```
 
@@ -96,7 +97,7 @@ modular kit, overlooking a bay with a ship at anchor, using 12 Poly Haven scans 
 22 million instanced triangles, and renders in about 3.5 ms on an RTX 5080. To build it:
 
 ```bash
-python scripts/fetch-scans.py scenes/cove.txt
+python scripts/fetch-scans.py scenes/cove.txt 2k
 ```
 
 ```bash
@@ -199,8 +200,8 @@ timing (`viewer assets/cove.solstice --flyover scenes/cove_flyover.txt --out DIR
 
 | GPU, resolution, quality | Average | 95th percentile | Worst frame | Frames over 33 ms |
 |---|---|---|---|---|
-| RTX 5080, 1600x900, High | 3.9 ms | 6.8 ms | 9.1 ms | 0 of 3570 |
-| AMD integrated, 1280x720, Low | 28 ms | 35 ms | 43 ms | 494 of 3570 |
+| RTX 5080, 1600x900, High | 3.8 ms | 5.7 ms | 8.5 ms | 0 of 3570 |
+| AMD integrated, 1280x720, Low | 30 ms | 37 ms | 43 ms | 753 of 3570 |
 
 Browsers tested on Windows, with the RTX 5080: Chromium 152, Edge 156 and Firefox 159, with no GPU
 errors in any, and frame rates at each display's limit where it could be measured. **Not tested:**

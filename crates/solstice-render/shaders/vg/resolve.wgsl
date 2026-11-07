@@ -162,10 +162,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var metallic = material.metallic;
     if material.texture_layer >= 0 {
         let layer = material.texture_layer;
-        let color = textureSampleGrad(color_textures, material_sampler, uv, layer, duv_dx, duv_dy);
-        let surface = textureSampleGrad(surface_textures, material_sampler, uv, layer, duv_dx, duv_dy);
+        let sample_dx = duv_dx * frame.mip_scale;
+        let sample_dy = duv_dy * frame.mip_scale;
+        let color = textureSampleGrad(color_textures, material_sampler, uv, layer, sample_dx, sample_dy);
+        let surface = textureSampleGrad(surface_textures, material_sampler, uv, layer, sample_dx, sample_dy);
         if material.macro_variation > 0.0 {
-            albedo = hide_tiling(albedo, color, uv, duv_dx, duv_dy, layer, material.macro_variation);
+            albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, layer, material.macro_variation);
         } else {
             albedo *= color.rgb;
         }

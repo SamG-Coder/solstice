@@ -22,8 +22,12 @@ def get(url):
 
 
 def fetch(entry, path):
+    # By checksum, not size: the same model at another resolution can have the same size, as its
+    # .gltf differs only in the "1k" or "2k" within its texture names.
     if os.path.exists(path) and os.path.getsize(path) == entry["size"]:
-        return
+        with open(path, "rb") as f:
+            if not entry.get("md5") or hashlib.md5(f.read()).hexdigest() == entry["md5"]:
+                return
     data = get(entry["url"])
     if entry.get("md5") and hashlib.md5(data).hexdigest() != entry["md5"]:
         sys.exit(f"checksum mismatch: {entry['url']}")

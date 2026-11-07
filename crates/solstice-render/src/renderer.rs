@@ -18,6 +18,11 @@ use crate::vg::{
 use glam::{Mat4, Vec2};
 use solstice_asset::SceneAsset;
 
+/// Scales texture gradients, selecting finer mips than one texel per pixel, about 0.75 of a mip
+/// here. Temporal filtering averages over several frames' jitter, which softens the image and
+/// also suppresses the shimmer that finer mips would otherwise cause.
+const TEXTURE_DETAIL: f32 = 0.6;
+
 const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Capacity of the main view's traversal queue and selected-cluster list.
@@ -525,6 +530,8 @@ impl Renderer {
             time: self.time,
             gi_intensity: environment.gi_intensity,
             temporal_accumulation: u32::from(self.settings.temporal_accumulation),
+            mip_scale: self.settings.render_scale * TEXTURE_DETAIL,
+            _pad: [0.0; 3],
         };
         gpu.queue
             .write_buffer(&self.frame_uniform, 0, bytemuck::bytes_of(&frame));

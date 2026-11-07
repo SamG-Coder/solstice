@@ -8,6 +8,8 @@
 //! camera 40 5 20 1.2 -0.05        # x y z yaw pitch
 //! light 0 2 0 16 40 14 3          # x y z range r g b
 //! model rocks/rock.gltf 0 0 0 45 2     # path x y z yaw_degrees scale
+//! model rocks/rock.gltf 9 ground 0 45 2     # standing on the terrain at this spot
+//! model rocks/rock.gltf 9 ground:0.2 0 45 2 # with its lowest 20% buried, as rocks are
 //! part kit/kit.gltf wall_01 0 0 0 90 1  # one named piece of a model, by its own origin
 //! ```
 //!
@@ -43,6 +45,9 @@ enum Command {
     Model {
         path: String,
         position: Vec3,
+        /// If set, `position.y` is ignored and the model stands on the terrain, with this
+        /// fraction of its height below ground.
+        seat: Option<f32>,
         yaw_degrees: f32,
         scale: f32,
     },
@@ -129,15 +134,86 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
         }
         "model" => {
             expect(6)?;
+            let (height, seat) = parse_height(values[2])?;
             Command::Model {
                 path: values[0].to_string(),
-                position: Vec3::new(number(1)?, number(2)?, number(3)?),
+                position: Vec3::new(number(1)?, height, number(3)?),
+                seat,
                 yaw_degrees: number(4)?,
                 scale: number(5)?,
             }
         }
         other => return Err(format!("unknown command '{other}'")),
     }))
+}
+
+/// Reads a model's height: a number, `ground`, or `ground:FRACTION`.
+fn parse_height(text: &str) -> Result<(f32, Option<f32>), String> {
+    /// Enough to close the gap left by small bumps, without visibly sinking anything.
+    const STANDING: f32 = 0.02;
+    match text.split_once(':') {
+        None if text == "ground" => Ok((0.0, Some(STANDING))),
+        Some(("ground", fraction)) => {
+            let fraction: f32 = fraction
+                .parse()
+                .map_err(|_| format!("'{fraction}' is not a number"))?;
+            if (0.0..1.0).contains(&fraction) {
+                Ok((0.0, Some(fraction)))
+            } else {
+                Err(format!("'{text}': the buried fraction must be below 1"))
+            }
+        }
+        _ => text
+            .parse()
+            .map(|height| (height, None))
+            .map_err(|_| format!("'{text}' is not a number")),
+    }
+}
+
+/// Every model vertex, thinned out, in the model's own space.
+fn model_points(scene: &SceneAsset) -> Vec<Vec3> {
+    const MAX_PER_INSTANCE: usize = 6000;
+    let mut points = Vec::new();
+    for instance in &scene.instances {
+        let mesh = &scene.meshes[instance.mesh as usize];
+        let stride = (mesh.vertices.len() / MAX_PER_INSTANCE).max(1);
+        for vertex in mesh.vertices.iter().step_by(stride) {
+            let grid = Vec3::new(
+                f32::from(vertex.data[0]),
+                f32::from(vertex.data[1]),
+                f32::from(vertex.data[2]),
+            );
+            let local = mesh.quant_origin + grid * mesh.quant_step;
+            points.push(instance.transform.transform_point3(local));
+        }
+    }
+    points
+}
+
+/// The height to place a model at so that its lowest `buried` fraction is wholly below `ground`.
+/// Rounded rock touches flat ground at a point and appears to float, so it has to sink into it,
+/// and on a slope this leaves no gap on the downhill side.
+fn seat_height(
+    points: &[Vec3],
+    position: Vec3,
+    yaw_degrees: f32,
+    scale: f32,
+    buried: f32,
+    ground: impl Fn(f32, f32) -> f32,
+) -> f32 {
+    let transform = placement_transform(Vec3::new(position.x, 0.0, position.z), yaw_degrees, scale);
+    let placed: Vec<Vec3> = points
+        .iter()
+        .map(|&p| transform.transform_point3(p))
+        .collect();
+    let lowest = placed.iter().map(|p| p.y).fold(f32::MAX, f32::min);
+    let highest = placed.iter().map(|p| p.y).fold(f32::MIN, f32::max);
+    let band = lowest + (highest - lowest) * buried;
+    placed
+        .iter()
+        .filter(|p| p.y <= band)
+        .map(|p| ground(p.x, p.z) - p.y)
+        .fold(f32::MAX, f32::min)
 }
 
 /// Gently rolling ground that falls away into the sea beyond `shore_x`.
@@ -253,6 +329,8 @@ pub fn build(path: &Path) -> Result<(SceneAsset, Vec<String>), String> {
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
     let mut order: Vec<PathBuf> = Vec::new();
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
+    // Placed once the model has been imported, since its shape decides the height.
+    let mut seated: HashMap<PathBuf, Vec<(Vec3, f32, f32, f32)>> = HashMap::new();
     for (number, line) in text.lines().enumerate() {
         let command =
             parse_line(line).map_err(|e| format!("{}:{}: {e}", path.display(), number + 1))?;
@@ -273,12 +351,25 @@ pub fn build(path: &Path) -> Result<(SceneAsset, Vec<String>), String> {
             Some(Command::Model {
                 path: model,
                 position,
+                seat,
                 yaw_degrees,
                 scale,
             }) => {
-                placements_of(&mut order, &mut models, base, model)
-                    .whole
-                    .push(placement_transform(position, yaw_degrees, scale));
+                let full = base.join(&model);
+                let placements = placements_of(&mut order, &mut models, base, model);
+                match seat {
+                    Some(buried) => {
+                        seated
+                            .entry(full)
+                            .or_default()
+                            .push((position, yaw_degrees, scale, buried))
+                    }
+                    None => {
+                        placements
+                            .whole
+                            .push(placement_transform(position, yaw_degrees, scale))
+                    }
+                }
             }
             Some(Command::Part {
                 path: model,
@@ -308,6 +399,25 @@ pub fn build(path: &Path) -> Result<(SceneAsset, Vec<String>), String> {
             .file_stem()
             .map_or(String::new(), |s| s.to_string_lossy().to_string());
         warnings.extend(imported.warnings.iter().map(|w| format!("{name}: {w}")));
+        if let Some(list) = seated.get(model) {
+            let Some((_, _, amplitude, shore_x)) = terrain else {
+                return Err(format!("{name}: 'ground' needs a terrain line"));
+            };
+            // Water hides whatever is below it, so the sea floor does not count.
+            let water_level = water.map_or(f32::MIN, |(level, _)| level);
+            let ground = |x: f32, z: f32| terrain_height(x, z, amplitude, shore_x).max(water_level);
+            let points = model_points(&imported.scene);
+            let placements = models.get_mut(model).expect("registered while parsing");
+            for &(position, yaw_degrees, scale, buried) in list {
+                let y = seat_height(&points, position, yaw_degrees, scale, buried, ground);
+                println!("  at {:.0} {:.0}: height {y:.2}", position.x, position.z);
+                placements.whole.push(placement_transform(
+                    Vec3::new(position.x, y, position.z),
+                    yaw_degrees,
+                    scale,
+                ));
+            }
+        }
         append_model(&mut scene, imported, &models[model])
             .map_err(|e| format!("{}: {e}", model.display()))?;
     }
@@ -339,10 +449,57 @@ mod tests {
             Some(Command::Model {
                 path: "a/b.gltf".to_string(),
                 position: Vec3::new(1.0, 2.0, 3.0),
+                seat: None,
                 yaw_degrees: 90.0,
                 scale: 0.5,
             })
         );
+    }
+
+    #[test]
+    fn a_height_can_ask_for_the_ground() {
+        assert_eq!(parse_height("1.5"), Ok((1.5, None)));
+        assert_eq!(parse_height("ground:0.25"), Ok((0.0, Some(0.25))));
+        assert!(parse_height("ground").unwrap().1.is_some());
+        assert!(parse_height("ground:2").is_err());
+        assert!(parse_height("grund").is_err());
+    }
+
+    /// A tall column, narrowest at its foot: one point at the bottom, then a wide ring.
+    fn column() -> Vec<Vec3> {
+        vec![
+            Vec3::ZERO,
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+            Vec3::new(0.0, 10.0, 0.0),
+        ]
+    }
+
+    #[test]
+    fn seating_on_flat_ground_rests_the_lowest_point_on_it() {
+        let y = seat_height(&column(), Vec3::ZERO, 0.0, 1.0, 0.0, |_, _| 2.0);
+        assert!((y - 2.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn burying_sinks_the_model_by_that_share_of_its_height() {
+        let y = seat_height(&column(), Vec3::ZERO, 0.0, 1.0, 0.2, |_, _| 0.0);
+        assert!(
+            (y + 1.0).abs() < 1.0e-5,
+            "the ring at height 1 is at ground level: {y}"
+        );
+    }
+
+    #[test]
+    fn seating_leaves_no_gap_on_a_slope() {
+        let ground = |x: f32, _: f32| x * 0.5;
+        let y = seat_height(&column(), Vec3::ZERO, 0.0, 1.0, 0.2, ground);
+        for point in &column()[..3] {
+            assert!(
+                point.y + y <= ground(point.x, point.z) + 1.0e-5,
+                "{point} floats"
+            );
+        }
     }
 
     #[test]
@@ -373,8 +530,8 @@ mod tests {
             "inland stays level"
         );
         assert!(
-            terrain_height(40.0, 0.0, 0.0, 40.0).abs() < 0.1,
-            "level at the shoreline"
+            terrain_height(10.0, 0.0, 0.0, 40.0).abs() < 0.1,
+            "level behind the shoreline, wherever it wanders"
         );
         assert!(
             terrain_height(130.0, 0.0, 0.0, 40.0) < -8.0,

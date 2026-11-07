@@ -240,7 +240,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // object scatters light from all around, not only the long path to the horizon line.
     let haze_direction = normalize(vec3f(-view.x, max(-view.y, 0.2), -view.z));
     let haze_sky = sky_radiance(haze_direction);
-    let haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
+    var haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
+    // That direction can land on the glow around the sun even when looking down at nearby ground,
+    // whose radiance is so high that this small share of it shows as smoke across shadows. So the
+    // haze is limited relative to the open sky on the side away from the sun.
+    let away_from_sun = normalize(vec3f(-frame.sun_direction.x, 0.2, -frame.sun_direction.z));
+    let haze_limit = luminance(sky_radiance(away_from_sun)) * 2.0;
+    haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
     color = mix(haze_color, color, transmittance);
 
     switch frame.debug_mode {

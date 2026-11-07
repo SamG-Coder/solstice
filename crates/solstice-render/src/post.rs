@@ -420,7 +420,7 @@ impl PostProcess {
             0,
             bytemuck::bytes_of(&TonemapParams {
                 bloom_strength: 0.045,
-                sharpen: 0.55,
+                sharpen: 0.9,
                 vignette: 0.18,
                 grain: 0.012,
                 frame_index,
