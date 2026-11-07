@@ -8,10 +8,11 @@
 //! away a meadow is then fewer, wider blades that cover the ground just as densely, rather than
 //! the same blades thinning to nothing.
 //!
-//! Pieces grow across their narrow side first, until they are as wide as they are long, so grass
-//! keeps its height, and only then grow evenly.
+//! Flat pieces grow across their narrow side first, until they are as wide as they are long, so
+//! grass keeps its height, and only then grow evenly. Tubes, such as twigs, grow thicker around
+//! their own axis, so a curved twig stays the curve it was.
 
-use crate::simplify::{Corner, Triangle};
+use crate::simplify::{Attribute, Corner, Triangle};
 use glam::{DMat3, DVec3, Vec3};
 use rustc_hash::FxHashMap;
 
@@ -20,6 +21,8 @@ use rustc_hash::FxHashMap;
 const MIN_PIECES: usize = 8;
 /// A piece holding more than this fraction of its group's triangles is a surface, not foliage.
 const MAX_PIECE_SHARE: f32 = 0.125;
+/// Pieces more than this many times wider than the group's median piece are not thinned.
+const WIDE: f64 = 3.0;
 
 /// A group's triangles sorted into separate pieces and everything else.
 pub struct Pieces {
@@ -109,6 +112,7 @@ pub fn thin(
     triangles: &[Triangle],
     pieces: &[Vec<u32>],
     positions: &[Vec3],
+    attributes: &[Attribute],
     target_triangles: usize,
 ) -> Thinned {
     let position = |corner: Corner| positions[corner.position as usize].as_dvec3();
@@ -173,9 +177,25 @@ pub fn thin(
             .iter()
             .map(|&v| positions[v as usize].as_dvec3())
             .collect();
+        let tube = tube_radius(triangles, piece, positions);
         let enlarge = enlargement(triangles, piece, positions, &points, growth);
+        // Each vertex's outward direction, from the normals of the corners that use it.
+        let mut outward: FxHashMap<u32, DVec3> = FxHashMap::default();
+        if tube.is_some() {
+            for &t in piece {
+                for corner in triangles[t as usize] {
+                    *outward.entry(corner.position).or_default() +=
+                        attributes[corner.attribute as usize].normal.as_dvec3();
+                }
+            }
+        }
         for (&v, &p) in vertices.iter().zip(&points) {
-            let to = enlarge(p);
+            let to = match tube {
+                // A tube's area grows with its radius, so every point moves out by the same
+                // fraction of the average radius.
+                Some(radius) => p + outward[&v].normalize_or_zero() * (radius * (growth - 1.0)),
+                None => enlarge(p),
+            };
             out.error = out.error.max(to.distance(p) as f32);
             moved.insert(v, NEW_POSITION | out.positions.len() as u32);
             out.positions.push(to.as_vec3());
@@ -191,14 +211,15 @@ pub fn thin(
     out
 }
 
-/// How to move a piece's vertices so its area grows by `growth`.
-fn enlargement(
-    triangles: &[Triangle],
-    piece: &[u32],
-    positions: &[Vec3],
-    points: &[DVec3],
-    growth: f64,
-) -> impl Fn(DVec3) -> DVec3 {
+/// A piece's centre, the directions it is longest and widest in, and how long and wide it is.
+struct Shape {
+    center: DVec3,
+    across: DVec3,
+    length: f64,
+    width: f64,
+}
+
+fn shape(triangles: &[Triangle], piece: &[u32], positions: &[Vec3], points: &[DVec3]) -> Shape {
     let center = points.iter().sum::<DVec3>() / points.len() as f64;
     let mut normal = DVec3::ZERO;
     for &t in piece {
@@ -227,7 +248,118 @@ fn enlargement(
         });
         hi - lo
     };
-    let (length, width) = (extent(axis), extent(across).max(1.0e-9));
+    Shape {
+        center,
+        across,
+        length: extent(axis),
+        width: extent(across).max(1.0e-9),
+    }
+}
+
+fn piece_points(
+    triangles: &[Triangle],
+    piece: &[u32],
+    positions: &[Vec3],
+) -> (Vec<u32>, Vec<DVec3>) {
+    let mut vertices: Vec<u32> = piece
+        .iter()
+        .flat_map(|&t| triangles[t as usize].map(|c| c.position))
+        .collect();
+    vertices.sort_unstable();
+    vertices.dedup();
+    let points = vertices
+        .iter()
+        .map(|&v| positions[v as usize].as_dvec3())
+        .collect();
+    (vertices, points)
+}
+
+/// Moves pieces much wider than is typical in their group, such as a branch among twigs, out of
+/// `pieces` and into `rest`. Thinning enlarges the survivors, which moves a wide one so far that
+/// it would hold back the whole group's detail; edge collapse shortens such a piece instead.
+pub fn set_aside_wide_pieces(triangles: &[Triangle], found: &mut Pieces, positions: &[Vec3]) {
+    if found.pieces.is_empty() {
+        return;
+    }
+    let widths: Vec<f64> = found
+        .pieces
+        .iter()
+        .map(|piece| match tube_radius(triangles, piece, positions) {
+            Some(radius) => radius * 2.0,
+            None => {
+                let (_, points) = piece_points(triangles, piece, positions);
+                shape(triangles, piece, positions, &points).width
+            }
+        })
+        .collect();
+    let mut sorted = widths.clone();
+    sorted.sort_by(f64::total_cmp);
+    let limit = sorted[sorted.len() / 2] * WIDE;
+    let mut kept = Vec::with_capacity(found.pieces.len());
+    for (piece, width) in found.pieces.drain(..).zip(widths) {
+        if width <= limit {
+            kept.push(piece);
+        } else {
+            found.rest.extend(piece);
+        }
+    }
+    if kept.len() < MIN_PIECES {
+        found.rest.extend(kept.drain(..).flatten());
+    }
+    found.pieces = kept;
+    found.rest.sort_unstable();
+}
+
+/// The average radius of a piece that is a closed tube, or `None` if it is flat. A tube's faces
+/// point every way, so their normals all but cancel; a blade's or a leaf's add up.
+fn tube_radius(triangles: &[Triangle], piece: &[u32], positions: &[Vec3]) -> Option<f64> {
+    let mut sum = DVec3::ZERO;
+    let mut area = 0.0;
+    let (_, points) = piece_points(triangles, piece, positions);
+    for &t in piece {
+        let [a, b, c] =
+            triangles[t as usize].map(|corner| positions[corner.position as usize].as_dvec3());
+        let face = (b - a).cross(c - a);
+        sum += face;
+        area += face.length() * 0.5;
+    }
+    if sum.length() * 0.5 > area * 0.3 {
+        return None;
+    }
+    // A tube's area is its circumference times its length.
+    let center = points.iter().sum::<DVec3>() / points.len() as f64;
+    let mut covariance = DMat3::ZERO;
+    for &p in &points {
+        let d = p - center;
+        covariance += DMat3::from_cols(d * d.x, d * d.y, d * d.z);
+    }
+    let mut axis = DVec3::new(0.57, 0.58, 0.58);
+    for _ in 0..16 {
+        axis = (covariance * axis).normalize_or(axis);
+    }
+    let (lo, hi) = points.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| {
+        let t = (*p - center).dot(axis);
+        (lo.min(t), hi.max(t))
+    });
+    let length = (hi - lo).max(1.0e-9);
+    Some(area / (std::f64::consts::TAU * length))
+}
+
+/// How to move a piece's vertices so its area grows by `growth`.
+fn enlargement(
+    triangles: &[Triangle],
+    piece: &[u32],
+    positions: &[Vec3],
+    points: &[DVec3],
+    growth: f64,
+) -> impl Fn(DVec3) -> DVec3 {
+    let Shape {
+        center,
+        across,
+        length,
+        width,
+        ..
+    } = shape(triangles, piece, positions, points);
     let widen = growth.min((length / width).max(1.0));
     let scale = (growth / widen).sqrt();
 
@@ -319,7 +451,13 @@ mod tests {
     fn thinning_halves_the_blades_and_keeps_their_area_and_height() {
         let (triangles, positions) = blades(40);
         let found = find_pieces(&triangles, |_| false);
-        let thinned = thin(&triangles, &found.pieces, &positions, 40);
+        let thinned = thin(
+            &triangles,
+            &found.pieces,
+            &positions,
+            &[Attribute::default()],
+            40,
+        );
 
         assert_eq!(thinned.triangles.len(), 40);
         let before = total_area(&triangles, |v| positions[v as usize]);
@@ -349,8 +487,20 @@ mod tests {
         let found = find_pieces(&triangles, |_| false);
         let mut reversed = found.pieces.clone();
         reversed.reverse();
-        let a = thin(&triangles, &found.pieces, &positions, 40);
-        let b = thin(&triangles, &reversed, &positions, 40);
+        let a = thin(
+            &triangles,
+            &found.pieces,
+            &positions,
+            &[Attribute::default()],
+            40,
+        );
+        let b = thin(
+            &triangles,
+            &reversed,
+            &positions,
+            &[Attribute::default()],
+            40,
+        );
         let mut pa: Vec<[u32; 3]> = a
             .positions
             .iter()
@@ -364,6 +514,61 @@ mod tests {
         pa.sort_unstable();
         pb.sort_unstable();
         assert_eq!(pa, pb);
+    }
+
+    /// `count` curved, closed tubes, like twigs: 6 sides, 2 cm across, bowed 10 cm over 50 cm.
+    fn twigs(count: u32) -> (Vec<Triangle>, Vec<Vec3>, Vec<Attribute>) {
+        const SIDES: u32 = 6;
+        const RINGS: u32 = 8;
+        let (mut triangles, mut positions, mut attributes) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..count {
+            let base = positions.len() as u32;
+            for r in 0..RINGS {
+                let t = r as f32 / (RINGS - 1) as f32;
+                let center = Vec3::new(i as f32, t * 0.5, (t * std::f32::consts::PI).sin() * 0.1);
+                for k in 0..SIDES {
+                    let angle = k as f32 / SIDES as f32 * std::f32::consts::TAU;
+                    let out = Vec3::new(angle.cos(), 0.0, angle.sin());
+                    positions.push(center + out * 0.01);
+                    attributes.push(Attribute {
+                        normal: out,
+                        uv: glam::Vec2::ZERO,
+                    });
+                }
+            }
+            for r in 0..RINGS - 1 {
+                for k in 0..SIDES {
+                    let a = base + r * SIDES + k;
+                    let b = base + r * SIDES + (k + 1) % SIDES;
+                    let (c, d) = (b + SIDES, a + SIDES);
+                    let corner = |v: u32| Corner {
+                        position: v,
+                        attribute: v,
+                    };
+                    triangles.push([corner(a), corner(d), corner(c)]);
+                    triangles.push([corner(a), corner(c), corner(b)]);
+                }
+            }
+        }
+        (triangles, positions, attributes)
+    }
+
+    #[test]
+    fn tubes_grow_thicker_and_keep_their_curve() {
+        let (triangles, positions, attributes) = twigs(20);
+        let found = find_pieces(&triangles, |_| false);
+        let target = triangles.len() / 2;
+        let thinned = thin(&triangles, &found.pieces, &positions, &attributes, target);
+        // Doubling a 1 cm radius moves the surface out by 1 cm, and no more.
+        assert!(thinned.error < 0.012, "a twig moved {} m", thinned.error);
+        let before = total_area(&triangles, |v| positions[v as usize]);
+        let after = total_area(&thinned.triangles, |v| {
+            thinned.positions[(v & !NEW_POSITION) as usize]
+        });
+        assert!(
+            (after / before - 1.0).abs() < 0.05,
+            "area went from {before} to {after}"
+        );
     }
 
     #[test]
@@ -387,7 +592,13 @@ mod tests {
             triangles.push([corner(base + 1), corner(base + 2), corner(base + 3)]);
         }
         let found = find_pieces(&triangles, |_| false);
-        let thinned = thin(&triangles, &found.pieces, &positions, 20);
+        let thinned = thin(
+            &triangles,
+            &found.pieces,
+            &positions,
+            &[Attribute::default()],
+            20,
+        );
         let piece = &thinned.positions[0..4];
         let width = piece.iter().map(|p| p.x).fold(f32::MIN, f32::max)
             - piece.iter().map(|p| p.x).fold(f32::MAX, f32::min);
