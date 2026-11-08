@@ -132,6 +132,8 @@ pub enum DebugView {
     Voxels = 9,
     /// The sea's normals, where it is drawn.
     Ocean = 10,
+    /// How wet each surface is: dark when dry, blue when soaked.
+    Wetness = 11,
 }
 
 impl DebugView {
@@ -149,10 +151,15 @@ impl DebugView {
             "reflections" => Self::Reflections,
             "voxels" => Self::Voxels,
             "ocean" => Self::Ocean,
+            "wetness" => Self::Wetness,
             _ => return None,
         })
     }
 }
+
+/// The sea level the shaders are given when there is no sea: far below anything, so that nothing
+/// is under water or wet from it.
+pub const NO_SEA: f32 = -1.0e30;
 
 /// Twin of `Frame` in `common/frame.wgsl`.
 #[repr(C)]
@@ -193,7 +200,8 @@ pub struct FrameUniform {
     pub frame_seconds: f32,
     /// Where the sun and moon are drawn: the true sun, whatever lights the scene.
     pub sun_disc: Vec3,
-    pub _pad1: f32,
+    /// The calm sea's level; [`NO_SEA`] when there is none.
+    pub sea_level: f32,
     pub moon_disc: Vec3,
     pub _pad2: f32,
 }

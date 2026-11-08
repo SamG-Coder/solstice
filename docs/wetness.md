@@ -1,0 +1,123 @@
+# Wetness: design
+
+Surfaces the sea reaches get wet: the sand along the waterline, rocks standing in the surf, the
+ship's hull. They stay wet a while after the water draws back, then dry. This document is the plan,
+to be agreed before any of it is built. Foam waits until later.
+
+## Goals
+
+- **Real wet materials, not a tint.** Wet sand turns darker and slightly glossy. Wet rock darkens
+  less but shines. A painted or metal hull only gains a film of water. Each follows from how water
+  fills a surface's pores and then covers it.
+- **Driven by the water that is really there.** Wetness comes from the waves the sea is drawing
+  this moment, shrunk over the seabed as the water surface is, and from where they reached in the
+  last minute or so. Nothing is painted by hand for one scene.
+- **It joins the whole system.** It is decided once, where each pixel's material is resolved.
+  Lighting, sun and moon shadows, reflections and screen GI then all see the wet surface. GI's
+  voxels see it too, so wet sand bounces darker light.
+- **Dynamic.** A rougher sea wets higher. A calmer one leaves the wet band to dry. Moving the sea
+  level moves all of it.
+- **Cheap.** Under 0.1 ms on the RTX 5080 at 1280×720, and modest on integrated GPUs.
+
+## What there is today
+
+- No wetness anywhere.
+- The resolve pass (`vg/resolve.wgsl`) works out each pixel's albedo, roughness, metallic and
+  normal and writes them to the G-buffer. Everything lit reads them from there.
+- The seabed map (`ocean/seabed.rs`): a top-down depth map of the scene around the camera, which
+  says how deep the calm water is at any point.
+- The waves' displacement on the GPU, and `shoal()`, which shrinks them in the shallows.
+- The weather has a `rain` value. Rain is out of scope here; see the last step.
+
+## References
+
+- Lekner and Dorf 1988, *Why some things are darker when wet*. Water in the pores lowers the
+  index contrast, so light scatters forward and is absorbed more. The darkening is strongest for
+  bright, rough, porous materials.
+- Lagarde 2013, *Water drop 2: wet surfaces* (also used in Unreal-era games). It describes two
+  stages. First, pores fill: albedo darkens and roughness falls a little. Second, a film forms:
+  roughness drops to about 0.05–0.1 and fine bumps drown under the water's flat surface.
+- Stockdon et al. 2006, *Empirical parameterization of setup, swash and runup*. How far waves run
+  up a beach, from the wave height, wavelength and beach slope.
+
+## The wet material
+
+Wetness `w` runs from 0 (dry) to 1 (soaked, under a film). It is applied in the resolve pass,
+just before the G-buffer is written.
+
+- **Porosity.** Materials have no porosity value yet, so it is derived:
+  `(1 - metallic) × smoothstep(0.3, 0.8, roughness)`. Sand and rough stone come out porous,
+  painted wood and polished stone much less, and metal not at all. A per-material `porosity`
+  value can come later through the scene file, if any material is judged wrong.
+- **Pores filling**, for `w` up to about 0.6:
+  - albedo darkens towards albedo² for porous materials, as Lekner and Dorf show, blended by
+    porosity;
+  - roughness falls by about a third.
+- **A film forming**, for `w` from about 0.6 to 1:
+  - roughness goes to 0.07;
+  - the normal map's bumps flatten towards the surface's own normal, as water fills the hollows;
+  - F0 stays 0.02–0.04, since water's own reflectance takes over from the material's.
+- **Cavity.** Cavities stay wet longest, so they reach their wettest first.
+- **Under the water** there is no film. A film's gloss comes from its own surface against the
+  air, and under the sea the sea's surface gives the reflection instead. The pores still fill, so
+  the seabed is darkened but not glossy.
+- **Debug view `wetness`**, to see `w` on its own.
+
+## Where the water has been: the water-line map
+
+The sea's surface is only drawn where it is. Wetness needs to know where the water has *been*.
+One small map, held from frame to frame, remembers it.
+
+- **Texels:** 512² over 128 m around the camera, so 25 cm each, R16Float. Each holds the highest
+  water level reached at that spot recently, relative to the calm sea.
+- **Fixed in the world.** The map wraps around rather than moving with the camera, so a remembered
+  wet band stays put as the camera moves. Texels that come newly into view start out at today's
+  level.
+- **Updated each frame** by a small compute pass:
+  1. The water's height at that spot, from the waves, shrunk over the seabed by `shoal()` exactly
+     as the surface is.
+  2. Run-up on beaches: waves rush up the slope beyond where the water itself stands, to a height
+     from Stockdon's formula, using the sea's significant wave height and the beach slope from the
+     seabed map. Without this there would be no wet strip of sand above the calm waterline.
+  3. The remembered level becomes the higher of the new height and the old memory. The memory
+     falls back towards the current water as it dries, with a half-life of about 30 s.
+- **Reading it in resolve,** for a surface point `p`:
+  - fully wet below the remembered level;
+  - a soft fringe above it, a few centimetres high on rock and up to tens of centimetres on sand,
+    as water wicks up through the pores (scaled by porosity);
+  - drier the longer it has been since the water was there.
+- **Beyond the map** (128 m out), only the calm level and a fringe for today's waves count: no
+  memory is needed that far away.
+
+This covers vertical faces too: a rock or hull at a spot gets wet up to that spot's level. Points
+under the water are wet anyway, and the water pass draws over them.
+
+## Steps
+
+Each step is its own PR, reviewed by a separate AI agent, and merged only with your go-ahead.
+
+1. **The wet material.** The shading model in resolve, porosity, and the `wetness` debug view. It
+   is driven for now by a fixed band, from the calm sea level up to 30 cm above it, so the look
+   can be judged on its own: sand, rock, the hull, metal.
+   - Tests: wet sand comes out darker than dry and smoother; metal does not darken.
+2. **The water-line map.** The persistent map, its update from the waves and the seabed, drying,
+   and reading it in resolve. The fixed band is removed.
+   - Tests: a wave's wet band stays after it draws back and dries out later; nothing high above
+     the sea is ever wet.
+3. **Run-up and wicking.** Stockdon run-up on beaches and the fringe by porosity, tuned against
+   photos of real beaches and rocky shores. GI's voxels see wetness too.
+4. **README, screenshots, costs**, measured on the RTX 5080 and the integrated GPU tier.
+
+Rain is left for later: wetness from the weather's `rain`, sheltered under overhangs, with
+puddles in hollows. It would reuse the same wet material from step 1.
+
+## Risks
+
+- **Derived porosity may misjudge some materials,** for example a smooth but porous plaster. The
+  fix would be a per-material value.
+- **Wetness only changes the G-buffer.** Anything that skips resolve (sky, clouds, foliage cards)
+  never gets wet, and none of those should.
+- **Wet bands will be soft-edged.** The map's 25 cm texels limit how sharp a wet edge can be on
+  flat ground. Vertical faces are exact, because height comes from the surface point itself.
+- **Run-up from a formula is an average.** Individual waves vary, so the wet band's top edge will
+  wander less than on a real beach.

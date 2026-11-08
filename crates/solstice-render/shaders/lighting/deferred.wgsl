@@ -124,7 +124,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
 
     // Views that the resolve pass wrote directly to emissive are shown as they are.
-    if frame.debug_mode >= DEBUG_CLUSTERS && frame.debug_mode <= DEBUG_NORMALS {
+    if (frame.debug_mode >= DEBUG_CLUSTERS && frame.debug_mode <= DEBUG_NORMALS) || frame.debug_mode == DEBUG_WETNESS {
         textureStore(output, pixel, vec4f(emissive, 1.0));
         return;
     }

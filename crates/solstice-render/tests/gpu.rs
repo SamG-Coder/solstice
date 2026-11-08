@@ -1499,3 +1499,151 @@ fn waves_do_not_rise_through_low_land() {
     let wet = pixels.chunks_exact(4).filter(|p| shows_sea(p)).count();
     assert_eq!(wet, 0, "{wet} pixels of sea show through the floor");
 }
+
+/// The ball on its floor, both of `material`, with a calm sea at `sea_level` or none, seen
+/// through the base-colour debug view: the albedo the G-buffer holds, wetness included.
+fn render_albedo(gpu: &Gpu, material: Material, sea_level: Option<f32>) -> Vec<u8> {
+    render_wet(
+        gpu,
+        material,
+        sea_level,
+        DebugView::Albedo,
+        Vec3::new(0.0, 1.6, 4.0),
+        0.0,
+    )
+}
+
+/// The ball on its floor, both of `material`, with a calm sea at `sea_level` or none, seen
+/// through `debug` from `position` pitched by `pitch`, under a low sun straight ahead.
+fn render_wet(
+    gpu: &Gpu,
+    material: Material,
+    sea_level: Option<f32>,
+    debug: DebugView,
+    position: Vec3,
+    pitch: f32,
+) -> Vec<u8> {
+    let size = 128;
+    let mut scene = ball_on_floor();
+    scene.materials = vec![material];
+    let settings = RendererSettings {
+        debug_view: debug,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(gpu, &paginate(&scene), FORMAT, settings);
+    if let Some(level) = sea_level {
+        renderer.set_ocean(Some(Ocean::by_name("murky").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+    }
+    let camera = Camera {
+        position,
+        pitch,
+        ..Default::default()
+    };
+    let environment = Environment {
+        sun_direction: Vec3::new(0.0, 0.35, -1.0).normalize(),
+        ..Default::default()
+    };
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+    for _ in 0..4 {
+        renderer.render(gpu, &camera, &environment, &view, (size, size), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    read_pixels(gpu, &target, size)
+}
+
+fn brightness_at(pixels: &[u8], x: u32, y: u32) -> f32 {
+    let i = ((y * 128 + x) * 4) as usize;
+    pixels[i..i + 3].iter().map(|&c| c as f32).sum::<f32>() / 3.0
+}
+
+#[test]
+fn water_darkens_porous_surfaces_but_not_metal_or_what_stands_above_it() {
+    let Some(gpu) = request_gpu() else { return };
+    // The sea lies 5 cm below the floor, so the floor is wet with it. The ball rises well
+    // above the water, out of its reach.
+    let (floor, ball) = ((64, 120), (64, 52));
+    let sand = Material {
+        base_color: [0.45, 0.38, 0.28, 1.0],
+        roughness: 0.95,
+        ..Default::default()
+    };
+    let dry = render_albedo(&gpu, sand, None);
+    let wet = render_albedo(&gpu, sand, Some(-0.05));
+    let (dry_floor, wet_floor) = (
+        brightness_at(&dry, floor.0, floor.1),
+        brightness_at(&wet, floor.0, floor.1),
+    );
+    // Wet sand reflects about half what it does dry; in the debug view's sRGB, darker by
+    // well over a tenth.
+    assert!(
+        wet_floor < dry_floor * 0.85,
+        "wet sand ({wet_floor}) is not darker than dry ({dry_floor})"
+    );
+    let (dry_ball, wet_ball) = (
+        brightness_at(&dry, ball.0, ball.1),
+        brightness_at(&wet, ball.0, ball.1),
+    );
+    assert!(
+        (dry_ball - wet_ball).abs() < 2.0,
+        "the ball's upper half, far above the water, changed: {dry_ball} dry, {wet_ball} wet"
+    );
+
+    // Metal has no pores to fill: water only films it, which leaves its colour alone.
+    let metal = Material {
+        base_color: [0.6, 0.55, 0.5, 1.0],
+        roughness: 0.6,
+        metallic: 1.0,
+        ..Default::default()
+    };
+    let dry = brightness_at(&render_albedo(&gpu, metal, None), floor.0, floor.1);
+    let wet = brightness_at(&render_albedo(&gpu, metal, Some(-0.05)), floor.0, floor.1);
+    assert!(
+        (dry - wet).abs() < 2.0,
+        "wet metal changed colour: {dry} dry, {wet} wet"
+    );
+}
+
+#[test]
+fn wet_ground_shines_where_dry_ground_does_not() {
+    let Some(gpu) = request_gpu() else { return };
+    // A low sun straight ahead, mirrored by the floor a few metres in front of the camera, to
+    // one side of the ball. Dry sand is too rough to show it as more than a faint sheen; wet,
+    // a film of water turns it into a bright glint.
+    let sand = Material {
+        base_color: [0.45, 0.38, 0.28, 1.0],
+        roughness: 0.95,
+        ..Default::default()
+    };
+    let position = Vec3::new(10.0, 1.6, 4.0);
+    let peak = |pixels: &[u8]| {
+        (70..128)
+            .flat_map(|y| (0..128).map(move |x| (x, y)))
+            .map(|(x, y)| brightness_at(pixels, x, y))
+            .fold(0.0, f32::max)
+    };
+    let dry = peak(&render_wet(
+        &gpu,
+        sand,
+        None,
+        DebugView::Lit,
+        position,
+        -0.25,
+    ));
+    let wet = peak(&render_wet(
+        &gpu,
+        sand,
+        Some(-0.05),
+        DebugView::Lit,
+        position,
+        -0.25,
+    ));
+    assert!(
+        wet > dry * 1.3 + 10.0,
+        "the wet floor's glint ({wet}) is no brighter than the dry floor's sheen ({dry})"
+    );
+}

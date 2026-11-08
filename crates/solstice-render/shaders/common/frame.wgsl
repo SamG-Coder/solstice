@@ -38,7 +38,8 @@ struct Frame {
     frame_seconds: f32,
     // Where the sun and moon are drawn: the true sun, whatever lights the scene, and the moon.
     sun_disc: vec3f,
-    _pad1: f32,
+    // The calm sea's level; far below everything when there is no sea.
+    sea_level: f32,
     moon_disc: vec3f,
     _pad2: f32,
 }
@@ -53,6 +54,7 @@ const DEBUG_NORMALS: u32 = 6u;
 const DEBUG_DIFFUSE_GI: u32 = 7u;
 const DEBUG_REFLECTIONS: u32 = 8u;
 const DEBUG_VOXELS: u32 = 9u;
+const DEBUG_WETNESS: u32 = 11u;
 
 fn pixel_to_ndc(pixel: vec2f, inv_viewport: vec2f) -> vec2f {
     let uv = pixel * inv_viewport;
