@@ -217,7 +217,9 @@ in radius and about 1.8 m tall. So the scene is built to make that easy:
 - until the sea has physics, walking off an edge would drop the player to the seabed, so the quay
   and mole edges and the beach's waterline get `blocker X Y Z SX SY SZ YAW` lines;
 - moving doors and the gate are actors with `collider box` lines. Their meshes are named parts of
-  the kit, with each part's origin at its hinge.
+  the kit (`mesh PATH SCALE part=NAME`), with each part's origin at its hinge;
+- the ground is kit meshes, at most about 300 m across and 500k triangles each, marked
+  `collide=coarse` for a 10 cm cut.
 
 ## Steps
 
