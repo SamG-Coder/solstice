@@ -300,20 +300,39 @@ hardware pipeline so that surfaces do not shadow themselves, and a pass of one t
 that buffer over the cascade's map under the usual depth test. Movable instances' quarters
 stay on the hardware path for now.
 
-| Flyover, shadows pass: redraw mean / p95 / max | Hardware only | With software |
+| Flyover, shadows pass: redraw mean / p95 / max (average per frame) | Hardware only | With software |
 |---|---|---|
-| Stress, fair 10:00 | 2.71 / 5.40 / 11.3 ms | 1.27 / 2.59 / 5.1 ms |
-| Stress, storm 18:40 (low sun) | 8.47 / 17.4 / 33.1 ms | 4.94 / 9.60 / 23.2 ms |
-| Cove, fair 10:00 | 0.36 / 0.31 / 0.59 ms | 0.40 / 0.38 / 0.66 ms |
+| Stress, fair 10:00 | 2.63 / 5.22 / 10.9 ms (0.81) | 1.61–1.78 / 3.1–3.5 / 6.3–8.0 ms (0.54–0.60) |
+| Stress, storm 18:40 (low sun) | 8.45 / 17.3 / 33.1 ms (2.91) | 6.41–6.88 / 11.9–12.6 / 28–33 ms (2.27–2.43) |
+| Cove, fair 10:00 (two runs each) | 0.35 / 0.29 / 0.6 ms (0.076) | 0.36 / 0.33 / 0.6 ms (0.083) |
 
-The cove pays the clear and the merge, about 0.04 ms a redraw, for little gain: its clusters
-are large. Images are unchanged within noise (hill 56.4 dB against a 58 dB floor, dusk 58.9,
-beach 44.6 against 45.4, cove 45.2 against 46.5); without the slope bias the first attempt
-darkened the barrels and leaves with self-shadowing, which the difference image showed. A GPU
-test renders a ball over a floor with and without the ball, under a sun alone, and requires the
-floor to darken under it; the ball's clusters all take the software path in the nearest
-cascade, so a software rasterizer that wrote nothing, or a merge that wrote the far plane,
-fails it, while turning the software path off (everything through the hardware) still passes.
+Measured against a build of `main` on the same day, cold frames discarded; the wood's two
+figures are two runs of the same build. The software list is drawn with no clears and no work
+driven from the CPU: each drawing stamps its depth words with a number of its own (24 bits of
+reversed depth under an 8-bit stamp), the merge reads only its own stamp, and the buffer is
+cleared once every 255 drawings; the merge is drawn indirectly from the cull's arguments, so
+a cascade with no software clusters draws nothing. A cluster goes to software under 16 texels
+across (40 pixels in the main view): at 40 the cove, whose clusters are mostly large, lost
+0.03 ms a redraw to mid-sized clusters that the hardware draws faster without a pixel shader;
+at 8 the wood lost a quarter of its gain.
+
+What the cove still pays, 0.007 ms a frame or 13 µs a cascade redraw, is one more dependent
+compute dispatch per redraw: timestamps around the sub-passes put the whole difference in the
+cull and software pass, with the hardware pass and merge unchanged (+0.8 µs), and a build whose
+cull never chose software (an empty dispatch) still cost 7 µs of it. Folding the dispatch into
+the cull's compute pass, marking touched tiles from the cull so the merge draws only those (64
+and 16 pixel tiles), and a lower threshold all measured the same or worse. Skipping the dispatch
+on the CPU would need the software count read back, a frame late, and a cascade can have
+pixel-sized casters whatever its size, so there is no safe bound without it.
+
+Images are unchanged within noise (hill 56.5 dB against a 58 dB floor, beach 45.7 against
+45.4, cove 46.4 against 46.5); without the slope bias the first attempt darkened the barrels
+and leaves with self-shadowing, which the difference image showed. A GPU test renders a ball
+over a floor with and without the ball, under a sun alone, and requires the floor to darken
+under it; the ball's clusters all take the software path in the nearest cascade, so a software
+rasterizer that wrote nothing, a merge that wrote the far plane or was never drawn, or a cull
+that sent nothing to software fails it. The software path holds a 16 MB depth buffer for the
+2048² cascades and 16 more bytes of indirect arguments.
 
 The low sun's far cascade still asks for over two million clusters; drawing them twice as fast
 does not change that count. The remaining lever is a coarser level of detail for leaves at

@@ -35,6 +35,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "vg/cull.wgsl",
     "vg/cull_control.wgsl",
     "vg/raster_hw_fragment.wgsl",
+    "vg/depth_stamp.wgsl",
     "vg/raster_sw_body.wgsl",
     "vg/raster_sw.wgsl",
     "vg/raster_sw_depth.wgsl",
