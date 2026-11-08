@@ -6,10 +6,12 @@
 //! the last two steps, and where the player's camera is.
 
 use crate::actor::ActorFile;
+use crate::animation::{AnimatedActors, AnimationAssets};
 use crate::input::{Devices, InputMap};
 use crate::resolve;
 use crate::scene::{SceneGame, GAME_FILE};
 use glam::{EulerRot, Mat4, Quat, Vec3};
+use solstice_asset::NO_POSE;
 use solstice_asset::{Collision, GameFile};
 use solstice_physics::{Overlap, Physics};
 use solstice_script::{Script, ScriptEvent, ScriptHost};
@@ -42,6 +44,8 @@ pub struct View {
 /// A placed actor with instances to move.
 struct Drawn {
     entity: Entity,
+    /// Its `.anim` file, if it is animated, by its path in the scene's gameplay.
+    animation: Option<String>,
     /// Each instance, and where it is relative to the actor.
     instances: Vec<(u32, Mat4)>,
     /// Where the actor was last drawn, to move its instances only when it moves.
@@ -70,6 +74,11 @@ pub struct Play {
     scripts: Vec<String>,
     messages: VecDeque<Message>,
     physics: Rc<RefCell<Physics>>,
+    /// Everything animated, once [`Play::attach_animation`] has been called.
+    animated: Rc<RefCell<AnimatedActors>>,
+    /// Bones to pose, for the viewer to hand to the renderer.
+    poses: Vec<(u32, Vec<Mat4>)>,
+    viewer: Vec3,
 }
 
 impl Play {
@@ -208,6 +217,7 @@ impl Play {
                 }
                 drawn.push(Drawn {
                     entity,
+                    animation: actor.animation.as_ref().map(|a| resolve(&line.file, a)),
                     instances,
                     drawn: None,
                 });
@@ -220,6 +230,18 @@ impl Play {
         let mut schedule = Schedule::new();
         ScriptHost::install(&host, &mut schedule);
         Physics::install(&physics, &mut schedule);
+        let animated: Rc<RefCell<AnimatedActors>> = Default::default();
+        let running = animated.clone();
+        schedule.add(TickGroup::PostPhysics, "animation", move |world| {
+            let commands = world.read_cloned::<solstice_script::AnimCommand>();
+            let mut running = running.borrow_mut();
+            running.apply(&commands);
+            let mut notifies = Vec::new();
+            running.step(world, &mut notifies);
+            for (entity, name) in notifies {
+                world.send(ScriptEvent::to(entity, "anim").arg(name.as_str()));
+            }
+        });
         // What enters and leaves a sensor reaches its script as `on_enter` and `on_exit`.
         schedule.add(TickGroup::PostPhysics, "touches", |world| {
             for overlap in world.read_cloned::<Overlap>() {
@@ -246,7 +268,52 @@ impl Play {
             scripts,
             messages,
             physics,
+            animated,
+            poses: Vec::new(),
+            viewer: Vec3::ZERO,
         })
+    }
+
+    /// Gives every animated actor its skeleton and clips, from what the scene holds. Returns every
+    /// mistake found.
+    pub fn attach_animation(
+        &mut self,
+        files: &[GameFile],
+        assets: &AnimationAssets<'_>,
+    ) -> Result<(), Vec<String>> {
+        let actors: Vec<_> = self
+            .drawn
+            .iter()
+            .filter_map(|d| {
+                let path = d.animation.as_ref()?;
+                // A rigid mesh can sit beside the skinned ones: the first that has a pose.
+                let posed = d
+                    .instances
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .find(|id| {
+                        assets
+                            .instance_poses
+                            .get(*id as usize)
+                            .is_some_and(|pose| *pose != NO_POSE)
+                    })
+                    .or_else(|| d.instances.first().map(|(id, _)| *id))?;
+                Some((d.entity, path.clone(), posed))
+            })
+            .collect();
+        *self.animated.borrow_mut() = AnimatedActors::load(files, assets, &actors)?;
+        Ok(())
+    }
+
+    /// Where the camera is, which decides how often distant characters update.
+    pub fn set_viewer(&mut self, position: Vec3) {
+        self.viewer = position;
+    }
+
+    /// Takes the poses to give the renderer: each pose's number, and its bones in the mesh's
+    /// own space.
+    pub fn take_poses(&mut self) -> Vec<(u32, Vec<Mat4>)> {
+        std::mem::take(&mut self.poses)
     }
 
     /// Every renderer instance an actor draws with, which must be made movable before play.
@@ -291,6 +358,12 @@ impl Play {
         }
         let steps = self.game.frame(seconds, &input);
         devices.end_frame();
+        self.animated.borrow_mut().frame(
+            steps.alpha,
+            &self.game.world,
+            self.viewer,
+            &mut self.poses,
+        );
         let pitch = (self.pitch + input.value("look_up") * self.unstepped as f32)
             .clamp(-MAX_PITCH, MAX_PITCH);
         if steps.steps > 0 {

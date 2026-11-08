@@ -537,6 +537,9 @@ impl ScriptHost {
                 for event in effects.sends {
                     world.send(event);
                 }
+                for command in effects.animation {
+                    world.send(command);
+                }
                 for change in effects.timers {
                     self.change_timer(world, entity, change);
                 }

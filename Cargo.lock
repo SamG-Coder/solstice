@@ -266,6 +266,7 @@ dependencies = [
  "glam 0.33.12",
  "rayon",
  "rustc-hash 2.1.3",
+ "solstice-anim",
  "solstice-asset",
  "solstice-builder",
  "solstice-game",
@@ -3196,6 +3197,7 @@ name = "solstice-game"
 version = "0.2.0"
 dependencies = [
  "glam 0.33.12",
+ "solstice-anim",
  "solstice-asset",
  "solstice-physics",
  "solstice-script",

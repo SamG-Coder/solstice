@@ -10,9 +10,13 @@
 //! camera 0 1.6 0                       # the player's eye, for the actor the player plays
 //! collider box 3.9 3.5 0.2 at 0 1.75 0 # what it bumps into, placed relative to the actor
 //! character 0.3 1.8                    # walks, as a capsule of this radius and height
+//! animation keeper.anim                 # a skinned mesh's state machine, relative to this file
 //! ```
 //!
-//! `mesh PATH SCALE part=NAME` takes one named piece of the model, by its own origin. A collider
+//! `mesh PATH SCALE yaw=DEGREES` turns the model about its own origin, as a character made
+//! facing +Z must be turned to face the way actors do. An actor with an `animation` has its mesh
+//! imported with its skeleton. `mesh PATH SCALE part=NAME` takes one named piece of the model, by
+//! its own origin. A collider
 //! is `box SX SY SZ` or `capsule RADIUS HEIGHT`, then optionally `at X Y Z`, then `sensor`, which
 //! blocks nothing and reports what enters and leaves it, or `dynamic MASS`, which physics moves.
 //!
@@ -130,6 +134,8 @@ pub struct Mesh {
     pub scale: f32,
     /// One named piece of the model, placed by its own origin, rather than the whole of it.
     pub part: Option<String>,
+    /// Turns the model about its own origin, in degrees.
+    pub yaw_degrees: f32,
 }
 
 /// One kind of actor.
@@ -147,6 +153,8 @@ pub struct ActorFile {
     pub collider: Option<ActorCollider>,
     /// Makes it walk, on the ground, with the character controller.
     pub character: Option<Character>,
+    /// A state machine for a skinned mesh, relative to the actor file.
+    pub animation: Option<String>,
 }
 
 /// Names `self` already has in a script, which a property can't take.
@@ -210,6 +218,7 @@ impl ActorFile {
             camera: None,
             collider: None,
             character: None,
+            animation: None,
         };
         for (line, words) in lines(text) {
             let error = |message: String| FileError { line, message };
@@ -241,10 +250,14 @@ impl ActorFile {
                     name = Some(values[0].to_owned());
                 }
                 "mesh" => {
-                    count(1..=3, "PATH [SCALE] [part=NAME]")?;
+                    count(1..=4, "PATH [SCALE] [part=NAME] [yaw=DEGREES]")?;
                     once(actor.mesh.is_some())?;
-                    let (mut scale, mut part) = (1.0, None);
+                    let (mut scale, mut part, mut yaw_degrees) = (1.0, None, 0.0);
                     for word in &values[1..] {
+                        if let Some(degrees) = word.strip_prefix("yaw=") {
+                            yaw_degrees = number(degrees).map_err(error)?;
+                            continue;
+                        }
                         match word.strip_prefix("part=") {
                             Some("") => return Err(error("`part=` needs a name".to_owned())),
                             Some(name) => part = Some(name.to_owned()),
@@ -260,7 +273,13 @@ impl ActorFile {
                         path: values[0].to_owned(),
                         scale,
                         part,
+                        yaw_degrees,
                     });
+                }
+                "animation" => {
+                    count(1..=1, "PATH")?;
+                    once(actor.animation.is_some())?;
+                    actor.animation = Some(values[0].to_owned());
                 }
                 "script" => {
                     count(1..=1, "PATH")?;
@@ -323,7 +342,7 @@ impl ActorFile {
                 other => {
                     return Err(error(format!(
                         "unknown line `{other}`: an actor file has name, mesh, script, property, \
-                         camera, collider and character lines"
+                         camera, collider, character and animation lines"
                     )))
                 }
             }
@@ -349,7 +368,13 @@ impl ActorFile {
             if let Some(part) = &mesh.part {
                 let _ = write!(text, " part={part}");
             }
+            if mesh.yaw_degrees != 0.0 {
+                let _ = write!(text, " yaw={}", mesh.yaw_degrees);
+            }
             text.push('\n');
+        }
+        if let Some(animation) = &self.animation {
+            let _ = writeln!(text, "animation {animation}");
         }
         if let Some(script) = &self.script {
             let _ = writeln!(text, "script {script}");
@@ -427,6 +452,7 @@ collider box 3.9 3.5 0.2 at 0 1.75 0
                 path: "../gate/gate.gltf".to_owned(),
                 scale: 1.15,
                 part: None,
+                yaw_degrees: 0.0,
             })
         );
         assert_eq!(gate.script.as_deref(), Some("gate.star"));
@@ -556,6 +582,17 @@ collider box 3.9 3.5 0.2 at 0 1.75 0
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn an_animation_and_a_turned_mesh_read_back_what_they_wrote() {
+        let text = "name w\nmesh a.glb 1 yaw=180\nanimation w.anim\n";
+        let walker = ActorFile::parse(text).unwrap();
+        assert_eq!(walker.animation.as_deref(), Some("w.anim"));
+        assert_eq!(walker.mesh.as_ref().unwrap().yaw_degrees, 180.0);
+        assert_eq!(ActorFile::parse(&walker.to_text()).unwrap(), walker);
+        let error = ActorFile::parse("name w\nanimation a\nanimation b\n").unwrap_err();
+        assert!(error.message.contains("twice"), "{error}");
     }
 
     #[test]

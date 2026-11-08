@@ -3,7 +3,7 @@
 //! ```text
 //! # scenes/harbour/walker.anim
 //! source ../../target/characters/keeper_clips.glb     # the glTF the clips are in
-//! roles ../../characters/rigs/game_engine.roles       # its bones, for retargeting (optional)
+//! roles ual.roles keeper.roles                        # its rig's, and the character's (optional)
 //! clip idle Idle                                      # a name here, and in the file
 //! clip walk Walk
 //! clip run Run
@@ -79,8 +79,9 @@ pub struct ClipLine {
 pub struct AnimGraph {
     /// The glTF the clips are in, relative to this file.
     pub source: Option<String>,
-    /// The role file of the source's rig, for retargeting. Without one, bones match by name.
-    pub roles: Option<String>,
+    /// The role files of the source's rig and the character's, for retargeting. Without them,
+    /// bones match by name.
+    pub roles: Option<(String, String)>,
     pub clips: Vec<ClipLine>,
     pub notifies: Vec<(String, f32, String)>,
     pub params: Vec<(String, f32)>,
@@ -112,7 +113,9 @@ impl AnimGraph {
             };
             match (keyword, rest) {
                 ("source", [path]) => graph.source = Some((*path).to_owned()),
-                ("roles", [path]) => graph.roles = Some((*path).to_owned()),
+                ("roles", [source, character]) => {
+                    graph.roles = Some(((*source).to_owned(), (*character).to_owned()))
+                }
                 ("clip", [name, source] | [name, source, "loop"]) => graph.clips.push(ClipLine {
                     name: (*name).to_owned(),
                     source_name: (*source).to_owned(),
@@ -413,11 +416,18 @@ impl Animator {
         if state == self.current.state {
             return;
         }
+        // A locomotion cycle stays in step across a fade; anything else starts from its start.
+        let phase = if self.state_loops(self.current.state) && self.state_loops(state) {
+            self.current.phase
+        } else {
+            0.0
+        };
         let from = if self.fade.is_some() {
-            // With nothing drawn yet, there is no pose to carry on from: no fade at all.
+            // With nothing drawn yet, there is no pose to carry on from: no fade at all. Only
+            // the fade: where the state starts mustn't depend on what has been drawn.
             if !self.evaluated {
-                self.current = Run { state, phase: 0.0 };
                 self.fade = None;
+                self.current = Run { state, phase };
                 return;
             }
             self.frozen.copy_from(&self.last);
@@ -426,12 +436,6 @@ impl Animator {
             FadeFrom::Running(self.current)
         };
         self.fade = (fade > 0.0).then_some((from, 0.0, fade));
-        // A locomotion cycle stays in step across a fade; anything else starts from its start.
-        let phase = if self.state_loops(self.current.state) && self.state_loops(state) {
-            self.current.phase
-        } else {
-            0.0
-        };
         self.current = Run { state, phase };
     }
 
@@ -561,7 +565,32 @@ impl Animator {
 
     /// The current pose, into `out`.
     pub fn evaluate(&mut self, clips: &ClipSet, rest: &Pose, out: &mut Pose) {
-        let fade = self.fade;
+        self.evaluate_ahead(clips, rest, out, 0.0);
+    }
+
+    /// Where a run will have got to `seconds` on, without moving it.
+    fn run_ahead(&self, run: Run, seconds: f32, clips: &ClipSet) -> Run {
+        let phase = run.phase + seconds / self.cycle_seconds(clips, run.state);
+        let phase = if self.state_loops(run.state) {
+            phase % 1.0
+        } else {
+            phase.min(1.0)
+        };
+        Run { phase, ..run }
+    }
+
+    /// The pose `ahead` seconds after the last step, into `out`. Time moves on in fixed steps, so
+    /// that a game replays exactly at any frame rate; this keeps what is drawn smooth between
+    /// them. It doesn't move anything on, so a state change waits for the next step.
+    pub fn evaluate_ahead(&mut self, clips: &ClipSet, rest: &Pose, out: &mut Pose, ahead: f32) {
+        let current_run = self.run_ahead(self.current, ahead, clips);
+        let fade = self.fade.map(|(from, elapsed, length)| {
+            let from = match from {
+                FadeFrom::Running(run) => FadeFrom::Running(self.run_ahead(run, ahead, clips)),
+                FadeFrom::Frozen => FadeFrom::Frozen,
+            };
+            (from, elapsed + ahead, length)
+        });
         let graph = std::mem::take(&mut self.graph);
         let params = std::mem::take(&mut self.params);
         let value = |name: &str| {
@@ -571,10 +600,10 @@ impl Animator {
                 .position(|(n, _)| n == name)
                 .map_or(0.0, |i| params[i])
         };
-        let current = shares_of(&graph.states[self.current.state].1, &value);
+        let current = shares_of(&graph.states[current_run.state].1, &value);
         Self::pose_of(
             &current,
-            self.current.phase,
+            current_run.phase,
             clips,
             rest,
             out,
@@ -863,6 +892,24 @@ mod tests {
         let mut animator = Animator::new(AnimGraph::parse(&graph("1.0")).unwrap(), 1);
         let count: usize = (0..40).map(|_| animator.advance(0.25, &clips).len()).sum();
         assert_eq!(count, 10, "a notify at the end of a 1 s loop, over 10 s");
+    }
+
+    #[test]
+    fn looking_ahead_moves_the_pose_and_not_the_clock() {
+        let clips = set();
+        let graph = "clip idle I\nclip walk W\nclip run R\nstate w clip walk\nstart w";
+        let mut animator = Animator::new(AnimGraph::parse(graph).unwrap(), 1);
+        animator.advance(0.25, &clips);
+        let rest = Pose::with_bones(1);
+        let mut pose = Pose::with_bones(1);
+        let phase = animator.current.phase;
+        animator.evaluate_ahead(&clips, &rest, &mut pose, 0.25);
+        assert!(
+            (pose.translations[0].y - 1.0).abs() < 0.02,
+            "{}",
+            pose.translations[0].y
+        );
+        assert_eq!(animator.current.phase, phase);
     }
 
     #[test]

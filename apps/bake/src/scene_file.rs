@@ -432,7 +432,7 @@ fn placements_of<'a>(
 type Seated = (Vec3, f32, f32, f32, Collide);
 
 /// An actor's mesh: the model's path relative to the scene, its scale, and which named part.
-type ActorMesh = (String, f32, Option<String>);
+type ActorMesh = (String, f32, Option<String>, f32, Option<String>);
 
 /// Which placement of a model something became.
 #[derive(Clone, Copy)]
@@ -515,11 +515,25 @@ impl Gameplay {
                 .load(&name, &source)
                 .map_err(|e| e.message)?;
         }
+        let animation = match &actor.animation {
+            None => None,
+            Some(path) => {
+                let name = resolve(&line.file, path);
+                let text = self.read(base, &name)?;
+                solstice_anim::AnimGraph::parse(text).map_err(|e| format!("{name}: {e}"))?;
+                Some(name)
+            }
+        };
+        if animation.is_some() && actor.mesh.is_none() {
+            return Err(format!("{} is animated but has no mesh", line.file));
+        }
         let mesh = actor.mesh.as_ref().map(|mesh| {
             (
                 resolve(&line.file, &mesh.path),
                 mesh.scale,
                 mesh.part.clone(),
+                mesh.yaw_degrees,
+                animation.clone(),
             )
         });
         self.game.actors.push(line);
@@ -553,6 +567,83 @@ impl Gameplay {
     }
 }
 
+/// Whether this `.anim` file's clips were already baked for this skeleton: two models can share
+/// a graph, and each needs clips fitted to its own skeleton.
+fn has_clips_for(clips: &[solstice_asset::Clip], graph_file: &str, skeleton: u32) -> bool {
+    let prefix = solstice_game::animation::clip_key(graph_file, "");
+    clips
+        .iter()
+        .any(|c| c.skeleton == skeleton && c.name.starts_with(&prefix))
+}
+
+/// Reads the clips an `.anim` file names, from the glTF it names, fitted to `skeleton`, and
+/// quantises them. Each is named as `solstice_game::animation::clip_key` says.
+fn bake_clips(
+    base: &Path,
+    graph_file: &str,
+    text: &str,
+    target: &solstice_asset::Skeleton,
+    skeleton: u32,
+) -> Result<Vec<solstice_asset::Clip>, String> {
+    let graph = solstice_anim::AnimGraph::parse(text).map_err(|e| format!("{graph_file}: {e}"))?;
+    let source = graph
+        .source
+        .as_ref()
+        .ok_or_else(|| format!("{graph_file}: has no `source` line"))?;
+    let source_file = base.join(resolve(graph_file, source));
+    let looping = |name: &str| {
+        graph
+            .clips
+            .iter()
+            .find(|clip| clip.source_name == name)
+            .is_none_or(|clip| clip.looping)
+    };
+    let file = solstice_import::animation::read_clips(&source_file, looping)
+        .map_err(|e| format!("{}: {e}", source_file.display()))?;
+    let roles = match &graph.roles {
+        None => None,
+        Some((from, to)) => {
+            let read = |name: &str| {
+                let path = base.join(resolve(graph_file, name));
+                std::fs::read_to_string(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))
+                    .and_then(|t| {
+                        solstice_import::character::Roles::parse(&t)
+                            .map_err(|e| format!("{}: {e}", path.display()))
+                    })
+            };
+            Some((read(from)?, read(to)?))
+        }
+    };
+    let mut out = Vec::new();
+    for line in &graph.clips {
+        let (_, frames) = file
+            .clips
+            .iter()
+            .find(|(name, _)| *name == line.source_name)
+            .ok_or_else(|| {
+                format!(
+                    "{graph_file}: {} has no clip `{}`",
+                    source_file.display(),
+                    line.source_name
+                )
+            })?;
+        let fitted = match &roles {
+            Some((from, to)) => {
+                solstice_import::animation::retarget(&file.rig, from, target, to, frames)
+            }
+            None => solstice_import::animation::by_name(&file.rig, target, frames),
+        };
+        out.push(solstice_anim::compress(
+            &solstice_game::animation::clip_key(graph_file, &line.name),
+            skeleton,
+            &fitted,
+            line.looping,
+        ));
+    }
+    Ok(out)
+}
+
 /// Builds the scene described by the file at `path`. Returns it with any import warnings.
 pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -571,6 +662,8 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     let mut seated: HashMap<PathBuf, Vec<Seated>> = HashMap::new();
     let mut gameplay = Gameplay::default();
     let mut skinned_models: std::collections::HashSet<PathBuf> = Default::default();
+    // Each model an actor animates, and the `.anim` file it does so with.
+    let mut animations: Vec<(PathBuf, String)> = Vec::new();
     let mut collides: HashMap<PathBuf, PlacedCollision> = HashMap::new();
     for (number, line) in text.lines().enumerate() {
         let at = |e: String| format!("{}:{}: {e}", path.display(), number + 1);
@@ -651,10 +744,16 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             Some(Command::Actor(actor)) => {
                 let (position, yaw) = (actor.position, actor.yaw_degrees);
                 let index = gameplay.game.actors.len();
-                if let Some((model, scale, part)) = gameplay.add_actor(base, actor).map_err(at)? {
+                if let Some((model, scale, part, mesh_yaw, animation)) =
+                    gameplay.add_actor(base, actor).map_err(at)?
+                {
                     let full = base.join(&model);
+                    if let Some(animation) = animation {
+                        skinned_models.insert(full.clone());
+                        animations.push((full.clone(), animation));
+                    }
                     let placements = placements_of(&mut order, &mut models, base, model);
-                    let transform = placement_transform(position, yaw, scale);
+                    let transform = placement_transform(position, yaw + mesh_yaw, scale);
                     // An actor bumps into things with its own collider, not its mesh.
                     let collide = collides.entry(full.clone()).or_default();
                     let placed = match part {
@@ -723,6 +822,26 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
         }
         let ranges = append_model(&mut scene, imported, &models[model])
             .map_err(|e| format!("{}: {e}", model.display()))?;
+        for (_, graph_file) in animations.iter().filter(|(m, _)| m == model) {
+            let skeleton = scene.skeletons.len() as u32 - 1;
+            if has_clips_for(&scene.clips, graph_file, skeleton) {
+                continue;
+            }
+            let text = gameplay
+                .files
+                .iter()
+                .find(|f| f.name == *graph_file)
+                .map(|f| f.text.clone())
+                .ok_or_else(|| format!("{graph_file}: not read"))?;
+            let clips = bake_clips(
+                base,
+                graph_file,
+                &text,
+                &scene.skeletons[skeleton as usize],
+                skeleton,
+            )?;
+            scene.clips.extend(clips);
+        }
         let whole_count = models[model].whole.len();
         for (actor, _, placed) in gameplay.meshes.iter().filter(|(_, m, _)| m == model) {
             let index = match placed {
@@ -760,6 +879,19 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_graph_shared_by_two_models_is_baked_for_each_skeleton() {
+        let clip = |skeleton| solstice_asset::Clip {
+            name: solstice_game::animation::clip_key("a.anim", "walk"),
+            skeleton,
+            ..Default::default()
+        };
+        let clips = vec![clip(0)];
+        assert!(has_clips_for(&clips, "a.anim", 0));
+        assert!(!has_clips_for(&clips, "a.anim", 1));
+        assert!(!has_clips_for(&clips, "b.anim", 0));
+    }
 
     #[test]
     fn blank_lines_and_comments_are_ignored() {

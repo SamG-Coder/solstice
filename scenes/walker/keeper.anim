@@ -1,0 +1,13 @@
+# How the keeper moves: idle when still, walking and running by how fast it goes.
+source ../../target/characters/keeper_clips.glb
+clip idle Idle
+clip walk Walk
+clip run Run
+notify walk 0.05 step_l
+notify walk 0.61 step_r
+param speed 0
+state idle clip idle
+state moving blend1d speed 0.1 idle 1.4 walk 4.0 run
+start idle
+transition idle moving speed > 0.1 fade 0.25
+transition moving idle speed < 0.1 fade 0.3

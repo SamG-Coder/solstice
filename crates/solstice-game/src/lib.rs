@@ -13,6 +13,7 @@
 use solstice_asset::MAX_COORDINATE;
 
 pub mod actor;
+pub mod animation;
 pub mod input;
 pub mod play;
 pub mod scene;
