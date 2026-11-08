@@ -479,6 +479,18 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
 cargo test --release
 ```
 
+To check only what a change affects, as CI does, run the checks for the crates whose files
+changed and everything that depends on them. That covers formatting, clippy, the tests (the GPU
+tests too) and, when the viewer is affected, the browser builds. Uncommitted work counts:
+
+```bash
+scripts/check-changed.sh
+```
+
+`scripts/affected.py` makes the choice: changing the renderer checks the renderer and the
+viewer, not the gameplay crates. A change outside every crate, such as `Cargo.lock`, CI or a
+build script, checks everything, and documentation checks nothing.
+
 - The key property of the DAG: every LOD cut is **watertight**, at uniform thresholds and from
   perspective viewpoints that mix levels.
 - All WGSL is validated without a GPU. Procedural meshes are checked to be closed and outward-facing.

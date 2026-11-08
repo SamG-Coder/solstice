@@ -18,21 +18,46 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
+      # Full history, to compare against where the change started.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy, rustfmt
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # Which crates the change affects (scripts/affected.py): those whose files changed and
+      # everything depending on them. A change outside the crates (Cargo.lock, CI, build
+      # scripts) affects everything. A pull request is checked out as its merge into the base,
+      # whose first parent is the base, so that is what it is compared against; a push to main
+      # is compared against the commit before it.
+      - name: Affected crates
+        id: affected
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [[ "${{ github.event_name }}" == pull_request ]]; then
+            base=$(git rev-parse HEAD^1)
+          else
+            base="$BEFORE"
+          fi
+          python3 scripts/affected.py --base "$base" --head HEAD --github-output
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Test the crate selection
+        run: python3 scripts/test_affected.py
       - name: Lint
-        run: cargo clippy --workspace --all-targets --release -- -D warnings
+        if: steps.affected.outputs.any == 'true'
+        run: cargo clippy ${{ steps.affected.outputs.all == 'true' && '--workspace' || '' }} $(for p in ${{ steps.affected.outputs.packages }}; do printf -- '-p %s ' "$p"; done) --all-targets --release -- -D warnings
       # These runners have no GPU, so tests/gpu.rs skips itself here. Shader validation
-      # and all geometry tests still run. Run `cargo test` locally to cover the GPU tests.
+      # and all geometry tests still run. Run scripts/check-changed.sh locally to cover the GPU
+      # tests too.
       - name: Test
-        run: cargo test --workspace --release
+        if: steps.affected.outputs.any == 'true'
+        run: cargo test ${{ steps.affected.outputs.all == 'true' && '--workspace' || '' }} $(for p in ${{ steps.affected.outputs.packages }}; do printf -- '-p %s ' "$p"; done) --release
       - name: Build for the browser
+        if: steps.affected.outputs.web == 'true'
         run: |
           cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features
           cargo clippy --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features -- -D warnings
