@@ -4,9 +4,12 @@
 
 #include "vg/raster_common.wgsl"
 
-// Reversed depth per pixel, 0 where nothing has been drawn, so that a cleared buffer is empty
-// and the nearest sample has the largest bits: positive floats order as their bits do.
+// Per pixel: the view's stamp in the top byte, over 24 bits of reversed depth, so that the
+// nearest sample of the current drawing has the largest value and anything an earlier
+// drawing left behind loses to it. The buffer is never cleared; the merge ignores other stamps.
 @group(1) @binding(0) var<storage, read_write> shadow_depth: array<atomic<u32>>;
+
+#include "vg/depth_stamp.wgsl"
 
 // Keeps the nearest depth. The view is orthographic with depth running 0 at the light's side
 // to 1 at the far side, so it is reversed here, and anything past either side is left out.
@@ -15,7 +18,7 @@ fn write_visibility(index: u32, depth: f32, id: u32) {
     if depth < 0.0 || reversed <= 0.0 {
         return;
     }
-    atomicMax(&shadow_depth[index], bitcast<u32>(reversed));
+    atomicMax(&shadow_depth[index], stamped(view.stamp, reversed));
 }
 
 // The same slope-scaled bias as the hardware shadow pipeline's, in depth per pixel of the

@@ -19,6 +19,10 @@ pub struct DepthBuffer {
     read: wgpu::BindGroup,
 }
 
+/// Stamps a drawing into a depth buffer can carry: a byte, with 0 meaning never drawn. Twin
+/// of `vg/depth_stamp.wgsl`.
+pub const DEPTH_STAMPS: u32 = 255;
+
 /// Per-pixel depth and triangle ID, as storage buffers both rasterizers can write.
 pub struct VisibilityBuffer {
     pub depth: wgpu::Buffer,
@@ -254,8 +258,10 @@ impl Rasterizer {
         }
     }
 
-    /// Clears `depth` and rasterizes into it the clusters the most recent cull of `work` sent
-    /// to software, as depth alone. [`Self::merge_depth`] then lays them over a depth map.
+    /// Rasterizes into `depth` the clusters the most recent cull of `work` sent to software,
+    /// as depth alone, under the stamp the view at `slot` carries. [`Self::merge_depth`] then
+    /// lays them over a depth map. Nothing is cleared: a drawing's entries outrank any left by
+    /// earlier drawings, and the merge reads only its own stamp.
     pub fn record_software_depth(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -264,7 +270,6 @@ impl Rasterizer {
         work: &CullWork,
         depth: &DepthBuffer,
     ) {
-        encoder.clear_buffer(&depth.buffer, 0, None);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("software depth raster"),
             timestamp_writes: None,
@@ -275,18 +280,21 @@ impl Rasterizer {
         pass.dispatch_workgroups_indirect(work.args(), CullWork::software_args_offset());
     }
 
-    /// Draws the depth in `depth` into the depth attachment of `pass`, under its depth test.
+    /// Draws the depth in `depth` into the depth attachment of `pass`, under its depth test:
+    /// one triangle over the map, which the cull's arguments drop when nothing went to
+    /// software, so an empty list costs nothing.
     pub fn merge_depth(
         &self,
         pass: &mut wgpu::RenderPass,
         bindings: &RasterBindings,
         slot: u32,
+        work: &CullWork,
         depth: &DepthBuffer,
     ) {
         pass.set_pipeline(&self.merge_depth);
         pass.set_bind_group(0, &bindings.group, &[ViewSlots::offset(slot)]);
         pass.set_bind_group(1, &depth.read, &[]);
-        pass.draw(0..3, 0..1);
+        pass.draw_indirect(work.args(), CullWork::merge_args_offset());
     }
 
     /// Binds a scene and a culling run's output for rasterization.

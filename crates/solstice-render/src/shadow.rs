@@ -18,7 +18,7 @@ use crate::gpu::{Gpu, LayoutBuilder};
 use crate::scene::GpuScene;
 use crate::vg::{
     CullPhase, CullPipelines, CullWork, DepthBuffer, InstanceFilter, PassView, RasterBindings,
-    Rasterizer, ViewSlots,
+    Rasterizer, ViewSlots, DEPTH_STAMPS,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -108,6 +108,9 @@ struct ShadowUniform {
 pub struct ShadowWork {
     /// Cascades whose static contents are redrawn.
     pub due: [bool; CASCADE_COUNT],
+    /// Whether the software depth buffer must be cleared before this frame's cascades, as the
+    /// stamps have started a new round.
+    pub clear_software_depth: bool,
     /// Cascades with movable instances to draw.
     pub moving: [bool; CASCADE_COUNT],
     /// Whether the movable instances are culled once, through the slot after the cascades'
@@ -140,6 +143,10 @@ pub struct ShadowMaps {
     /// over its map. Most of a wood's clusters are pixel-sized, and the hardware rasterizer
     /// draws those slowly, as the main view found long ago.
     software_depth: DepthBuffer,
+    /// The stamp of the last cascade drawn through it, 1 to `DEPTH_STAMPS`; 0 before any.
+    /// Once the stamps have gone round, the buffer is cleared before they start again, so
+    /// that a word left from exactly a round ago cannot pass for this drawing's.
+    software_stamp: u32,
     data: ShadowUniform,
     /// What each cascade last drew, to tell when it has gone stale.
     drawn: [Option<Drawn>; CASCADE_COUNT],
@@ -239,6 +246,7 @@ impl ShadowMaps {
             moving_view,
             pipeline,
             software_depth: rasterizer.depth_buffer(gpu, (RESOLUTION, RESOLUTION)),
+            software_stamp: 0,
             data: ShadowUniform {
                 view_proj: [Mat4::IDENTITY; CASCADE_COUNT],
                 splits: Vec4::from_array(SPLITS),
@@ -318,6 +326,7 @@ impl ShadowMaps {
         if std::mem::take(&mut self.redraw_all) {
             due = stale;
         }
+        let mut clear_software_depth = false;
 
         for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
             self.outdated[cascade] = false;
@@ -354,8 +363,15 @@ impl ShadowMaps {
                 nearest[cascade],
             )
             .shadowing(&planes, sun_direction);
-            // Small clusters go to the software rasterizer, as in the main view.
+            // Small clusters go to the software rasterizer, as in the main view, each cascade
+            // under a stamp of its own.
             view.allow_software = 1;
+            if self.software_stamp == DEPTH_STAMPS {
+                clear_software_depth = true;
+                self.software_stamp = 0;
+            }
+            self.software_stamp += 1;
+            view.stamp = self.software_stamp;
             self.drawn[cascade] = Some(Drawn {
                 view_proj,
                 lod_threshold,
@@ -424,6 +440,7 @@ impl ShadowMaps {
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.data));
         ShadowWork {
             due,
+            clear_software_depth,
             moving: moving_due,
             shared_cull,
         }
@@ -444,6 +461,9 @@ impl ShadowMaps {
         first_moving_slot: u32,
         shadow_work: &ShadowWork,
     ) {
+        if shadow_work.clear_software_depth {
+            encoder.clear_buffer(&self.software_depth.buffer, 0, None);
+        }
         for cascade in (0..CASCADE_COUNT).filter(|&c| shadow_work.due[c]) {
             let slot = first_slot + cascade as u32;
             cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
@@ -465,7 +485,7 @@ impl ShadowMaps {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
-            rasterizer.merge_depth(&mut pass, raster, slot, &self.software_depth);
+            rasterizer.merge_depth(&mut pass, raster, slot, work, &self.software_depth);
         }
 
         if shadow_work.shared_cull && shadow_work.moving.iter().any(|&moving| moving) {

@@ -1,10 +1,13 @@
 // Lays the depth the software rasterizer wrote for a shadow cascade over the cascade's depth
-// map: one triangle over the whole map, writing each pixel's depth where there is one, under
-// the same depth test as the hardware rasterizer's clusters.
+// map: one triangle over the whole map, writing each pixel's depth where this drawing left
+// one, under the same depth test as the hardware rasterizer's clusters. The cull's arguments
+// drop the triangle when no cluster went to software, so an empty drawing costs nothing.
 
 #include "vg/raster_common.wgsl"
 
 @group(1) @binding(0) var<storage, read> shadow_depth: array<u32>;
+
+#include "vg/depth_stamp.wgsl"
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4f {
@@ -17,9 +20,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4f {
 @fragment
 fn fs_main(@builtin(position) position: vec4f) -> @builtin(frag_depth) f32 {
     let pixel = vec2u(position.xy);
-    let bits = shadow_depth[pixel.y * u32(view.viewport.x) + pixel.x];
-    if bits == 0u {
+    let word = shadow_depth[pixel.y * u32(view.viewport.x) + pixel.x];
+    if stamp_of(word) != view.stamp {
         discard;
     }
-    return 1.0 - bitcast<f32>(bits);
+    return stamped_depth(word);
 }

@@ -1212,7 +1212,7 @@ impl Renderer {
             eye_near: 0.0,
             receiver_plane_count: 0,
             instance_filter: InstanceFilter::All as u32,
-            _pad: 0,
+            stamp: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             _pad2: 0.0,

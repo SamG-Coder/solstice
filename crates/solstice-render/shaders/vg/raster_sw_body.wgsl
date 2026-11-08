@@ -1,6 +1,6 @@
 // The software rasterizer's body, shared by the visibility and the depth-only entry points,
-// which each define `write_visibility` and the bindings it writes to, and `depth_bias`, the
-// offset added to a triangle's depth from its slope on screen, before including this.
+// which each define, before including this: `write_visibility` and the bindings it writes to;
+// and `depth_bias`, the offset added to a triangle's depth from its slope on screen.
 //
 // Hardware rasterizers shade 2x2 quads and waste most of their work on triangles near
 // pixel size. A compute shader has no such overhead, so small clusters come here. The

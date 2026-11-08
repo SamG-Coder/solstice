@@ -38,7 +38,10 @@ pub struct PassView {
     pub receiver_plane_count: u32,
     /// Which instances the view draws: an [`InstanceFilter`].
     pub instance_filter: u32,
-    pub _pad: u32,
+    /// For a depth map drawn by the software rasterizer: which drawing this is, 1 to 255.
+    /// Depth is kept under the stamp, so entries from earlier drawings lose to this one's
+    /// and are ignored when the depth is read, and the buffer never needs clearing.
+    pub stamp: u32,
     /// Further planes a cluster must lie inside: for a shadow view, the bounds of the volume
     /// whose shadows this view supplies, swept towards the light, so that casters whose shadow
     /// falls outside it are not drawn.
@@ -114,7 +117,7 @@ impl PassView {
             eye_near: 0.0,
             receiver_plane_count: 0,
             instance_filter: InstanceFilter::Static as u32,
-            _pad: 0,
+            stamp: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             _pad2: 0.0,
@@ -199,7 +202,8 @@ impl ViewSlots {
 const ARGS_QUEUE_OFFSET: u64 = 0;
 const ARGS_SOFTWARE_OFFSET: u64 = 12;
 const ARGS_DRAW_OFFSET: u64 = 24;
-const ARGS_SIZE: u64 = 40;
+const ARGS_MERGE_OFFSET: u64 = 40;
+const ARGS_SIZE: u64 = 56;
 /// Size of `CullState` in bytes.
 const STATE_SIZE: u64 = 48;
 
@@ -290,6 +294,12 @@ impl CullWork {
 
     pub const fn draw_args_offset() -> u64 {
         ARGS_DRAW_OFFSET
+    }
+
+    /// Offset of the draw arguments for merging software-rasterized depth into a depth map:
+    /// one triangle when the software list holds something, nothing otherwise.
+    pub const fn merge_args_offset() -> u64 {
+        ARGS_MERGE_OFFSET
     }
 
     /// Queues a copy of the counters. Call at the end of a frame's encoding.
@@ -580,6 +590,7 @@ mod tests {
                 eye_near,
                 receiver_plane_count,
                 instance_filter,
+                stamp,
                 receiver_planes,
                 eye_light,
             ]
