@@ -14,6 +14,8 @@ pub const FLAG_ADD: u32 = 2;
 pub const FLAG_SURFACE: u32 = 4;
 pub const FLAG_LIT: u32 = 8;
 pub const FLAG_GLOW: u32 = 16;
+pub const FLAG_SOLID: u32 = 32;
+pub const FLAG_SORT: u32 = 64;
 
 /// The air's temperature, which glowing particles cool towards, in kelvin.
 pub const AIR_TEMPERATURE: f32 = 300.0;

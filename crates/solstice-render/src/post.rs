@@ -138,6 +138,7 @@ impl PostProcess {
             .texture()
             .sampler()
             .storage_texture(FORMAT)
+            .texture()
             .build(gpu, "taa");
         let bloom_layout = LayoutBuilder::new()
             .uniform()
@@ -264,6 +265,7 @@ impl PostProcess {
         hdr: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         motion: &wgpu::TextureView,
+        reactive: &wgpu::TextureView,
         history: [Target; 2],
         render_size: (u32, u32),
         output_size: (u32, u32),
@@ -283,6 +285,7 @@ impl PostProcess {
                     tex(&history[1 - parity].view),
                     sampler.clone(),
                     tex(&history[parity].view),
+                    tex(reactive),
                 ],
             )
         };
