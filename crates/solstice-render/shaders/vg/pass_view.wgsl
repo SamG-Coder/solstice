@@ -22,6 +22,17 @@ struct PassView {
     occlusion_enabled: u32,
     // 0: hardware only. 1: small clusters go to software. 2: every cluster does.
     allow_software: u32,
+    // For an orthographic view drawn for a camera: that camera, its pixels per world unit at
+    // unit distance (0 for none), and the nearest it sees anything drawn here.
+    eye_position: vec3f,
+    eye_lod_scale: f32,
+    eye_near: f32,
+    // Further planes a cluster must lie inside, and how many of them are in use: for a shadow
+    // view, the bounds of what it shadows, open towards the light.
+    receiver_plane_count: u32,
+    receiver_planes: array<vec4f, 6>,
+    // Towards the light, for a shadow view.
+    eye_light: vec3f,
 }
 
 // Written by the cull passes. Atomic view of `CullStateRead`.

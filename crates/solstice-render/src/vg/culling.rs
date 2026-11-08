@@ -26,6 +26,25 @@ pub struct PassView {
     pub phase: u32,
     pub occlusion_enabled: u32,
     pub allow_software: u32,
+    /// For an orthographic view drawn on behalf of a camera: where that camera is, its pixels
+    /// per world unit at unit distance, and the nearest distance from it at which what this view
+    /// draws can show. Error too small for the camera to see is then not drawn here either, so
+    /// a far shadow cascade stops short of detail finer than the camera's pixels. A scale of 0
+    /// turns this off.
+    pub eye_position: Vec3,
+    pub eye_lod_scale: f32,
+    pub eye_near: f32,
+    /// How many of `receiver_planes` are in use.
+    pub receiver_plane_count: u32,
+    pub _pad: [u32; 2],
+    /// Further planes a cluster must lie inside: for a shadow view, the bounds of the volume
+    /// whose shadows this view supplies, swept towards the light, so that casters whose shadow
+    /// falls outside it are not drawn.
+    pub receiver_planes: [Vec4; 6],
+    /// Towards the light, for a shadow view: a caster's error shows where its shadow lands,
+    /// anywhere along the line from it away from the light.
+    pub eye_light: Vec3,
+    pub _pad2: f32,
 }
 
 impl PassView {
@@ -72,7 +91,45 @@ impl PassView {
             phase: 0,
             occlusion_enabled: 0,
             allow_software: 0,
+            eye_position: Vec3::ZERO,
+            eye_lod_scale: 0.0,
+            eye_near: 0.0,
+            receiver_plane_count: 0,
+            _pad: [0; 2],
+            receiver_planes: [Vec4::ZERO; 6],
+            eye_light: Vec3::Y,
+            _pad2: 0.0,
         }
+    }
+
+    /// Restricts a light's view to casters that can shadow the volume inside `planes`, given
+    /// light arriving along `-light` (`light` points at the light). Anything whose shadow lands
+    /// in the volume lies in it or towards the light from it: that is, inside every plane of
+    /// the volume that faces the light. The others are dropped, which leaves the volume open
+    /// in the light's direction. Planes face inwards, with inside positive.
+    pub fn shadowing(mut self, planes: &[Vec4; 6], light: Vec3) -> Self {
+        let mut count = 0;
+        for plane in planes {
+            if plane.truncate().dot(light) >= 0.0 {
+                self.receiver_planes[count] = *plane;
+                count += 1;
+            }
+        }
+        self.receiver_plane_count = count as u32;
+        self
+    }
+
+    /// Bounds a light's view's level of detail by what a camera at `eye`, with `lod_scale`
+    /// pixels per world unit at unit distance, can see of the shadows it draws: a caster's
+    /// error shows wherever its shadow lands, along the line from it away from `light`, and
+    /// nothing this view draws is seen nearer than `nearest` from that camera.
+    pub fn seen_from(mut self, eye: Vec3, light: Vec3, lod_scale: f32, nearest: f32) -> Self {
+        self.eye_position = eye;
+        // The distance to the shadow's line needs a unit direction.
+        self.eye_light = light.normalize_or(Vec3::Y);
+        self.eye_lod_scale = lod_scale;
+        self.eye_near = nearest.max(1.0e-3);
+        self
     }
 }
 
@@ -215,8 +272,10 @@ impl CullWork {
         self.stats.capture(encoder, &self.state);
     }
 
-    /// Starts reading back any counters captured this frame. Call after submitting.
+    /// Takes in any counters that have arrived and starts reading back any captured this
+    /// frame. Call after submitting, every frame, even ones that captured nothing.
     pub fn map_stats(&self) {
+        self.stats.collect();
         self.stats.request_map();
     }
 
@@ -263,13 +322,18 @@ impl CullStats {
     }
 
     fn capture(&self, encoder: &mut wgpu::CommandEncoder, state: &wgpu::Buffer) {
-        if self.shared.mapped.swap(false, Ordering::AcqRel) {
-            self.consume_mapped_data();
-            self.shared.busy.store(false, Ordering::Release);
-        }
+        self.collect();
         if !self.shared.busy.load(Ordering::Acquire) {
             encoder.copy_buffer_to_buffer(state, 0, &self.staging, 0, STATE_SIZE);
             self.shared.copied.store(true, Ordering::Release);
+        }
+    }
+
+    /// Reads the counters once the buffer has mapped, freeing it for the next capture.
+    fn collect(&self) {
+        if self.shared.mapped.swap(false, Ordering::AcqRel) {
+            self.consume_mapped_data();
+            self.shared.busy.store(false, Ordering::Release);
         }
     }
 
@@ -459,7 +523,10 @@ mod tests {
 
     #[test]
     fn pass_view_size_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<PassView>(), 288);
+        // The receiver planes follow a vec3 and four scalars, so WGSL pads them to 16 bytes.
+        assert_eq!(std::mem::offset_of!(PassView, receiver_planes), 320);
+        assert_eq!(std::mem::offset_of!(PassView, eye_light), 416);
+        assert_eq!(std::mem::size_of::<PassView>(), 432);
     }
 
     #[test]

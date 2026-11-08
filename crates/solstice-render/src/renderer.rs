@@ -24,7 +24,7 @@ use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, PassView, RasterBindings, Rasterizer,
     Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
 };
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use solstice_asset::paged::{PagedScene, PAGE_BYTES};
 use solstice_asset::LoadedScene;
 
@@ -190,6 +190,10 @@ pub struct FrameStats {
     pub unique_triangles: u64,
     pub streaming: StreamingStats,
     pub particles: ParticleStats,
+    /// What the most recently read back shadow cascade redraw selected. Counters take a few
+    /// frames to arrive, and a redraw is skipped over while the last is still in flight.
+    pub shadow_clusters: u32,
+    pub shadow_triangles: u32,
 }
 
 /// Everything whose size depends on the resolution.
@@ -543,6 +547,8 @@ impl Renderer {
             unique_triangles: self.scene.unique_triangles,
             streaming: self.streamer.stats(),
             particles: self.particles.stats(),
+            shadow_clusters: self.aux_work.stats().clusters(),
+            shadow_triangles: self.aux_work.stats().triangles(),
         }
     }
 
@@ -622,6 +628,7 @@ impl Renderer {
             aspect,
             environment.sun_direction,
             self.settings.shadow_lod_threshold,
+            0.5 * render_size.1 as f32 * camera.projection(aspect).y_axis.y,
         );
         let volume_work = self
             .volume
@@ -684,6 +691,11 @@ impl Renderer {
             SLOT_SHADOW,
             &due_cascades,
         );
+        // The seabed and voxel views share this work, so the counters are read now, while
+        // they are the last cascade's.
+        if due_cascades.iter().any(|&due| due) {
+            self.aux_work.capture_stats(&mut encoder);
+        }
 
         if let Some(water) = self.water.as_ref().filter(|_| seabed_due) {
             water.seabed.record(
@@ -861,6 +873,7 @@ impl Renderer {
         gpu.queue.submit([encoder.finish()]);
         self.main_work.map_stats();
         self.particles.map_stats();
+        self.aux_work.map_stats();
         self.streamer.map_requests();
         if let Some(profiler) = &mut self.profiler {
             profiler.request_map();
@@ -1057,6 +1070,14 @@ impl Renderer {
             phase,
             occlusion_enabled: u32::from(occlusion_enabled),
             allow_software: 1,
+            eye_position: Vec3::ZERO,
+            eye_lod_scale: 0.0,
+            eye_near: 0.0,
+            receiver_plane_count: 0,
+            _pad: [0; 2],
+            receiver_planes: [Vec4::ZERO; 6],
+            eye_light: Vec3::Y,
+            _pad2: 0.0,
         };
         self.view_slots.write(
             gpu,
