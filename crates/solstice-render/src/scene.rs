@@ -35,7 +35,7 @@ pub struct GpuInstance {
     bones: u32,
     /// What to add to a cluster's number to find its bone list.
     bone_lists: i32,
-    /// The farthest its pose carries anything, in world units.
+    /// The farthest its pose carries anything, in the mesh's units.
     lod_margin: f32,
 }
 
@@ -88,7 +88,17 @@ impl GpuInstance {
 
     /// Sets how far its pose carries anything, in the mesh's own units.
     pub(crate) fn set_lod_margin(&mut self, margin: f32) {
-        self.lod_margin = margin * self.max_scale;
+        self.lod_margin = margin;
+    }
+
+    /// Whether it bends to a pose.
+    pub(crate) fn is_skinned(&self) -> bool {
+        self.bones != NO_BONES
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_bones(&mut self, bones: u32) {
+        self.bones = bones;
     }
 
     pub(crate) fn lod_margin(&self) -> f32 {

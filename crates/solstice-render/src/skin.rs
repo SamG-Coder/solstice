@@ -94,12 +94,19 @@ impl GpuSkins {
                 started: false,
             })
             .collect();
-        for (&pose, slot) in scene.instance_poses.iter().zip(gpu_index) {
-            if let (true, Some(i)) = (pose != NO_POSE, slot) {
+        for (number, (&pose, slot)) in scene.instance_poses.iter().zip(gpu_index).enumerate() {
+            let bends = scene.instances[number..]
+                .first()
+                .is_some_and(|i| scene.meshes[i.mesh as usize].bone_lists.is_some());
+            if let (true, true, Some(i)) = (bends, pose != NO_POSE, slot) {
                 poses[pose as usize].instances.push(*i);
             }
         }
 
+        assert!(
+            rows * 2 <= gpu.device.limits().max_texture_dimension_2d,
+            "this scene has too many posed bones for one texture"
+        );
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("bones"),
             size: wgpu::Extent3d {
@@ -127,7 +134,7 @@ impl GpuSkins {
             pending: Vec::new(),
             moved_last_frame: Vec::new(),
         };
-        this.upload(gpu);
+        this.upload(gpu, 0..rows);
         this
     }
 
@@ -161,15 +168,22 @@ impl GpuSkins {
     /// Applies this frame's poses, lets last frame's catch up, and uploads what changed. Sets each
     /// changed pose's instances' LOD margins.
     pub fn update(&mut self, gpu: &Gpu, instances: &mut InstanceTable) {
-        let mut changed = false;
+        let mut rows: Option<std::ops::Range<u32>> = None;
+        let mut touch = |rows_of_pose: std::ops::Range<u32>| {
+            rows = Some(rows.as_ref().map_or(rows_of_pose.clone(), |r| {
+                r.start.min(rows_of_pose.start)..r.end.max(rows_of_pose.end)
+            }));
+        };
         for pose in std::mem::take(&mut self.moved_last_frame) {
             self.settle(pose);
-            changed = true;
+            touch(self.rows_of(pose));
         }
-        let pending = std::mem::take(&mut self.pending);
+        // A stable sort keeps each pose's entries in the order given, so the last of each run is
+        // the one that counts.
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.sort_by_key(|p| p.pose);
         for (index, entry) in pending.iter().enumerate() {
-            // The last pose given for a frame is the one that counts.
-            if pending[index + 1..].iter().any(|p| p.pose == entry.pose) {
+            if pending.get(index + 1).is_some_and(|p| p.pose == entry.pose) {
                 continue;
             }
             self.settle(entry.pose);
@@ -184,11 +198,17 @@ impl GpuSkins {
             } else {
                 self.moved_last_frame.push(entry.pose);
             }
-            changed = true;
+            touch(self.rows_of(entry.pose));
         }
-        if changed {
-            self.upload(gpu);
+        if let Some(rows) = rows {
+            self.upload(gpu, rows);
         }
+    }
+
+    /// The rows of one frame's matrices a pose's bones lie on.
+    fn rows_of(&self, pose: u32) -> std::ops::Range<u32> {
+        let texels = self.range(pose);
+        texels.start as u32 / BONE_TEXTURE_WIDTH..(texels.end as u32).div_ceil(BONE_TEXTURE_WIDTH)
     }
 
     /// Makes last frame's matrices for a pose the same as this frame's, so that it shows no motion.
@@ -221,24 +241,35 @@ impl GpuSkins {
         margin
     }
 
-    fn upload(&self, gpu: &Gpu) {
+    /// Uploads some rows of this frame's matrices and of last frame's.
+    fn upload(&self, gpu: &Gpu, rows: std::ops::Range<u32>) {
+        if rows.is_empty() {
+            return;
+        }
+        let height = rows.end - rows.start;
+        let texels =
+            (rows.start * BONE_TEXTURE_WIDTH) as usize..(rows.end * BONE_TEXTURE_WIDTH) as usize;
         for (data, top) in [(&self.current, 0), (&self.previous, self.rows)] {
             gpu.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
                     mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: top, z: 0 },
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: top + rows.start,
+                        z: 0,
+                    },
                     aspect: wgpu::TextureAspect::All,
                 },
-                bytemuck::cast_slice(data),
+                bytemuck::cast_slice(&data[texels.clone()]),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(BONE_TEXTURE_WIDTH * 16),
-                    rows_per_image: Some(self.rows),
+                    rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
                     width: BONE_TEXTURE_WIDTH,
-                    height: self.rows,
+                    height,
                     depth_or_array_layers: 1,
                 },
             );
@@ -261,6 +292,10 @@ fn bone_reach(skinning: Mat4, center: Vec3, radius: f32) -> f32 {
 fn cluster_list_texture(gpu: &Gpu, scene: &PagedScene) -> wgpu::Texture {
     let count = scene.cluster_bones.len() as u32;
     let rows = count.div_ceil(BONE_TEXTURE_WIDTH).max(1);
+    assert!(
+        rows <= gpu.device.limits().max_texture_dimension_2d,
+        "this scene has too many skinned clusters for one texture"
+    );
     let mut texels = scene.cluster_bones.clone();
     texels.resize((BONE_TEXTURE_WIDTH * rows) as usize, [0; 16]);
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {

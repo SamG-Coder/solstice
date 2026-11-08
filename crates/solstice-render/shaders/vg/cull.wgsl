@@ -273,7 +273,7 @@ fn posed_sphere(instance: Instance, cluster_index: u32, c: Cluster) -> vec4f {
     if (list.x & 0xffffu) == 0xffu {
         return vec4f(
             transform_point(instance, c.center),
-            c.radius * instance.max_scale + instance.lod_margin,
+            (c.radius + instance.lod_margin) * instance.max_scale,
         );
     }
     // Sixteen bones in four words, ascending, with unused slots repeating the last.
@@ -352,7 +352,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     // If even the coarsest parent below is good enough, everything below is finer
     // than required and this subtree cannot contribute to the cut.
     let lod_center = transform_point(instance, node.lod_center);
-    let lod_radius = node.lod_radius * instance.max_scale + instance.lod_margin;
+    let lod_radius = (node.lod_radius + instance.lod_margin) * instance.max_scale;
     let scaled_error = node.max_parent_error * instance.max_scale;
     let parent_pixels = projected_error(lod_center, lod_radius, scaled_error);
     if parent_pixels <= view.lod_threshold {
@@ -360,7 +360,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let center = transform_point(instance, node.center);
-    let radius = node.radius * instance.max_scale + instance.lod_margin;
+    let radius = (node.radius + instance.lod_margin) * instance.max_scale;
     if !in_frustum(center, radius) {
         return;
     }
@@ -395,7 +395,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
         let cluster_index = node.first + i;
         let cluster = clusters[cluster_index];
         let own_center = transform_point(instance, cluster.lod_center);
-        let own_radius = cluster.lod_radius * instance.max_scale + instance.lod_margin;
+        let own_radius = (cluster.lod_radius + instance.lod_margin) * instance.max_scale;
         let own_error = cluster.lod_error * instance.max_scale;
         if projected_error(own_center, own_radius, own_error) <= view.lod_threshold
             || (cluster.counts & CLUSTER_CHILDREN_MISSING) != 0u {

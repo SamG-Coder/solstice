@@ -401,7 +401,7 @@ impl Renderer {
     /// frame, with its shadow drawn separately, and so costs more; a static one is drawn into
     /// views kept from frame to frame. Either change redraws those views once. Set an instance
     /// movable before it starts moving, for example when a scene loads, to have that happen at
-    /// a quiet moment.
+    /// a quiet moment. A skinned instance can't be made static, and is refused.
     pub fn set_instance_movable(&mut self, instance: u32, movable: bool) -> bool {
         self.scene.instance_table.set_movable(instance, movable)
     }
@@ -410,7 +410,8 @@ impl Renderer {
     /// leaves it out (the default). Movable instances are left out because the voxels are kept
     /// from frame to frame, and would hold them where they were. Something that moves only a
     /// little, such as a ship riding at anchor, is better kept in: its shade and the light it
-    /// bounces, and its reflection in the water, would otherwise be missing.
+    /// bounces, and its reflection in the water, would otherwise be missing. A skinned instance
+    /// is refused: the voxels are drawn without poses.
     pub fn set_instance_stays_in_gi(&mut self, instance: u32, stays: bool) -> bool {
         self.scene.instance_table.set_stays_in_gi(instance, stays)
     }

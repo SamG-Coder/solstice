@@ -58,7 +58,7 @@ struct Instance {
     bones: u32,
     // What to add to a cluster's number to find its bone list.
     bone_lists: i32,
-    // The farthest its pose carries anything, in world units. Added to spheres it can't track
+    // The farthest its pose carries anything, in the mesh's units. Added to spheres it can't track
     // bone by bone: its nodes, and its LOD spheres, so that both sides of a LOD choice agree.
     lod_margin: f32,
 }

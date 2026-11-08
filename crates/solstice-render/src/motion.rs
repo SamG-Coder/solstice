@@ -110,10 +110,14 @@ impl InstanceTable {
     }
 
     /// Makes an instance movable, or static again. Either way, the cached views are drawn again.
+    /// A skinned instance is refused going static: the cached views can't hold a pose.
     pub fn set_movable(&mut self, instance: u32, movable: bool) -> bool {
         let Some(i) = self.index(instance) else {
             return false;
         };
+        if !movable && self.data[i].is_skinned() {
+            return false;
+        }
         self.make_movable(i, movable);
         true
     }
@@ -148,11 +152,15 @@ impl InstanceTable {
     }
 
     /// Keeps a movable instance in the GI voxels, where it stood when they were last drawn, or
-    /// leaves it out of them. For things that move only a little.
+    /// leaves it out of them. For things that move only a little. A skinned instance is refused
+    /// staying in: the voxels are drawn without poses.
     pub fn set_stays_in_gi(&mut self, instance: u32, stays: bool) -> bool {
         let Some(i) = self.index(instance) else {
             return false;
         };
+        if stays && self.data[i].is_skinned() {
+            return false;
+        }
         if self.data[i].has_flag(INSTANCE_STAYS_IN_GI) != stays {
             self.data[i].set_flag(INSTANCE_STAYS_IN_GI, stays);
             self.changed.push(i as u32);
@@ -205,7 +213,7 @@ impl InstanceTable {
         let world = self.data[i].worlds().0;
         (
             world.transform_point3(center),
-            radius * self.data[i].max_scale() + self.data[i].lod_margin(),
+            (radius + self.data[i].lod_margin()) * self.data[i].max_scale(),
         )
     }
 
@@ -291,6 +299,7 @@ mod tests {
         instance.set_world(Mat4::from_translation(Vec3::new(x, 0.0, 0.0)));
         instance.settle();
         instance.set_glow(1.0);
+        instance.set_bones(crate::skin::NO_BONES);
         instance
     }
 
@@ -449,6 +458,28 @@ mod tests {
         table.set_glow(0, 1.0);
         table.set_movable(0, false);
         assert_eq!(table.advance(), FrameChanges::default());
+    }
+
+    #[test]
+    fn a_skinned_instance_stays_out_of_the_views_that_cant_hold_a_pose() {
+        let mut table = table();
+        table.data[0].set_bones(0);
+        assert!(table.set_movable(0, true));
+        table.advance();
+        assert!(!table.set_movable(0, false));
+        assert!(!table.set_stays_in_gi(0, true));
+        assert!(table.set_stays_in_gi(0, false));
+        assert!(table.data[0].has_flag(INSTANCE_MOVABLE));
+        assert!(!table.data[0].has_flag(INSTANCE_STAYS_IN_GI));
+    }
+
+    #[test]
+    fn a_margin_follows_the_instances_scale() {
+        let mut table = table();
+        table.data[0].set_lod_margin(0.5);
+        table.set_transform(0, Mat4::from_scale(Vec3::splat(4.0)), false);
+        table.advance();
+        assert_eq!(table.world_sphere(0).unwrap().1, (1.0 + 0.5) * 4.0);
     }
 
     #[test]
