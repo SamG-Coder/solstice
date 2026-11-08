@@ -48,12 +48,12 @@ pub struct ScreenGiBindings {
 }
 
 impl ScreenGiBindings {
-    /// Rays each probe traces on a side.
     /// The opaque scene's closest-depth pyramid, for screen traces.
     pub fn depth_pyramid_view(&self) -> &wgpu::TextureView {
         &self.depth_pyramid.view
     }
 
+    /// Rays each probe traces on a side.
     pub fn probe_rays(&self) -> u32 {
         self.probe_rays
     }

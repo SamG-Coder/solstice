@@ -43,7 +43,8 @@ const SLOT_MAIN_FIRST: u32 = 0;
 const SLOT_MAIN_SECOND: u32 = 1;
 const SLOT_SHADOW: u32 = 2;
 const SLOT_VOXEL: u32 = SLOT_SHADOW + CASCADE_COUNT as u32;
-const SLOT_COUNT: u32 = SLOT_VOXEL + LEVEL_COUNT as u32;
+const SLOT_SEABED: u32 = SLOT_VOXEL + LEVEL_COUNT as u32;
+const SLOT_COUNT: u32 = SLOT_SEABED + 1;
 
 /// A named balance between image quality and GPU cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -548,7 +549,12 @@ impl Renderer {
         if self.sea.is_none() {
             self.water = None;
         } else if self.water.as_ref().is_none_or(|w| w.cells() != cells) {
-            self.water = Some(WaterSurface::new(gpu, &self.environment_layout, cells));
+            self.water = Some(WaterSurface::new(
+                gpu,
+                &self.environment_layout,
+                &self.rasterizer,
+                cells,
+            ));
         }
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
@@ -559,6 +565,9 @@ impl Renderer {
         if self.streamer.should_refresh_cached_views() {
             self.shadows.mark_stale();
             self.volume.mark_stale();
+            if let Some(water) = &mut self.water {
+                water.seabed.mark_stale();
+            }
         }
 
         let aspect = render_size.0 as f32 / render_size.1 as f32;
@@ -577,6 +586,16 @@ impl Renderer {
         let volume_work = self
             .volume
             .prepare(gpu, &self.view_slots, SLOT_VOXEL, camera.position);
+        let seabed_due = self.water.as_mut().is_some_and(|water| {
+            water.seabed.prepare(
+                gpu,
+                &self.view_slots,
+                SLOT_SEABED,
+                camera.position,
+                self.sea_level,
+                self.settings.shadow_lod_threshold,
+            )
+        });
 
         let mut encoder = gpu
             .device
@@ -619,6 +638,18 @@ impl Renderer {
             SLOT_SHADOW,
             &due_cascades,
         );
+
+        if let Some(water) = self.water.as_ref().filter(|_| seabed_due) {
+            water.seabed.record(
+                &mut encoder,
+                &self.cull,
+                &self.scene,
+                &self.aux_cull_scene,
+                &self.aux_work,
+                &self.aux_raster,
+                SLOT_SEABED,
+            );
+        }
 
         self.volume.record(
             &mut encoder,

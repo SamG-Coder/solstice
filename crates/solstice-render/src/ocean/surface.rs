@@ -8,12 +8,14 @@
 //! reads. The lit opaque scene stays untouched, for refraction to see through the water.
 
 use super::grid::{self, Patch, FINEST_PATCH};
+use super::seabed::SeabedMap;
 use super::spectrum::{CASCADE_SIZES, SLOPE_TABLE_FIRST, SLOPE_TABLE_SIZE, SLOPE_TABLE_STEP};
 use super::waves::OceanWaves;
 use super::Ocean;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
 use crate::shaders;
 use crate::shadow::ShadowMaps;
+use crate::vg::Rasterizer;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
@@ -41,6 +43,8 @@ struct SurfaceUniform {
     scattering: [f32; 4],
     slope_range: [f32; 4],
     slopes: [[f32; 4]; 8],
+    seabed_view_proj: [[f32; 4]; 4],
+    seabed: [f32; 4],
 }
 
 /// One patch, as the vertex shader reads it.
@@ -188,18 +192,26 @@ pub struct WaterSurface {
     quarter_count: u32,
     /// Bind groups, and the waves and targets they were made for.
     groups: Option<(u64, u64, wgpu::BindGroup, wgpu::BindGroup)>,
+    /// The seabed under the sea, which the waves shrink over as it shoals.
+    pub seabed: SeabedMap,
 }
 
 impl WaterSurface {
     /// Patches of `cells` cells across: [`grid::PATCH_CELLS`] for desktop GPUs, half that for
     /// integrated ones.
-    pub fn new(gpu: &Gpu, environment: &wgpu::BindGroupLayout, cells: u32) -> Self {
+    pub fn new(
+        gpu: &Gpu,
+        environment: &wgpu::BindGroupLayout,
+        rasterizer: &Rasterizer,
+        cells: u32,
+    ) -> Self {
         let raster_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::VERTEX)
             .uniform()
             .uniform()
             .texture_array()
             .sampler()
+            .depth_texture()
             .build(gpu, "ocean surface");
         let module = shaders::module(&gpu.device, "ocean/surface.wgsl");
         let layout = gpu
@@ -278,6 +290,7 @@ impl WaterSurface {
         )
         .texture_unfilterable()
         .texture()
+        .depth_texture()
         .build(gpu, "ocean shade");
         let shade = gpu.compute_pipeline(
             "ocean shade",
@@ -316,6 +329,7 @@ impl WaterSurface {
             whole_count: 0,
             quarter_count: 0,
             groups: None,
+            seabed: SeabedMap::new(gpu, rasterizer),
         }
     }
 
@@ -324,7 +338,8 @@ impl WaterSurface {
         self.cells
     }
 
-    /// Chooses this frame's patches for a camera at `camera`, over a sea at `sea_level`.
+    /// Chooses this frame's patches for a camera at `camera`, over a sea at `sea_level`. The
+    /// seabed map must have been placed for this frame first.
     /// `slopes` is the sea's table of unresolved slopes, from `spectrum::unresolved_slopes`.
     pub fn prepare(
         &mut self,
@@ -377,6 +392,13 @@ impl WaterSurface {
                 SMOOTHEST,
             ],
             slopes: std::array::from_fn(|i| std::array::from_fn(|j| slopes[i * 4 + j])),
+            seabed_view_proj: self.seabed.current().view_proj.to_cols_array_2d(),
+            seabed: [
+                self.seabed.current().top,
+                self.seabed.current().reach,
+                0.0,
+                0.0,
+            ],
         };
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -409,6 +431,7 @@ impl WaterSurface {
                     self.uniform.as_entire_binding(),
                     tex(&waves.displacement.view),
                     wgpu::BindingResource::Sampler(&self.sampler),
+                    tex(&self.seabed.view),
                 ],
             );
             let shade = gpu.bind_group(
@@ -432,6 +455,7 @@ impl WaterSurface {
                     wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
                     tex(scene.depth_pyramid),
                     tex(scene.normals),
+                    tex(&self.seabed.view),
                 ],
             );
             self.groups = Some((waves.generation(), targets.generation, raster, shade));

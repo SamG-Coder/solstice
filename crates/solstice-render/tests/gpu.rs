@@ -1472,3 +1472,30 @@ fn the_bed_shows_through_shallow_water_and_not_through_deep() {
         "the bed under 30 cm of water ({shallow}) is not brighter than 30 m of sea ({deep})"
     );
 }
+
+#[test]
+fn waves_do_not_rise_through_low_land() {
+    let Some(gpu) = request_gpu() else { return };
+    // The floor stands just 20 cm above the open ocean, whose swell rises far higher. Waves die
+    // as the water shoals, and over dry land there are none, so no crest ever shows through the
+    // floor, however low it lies. Seen from high above, the view spans more than a whole
+    // wavelength of the swell, so crests are always in it, and all of it is floor.
+    let size = 128;
+    let camera = Camera {
+        position: Vec3::new(20.0, 250.0, 10.0),
+        yaw: -1.57,
+        pitch: -1.55,
+        ..Default::default()
+    };
+    let pixels = render_sea(
+        &gpu,
+        &camera,
+        "ocean",
+        -0.2,
+        DebugView::Ocean,
+        Quality::High,
+        size,
+    );
+    let wet = pixels.chunks_exact(4).filter(|p| shows_sea(p)).count();
+    assert_eq!(wet, 0, "{wet} pixels of sea show through the floor");
+}

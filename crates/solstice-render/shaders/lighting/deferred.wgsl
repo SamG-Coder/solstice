@@ -29,6 +29,8 @@
 // and Ustin 2019), slightly less towards blue.
 const FOLIAGE_TRANSMITTANCE: vec3f = vec3f(0.8, 0.8, 0.6);
 
+// A short ray through the depth buffer towards the sun. Catches the small-scale shadowing
+// of dense geometry, which is finer than any shadow map texel.
 fn contact_shadow(world: vec3f, normal: vec3f, view: vec3f, distance: f32, noise: f32) -> f32 {
     const STEPS: u32 = 10u;
     const LENGTH: f32 = 0.35;

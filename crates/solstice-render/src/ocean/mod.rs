@@ -22,6 +22,7 @@
 
 pub mod grid;
 pub mod sea;
+pub mod seabed;
 pub mod spectrum;
 pub mod surface;
 pub mod waves;

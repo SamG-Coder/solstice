@@ -61,6 +61,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "ocean/fft_columns.wgsl",
     "ocean/mips.wgsl",
     "ocean/surface_params.wgsl",
+    "ocean/seabed.wgsl",
     "ocean/surface.wgsl",
     "ocean/shade.wgsl",
     "sky/milky_way.wgsl",

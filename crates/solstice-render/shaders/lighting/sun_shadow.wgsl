@@ -71,6 +71,3 @@ fn sun_shadow(world: vec3f, normal: vec3f, distance: f32, noise: f32) -> f32 {
     }
     return shadow;
 }
-
-// A short ray through the depth buffer towards the sun. Catches the small-scale shadowing
-// of dense geometry, which is finer than any shadow map texel.
