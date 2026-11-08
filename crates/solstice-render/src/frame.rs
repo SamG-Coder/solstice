@@ -134,8 +134,11 @@ pub enum DebugView {
     Ocean = 10,
     /// How wet each surface is: dark when dry, blue when soaked.
     Wetness = 11,
+    /// How far each pixel moved since the last frame: grey where nothing moved, more red as it
+    /// moved right on screen and more green as it moved up.
+    Motion = 12,
     /// How many layers of particles cover each pixel: dark red for one, through yellow to white.
-    Particles = 12,
+    Particles = 13,
 }
 
 impl DebugView {
@@ -154,6 +157,7 @@ impl DebugView {
             "voxels" => Self::Voxels,
             "ocean" => Self::Ocean,
             "wetness" => Self::Wetness,
+            "motion" => Self::Motion,
             "particles" => Self::Particles,
             _ => return None,
         })

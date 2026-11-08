@@ -4,7 +4,7 @@ use crate::gpu::{groups_for, Gpu, LayoutBuilder};
 use crate::profiler::{section, Profiler};
 use crate::scene::GpuScene;
 use crate::shaders;
-use crate::vg::{CullPhase, CullPipelines, CullWork, PassView, ViewSlots};
+use crate::vg::{CullPhase, CullPipelines, CullWork, InstanceFilter, PassView, ViewSlots};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec2, Vec3, Vec4};
 
@@ -116,8 +116,10 @@ pub struct GiVolume {
     light_count: u32,
     schedule_index: usize,
     pending: Option<PendingRebuild>,
-    /// Levels still to voxelize again where they stand, as finer geometry has arrived.
+    /// Levels still to voxelize again where they stand, as what they hold has changed.
     outdated: [bool; LEVEL_COUNT],
+    /// A change that came while levels were still outdated, to start over once they are done.
+    refresh_waiting: bool,
 }
 
 /// What [`GiVolume::prepare`] decided should happen this frame.
@@ -387,6 +389,7 @@ impl GiVolume {
             schedule_index: 0,
             pending: None,
             outdated: [false; LEVEL_COUNT],
+            refresh_waiting: false,
         }
     }
 
@@ -399,6 +402,7 @@ impl GiVolume {
         first_slot: u32,
         camera_position: Vec3,
     ) -> VolumeWork {
+        self.start_waiting_refresh();
         let first_build = self.levels[0].origin_voxels.is_none();
         let mut rebuild = Vec::new();
         let mut slice = None;
@@ -679,9 +683,20 @@ impl GiVolume {
 }
 
 impl GiVolume {
-    /// Makes every level voxelize again, one at a time, as finer geometry has arrived.
+    /// Makes every level voxelize again where it stands, as what the levels hold has changed:
+    /// finer geometry has arrived, or instances changed.
+    ///
+    /// Levels are rebuilt one at a time, coarsest first, over several frames. A change that
+    /// comes while some are still outdated waits until they are all done, and then starts the
+    /// whole round again. Starting over at once would rebuild the coarsest level for ever while
+    /// changes kept coming, and never reach the finer ones.
     pub fn mark_stale(&mut self) {
-        self.outdated = [true; LEVEL_COUNT];
+        mark_outdated(&mut self.outdated, &mut self.refresh_waiting);
+    }
+
+    /// Starts a round of rebuilds that was waiting, once the last round is done.
+    fn start_waiting_refresh(&mut self) {
+        start_waiting(&mut self.outdated, &mut self.refresh_waiting);
     }
 
     /// An outdated level to rebuild where it stands, coarsest first: those cover the most
@@ -749,14 +764,55 @@ fn write_level_view(
         1.0 / voxel_size,
         // Half a voxel of geometric error is invisible at this resolution.
         0.5,
-    );
+    )
+    .drawing(InstanceFilter::Gi);
     pass_view.allow_software = 2;
     slots.write(gpu, slot, &pass_view);
+}
+
+/// Marks every level outdated, or, while some still are, notes that another round is waiting.
+fn mark_outdated(outdated: &mut [bool; LEVEL_COUNT], waiting: &mut bool) {
+    if outdated.contains(&true) {
+        *waiting = true;
+    } else {
+        *outdated = [true; LEVEL_COUNT];
+    }
+}
+
+/// Starts a waiting round once no level is outdated.
+fn start_waiting(outdated: &mut [bool; LEVEL_COUNT], waiting: &mut bool) {
+    if *waiting && !outdated.contains(&true) {
+        *waiting = false;
+        *outdated = [true; LEVEL_COUNT];
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changes_during_a_round_of_rebuilds_wait_for_it_to_finish() {
+        let (mut outdated, mut waiting) = ([false; LEVEL_COUNT], false);
+        mark_outdated(&mut outdated, &mut waiting);
+        assert_eq!((outdated, waiting), ([true; LEVEL_COUNT], false));
+        // The coarsest level is rebuilt, then a change comes, every frame for a while: the
+        // finer levels must still get their turn.
+        outdated[LEVEL_COUNT - 1] = false;
+        for _ in 0..10 {
+            mark_outdated(&mut outdated, &mut waiting);
+            start_waiting(&mut outdated, &mut waiting);
+        }
+        assert!(!outdated[LEVEL_COUNT - 1] && outdated[0] && waiting);
+        // Once the round is done, the waiting one starts.
+        outdated = [false; LEVEL_COUNT];
+        start_waiting(&mut outdated, &mut waiting);
+        assert_eq!((outdated, waiting), ([true; LEVEL_COUNT], false));
+        // And with nothing waiting, a finished round stays finished.
+        outdated = [false; LEVEL_COUNT];
+        start_waiting(&mut outdated, &mut waiting);
+        assert_eq!(outdated, [false; LEVEL_COUNT]);
+    }
 
     #[test]
     fn origin_keeps_the_camera_near_the_centre_of_the_grid() {

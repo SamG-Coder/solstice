@@ -20,6 +20,7 @@ pub mod frame;
 pub mod gi;
 pub mod gpu;
 pub mod lighting;
+pub mod motion;
 pub mod ocean;
 pub mod particles;
 pub mod post;
