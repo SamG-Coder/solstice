@@ -428,10 +428,37 @@ physics depend on the GPU's timing.
 
 ### Content
 
-- Rigs and clips are made outside the engine, in Blender, and imported as glTF skins and
-  animations. The importer already parses glTF, and today only warns that it ignores them.
-- **Sources.** The cove's models come from Poly Haven, which has no characters. CC0 rigged
-  characters with animation sets exist (Quaternius, for example). Which to use is your decision.
+Chosen on 8 November 2026: a MakeHuman character, animated with Quaternius's Universal
+Animation Library.
+
+- **The character** comes from MakeHuman's Blender plugin, MPFB 2. What it makes is CC0, and
+  so are its bundled assets: bodies, skins, hair and clothes. The plugin's own code is GPL, but
+  none of it ends up in Solstice. MakeHuman makes realistic people, so the character suits the
+  photoscanned cove better than a stylised one would.
+  - The character is made by a Blender Python script kept in the repository, written like every
+    other script here. Its body, clothes, rig and export settings are all in that script, so it
+    can be remade or changed by editing it, the way scenes are made from `scenes/*.txt`.
+  - It is exported as glTF with MPFB 2's game-engine rig, with modifiers applied and PBR
+    materials, as its users advise.
+  - Blender is not installed on this machine yet. Installing it, and the plugin, waits for your
+    go-ahead when step 6 begins.
+- **The animations** come from the Universal Animation Library, volumes 1 and 2: over 250 CC0
+  clips in glTF on one humanoid rig, with walking in eight directions, jogging, sprinting,
+  sitting, climbing, swimming and more. The free tier is enough. The *Source* tier, with its
+  Blender files, is not needed.
+- **Retargeting.** The two rigs differ: they name, count and orient their bones differently,
+  and their proportions differ. So the bake retargets each clip onto the character, as Unreal's
+  IK Retargeter does:
+  - each rig gets a small text file naming the bone that plays each role: pelvis, spine chain,
+    neck, head, and each limb's chain;
+  - rotations are carried across in each bone's rest frame, so a difference in rest pose cancels
+    out;
+  - the pelvis's movement is scaled by the ratio of leg lengths, so feet don't slide;
+  - IK cleans up the hands and feet afterwards (step 8).
+
+  Doing it in the bake, in Rust, keeps it reproducible and tested. Changing the character later
+  means changing its role file, and no clip needs touching.
+- **Licences** are recorded with each asset, as for the Poly Haven scans.
 
 ### Skinning in virtual geometry
 
@@ -563,10 +590,14 @@ your go-ahead, and nothing is published without asking.
    - Demo: a capsule walks the fort, climbs the stair to the rampart, and opens the gate.
 6. **Skinned virtual geometry.** Importing skins, weights through the DAG, per-cluster bone
    lists and bounds, and skinning in both rasterizers, resolve and shadows, with motion vectors.
-   - First a character in its bind pose, compared with the static import; then one looping clip.
+   - First the MakeHuman character in its bind pose, compared with the static import; then one
+     looping clip.
    - The cost is measured, against the scratch-buffer fallback.
-7. **Animation.** Clips and their compression, blends, blend spaces, state machines, root motion,
-   notifies, and animation LOD.
+7. **Animation.** Clips and their compression, retargeting from the Universal Animation Library's
+   rig onto the character's, blends, blend spaces, state machines, root motion, notifies, and
+   animation LOD.
+   - Tests: a retargeted walk keeps its feet still on the ground while they bear weight; a clip
+     retargeted onto its own rig comes back unchanged.
    - Demo: the capsule becomes a character that idles, walks and runs.
 8. **IK and secondary motion.** Two-bone IK, foot placement, look-at, FABRIK, and spring chains.
    - Demo: feet planted on the stair and the uneven courtyard. This is the first playable
@@ -602,7 +633,11 @@ sea (9–10).
 - **Skinned virtual geometry is new ground.** Unreal only shipped it in 5.5, and has published
   little about it. Step 6 starts with a bind-pose comparison, so any crack or LOD error shows up
   before animation depends on it.
-- **Content.** Characters and animations need a CC0 source, or yours.
+- **Content.** MakeHuman's glTF export has rough edges: users report exporting every clothing
+  vertex group unless modifiers are applied, and materials coming out grey when Blender's shader
+  nodes are too complex. Step 6 checks the export before anything depends on it. Retargeting
+  between two different rigs can leave feet sliding or limbs twisted, which the retargeting
+  tests and IK are there to catch.
 - **Determinism across native and the web** depends on Rapier's option and on avoiding
   platform-specific maths in gameplay code. Tests compare the two builds.
 - **Dependencies move.** Starlark and Rapier are both pre-1.0. Both are pinned, and upgraded on
