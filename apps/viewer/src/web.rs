@@ -1,10 +1,14 @@
 //! The browser front end: a small API for `web/index.html` to drive.
 //!
 //! JavaScript owns the page: the animation loop, input and UI. Rust owns the renderer.
+//!
+//! Built with the `gameplay` feature, it can also play a scene's game: the page passes on keys,
+//! the mouse, gamepads and touch, and shows what scripts log. The plain build has none of that,
+//! and only says whether a scene has a game to play, so the page can offer the other build.
 
 use crate::{initial_camera, CameraInput, DayClock, FlyCamera, DEFAULT_DAY_SECONDS};
 use glam::Vec3;
-use solstice_asset::file;
+use solstice_asset::{file, GameFile};
 use solstice_render::{
     DebugView, Effect, Gpu, Observation, Quality, Renderer, RendererSettings, StreamingBudget,
     TimeOfDay, Weather,
@@ -36,6 +40,13 @@ pub struct WebViewer {
     /// The time of day, which places the sun and moon.
     clock: DayClock,
     gpu_errors: Arc<AtomicU32>,
+    /// The scene's gameplay files, empty if it has none.
+    gameplay: Vec<GameFile>,
+    #[cfg(feature = "gameplay")]
+    play: Option<crate::play::PlayMode>,
+    /// What scripts logged, and errors, for the page to take.
+    #[cfg(feature = "gameplay")]
+    messages: Vec<crate::play::Message>,
 }
 
 #[wasm_bindgen]
@@ -106,6 +117,11 @@ impl WebViewer {
             camera: FlyCamera::new(initial_camera(scene.viewpoint)),
             clock: DayClock::new(TimeOfDay::default(), DEFAULT_DAY_SECONDS),
             gpu_errors,
+            gameplay: scene.gameplay,
+            #[cfg(feature = "gameplay")]
+            play: None,
+            #[cfg(feature = "gameplay")]
+            messages: Vec::new(),
         })
     }
 
@@ -197,17 +213,24 @@ impl WebViewer {
         look_pitch: f32,
         fast: bool,
     ) {
-        self.camera.update(
-            &CameraInput {
-                forward,
-                right,
-                up,
-                look_yaw,
-                look_pitch,
-                fast,
-            },
-            delta_seconds,
-        );
+        if !self.playing_as_someone() {
+            self.camera.update(
+                &CameraInput {
+                    forward,
+                    right,
+                    up,
+                    look_yaw,
+                    look_pitch,
+                    fast,
+                },
+                delta_seconds,
+            );
+        }
+        #[cfg(feature = "gameplay")]
+        if let Some(play) = &mut self.play {
+            let messages = play.frame(&mut self.renderer, &mut self.camera.camera, delta_seconds);
+            self.messages.extend(messages);
+        }
         let texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
@@ -384,6 +407,145 @@ impl WebViewer {
 
     pub fn gpu_error_count(&self) -> u32 {
         self.gpu_errors.load(Ordering::Relaxed)
+    }
+
+    /// Whether the scene has a game to play.
+    pub fn has_gameplay(&self) -> bool {
+        !self.gameplay.is_empty()
+    }
+
+    /// Whether this build can play one: the gameplay build can, the plain one can't.
+    pub fn can_play() -> bool {
+        cfg!(feature = "gameplay")
+    }
+
+    fn playing_as_someone(&self) -> bool {
+        #[cfg(feature = "gameplay")]
+        if let Some(play) = &self.play {
+            return play.play.has_player();
+        }
+        false
+    }
+}
+
+/// Play mode, in the gameplay build only.
+#[cfg(feature = "gameplay")]
+#[wasm_bindgen]
+impl WebViewer {
+    /// Starts the scene's game. Rejects with every mistake in its files, one to a line.
+    pub fn play(&mut self) -> Result<(), JsValue> {
+        if self.gameplay.is_empty() {
+            return Err(JsValue::from_str("this scene has no game to play"));
+        }
+        let play = crate::play::PlayMode::start(&mut self.renderer, &self.gameplay)
+            .map_err(|errors| JsValue::from_str(&errors.join("\n")))?;
+        self.play = Some(play);
+        Ok(())
+    }
+
+    /// Whether a game is running, and someone in it has the camera.
+    pub fn has_player(&self) -> bool {
+        self.playing_as_someone()
+    }
+
+    fn devices(&mut self) -> Option<&mut solstice_game::Devices> {
+        self.play.as_mut().map(|play| &mut play.devices)
+    }
+
+    /// A key, by its `KeyboardEvent.code`, going down or up.
+    pub fn key(&mut self, code: &str, down: bool) {
+        if let Some(devices) = self.devices() {
+            devices.key(code, down);
+        }
+    }
+
+    /// A mouse button, `left`, `right` or `middle`, going down or up.
+    pub fn mouse_button(&mut self, button: &str, down: bool) {
+        if let Some(devices) = self.devices() {
+            devices.mouse_button(button, down);
+        }
+    }
+
+    /// The mouse moving by this many pixels, right and down.
+    pub fn mouse_motion(&mut self, x: f32, y: f32) {
+        if let Some(devices) = self.devices() {
+            devices.mouse_motion(x, y);
+        }
+    }
+
+    /// A gamepad button's value, from 0 to 1, by its name in the standard layout.
+    pub fn gamepad_button(&mut self, button: &str, value: f32) {
+        if let Some(devices) = self.devices() {
+            devices.gamepad_button(button, value);
+        }
+    }
+
+    /// A gamepad stick's axis, from -1 to 1: `left_x`, `left_y`, `right_x` or `right_y`.
+    pub fn gamepad_axis(&mut self, axis: &str, value: f32) {
+        if let Some(devices) = self.devices() {
+            devices.gamepad_axis(axis, value);
+        }
+    }
+
+    /// Where the touch stick is pushed, each axis from -1 to 1.
+    pub fn touch_stick(&mut self, x: f32, y: f32) {
+        if let Some(devices) = self.devices() {
+            devices.touch_stick(x, y);
+        }
+    }
+
+    /// A drag on the look side of the screen, by this many pixels.
+    pub fn touch_look(&mut self, x: f32, y: f32) {
+        if let Some(devices) = self.devices() {
+            devices.touch_look(x, y);
+        }
+    }
+
+    pub fn touch_tap(&mut self) {
+        if let Some(devices) = self.devices() {
+            devices.touch_tap();
+        }
+    }
+
+    /// Lets every key and button go, for when the page loses focus.
+    pub fn release_all(&mut self) {
+        if let Some(devices) = self.devices() {
+            devices.release_all();
+        }
+    }
+
+    /// The game's scripts, by name.
+    pub fn scripts(&self) -> Vec<String> {
+        self.play
+            .as_ref()
+            .map_or_else(Vec::new, |play| play.play.scripts().to_vec())
+    }
+
+    /// Loads a new version of a script, keeping every actor's state. Rejects with the reason
+    /// if it fails to load, and the old version keeps running.
+    pub fn reload_script(&mut self, name: &str, source: &str) -> Result<(), JsValue> {
+        let play = self
+            .play
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("no game is running"))?;
+        play.play
+            .reload(name, source)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// What scripts have logged, and every error, since this was last asked, oldest first.
+    /// Errors start with `error: `.
+    pub fn take_messages(&mut self) -> Vec<String> {
+        self.messages
+            .drain(..)
+            .map(|m| {
+                if m.error {
+                    format!("error: {}", m.text)
+                } else {
+                    m.text
+                }
+            })
+            .collect()
     }
 }
 

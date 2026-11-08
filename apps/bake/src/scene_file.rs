@@ -11,15 +11,21 @@
 //! model rocks/rock.gltf 9 ground 0 45 2     # standing on the terrain at this spot
 //! model rocks/rock.gltf 9 ground:0.2 0 45 2 # with its lowest 20% buried, as rocks are
 //! part kit/kit.gltf wall_01 0 0 0 90 1  # one named piece of a model, by its own origin
+//! actor cove/gate.actor 20.7 0 0 90 locked=true  # an actor, with its properties' values
+//! input cove/play.input                # the input actions, if not the built-in ones
 //! ```
+//!
+//! Actors, their scripts and the input actions travel inside the scene file, as its gameplay
+//! (`solstice_game::scene`). An actor's mesh is placed here, like a model, and moves with it.
 //!
 //! A model placed several times is imported once and shared, so repeats cost almost nothing.
 
 use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
-use solstice_asset::{Instance, Light, Material, SceneAsset, Sea};
+use solstice_asset::{GameFile, Instance, Light, Material, SceneAsset, Sea};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
+use solstice_game::{resolve, ActorFile, ActorLine, InputMap, SceneGame, GAME_FILE};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
@@ -64,6 +70,8 @@ enum Command {
         yaw_degrees: f32,
         scale: f32,
     },
+    Actor(ActorLine),
+    Input(String),
 }
 
 fn parse_line(line: &str) -> Result<Option<Command>, String> {
@@ -155,6 +163,11 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 yaw_degrees: number(4)?,
                 scale: number(5)?,
             }
+        }
+        "actor" => Command::Actor(ActorLine::parse(&values)?),
+        "input" => {
+            expect(1)?;
+            Command::Input(values[0].to_string())
         }
         other => return Err(format!("unknown command '{other}'")),
     }))
@@ -349,6 +362,93 @@ fn placements_of<'a>(
     models.entry(full).or_default()
 }
 
+/// A scene's gameplay, gathered while its file is read.
+#[derive(Default)]
+struct Gameplay {
+    game: SceneGame,
+    /// Each actor file, script and input file, by name, once each.
+    files: Vec<GameFile>,
+    /// For each actor with a mesh: which actor, which model, and which of its whole placements.
+    meshes: Vec<(usize, PathBuf, usize)>,
+}
+
+impl Gameplay {
+    /// Reads a gameplay file once, by its name relative to the scene.
+    fn read(&mut self, base: &Path, name: &str) -> Result<&str, String> {
+        if let Some(index) = self.files.iter().position(|f| f.name == name) {
+            return Ok(&self.files[index].text);
+        }
+        let path = base.join(name);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.files.push(GameFile {
+            name: name.to_owned(),
+            text,
+        });
+        Ok(&self.files.last().expect("just pushed").text)
+    }
+
+    /// Adds an actor, reading and checking its file, its settings and its script. Returns its
+    /// mesh, if it has one: the model's path relative to the scene, and its scale.
+    fn add_actor(
+        &mut self,
+        base: &Path,
+        mut line: ActorLine,
+    ) -> Result<Option<(String, f32)>, String> {
+        line.file = resolve(GAME_FILE, &line.file);
+        let actor = ActorFile::parse(self.read(base, &line.file)?)
+            .map_err(|e| format!("{}: {e}", line.file))?;
+        for (name, value) in &line.settings {
+            let property = actor
+                .property(name)
+                .ok_or_else(|| format!("{} has no property `{name}`", line.file))?;
+            property
+                .kind
+                .parse_setting(value)
+                .map_err(|e| format!("`{name}`: {e}"))?;
+        }
+        if let Some(script) = &actor.script {
+            let name = resolve(&line.file, script);
+            let source = self.read(base, &name)?.to_owned();
+            // Checked now, so a mistake is found while baking, not when someone plays.
+            solstice_script::ScriptHost::new()
+                .load(&name, &source)
+                .map_err(|e| e.message)?;
+        }
+        let mesh = actor
+            .mesh
+            .as_ref()
+            .map(|mesh| (resolve(&line.file, &mesh.path), mesh.scale));
+        self.game.actors.push(line);
+        Ok(mesh)
+    }
+
+    fn set_input(&mut self, base: &Path, name: &str) -> Result<(), String> {
+        if self.game.input.is_some() {
+            return Err("`input` is given twice".to_owned());
+        }
+        let name = resolve(GAME_FILE, name);
+        InputMap::parse(self.read(base, &name)?).map_err(|e| format!("{name}: {e}"))?;
+        self.game.input = Some(name);
+        Ok(())
+    }
+
+    /// The scene's gameplay files, with the list of its actors first, or none if it has none.
+    fn finish(mut self) -> Vec<GameFile> {
+        if self.game.actors.is_empty() && self.game.input.is_none() {
+            return Vec::new();
+        }
+        self.files.insert(
+            0,
+            GameFile {
+                name: GAME_FILE.to_owned(),
+                text: self.game.to_text(),
+            },
+        );
+        self.files
+    }
+}
+
 /// Builds the scene described by the file at `path`. Returns it with any import warnings.
 pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -365,9 +465,10 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
     // Placed once the model has been imported, since its shape decides the height.
     let mut seated: HashMap<PathBuf, Vec<(Vec3, f32, f32, f32)>> = HashMap::new();
+    let mut gameplay = Gameplay::default();
     for (number, line) in text.lines().enumerate() {
-        let command =
-            parse_line(line).map_err(|e| format!("{}:{}: {e}", path.display(), number + 1))?;
+        let at = |e: String| format!("{}:{}: {e}", path.display(), number + 1);
+        let command = parse_line(line).map_err(at)?;
         match command {
             None => {}
             Some(Command::TextureSize(size)) => scene.texture_size = size,
@@ -431,6 +532,17 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                     .parts
                     .push((name, transform));
             }
+            Some(Command::Actor(actor)) => {
+                let (position, yaw) = (actor.position, actor.yaw_degrees);
+                let index = gameplay.game.actors.len();
+                if let Some((model, scale)) = gameplay.add_actor(base, actor).map_err(at)? {
+                    let full = base.join(&model);
+                    let whole = &mut placements_of(&mut order, &mut models, base, model).whole;
+                    gameplay.meshes.push((index, full, whole.len()));
+                    whole.push(placement_transform(position, yaw, scale));
+                }
+            }
+            Some(Command::Input(input)) => gameplay.set_input(base, &input).map_err(at)?,
         }
     }
 
@@ -469,9 +581,20 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 ));
             }
         }
+        // Each whole placement adds the model's instances, in order, so an actor's are found by
+        // which placement it was.
+        let (first, per_placement) = (
+            scene.instances.len() as u32,
+            imported.scene.instances.len() as u32,
+        );
+        for (actor, _, placement) in gameplay.meshes.iter().filter(|(_, m, _)| m == model) {
+            let start = first + *placement as u32 * per_placement;
+            gameplay.game.actors[*actor].instances = Some(start..start + per_placement);
+        }
         append_model(&mut scene, imported, &models[model])
             .map_err(|e| format!("{}: {e}", model.display()))?;
     }
+    scene.gameplay = gameplay.finish();
 
     if let Some((size, cells, height, shore_x)) = terrain {
         let ground_layer = add_terrain(&mut scene, size, cells, height, shore_x);
@@ -629,6 +752,149 @@ mod tests {
                 terrain_height(x, z, 0.0, 52.0).abs() < 0.1,
                 "({x}, {z}) moved"
             );
+        }
+    }
+
+    /// A scratch folder holding the files given, removed when dropped.
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn with(files: &[(&str, &[u8])]) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("solstice-bake-{}-{unique}", std::process::id()));
+            for (name, bytes) in files {
+                let path = dir.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, bytes).unwrap();
+            }
+            Self(dir)
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A glTF of one triangle drawn twice, by two nodes, so that each placement is two instances.
+    fn two_triangles() -> (Vec<u8>, Vec<u8>) {
+        let mut bin = Vec::new();
+        for value in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "scene": 0,
+            "scenes": [{"nodes": [0, 1]}],
+            "nodes": [{"mesh": 0}, {"mesh": 0, "translation": [0, 2, 0]}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+            "buffers": [{"uri": "tri.bin", "byteLength": 36}],
+            "bufferViews": [{"buffer": 0, "byteLength": 36}],
+            "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                           "min": [0, 0, 0], "max": [1, 1, 0]}]
+        }"#;
+        (json.as_bytes().to_vec(), bin)
+    }
+
+    #[test]
+    fn actors_their_meshes_and_scripts_are_baked_into_the_scene() {
+        let (gltf, bin) = two_triangles();
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"model models/tri.gltf 0 0 0 0 1\nactor fort/gate.actor 20 0 3 90 locked=true\nactor fort/gate.actor -5 1 0 0\ninput fort/play.input\n",
+            ),
+            ("models/tri.gltf", &gltf),
+            ("models/tri.bin", &bin),
+            (
+                "fort/gate.actor",
+                b"name gate\nmesh ../models/tri.gltf 2\nscript gate.star\nproperty locked bool false\n",
+            ),
+            ("fort/gate.star", b"def on_tick(self, dt):\n    self.yaw += dt\n"),
+            ("fort/play.input", b"interact key KeyF\n"),
+        ]);
+        let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
+        // The model line's two instances, then two for each gate.
+        assert_eq!(scene.instances.len(), 6);
+        let names: Vec<&str> = scene.gameplay.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                GAME_FILE,
+                "fort/gate.actor",
+                "fort/gate.star",
+                "fort/play.input"
+            ]
+        );
+        let game = SceneGame::parse(&scene.gameplay[0].text).unwrap();
+        assert_eq!(game.input.as_deref(), Some("fort/play.input"));
+        assert_eq!(game.actors[0].instances, Some(2..4));
+        assert_eq!(game.actors[1].instances, Some(4..6));
+        let second_node = scene.instances[3].transform.transform_point3(Vec3::ZERO);
+        let expected = placement_transform(Vec3::new(20.0, 0.0, 3.0), 90.0, 2.0)
+            .transform_point3(Vec3::new(0.0, 2.0, 0.0));
+        assert!(second_node.abs_diff_eq(expected, 1.0e-3), "{second_node}");
+
+        // And it plays: drawn first where it was baked.
+        let instances = scene.instances.clone();
+        let mut play = solstice_game::Play::load(&scene.gameplay, |id| {
+            instances.get(id as usize).map(|i| i.transform)
+        })
+        .unwrap();
+        let mut placed = Vec::new();
+        // One step in, before the script has turned it far.
+        play.frame(
+            1.0 / 60.0 * 1.001,
+            &solstice_game::Devices::new(),
+            |id, at| placed.push((id, at)),
+        );
+        assert_eq!(placed.len(), 4);
+        for (id, at) in placed {
+            assert!(
+                at.abs_diff_eq(scene.instances[id as usize].transform, 0.1),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scene_without_actors_has_no_gameplay() {
+        let (gltf, bin) = two_triangles();
+        let folder = Folder::with(&[
+            ("scene.txt", b"model tri.gltf 0 0 0 0 1\n"),
+            ("tri.gltf", &gltf),
+            ("tri.bin", &bin),
+        ]);
+        let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
+        assert!(scene.gameplay.is_empty());
+    }
+
+    #[test]
+    fn gameplay_mistakes_are_found_while_baking() {
+        let cases: [(&[u8], &str); 5] = [
+            (
+                b"actor gate.actor 0 0 0 0 colour=red\n",
+                "has no property `colour`",
+            ),
+            (b"actor gate.actor 0 0 0 0 locked=maybe\n", "true or false"),
+            (b"actor nowhere.actor 0 0 0 0\n", "nowhere.actor"),
+            (b"actor broken.actor 0 0 0 0\n", "broken.star:2"),
+            (b"input bad.input\n", "bad.input: line 1"),
+        ];
+        for (scene, part) in cases {
+            let folder = Folder::with(&[
+                ("scene.txt", scene),
+                ("gate.actor", b"name gate\nproperty locked bool false\n"),
+                ("broken.actor", b"name broken\nscript broken.star\n"),
+                ("broken.star", b"def on_tick(self, dt):\n    x = = 1\n"),
+                ("bad.input", b"jump\n"),
+            ]);
+            let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
+            assert!(error.contains(part), "{error}");
+            assert!(error.contains("scene.txt:1:"), "{error}");
         }
     }
 

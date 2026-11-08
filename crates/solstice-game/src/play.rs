@@ -1,0 +1,339 @@
+//! Play mode: a scene's game, running.
+//!
+//! [`Play::load`] builds a world from a baked scene's gameplay files: an entity for each placed
+//! actor, with its name, its place, and its script with the placement's property values. Each
+//! frame, [`Play::frame`] runs the game, then says where to draw each actor's instances, between
+//! the last two steps, and where the player's camera is.
+
+use crate::actor::ActorFile;
+use crate::input::{Devices, InputMap};
+use crate::resolve;
+use crate::scene::{SceneGame, GAME_FILE};
+use glam::{EulerRot, Mat4, Quat, Vec3};
+use solstice_asset::GameFile;
+use solstice_script::{Script, ScriptHost};
+use solstice_world::{Entity, Game, GlobalTransform, Input, Name, Schedule, Transform, World};
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+
+/// How many messages are kept for the viewer to show, newest last.
+pub const MAX_MESSAGES: usize = 200;
+/// How far the player's camera may look up or down, in radians: not quite straight.
+pub const MAX_PITCH: f32 = 1.5;
+
+/// A line for the viewer to show: something a script logged, or an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub error: bool,
+    pub text: String,
+}
+
+/// Where the player's camera is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct View {
+    pub position: Vec3,
+    /// Around +Y, in radians; zero looks along -Z, as the renderer's camera does.
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+/// A placed actor with instances to move.
+struct Drawn {
+    entity: Entity,
+    /// Each instance, and where it is relative to the actor.
+    instances: Vec<(u32, Mat4)>,
+    /// Where the actor was last drawn, to move its instances only when it moves.
+    drawn: Option<Mat4>,
+}
+
+/// The actor the player plays, and where its eye is.
+struct Player {
+    entity: Entity,
+    eye: Vec3,
+}
+
+/// A scene's game, running.
+pub struct Play {
+    game: Game,
+    host: Rc<RefCell<ScriptHost>>,
+    drawn: Vec<Drawn>,
+    player: Option<Player>,
+    map: InputMap,
+    pitch: f32,
+    scripts: Vec<String>,
+    messages: VecDeque<Message>,
+}
+
+impl Play {
+    /// Builds the game in a baked scene's gameplay `files`. `instance` gives where the bake
+    /// placed a renderer instance. Every mistake found is reported, each with its file and line.
+    pub fn load(
+        files: &[GameFile],
+        instance: impl Fn(u32) -> Option<Mat4>,
+    ) -> Result<Self, Vec<String>> {
+        let file = |name: &str| files.iter().find(|f| f.name == name).map(|f| &f.text);
+        let mut errors = Vec::new();
+        let scene = file(GAME_FILE)
+            .ok_or_else(|| vec![format!("the scene's gameplay has no {GAME_FILE}")])?;
+        let scene = SceneGame::parse(scene).map_err(|e| vec![format!("{GAME_FILE}: {e}")])?;
+        let map = match &scene.input {
+            None => InputMap::default(),
+            Some(name) => match file(name).map(|text| InputMap::parse(text)) {
+                Some(Ok(map)) => map,
+                Some(Err(e)) => {
+                    errors.push(format!("{name}: {e}"));
+                    InputMap::default()
+                }
+                None => {
+                    errors.push(format!("{name}: missing from the scene's gameplay"));
+                    InputMap::default()
+                }
+            },
+        };
+
+        let host = Rc::new(RefCell::new(ScriptHost::new()));
+        let mut world = World::new();
+        let mut drawn = Vec::new();
+        let mut player = None;
+        let mut scripts: Vec<String> = Vec::new();
+        for (index, line) in scene.actors.iter().enumerate() {
+            let at = format!("{GAME_FILE}: actor {} ({})", index + 1, line.file);
+            let Some(text) = file(&line.file) else {
+                errors.push(format!("{at}: missing from the scene's gameplay"));
+                continue;
+            };
+            let actor = match ActorFile::parse(text) {
+                Ok(actor) => actor,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", line.file));
+                    continue;
+                }
+            };
+            let rotation = Quat::from_rotation_y(line.yaw_degrees.to_radians());
+            let mut components = hecs_builder();
+            components
+                .add(Name::new(&actor.name))
+                .add(Transform::from_translation(line.position).with_rotation(rotation));
+            if let Some(relative) = &actor.script {
+                let name = resolve(&line.file, relative);
+                let mut script = Script::new(&name);
+                for property in &actor.properties {
+                    script
+                        .properties
+                        .insert(property.name.clone(), property.default.clone());
+                }
+                for (setting, value) in &line.settings {
+                    match actor.property(setting) {
+                        None => {
+                            errors.push(format!("{at}: {} has no property `{setting}`", line.file))
+                        }
+                        Some(property) => match property.kind.parse_setting(value) {
+                            Ok(value) => {
+                                script.properties.insert(setting.clone(), value);
+                            }
+                            Err(e) => errors.push(format!("{at}: `{setting}`: {e}")),
+                        },
+                    }
+                }
+                if !scripts.contains(&name) {
+                    match file(&name) {
+                        None => errors.push(format!(
+                            "{}: its script {name} is missing from the scene's gameplay",
+                            line.file
+                        )),
+                        Some(source) => {
+                            if let Err(e) = host.borrow_mut().load(&name, source) {
+                                errors.push(e.message);
+                            }
+                        }
+                    }
+                    scripts.push(name);
+                }
+                components.add(script);
+            } else if !line.settings.is_empty() {
+                errors.push(format!(
+                    "{at}: {} has no script, so no properties",
+                    line.file
+                ));
+            }
+            let entity = world.spawn(components.build());
+            if let Some(eye) = actor.camera {
+                if player.is_some() {
+                    errors.push(format!(
+                        "{at}: only one actor can have a camera, and one already does"
+                    ));
+                }
+                player = Some(Player { entity, eye });
+            }
+            if let Some(range) = &line.instances {
+                let placed = Mat4::from_rotation_translation(rotation, line.position);
+                let mut instances = Vec::new();
+                for id in range.clone() {
+                    match instance(id) {
+                        Some(world) => instances.push((id, placed.inverse() * world)),
+                        None => {
+                            errors.push(format!("{at}: the scene has no instance {id}"));
+                            break;
+                        }
+                    }
+                }
+                drawn.push(Drawn {
+                    entity,
+                    instances,
+                    drawn: None,
+                });
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        let mut schedule = Schedule::new();
+        ScriptHost::install(&host, &mut schedule);
+        Ok(Self {
+            game: Game::new(world, schedule),
+            host,
+            drawn,
+            player,
+            map,
+            pitch: 0.0,
+            scripts,
+            messages: VecDeque::new(),
+        })
+    }
+
+    /// Every renderer instance an actor draws with, which must be made movable before play.
+    pub fn instances(&self) -> impl Iterator<Item = u32> + '_ {
+        self.drawn
+            .iter()
+            .flat_map(|d| d.instances.iter().map(|(id, _)| *id))
+    }
+
+    /// The scripts the game runs, by name, which a viewer may watch and [`Play::reload`].
+    pub fn scripts(&self) -> &[String] {
+        &self.scripts
+    }
+
+    /// Whether some actor is the player, with a camera to look through.
+    pub fn has_player(&self) -> bool {
+        self.player.is_some()
+    }
+
+    /// Runs a frame `seconds` long, with the devices as they are. `place` is told where to draw
+    /// each instance that moved. Returns where the player's camera is, if there is a player.
+    pub fn frame(
+        &mut self,
+        seconds: f64,
+        devices: &Devices,
+        mut place: impl FnMut(u32, Mat4),
+    ) -> Option<View> {
+        let input = self.map.actions(devices, seconds as f32);
+        self.frame_with(seconds, &input, &mut place)
+    }
+
+    /// Each action's value this frame, from the devices, by the scene's input actions.
+    pub fn actions(&self, devices: &Devices, seconds: f32) -> Input {
+        self.map.actions(devices, seconds)
+    }
+
+    /// [`Play::frame`], with actions already worked out.
+    pub fn frame_with(
+        &mut self,
+        seconds: f64,
+        input: &Input,
+        mut place: impl FnMut(u32, Mat4),
+    ) -> Option<View> {
+        let steps = self.game.frame(seconds, input);
+        self.gather_messages();
+        let entities = &self.game.world.entities;
+        for drawn in &mut self.drawn {
+            let Ok(global) = entities.get::<&GlobalTransform>(drawn.entity) else {
+                continue;
+            };
+            let world = global.interpolated(steps.alpha);
+            if drawn.drawn == Some(world) {
+                continue;
+            }
+            for (id, local) in &drawn.instances {
+                place(*id, world * *local);
+            }
+            drawn.drawn = Some(world);
+        }
+
+        let player = self.player.as_ref()?;
+        let world = entities
+            .get::<&GlobalTransform>(player.entity)
+            .ok()?
+            .interpolated(steps.alpha);
+        let (_, rotation, translation) = world.to_scale_rotation_translation();
+        self.pitch =
+            (self.pitch + input.value("look_up") * seconds as f32).clamp(-MAX_PITCH, MAX_PITCH);
+        Some(View {
+            position: translation + rotation * player.eye,
+            yaw: rotation.to_euler(EulerRot::YXZ).0,
+            pitch: self.pitch,
+        })
+    }
+
+    /// Loads a new version of a script, keeping every actor's state. If it fails to load, the
+    /// old one keeps running, and the error says why.
+    pub fn reload(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.host
+            .borrow_mut()
+            .load(name, source)
+            .map_err(|e| e.message)
+    }
+
+    /// What scripts have logged, and every error, since this was last asked, oldest first.
+    pub fn take_messages(&mut self) -> Vec<Message> {
+        self.gather_messages();
+        self.messages.drain(..).collect()
+    }
+
+    /// The world, for tests and tools to look into.
+    pub fn world(&self) -> &World {
+        &self.game.world
+    }
+
+    fn gather_messages(&mut self) {
+        let mut host = self.host.borrow_mut();
+        let world = &self.game.world;
+        let who = |entity: Option<Entity>| {
+            entity
+                .and_then(|e| {
+                    world
+                        .entities
+                        .get::<&Name>(e)
+                        .ok()
+                        .map(|n| n.as_str().to_owned())
+                })
+                .unwrap_or_default()
+        };
+        for error in host.take_errors() {
+            let text = match error.step {
+                Some(step) => format!("step {step}, {}: {}", who(error.entity), error.message),
+                None => error.message,
+            };
+            self.messages.push_back(Message { error: true, text });
+        }
+        for line in host.take_log() {
+            let text = format!("{}: {}", who(Some(line.entity)), line.text);
+            self.messages.push_back(Message { error: false, text });
+        }
+        let dropped = host.take_dropped();
+        if dropped > 0 {
+            self.messages.push_back(Message {
+                error: true,
+                text: format!("{dropped} more lines dropped"),
+            });
+        }
+        while self.messages.len() > MAX_MESSAGES {
+            self.messages.pop_front();
+        }
+    }
+}
+
+fn hecs_builder() -> solstice_world::hecs::EntityBuilder {
+    solstice_world::hecs::EntityBuilder::new()
+}

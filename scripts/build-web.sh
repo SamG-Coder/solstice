@@ -16,13 +16,22 @@ if ! "$bindgen" --version 2>/dev/null | grep -q "$version"; then
   cargo install wasm-bindgen-cli --version "$version" --root "$tools" --locked
 fi
 
-cargo build --release --target wasm32-unknown-unknown -p viewer --lib
+# Two builds (docs/gameplay.md): the plain viewer, which every page loads, and the gameplay
+# viewer, with scripts, loaded only to play a scene's game. Each goes to its own target folder,
+# so neither overwrites the other's wasm.
+cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features \
+  --target-dir target/web-plain
+cargo build --release --target wasm32-unknown-unknown -p viewer --lib \
+  --target-dir target/web-play
 
 rm -rf dist
 mkdir -p dist/assets
 "$bindgen" --target web --no-typescript \
   --out-dir dist/pkg \
-  target/wasm32-unknown-unknown/release/solstice_viewer.wasm
+  target/web-plain/wasm32-unknown-unknown/release/solstice_viewer.wasm
+"$bindgen" --target web --no-typescript \
+  --out-dir dist/play \
+  target/web-play/wasm32-unknown-unknown/release/solstice_viewer.wasm
 cp apps/viewer/web/index.html dist/
 # Scene files are already compressed where it helps, part by part, so that the page can fetch
 # any part alone. Hard links keep big scenes from taking disk space twice.

@@ -205,6 +205,7 @@ pub fn import_gltf(
             textures,
             viewpoint: Some(frame_bounds(&world_bounds)),
             sea: None,
+            gameplay: Vec::new(),
         },
         parts,
         warnings,

@@ -4,7 +4,12 @@
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
+//! viewer [SCENE] --play [--scripts DIR] [--capture out.png --frames N [--press ACTION@FRAME]...]
 //! ```
+//!
+//! `--play` runs the scene's game, if it has one: its actors move, the camera is the player's,
+//! and keys and the mouse are its input. Its scripts are reloaded from `--scripts` (by default
+//! `scenes`, where scene text files live) when they change on disk.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
@@ -25,6 +30,7 @@ mod native {
         StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
     use solstice_viewer::bob::Bobbing;
+    use solstice_viewer::play::PlayMode;
     use solstice_viewer::{
         default_environment, initial_camera, parse_time, CameraInput, DayClock, FlyCamera,
     };
@@ -137,6 +143,13 @@ mod native {
             }
         }
 
+        fn gameplay(&self) -> &[solstice_asset::GameFile] {
+            match self {
+                Self::Loaded(loaded) => &loaded.scene.gameplay,
+                Self::Streamed(paged) => &paged.gameplay,
+            }
+        }
+
         fn renderer(
             &self,
             gpu: &Gpu,
@@ -200,6 +213,13 @@ mod native {
         /// Instances to rock as if afloat: those centred within a radius of a point across the
         /// ground, as x, z, radius, the height they rock about, and how far they rock.
         bob: Option<[f32; 5]>,
+        /// Run the scene's game.
+        play: bool,
+        /// Where the scene's scripts are on disk, by the names the scene gives them, to reload
+        /// them when they change.
+        scripts: PathBuf,
+        /// Actions to press in a capture, and the frame to press each in.
+        presses: Vec<(String, u32)>,
     }
 
     /// Starts the effects the options name.
@@ -217,6 +237,103 @@ mod native {
         let bobbing = Bobbing::around(renderer, [x, z], radius, height, amplitude);
         log::info!("{} instances bob around ({x}, {z})", bobbing.len());
         Some(bobbing)
+    }
+
+    /// Starts the scene's game, if `--play` asks and the scene has one, logging every mistake
+    /// in its files if it can't start.
+    fn start_play(options: &Options, scene: &Source, renderer: &mut Renderer) -> Option<PlayMode> {
+        if !options.play {
+            return None;
+        }
+        let files = scene.gameplay();
+        if files.is_empty() {
+            log::warn!("--play: this scene has no gameplay, so there is nothing to play");
+            return None;
+        }
+        match PlayMode::start(renderer, files) {
+            Ok(play) => {
+                log::info!(
+                    "playing: {} instances move, scripts {}",
+                    play.play.instances().count(),
+                    play.play.scripts().join(", ")
+                );
+                Some(play)
+            }
+            Err(errors) => {
+                for error in errors {
+                    log::error!("{error}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Logs what a game's scripts logged, and its errors.
+    fn log_messages(messages: Vec<solstice_viewer::play::Message>) {
+        for message in messages {
+            if message.error {
+                log::error!("{}", message.text);
+            } else {
+                log::info!("{}", message.text);
+            }
+        }
+    }
+
+    /// Reloads a game's scripts when they change on disk.
+    struct ScriptWatch {
+        /// Each script's name in the game, its file, and when that last changed.
+        files: Vec<(String, PathBuf, Option<std::time::SystemTime>)>,
+        since_check: f32,
+    }
+
+    impl ScriptWatch {
+        /// How often to look, in seconds.
+        const INTERVAL: f32 = 0.5;
+
+        fn new(play: &PlayMode, folder: &Path) -> Self {
+            let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+            let files = play
+                .play
+                .scripts()
+                .iter()
+                .map(|name| {
+                    let path = folder.join(name);
+                    let time = modified(&path);
+                    if time.is_none() {
+                        log::warn!("{} is not there to watch", path.display());
+                    }
+                    (name.clone(), path, time)
+                })
+                .collect();
+            Self {
+                files,
+                since_check: 0.0,
+            }
+        }
+
+        fn check(&mut self, play: &mut PlayMode, seconds: f32) {
+            self.since_check += seconds;
+            if self.since_check < Self::INTERVAL {
+                return;
+            }
+            self.since_check = 0.0;
+            for (name, path, last) in &mut self.files {
+                let Ok(now) = std::fs::metadata(&*path).and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if *last == Some(now) {
+                    continue;
+                }
+                *last = Some(now);
+                match std::fs::read_to_string(&*path) {
+                    Ok(source) => match play.play.reload(name, &source) {
+                        Ok(()) => log::info!("reloaded {name}"),
+                        Err(error) => log::error!("{error}"),
+                    },
+                    Err(error) => log::error!("{}: {error}", path.display()),
+                }
+            }
+        }
     }
 
     /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
@@ -251,6 +368,9 @@ mod native {
             clock: None,
             effects: Vec::new(),
             bob: None,
+            play: false,
+            scripts: PathBuf::from("scenes"),
+            presses: Vec::new(),
         };
         // The time of day, built up from its options and made at the end.
         let (mut time, mut day_seconds, mut latitude) = (None, 0.0, None);
@@ -389,6 +509,16 @@ mod native {
                     });
                 }
                 "--stream" => options.stream = true,
+                "--play" => options.play = true,
+                "--scripts" => options.scripts = PathBuf::from(value()?),
+                "--press" => {
+                    let text = value()?;
+                    let (action, frame) = text
+                        .split_once('@')
+                        .and_then(|(a, f)| Some((a.to_owned(), f.parse().ok()?)))
+                        .ok_or("--press expects ACTION@FRAME")?;
+                    options.presses.push((action, frame));
+                }
                 "--geometry-budget-mb" => {
                     let megabytes: u64 = value()?
                         .parse()
@@ -512,6 +642,7 @@ mod native {
         let (mut renderer, mut reader) = scene.renderer(&gpu, CAPTURE_FORMAT, options);
         log::info!("renderer created in {:.2}s", start.elapsed().as_secs_f32());
         let mut bob = bobbing(options, &mut renderer);
+        let mut play = start_play(options, scene, &mut renderer);
 
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
@@ -547,6 +678,14 @@ mod native {
             let environment = light(&mut clock, options.environment, 1.0 / 60.0);
             if let Some(bob) = &mut bob {
                 bob.advance(&mut renderer, 1.0 / 60.0);
+            }
+            if let Some(play) = &mut play {
+                for (action, at) in &options.presses {
+                    if *at == frame {
+                        play.presses.push(action.clone());
+                    }
+                }
+                log_messages(play.frame(&mut renderer, &mut camera, 1.0 / 60.0));
             }
             renderer.render(&gpu, &camera, &environment, &view, options.size, 1.0 / 60.0);
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
@@ -1003,6 +1142,7 @@ mod native {
         reader: Option<PageReader>,
         camera: FlyCamera,
         bob: Option<Bobbing>,
+        play: Option<(PlayMode, ScriptWatch)>,
         last_frame: Instant,
         title_timer: f32,
         frames_since_title: u32,
@@ -1049,8 +1189,13 @@ mod native {
 
             let (mut renderer, reader) = self.scene.renderer(&gpu, config.format, &self.options);
             let bob = bobbing(&self.options, &mut renderer);
+            let play = start_play(&self.options, &self.scene, &mut renderer).map(|play| {
+                let watch = ScriptWatch::new(&play, &self.options.scripts);
+                (play, watch)
+            });
             Ok(WindowState {
                 bob,
+                play,
                 reader,
                 window,
                 surface,
@@ -1095,16 +1240,27 @@ mod native {
             if let Some(bob) = &mut state.bob {
                 bob.advance(&mut state.renderer, delta);
             }
-            state.camera.update(
-                &CameraInput {
-                    forward,
-                    right,
-                    up,
-                    fast,
-                    ..look
-                },
-                delta,
-            );
+            // Playing as someone, the keys and the mouse are theirs; otherwise they fly the camera.
+            let playing_as_someone = state
+                .play
+                .as_ref()
+                .is_some_and(|(p, _)| p.play.has_player());
+            if !playing_as_someone {
+                state.camera.update(
+                    &CameraInput {
+                        forward,
+                        right,
+                        up,
+                        fast,
+                        ..look
+                    },
+                    delta,
+                );
+            }
+            if let Some((play, watch)) = &mut state.play {
+                watch.check(play, delta);
+                log_messages(play.frame(&mut state.renderer, &mut state.camera.camera, delta));
+            }
 
             state.title_timer += delta;
             state.frames_since_title += 1;
@@ -1172,6 +1328,13 @@ mod native {
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
                     if let PhysicalKey::Code(code) = event.physical_key {
+                        // winit's key names are the browser's `KeyboardEvent.code` names.
+                        if let Some((play, _)) = self.state.as_mut().and_then(|s| s.play.as_mut()) {
+                            if !event.repeat {
+                                let down = event.state == ElementState::Pressed;
+                                play.devices.key(&format!("{code:?}"), down);
+                            }
+                        }
                         match event.state {
                             ElementState::Pressed => {
                                 self.keys.insert(code);
@@ -1200,11 +1363,30 @@ mod native {
                         }
                     }
                 }
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button: MouseButton::Left,
-                    ..
-                } => self.set_mouse_capture(true),
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if let Some((play, _)) = self.state.as_mut().and_then(|s| s.play.as_mut()) {
+                        let name = match button {
+                            MouseButton::Left => Some("left"),
+                            MouseButton::Right => Some("right"),
+                            MouseButton::Middle => Some("middle"),
+                            _ => None,
+                        };
+                        // The click that captures the mouse is not a click in the game.
+                        if let (Some(name), true) = (name, self.captured_mouse) {
+                            play.devices
+                                .mouse_button(name, state == ElementState::Pressed);
+                        }
+                    }
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.set_mouse_capture(true);
+                    }
+                }
+                WindowEvent::Focused(false) => {
+                    self.keys.clear();
+                    if let Some((play, _)) = self.state.as_mut().and_then(|s| s.play.as_mut()) {
+                        play.devices.release_all();
+                    }
+                }
                 WindowEvent::RedrawRequested => {
                     self.draw();
                     if let Some(state) = &self.state {
@@ -1219,6 +1401,9 @@ mod native {
             if let (DeviceEvent::MouseMotion { delta }, true) = (event, self.captured_mouse) {
                 self.input.look_yaw -= delta.0 as f32 * 0.002;
                 self.input.look_pitch -= delta.1 as f32 * 0.002;
+                if let Some((play, _)) = self.state.as_mut().and_then(|s| s.play.as_mut()) {
+                    play.devices.mouse_motion(delta.0 as f32, delta.1 as f32);
+                }
             }
         }
     }

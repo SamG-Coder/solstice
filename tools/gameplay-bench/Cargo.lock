@@ -13,6 +13,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -248,6 +254,20 @@ dependencies = [
  "getrandom 0.4.3",
  "monty",
  "monty-types",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "b_play"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "glam 0.30.10",
+ "solstice-asset",
+ "solstice-game",
+ "solstice-script",
+ "solstice-world",
  "wasm-bindgen",
 ]
 
@@ -1915,6 +1935,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "monty"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3186,6 +3215,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "solstice-asset"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "glam 0.30.10",
+ "miniz_oxide",
+]
+
+[[package]]
+name = "solstice-game"
+version = "0.2.0"
+dependencies = [
+ "glam 0.30.10",
+ "solstice-asset",
+ "solstice-script",
+ "solstice-world",
 ]
 
 [[package]]
