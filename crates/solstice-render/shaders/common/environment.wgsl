@@ -30,6 +30,8 @@ struct VolumeParams {
 @group(1) @binding(7) var cloud_sky: texture_2d<f32>;
 @group(1) @binding(8) var cloud_shadow_map: texture_2d<f32>;
 @group(1) @binding(9) var<uniform> clouds: CloudParams;
+// One texel: the shadow map's mean.
+@group(1) @binding(10) var cloud_shadow_mean: texture_2d<f32>;
 
 // Height of the viewer above the planet centre, in kilometres.
 fn viewer_radius() -> f32 {
@@ -120,8 +122,13 @@ fn cloud_shadow(p: vec3f) -> f32 {
     // sun, from where that line meets the ground.
     let ground = p.xz - frame.sun_direction.xz * (p.y / max(frame.sun_direction.y, 0.08));
     let uv = (ground - clouds.shadow_origin) / clouds.shadow_extent;
-    // Beyond the map, use its average: the edge texel is as good a guess as any.
-    return textureSampleLevel(cloud_shadow_map, clamp_sampler, clamp(uv, vec2f(0.0), vec2f(1.0)), 0.0).r;
+    let mapped = textureSampleLevel(cloud_shadow_map, clamp_sampler, clamp(uv, vec2f(0.0), vec2f(1.0)), 0.0).r;
+    // Beyond the map, its mean stands in, blended in across its outer band. From a height the
+    // horizon lies far past the map's edge, and that edge's texels, held out to the horizon,
+    // would stretch into streaks across the sea.
+    let edge = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
+    let mean = textureLoad(cloud_shadow_mean, vec2i(0), 0).r;
+    return mix(mapped, mean, smoothstep(0.75, 1.0, edge));
 }
 
 // Sunlight reaching `p`, after the atmosphere and the clouds.
