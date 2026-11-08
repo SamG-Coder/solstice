@@ -674,7 +674,8 @@ async function startGame(viewer, file) {
       const first = ranges[0];
       const whole = await readWithRetries(file, first, ranges[ranges.length - 1]);
       const sizes = viewer.collision_sizes();
-      const parts = sizes.map((size, i) =>
+      // Array.from: `sizes` is a typed array, whose own `map` can only hold numbers.
+      const parts = Array.from(sizes, (size, i) =>
         inflateAtMost(whole.subarray(ranges[i * 2] - first, ranges[i * 2 + 1] - first), size));
       for (const part of await Promise.all(parts)) viewer.deliver_collision(part);
     }

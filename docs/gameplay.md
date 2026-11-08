@@ -592,8 +592,9 @@ rest. At 60 fps a frame runs one fixed step:
     on this machine;
   - 8 walkers: 0.25 ms a step on the web, 0.2 natively.
   - The cove's collision is 453,000 triangles and 6.5 MB, fetched on *Play*. Building the
-    world takes 1.1 s on the web, once, when the game starts.
-  - The gameplay web build grows from 2.15 MB to 3.0 MB gzipped, for Rapier.
+    world takes 0.7 s on the web, once, when the game starts.
+  - The gameplay web build grows from 2.15 MB to 3.0 MB gzipped, for Rapier. The plain viewer
+    grows by 1.2 KB, for reading the section.
 - **The demo** runs headless, with `viewer --play --capture --hold KEY@FROM-TO`: in the cove,
   the player is stopped by the gate, opens it and walks through into the courtyard, climbs the
   stair, and reaches the rampart, 7 m up, where the wall stops them. The stair's bottom step

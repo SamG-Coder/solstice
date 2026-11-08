@@ -619,7 +619,7 @@ fn build_shape(
         .collect();
     let out_of_range = vertices
         .iter()
-        .any(|v| !(v.abs().max_element() <= MAX_COORDINATE));
+        .any(|v| !v.is_finite() || v.abs().max_element() > MAX_COORDINATE);
     if out_of_range {
         warnings.push("a collision shape reaches too far out, and was left out".to_owned());
         return None;
