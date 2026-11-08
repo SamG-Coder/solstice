@@ -6,9 +6,11 @@ use crate::shaders;
 use crate::vg::GBuffer;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-/// Must match the constants of the same names in `gi/probe_common.wgsl`.
+/// Must match the constant of the same name in `gi/probe_common.wgsl`.
 const PROBE_SPACING: u32 = 16;
-const PROBE_RAYS: u32 = 8;
+/// The rays a probe may trace on a side, `RendererSettings::probe_rays`. Each has its own
+/// pipelines, since `PROBE_RAYS` is an override constant that loops are unrolled over.
+pub const PROBE_RAY_OPTIONS: [u32; 2] = [6, 8];
 /// Size of `Probe` in `gi/probe_common.wgsl`: nine SH vectors, position and normal.
 const PROBE_BYTES: u64 = 11 * 16;
 
@@ -18,8 +20,9 @@ pub struct ScreenGi {
     project_layout: wgpu::BindGroupLayout,
     integrate_layout: wgpu::BindGroupLayout,
     reflect_layout: wgpu::BindGroupLayout,
-    trace: wgpu::ComputePipeline,
-    project: wgpu::ComputePipeline,
+    /// One per entry of `PROBE_RAY_OPTIONS`.
+    trace: [wgpu::ComputePipeline; 2],
+    project: [wgpu::ComputePipeline; 2],
     filter: wgpu::ComputePipeline,
     integrate: wgpu::ComputePipeline,
     reflect: wgpu::ComputePipeline,
@@ -39,8 +42,16 @@ pub struct ScreenGiBindings {
     depth_pyramid: DepthPyramid,
     atlas_size: (u32, u32),
     grid_size: (u32, u32),
+    probe_rays: u32,
     size: (u32, u32),
     half_size: (u32, u32),
+}
+
+impl ScreenGiBindings {
+    /// Rays each probe traces on a side.
+    pub fn probe_rays(&self) -> u32 {
+        self.probe_rays
+    }
 }
 
 impl ScreenGi {
@@ -84,18 +95,24 @@ impl ScreenGi {
         let reflect_module = shaders::module(&gpu.device, "gi/reflections.wgsl");
 
         Self {
-            trace: gpu.compute_pipeline(
-                "probe trace",
-                &trace_module,
-                "main",
-                &[&trace_layout, environment_layout],
-            ),
-            project: gpu.compute_pipeline(
-                "probe project",
-                &project_module,
-                "project",
-                &[&project_layout, environment_layout],
-            ),
+            trace: PROBE_RAY_OPTIONS.map(|rays| {
+                gpu.compute_pipeline_with(
+                    "probe trace",
+                    &trace_module,
+                    "main",
+                    &[&trace_layout, environment_layout],
+                    &[("PROBE_RAYS", f64::from(rays))],
+                )
+            }),
+            project: PROBE_RAY_OPTIONS.map(|rays| {
+                gpu.compute_pipeline_with(
+                    "probe project",
+                    &project_module,
+                    "project",
+                    &[&project_layout, environment_layout],
+                    &[("PROBE_RAYS", f64::from(rays))],
+                )
+            }),
             filter: gpu.compute_pipeline(
                 "probe filter",
                 &project_module,
@@ -128,15 +145,20 @@ impl ScreenGi {
         &self,
         gpu: &Gpu,
         size: (u32, u32),
+        probe_rays: u32,
         gbuffer: &GBuffer,
         scene_history: [&wgpu::TextureView; 2],
     ) -> ScreenGiBindings {
+        assert!(
+            PROBE_RAY_OPTIONS.contains(&probe_rays),
+            "probe_rays must be one of {PROBE_RAY_OPTIONS:?}, not {probe_rays}"
+        );
         let none = wgpu::TextureUsages::empty();
         let grid_size = (
             size.0.div_ceil(PROBE_SPACING),
             size.1.div_ceil(PROBE_SPACING),
         );
-        let atlas_size = (grid_size.0 * PROBE_RAYS, grid_size.1 * PROBE_RAYS);
+        let atlas_size = (grid_size.0 * probe_rays, grid_size.1 * probe_rays);
         let half_size = ((size.0 / 2).max(1), (size.1 / 2).max(1));
 
         let atlas = Target::new(gpu, "probe atlas", atlas_size, FORMAT, none);
@@ -224,6 +246,7 @@ impl ScreenGi {
             reflections,
             atlas_size,
             grid_size,
+            probe_rays,
             size,
             half_size,
         }
@@ -245,7 +268,11 @@ impl ScreenGi {
             .record(&mut pass, &bindings.depth_pyramid);
 
         pass.set_bind_group(1, environment, &[]);
-        pass.set_pipeline(&self.trace);
+        let variant = PROBE_RAY_OPTIONS
+            .iter()
+            .position(|&rays| rays == bindings.probe_rays)
+            .expect("checked when the bindings were made");
+        pass.set_pipeline(&self.trace[variant]);
         pass.set_bind_group(0, &bindings.trace_groups[parity], &[]);
         pass.dispatch_workgroups(
             groups_for(bindings.atlas_size.0, 8),
@@ -257,7 +284,7 @@ impl ScreenGi {
             groups_for(bindings.grid_size.0, 8),
             groups_for(bindings.grid_size.1, 8),
         );
-        pass.set_pipeline(&self.project);
+        pass.set_pipeline(&self.project[variant]);
         pass.set_bind_group(0, &bindings.project_group, &[]);
         pass.dispatch_workgroups(grid.0, grid.1, 1);
 

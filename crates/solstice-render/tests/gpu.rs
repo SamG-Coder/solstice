@@ -6,7 +6,7 @@ use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Environment, Gpu, Place, Renderer, RendererSettings, StreamRequest,
+    Camera, DebugView, Environment, Gpu, Place, Quality, Renderer, RendererSettings, StreamRequest,
     StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
@@ -633,6 +633,58 @@ fn tiny_outputs_render_without_errors() {
     for size in [1, 2, 3, 17, 33] {
         render(&gpu, &scene, &camera, RendererSettings::default(), size);
     }
+}
+
+/// Every probe ray count has its own pipelines, and switching quality at run time picks
+/// another, with targets of another size. Each must render, alone and after a switch.
+#[test]
+fn every_probe_ray_count_renders_without_errors() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(2), &BuildOptions::default());
+    let scene = SceneAsset {
+        meshes: vec![mesh],
+        materials: vec![white_material()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 5.0),
+        ..Default::default()
+    };
+    for quality in [Quality::Low, Quality::Medium, Quality::High] {
+        let mut settings = RendererSettings::default();
+        settings.apply_quality(quality);
+        let run = render(&gpu, &scene, &camera, settings, 64);
+        assert!(run.clusters > 0, "nothing was drawn at {quality:?}");
+    }
+
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut renderer = Renderer::new(&gpu, &paginate(&scene), FORMAT, RendererSettings::default());
+    let target = test_target(&gpu, 64);
+    let view = target.create_view(&Default::default());
+    for rays in [8, 6, 8] {
+        renderer.settings_mut().probe_rays = rays;
+        for _ in 0..3 {
+            renderer.render(&gpu, &camera, &darkness(), &view, (64, 64), 1.0 / 60.0);
+        }
+    }
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    let errors = errors.lock().unwrap();
+    assert!(
+        errors.is_empty(),
+        "GPU errors: {}",
+        errors.join(
+            "
+"
+        )
+    );
 }
 
 /// The same flat texture must look the same stored raw, as blocks the GPU samples directly,

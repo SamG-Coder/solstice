@@ -83,6 +83,9 @@ pub struct RendererSettings {
     pub clouds: bool,
     /// Texels across each of the ocean's wave tiles: a power of two, at most 256.
     pub ocean_resolution: u32,
+    /// Rays each GI probe traces on a side: one of `PROBE_RAY_OPTIONS`. More rays mean less
+    /// boiling in indirect light, for more tracing.
+    pub probe_rays: u32,
 }
 
 impl Default for RendererSettings {
@@ -95,6 +98,7 @@ impl Default for RendererSettings {
             temporal_accumulation: true,
             clouds: true,
             ocean_resolution: 256,
+            probe_rays: 8,
         }
     }
 }
@@ -112,6 +116,7 @@ impl RendererSettings {
             Quality::High => (1.0, 1.0, 1.0),
         };
         self.ocean_resolution = if quality == Quality::Low { 128 } else { 256 };
+        self.probe_rays = if quality == Quality::Low { 6 } else { 8 };
     }
 }
 
@@ -672,10 +677,11 @@ impl Renderer {
     }
 
     fn ensure_sized(&mut self, gpu: &Gpu, render_size: (u32, u32), output_size: (u32, u32)) {
-        let unchanged = self
-            .sized
-            .as_ref()
-            .is_some_and(|s| s.render_size == render_size && s.output_size == output_size);
+        let unchanged = self.sized.as_ref().is_some_and(|s| {
+            s.render_size == render_size
+                && s.output_size == output_size
+                && s.screen_gi.probe_rays() == self.settings.probe_rays
+        });
         if unchanged {
             return;
         }
@@ -710,6 +716,7 @@ impl Renderer {
         let screen_gi = self.screen_gi.bindings(
             gpu,
             render_size,
+            self.settings.probe_rays,
             &gbuffer,
             [&history[1].view, &history[0].view],
         );

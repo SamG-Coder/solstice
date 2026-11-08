@@ -125,7 +125,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             // A moving view exposes new surfaces, which need history to fade out faster.
             let moved = length(motion * frame.viewport);
             let settled = frame_rate_blend(0.08, frame.frame_seconds);
-            let blend = clamp(settled + moved * 0.03, settled, 0.5);
+            // The motion term and its cap are per frame, so how fast history gives way under
+            // motion still depends on the frame rate.
+            let blend = max(settled, min(settled + moved * 0.03, 0.5));
             current = mix(history, current, blend);
         }
     }
