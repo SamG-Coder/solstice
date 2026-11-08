@@ -291,6 +291,11 @@ impl Physics {
         shapes.len()
     }
 
+    /// How many colliders of actors physics is keeping track of: for tools and tests.
+    pub fn tracked_colliders(&self) -> usize {
+        self.owners.len()
+    }
+
     /// How many colliders there are: for tools and tests.
     pub fn collider_count(&self) -> usize {
         self.colliders.len()
@@ -626,17 +631,11 @@ fn build_shape(
         }
         return built;
     }
-    // A mirrored instance turns its triangles inside out; turn them back.
-    let mirrored = scale.x * scale.y * scale.z < 0.0;
-    let triangles = shape
-        .triangles
-        .iter()
-        .map(|&[a, b, c]| if mirrored { [a, c, b] } else { [a, b, c] })
-        .collect();
-    // Two-sided: scanned meshes are often open behind, and a body can touch them from there.
+    // Two-sided: scanned meshes are often open behind, a body can touch them from there, and a
+    // mirrored instance turns its triangles inside out.
     match SharedShape::trimesh_with_flags(
         vertices,
-        triangles,
+        shape.triangles.clone(),
         TriMeshFlags::FIX_INTERNAL_EDGES_TWO_SIDED,
     ) {
         Ok(built) => Some(built),

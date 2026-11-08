@@ -589,6 +589,11 @@ fn removed_actors_leave_physics() {
     game.world.entities.despawn(hero).unwrap();
     steps(&mut game, 2);
     assert_eq!(physics.borrow().collider_count(), 1);
+    assert_eq!(
+        physics.borrow().tracked_colliders(),
+        0,
+        "nothing is kept of it"
+    );
 }
 
 #[test]
@@ -696,10 +701,10 @@ fn instances_at_other_turns_share_their_shape() {
     let at = |yaw: f32| {
         Mat4::from_scale_rotation_translation(scale, Quat::from_rotation_y(yaw), Vec3::ZERO)
     };
-    let transforms = [at(0.3), at(1.7), at(2.9)];
+    let transforms: Vec<Mat4> = (0..40).map(|i| at(i as f32 * 0.37)).collect();
     let collision = Collision {
         shapes: vec![floor()],
-        instance_shapes: vec![0, 0, 0],
+        instance_shapes: vec![0; 40],
         heightfield: None,
     };
     let (_, physics) = with_collision(&collision, |i| transforms.get(i as usize).copied());

@@ -547,8 +547,7 @@ rest. At 60 fps a frame runs one fixed step:
     gets a finer cut in its own space. A mesh with a bounding radius under 0.75 m gets a convex
     hull of the same cut, of at most 512 points, keeping those furthest out in every direction.
   - Each is built once for each size it is used at, and shared by those instances. They are
-    two-sided, as scanned meshes are often open behind, and turned the right way for mirrored
-    instances.
+    two-sided, as scanned meshes are often open behind and mirrored instances are inside out.
   - Everything is checked before use: sizes and offsets before anything is fetched, what unpacks
     no larger than it says, and every coordinate within a million metres, as physics panics
     on far larger ones and a scene file comes from outside.
