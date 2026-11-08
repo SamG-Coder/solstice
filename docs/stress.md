@@ -120,3 +120,43 @@ What remains of the shadow cost is the hardware rasterizer drawing clusters of p
 triangles that the main view would send to the software rasterizer, and a redraw still culls
 and draws the whole cascade. Both are candidates for later rounds.
 
+### Round 2: more of everything
+
+Textures at 2048. Trees 11,000 → 27,000 (oaks 7,000, birches 5,000, firs 7,000, bushes 8,000,
+spaced closer), grass 17,300 → 48,800 patches (meadow 400 m, a tall-grass field to the west),
+rocks 4,900 → 13,200, ships 12 → 40, and 448 lamps over the wood and beach besides the 64
+torches. **122,361 instances, 18.8 billion instanced triangles, baked in 5.1 minutes.**
+
+Still camera, 10:00, fair, with fix 1 (the receiver planes, see below):
+
+| View | Total | Passes over 0.2 ms |
+|---|---|---|
+| Hill | 4.42 | raster 1 1.71, lighting 0.80, cull 1 0.73, screen gi 0.25 |
+| Beach | 3.98 | lighting 1.04, raster 1 0.90, cull 1 0.38, screen gi 0.38, gi light 0.27 |
+| Courtyard | 4.44 | lighting 1.77, gi light 0.82, raster 1 0.57, screen gi 0.33, cull 1 0.27 |
+
+Flyover: **avg 6.0 ms, p95 10.7 ms, worst 16.3 ms.** Per pass, average / p95 / worst: shadows
+0.86 / 5.69 / 9.99 (redraw mean 2.56 ms); raster 1 1.20 / 1.92 / 2.49; lighting 0.88 / 1.61 /
+2.71; cull 1 0.47 / 0.65 / 0.90; gi light 0.25 / 0.72 / 1.69; screen gi 0.27 / 0.36 / 0.66;
+raster 2 worst 3.22. Up to 94 M triangles drawn, 34.5 M on average.
+
+What this round found:
+
+- **The visible-cluster list overflows.** Each cull writes the clusters it selects into a list
+  of 1,048,576 entries and silently drops the rest. Without the receiver planes the far shadow
+  cascade selected 1,050,000 to 1,056,000 clusters from every viewpoint tried: the list is
+  full, and whatever came after it in traversal order casts no shadow. With the planes the
+  far cascade selects 540,000 to 960,000, under the cap, but only just in the courtyard. The
+  main view is heading the same way: 94 M triangles is about 900,000 clusters. Nothing reports
+  the overflow. That needs a counter at least, and the far cascades need to select far fewer
+  clusters than the receivers' grass and leaves currently give them.
+- **Local lights scale with how many overlap, not how many exist.** 512 lights over the island
+  took the lighting pass to 0.80 ms on the hill and 1.77 ms in the courtyard, and the voxel
+  light pass to 0.82 ms there. The per-light work is the visibility trace, 16 steps per pixel
+  per light in range, so the cost is set by how many lights reach each pixel: the courtyard's
+  64 torches 14 m apart overlap thirty deep. A tile or cluster list would cut the loop over the
+  other 450, which costs little; the traces are the content's own cost.
+- **Triangles drawn per pixel.** 94 M triangles at 720p is about a hundred per pixel, from
+  foliage whose clusters stay fine. The software rasterizer carries it (raster 1 1.2 ms), but
+  it is the ceiling for small GPUs.
+

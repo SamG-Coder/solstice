@@ -7,7 +7,7 @@
 # Layout: the sea lies towards +X. The fort is a 44 m square centred on the origin, and the
 # ground is level for 110 m around it; beyond that, the hills begin.
 
-texture_size 1024
+texture_size 2048
 terrain 1800 2048 0.3 52
 hills 45 260 110
 ocean -0.6 coastal
@@ -39,6 +39,8 @@ model ../target/scan/marble_bust_01/marble_bust_01.gltf -2 0 -9 -20 3.2
 
 # ---- Lights in the courtyard: torches at head height.
 lights 64 -20 -20 20 20 2.5 14 40 14 3 1
+# ---- Lamps along the paths through the wood, and lanterns on the beach.
+lights 448 -400 -400 400 400 3 16 30 12 3 2
 
 # ---- Stores and monuments scattered over the level ground around the fort.
 scatter ../target/scan/wooden_barrels_01/wooden_barrels_01.gltf 300 -100 -100 100 100 ground 0.8 1.2 2
@@ -47,18 +49,20 @@ scatter ../target/scan/marble_bust_01/marble_bust_01.gltf 100 -100 -100 100 100 
 
 # ---- Rock everywhere: crags on the hills, boulders and stones on every slope, reefs in the surf.
 scatter ../target/scan/coastal_cliff_04/coastal_cliff_04.gltf 40 -650 -650 650 650 ground:0.3 1.5 2.5 5
-scatter ../target/scan/boulder_01/boulder_01.gltf 1500 -700 -700 700 700 ground:0.2 0.6 2.5 6
-scatter ../target/scan/coast_rocks_05/coast_rocks_05.gltf 3000 -700 -700 700 700 ground:0.2 0.4 1.5 7
-scatter ../target/scan/coast_land_rocks_02/coast_land_rocks_02.gltf 400 -700 -700 700 700 ground:0.2 0.8 1.8 8
+scatter ../target/scan/boulder_01/boulder_01.gltf 4000 -700 -700 700 700 ground:0.2 0.6 2.5 6
+scatter ../target/scan/coast_rocks_05/coast_rocks_05.gltf 8000 -700 -700 700 700 ground:0.2 0.4 1.5 7
+scatter ../target/scan/coast_land_rocks_02/coast_land_rocks_02.gltf 1200 -700 -700 700 700 ground:0.2 0.8 1.8 8
 
 # ---- Ships riding in the bay.
-scatter ../target/scan/ship_pinnace/ship_pinnace.gltf 12 160 -300 420 300 -0.6 1 1 9
+scatter ../target/scan/ship_pinnace/ship_pinnace.gltf 40 160 -500 600 500 -0.6 0.8 1.2 9
 
 # ---- The wood: firs on the high ground, oaks and birches lower, bushes everywhere between.
-trees oak 3000 -700 -700 700 700 7 1
-trees birch 2000 -700 -700 700 700 6 2
-trees fir 3000 -700 -700 700 700 5 3
-trees bush 3000 -700 -700 700 700 3 4
+trees oak 7000 -800 -800 800 800 6 1
+trees birch 5000 -800 -800 800 800 5 2
+trees fir 7000 -800 -800 800 800 4.5 3
+trees bush 8000 -800 -800 800 800 3 4
 
 # ---- A meadow around the fort.
-grass meadow -150 -150 150 150
+grass meadow -200 -200 200 200
+grass tall -400 -200 -200 200
+grass dry 200 -300 500 300
