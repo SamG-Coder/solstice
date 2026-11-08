@@ -8,6 +8,7 @@
 //! bake --forest [--texture-size N] [--output FILE]
 //! bake --plants [--species FILE.species]... [--grass FILE.grass]... [--texture-size N] [--output FILE]
 //! bake --check-character CHARACTER.glb [--roles RIG.roles]
+//! bake --scene SCENE.txt --show-collision [--output FILE]
 //! ```
 //!
 //! `--check-character` bakes nothing: it checks a rigged character as the export tool wrote it
@@ -19,6 +20,7 @@
 //!
 //! Textures are block compressed unless `--raw-textures` is given.
 
+mod collision_view;
 mod forest;
 mod gallery;
 mod meshes;
@@ -45,6 +47,8 @@ struct Options {
     gallery: bool,
     /// The procedural meadow and wood, instead of the demo scene.
     forest: bool,
+    /// Bakes what the scene collides with, instead of how it looks.
+    show_collision: bool,
     /// A row of every species, instead of the demo scene.
     plants: bool,
     /// Species files to add to the row of plants.
@@ -67,6 +71,7 @@ fn parse_args() -> Result<Options, String> {
         raw_textures: false,
         gallery: false,
         forest: false,
+        show_collision: false,
         plants: false,
         species: Vec::new(),
         grass: Vec::new(),
@@ -105,6 +110,7 @@ fn parse_args() -> Result<Options, String> {
             "--raw-textures" => options.raw_textures = true,
             "--gallery" => options.gallery = true,
             "--forest" => options.forest = true,
+            "--show-collision" => options.show_collision = true,
             "--plants" => options.plants = true,
             "--species" => {
                 options.plants = true;
@@ -181,6 +187,9 @@ fn main() -> Result<(), String> {
     }
     let start = Instant::now();
     let mut scene = load_scene(&options)?;
+    if options.show_collision {
+        scene = collision_view::collision_scene(&scene)?;
+    }
     if !options.raw_textures {
         println!("compressing {} texture layers...", scene.textures.len());
         solstice_builder::compress_textures(&mut scene);

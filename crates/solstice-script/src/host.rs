@@ -30,8 +30,10 @@
 use crate::actor::ActorValue;
 use crate::api::{engine, Context, Effects, ScriptTimer, TimerChange, Timers};
 use crate::value::ScriptValue;
-use glam::{EulerRot, Quat};
-use solstice_world::{steps_for, Entity, Schedule, TickGroup, Transform, World, STEP_SECONDS};
+use glam::{EulerRot, Quat, Vec3};
+use solstice_world::{
+    steps_for, Entity, Schedule, TickGroup, Transform, Walk, World, STEP_SECONDS,
+};
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
@@ -43,7 +45,7 @@ use std::sync::Arc;
 
 /// Event names the engine uses itself, which scripts can't send: their handlers run on the
 /// engine's own schedule.
-pub const RESERVED_EVENTS: [&str; 2] = ["begin", "tick"];
+pub const RESERVED_EVENTS: [&str; 4] = ["begin", "tick", "enter", "exit"];
 
 /// The most errors and log lines kept between takings. More are counted, but dropped.
 const MAX_KEPT: usize = 10_000;
@@ -426,6 +428,10 @@ impl ScriptHost {
                     &script.vars,
                     transform.translation,
                     yaw,
+                    world
+                        .entities
+                        .get::<&Walk>(entity)
+                        .map_or(Vec3::ZERO, |w| w.0),
                 )
             };
             let context = Context {
@@ -458,6 +464,9 @@ impl ScriptHost {
                     ));
                 }
                 let state = ActorValue::state(actor)?;
+                if state.walk.is_some_and(|w| !w.is_finite()) {
+                    return Err("self.walk must be finite".to_owned());
+                }
                 if !state.position.is_finite() || !state.yaw.is_finite() {
                     return Err(format!(
                         "self.position ({}) and self.yaw ({}) must be finite",
@@ -512,6 +521,18 @@ impl ScriptHost {
                                 .with_rotation(Quat::from_rotation_y(state.yaw)),
                         )
                         .expect("the actor was just found");
+                }
+                if let Some(walk) = state.walk {
+                    let held = world.entities.get::<&mut Walk>(entity);
+                    if let Ok(mut held) = held {
+                        held.0 = walk;
+                    } else {
+                        drop(held);
+                        world
+                            .entities
+                            .insert_one(entity, Walk(walk))
+                            .expect("the actor was just found");
+                    }
                 }
                 for event in effects.sends {
                     world.send(event);

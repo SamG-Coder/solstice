@@ -14,6 +14,7 @@
 //! separately so a client can fetch any one with an HTTP Range request. All values are
 //! little-endian, and loading is one bounds-checked copy per array.
 
+use crate::collision::{encode_shape, Collision, CollisionIndex, HeightfieldEntry, ShapeEntry};
 use crate::gpu::{PackedCluster, PackedNode};
 use crate::paged::{
     upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
@@ -34,6 +35,8 @@ const SEA_TAG: [u8; 4] = *b"SEA ";
 /// The optional section holding the scene's gameplay: how many [`GameFile`]s, then each one's
 /// name and text. Written only for scenes that have gameplay.
 const GAME_TAG: [u8; 4] = *b"GAME";
+/// The optional section listing the scene's collision shapes, whose data is in the data area.
+const COLLISION_TAG: [u8; 4] = *b"COLL";
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +49,7 @@ pub enum DecodeError {
     BadPages,
     BadSea,
     BadGameplay,
+    BadCollision,
 }
 
 impl fmt::Display for DecodeError {
@@ -66,6 +70,7 @@ impl fmt::Display for DecodeError {
             Self::BadPages => write!(f, "the page tables are inconsistent"),
             Self::BadSea => write!(f, "the sea's description is not text"),
             Self::BadGameplay => write!(f, "the scene's gameplay files are malformed"),
+            Self::BadCollision => write!(f, "the scene's collision shapes are malformed"),
         }
     }
 }
@@ -143,6 +148,10 @@ pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
             data.extend_from_slice(&layer.normal_mips[mip]);
             data.extend_from_slice(&layer.material_mips[mip]);
         }
+    }
+
+    if let Some(collision) = &loaded.collision {
+        scene.collision = Some(append_collision(collision, &mut data));
     }
 
     let manifest = miniz_oxide::deflate::compress_to_vec(&encode_manifest(&scene), DEFLATE_LEVEL);
@@ -227,7 +236,77 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     if !scene.gameplay.is_empty() {
         w.section(GAME_TAG, &encode_gameplay(&scene.gameplay));
     }
+    if let Some(index) = &scene.collision {
+        w.section(COLLISION_TAG, &encode_collision_index(index));
+    }
     w.finish()
+}
+
+/// Writes a scene's collision shapes into the data area, each deflated on its own so that it
+/// can be fetched alone, and lists where they went.
+fn append_collision(collision: &Collision, data: &mut Vec<u8>) -> CollisionIndex {
+    let mut store = |raw: &[u8]| {
+        let packed = miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL);
+        let offset = data.len() as u64;
+        data.extend_from_slice(&packed);
+        (offset, packed.len() as u32)
+    };
+    let shapes = collision
+        .shapes
+        .iter()
+        .map(|shape| {
+            let (offset, stored_bytes) = store(&encode_shape(shape));
+            ShapeEntry {
+                offset,
+                stored_bytes,
+                hull: u32::from(shape.hull),
+                vertices: shape.vertices.len() as u32,
+                triangles: shape.triangles.len() as u32,
+            }
+        })
+        .collect();
+    let heightfield = collision.heightfield.as_ref().map(|ground| {
+        let (offset, stored_bytes) = store(bytemuck::cast_slice(&ground.heights));
+        HeightfieldEntry {
+            offset,
+            stored_bytes,
+            columns: ground.columns,
+            rows: ground.rows,
+            origin: ground.origin,
+            spacing: ground.spacing,
+            _pad: 0,
+        }
+    });
+    CollisionIndex {
+        shapes,
+        instance_shapes: collision.instance_shapes.clone(),
+        heightfield,
+    }
+}
+
+fn encode_collision_index(index: &CollisionIndex) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.slice(&index.shapes);
+    w.slice(&index.instance_shapes);
+    let heightfield: Vec<HeightfieldEntry> = index.heightfield.iter().copied().collect();
+    w.slice(&heightfield);
+    w.finish()
+}
+
+fn decode_collision_index(bytes: &[u8]) -> Result<CollisionIndex, DecodeError> {
+    let mut r = Reader { bytes };
+    let bad = |_| DecodeError::BadCollision;
+    let shapes: Vec<ShapeEntry> = r.slice().map_err(bad)?;
+    let instance_shapes: Vec<u32> = r.slice().map_err(bad)?;
+    let heightfield: Vec<HeightfieldEntry> = r.slice().map_err(bad)?;
+    if heightfield.len() > 1 || !r.bytes.is_empty() {
+        return Err(DecodeError::BadCollision);
+    }
+    Ok(CollisionIndex {
+        shapes,
+        instance_shapes,
+        heightfield: heightfield.first().copied(),
+    })
 }
 
 /// A gameplay section's contents: a count, then each file's name and text, each a length and
@@ -351,6 +430,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
 
     let mut sea = None;
     let mut gameplay = Vec::new();
+    let mut collision = None;
     while !r.bytes.is_empty() {
         let tag: [u8; 4] = r.pod()?;
         let contents: Vec<u8> = r.slice()?;
@@ -364,7 +444,13 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             });
         } else if tag == GAME_TAG {
             gameplay = decode_gameplay(&contents)?;
+        } else if tag == COLLISION_TAG {
+            collision = Some(decode_collision_index(&contents)?);
         }
+    }
+
+    if let Some(index) = &collision {
+        index.validate(instances.len(), data_offset)?;
     }
 
     let scene = PagedScene {
@@ -382,6 +468,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         viewpoint: (has_viewpoint != 0).then_some(viewpoint),
         sea,
         gameplay,
+        collision,
         hierarchy_depth,
         source_triangles,
         unique_triangles,
@@ -438,10 +525,24 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedScene, DecodeError> {
         upper_textures.push(out);
     }
 
+    let collision = match &scene.collision {
+        None => None,
+        Some(index) => {
+            let mut pieces = Vec::new();
+            for ((offset, stored), raw) in index.ranges().into_iter().zip(index.raw_sizes()) {
+                let start = scene.data_offset + offset;
+                let packed = stored_range(bytes, (start, start + u64::from(stored)))?;
+                pieces.push(inflate_limited(packed, raw)?);
+            }
+            Some(index.decode(&pieces)?)
+        }
+    };
+
     Ok(LoadedScene {
         scene,
         pages,
         upper_textures,
+        collision,
     })
 }
 
@@ -478,6 +579,12 @@ fn stored_range(bytes: &[u8], (start, end): (u64, u64)) -> Result<&[u8], DecodeE
 /// Unpacks a deflated block.
 pub fn inflate(packed: &[u8]) -> Result<Vec<u8>, DecodeError> {
     miniz_oxide::inflate::decompress_to_vec(packed).map_err(|_| DecodeError::Truncated)
+}
+
+/// Unpacks a deflated block that should come to `limit` bytes, refusing to unpack more.
+pub fn inflate_limited(packed: &[u8], limit: u64) -> Result<Vec<u8>, DecodeError> {
+    miniz_oxide::inflate::decompress_to_vec_with_limit(packed, limit as usize)
+        .map_err(|_| DecodeError::BadCollision)
 }
 
 /// Unpacks a page and checks that it is the size the tables say.
@@ -606,6 +713,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collision::{CollisionShape, Heightfield};
     use crate::gpu::{pack_triangle, PackedVertex, NODE_LEAF};
 
     /// One pinned page and one that loads on demand, with textures above and below the base.
@@ -718,6 +826,7 @@ mod tests {
                 normal_mips: vec![mip(edge, 2, 5)],
                 material_mips: vec![mip(edge, 2, 6)],
             }],
+            collision: None,
         }
     }
 
@@ -792,12 +901,241 @@ mod tests {
         assert_eq!(decode(&encode(&loaded)).unwrap().scene.gameplay, files);
     }
 
+    fn sample_collision() -> Collision {
+        Collision {
+            shapes: vec![
+                CollisionShape {
+                    hull: false,
+                    vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.5]],
+                    triangles: vec![[0, 1, 2]],
+                },
+                CollisionShape {
+                    hull: true,
+                    vertices: vec![[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0], [1.0; 3]],
+                    triangles: vec![],
+                },
+            ],
+            instance_shapes: vec![1],
+            heightfield: Some(Heightfield {
+                columns: 2,
+                rows: 3,
+                origin: [-5.0, 2.0],
+                spacing: [1.5, 2.5],
+                heights: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+            }),
+        }
+    }
+
+    #[test]
+    fn collision_travels_with_its_scene_and_stays_out_of_the_manifest() {
+        let mut loaded = sample_scene();
+        let plain = encode(&loaded);
+        let mut collision = sample_collision();
+        collision.instance_shapes = vec![1; loaded.scene.instances.len()];
+        loaded.collision = Some(collision.clone());
+        let bytes = encode(&loaded);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.collision, loaded.collision);
+        // The shapes are in the data area, each to be fetched alone.
+        let index = decoded.scene.collision.as_ref().unwrap();
+        assert_eq!(index.ranges().len(), 3);
+        let mut pieces = Vec::new();
+        for (offset, stored) in index.ranges() {
+            let start = (decoded.scene.data_offset + offset) as usize;
+            pieces.push(inflate(&bytes[start..start + stored as usize]).unwrap());
+        }
+        assert_eq!(index.decode(&pieces).unwrap(), collision);
+        // The data shares nothing with the rest: pages and textures stay where they were.
+        assert_eq!(decode(&plain).unwrap().scene.collision, None);
+        assert_eq!(decoded.pages, sample_scene().pages);
+    }
+
+    #[test]
+    fn broken_collision_is_an_error_not_a_guess() {
+        let collision = sample_collision();
+        let mut data = Vec::new();
+        let index = append_collision(&collision, &mut data);
+        let mut pieces: Vec<Vec<u8>> = index
+            .ranges()
+            .iter()
+            .map(|&(o, s)| inflate(&data[o as usize..o as usize + s as usize]).unwrap())
+            .collect();
+        assert_eq!(index.decode(&pieces).unwrap(), collision);
+        let bad = |index: &CollisionIndex, pieces: &[Vec<u8>]| {
+            assert_eq!(index.decode(pieces), Err(DecodeError::BadCollision));
+        };
+        bad(&index, &pieces[..2]);
+        let mut wrong = index.clone();
+        wrong.shapes[0].vertices = 4;
+        bad(&wrong, &pieces);
+        let mut wrong = index.clone();
+        wrong.shapes[0].vertices = u32::MAX;
+        bad(&wrong, &pieces);
+        let mut wrong = index.clone();
+        wrong.instance_shapes[0] = 2;
+        bad(&wrong, &pieces);
+        let mut wrong = index.clone();
+        wrong.heightfield.as_mut().unwrap().rows = 2;
+        bad(&wrong, &pieces);
+        let mut wrong = index.clone();
+        wrong.heightfield.as_mut().unwrap().spacing[0] = 0.0;
+        bad(&wrong, &pieces);
+        // A triangle naming a vertex that isn't there.
+        let saved = pieces[0].clone();
+        let at = pieces[0].len() - 4;
+        pieces[0][at..].copy_from_slice(&3u32.to_le_bytes());
+        bad(&index, &pieces);
+        pieces[0] = saved;
+        // A vertex that isn't a number, or is further out than physics can work with.
+        let saved = pieces[1].clone();
+        pieces[1][0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        bad(&index, &pieces);
+        pieces[1][0..4].copy_from_slice(&1.0e7_f32.to_le_bytes());
+        bad(&index, &pieces);
+        pieces[1] = saved;
+        // A height too high.
+        let at = pieces[2].len() - 4;
+        pieces[2][at..].copy_from_slice(&1.0e7_f32.to_le_bytes());
+        bad(&index, &pieces);
+        // A section cut short.
+        let section = encode_collision_index(&index);
+        for cut in 0..section.len() {
+            assert_eq!(
+                decode_collision_index(&section[..cut]),
+                Err(DecodeError::BadCollision),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collision_index_is_checked_before_anything_is_fetched() {
+        let mut data = Vec::new();
+        let index = append_collision(&sample_collision(), &mut data);
+        assert_eq!(index.validate(1, 100), Ok(()));
+        assert_eq!(index.raw_sizes(), [48, 48, 24]);
+        let bad = |index: &CollisionIndex| {
+            assert_eq!(index.validate(1, 100), Err(DecodeError::BadCollision));
+        };
+        assert_eq!(
+            index.validate(2, 100),
+            Err(DecodeError::BadCollision),
+            "one too few"
+        );
+        let mut wrong = index.clone();
+        wrong.instance_shapes = vec![9];
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.shapes[0].vertices = u32::MAX;
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.shapes[0].stored_bytes = 1_000_000;
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.shapes[0].offset = u64::MAX;
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.heightfield.as_mut().unwrap().columns = u32::MAX;
+        bad(&wrong);
+        // Unpacking stops at the size it should be.
+        let packed = miniz_oxide::deflate::compress_to_vec(&[7; 1000], 6);
+        assert_eq!(inflate_limited(&packed, 1000).unwrap().len(), 1000);
+        assert_eq!(
+            inflate_limited(&packed, 999),
+            Err(DecodeError::BadCollision)
+        );
+    }
+
+    #[test]
+    fn a_collision_index_cannot_ask_for_too_much() {
+        use crate::collision::{ShapeEntry, MAX_COLLISION_BYTES, MAX_HULL_POINTS};
+        let mesh = |vertices: u32| ShapeEntry {
+            vertices,
+            ..ShapeEntry::default()
+        };
+        let index = |shapes: Vec<ShapeEntry>| CollisionIndex {
+            shapes,
+            ..CollisionIndex::default()
+        };
+        // As much as is allowed, then one vertex more, spread over two pieces.
+        assert_eq!(
+            MAX_COLLISION_BYTES,
+            1 << 30,
+            "what a browser is asked to set aside"
+        );
+        let most = (MAX_COLLISION_BYTES / 12) as u32;
+        assert_eq!(index(vec![mesh(most)]).validate(0, 0), Ok(()));
+        assert_eq!(
+            index(vec![mesh(most), mesh(1)]).validate(0, 0),
+            Err(DecodeError::BadCollision),
+            "too much in all, though each piece would fit"
+        );
+        // Hulls are limited, at what the bake can make. Meshes are not.
+        let hull = |vertices: u32| ShapeEntry {
+            hull: 1,
+            ..mesh(vertices)
+        };
+        let most = MAX_HULL_POINTS as u32;
+        assert_eq!(index(vec![hull(most)]).validate(0, 0), Ok(()));
+        assert_eq!(
+            index(vec![hull(most + 1)]).validate(0, 0),
+            Err(DecodeError::BadCollision)
+        );
+        assert_eq!(index(vec![mesh(most + 1)]).validate(0, 0), Ok(()));
+        // A grid whose size wraps round to nothing in 64 bits.
+        let ground = CollisionIndex {
+            heightfield: Some(crate::collision::HeightfieldEntry {
+                columns: 1 << 31,
+                rows: 1 << 31,
+                ..Default::default()
+            }),
+            ..CollisionIndex::default()
+        };
+        assert_eq!(ground.validate(0, 0), Err(DecodeError::BadCollision));
+    }
+
+    /// A scene with collision, written to a file.
+    fn scene_with_collision() -> (LoadedScene, Vec<u8>) {
+        let mut loaded = sample_scene();
+        let mut collision = sample_collision();
+        collision.instance_shapes = vec![1; loaded.scene.instances.len()];
+        loaded.collision = Some(collision);
+        let bytes = encode(&loaded);
+        (loaded, bytes)
+    }
+
+    #[test]
+    fn a_manifest_with_a_bad_collision_index_is_refused_when_it_is_read() {
+        let (_, bytes) = scene_with_collision();
+        let scene = decode(&bytes).unwrap().scene;
+        assert!(decode_manifest(&encode_manifest(&scene), 0).is_ok());
+        let mut bad = scene;
+        bad.collision.as_mut().unwrap().shapes[0].vertices = u32::MAX;
+        assert_eq!(
+            decode_manifest(&encode_manifest(&bad), 0).err(),
+            Some(DecodeError::BadCollision)
+        );
+    }
+
+    #[test]
+    fn a_collision_piece_is_unpacked_with_its_limit_when_a_whole_file_is_read() {
+        let (_, mut bytes) = scene_with_collision();
+        let scene = decode(&bytes).unwrap().scene;
+        let (offset, stored) = scene.collision.as_ref().unwrap().ranges()[0];
+        let start = (scene.data_offset + offset) as usize;
+        // Not deflate at all. Only the limited way of unpacking calls that bad collision, as
+        // the plain one would say the file was truncated.
+        bytes[start..start + stored as usize].fill(0xff);
+        assert_eq!(decode(&bytes).err(), Some(DecodeError::BadCollision));
+    }
+
     #[test]
     fn a_scene_without_gameplay_is_written_exactly_as_before() {
         // No section at all, so viewers from before gameplay read it as they always did.
         let plain = sample_scene();
         let manifest = encode_manifest(&plain.scene);
         assert!(!manifest.windows(4).any(|w| w == GAME_TAG));
+        assert!(!manifest.windows(4).any(|w| w == COLLISION_TAG));
         let mut with = sample_scene();
         with.scene.gameplay = vec![GameFile {
             name: "a".to_string(),
@@ -806,6 +1144,15 @@ mod tests {
         let longer = encode_manifest(&with.scene);
         assert_eq!(&longer[..manifest.len()], &manifest[..]);
         assert_eq!(decode_manifest(&manifest, 0).unwrap().gameplay, vec![]);
+        // Collision only adds a section too, so what comes before it is unchanged.
+        let (with_collision, _) = scene_with_collision();
+        let mut index = sample_scene().scene;
+        index.collision = Some(append_collision(
+            with_collision.collision.as_ref().unwrap(),
+            &mut Vec::new(),
+        ));
+        let longer = encode_manifest(&index);
+        assert_eq!(&longer[..manifest.len()], &manifest[..]);
     }
 
     #[test]

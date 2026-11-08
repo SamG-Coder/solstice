@@ -42,6 +42,13 @@ pub struct WebViewer {
     gpu_errors: Arc<AtomicU32>,
     /// The scene's gameplay files, empty if it has none.
     gameplay: Vec<GameFile>,
+    /// Where its collision shapes are, and those delivered so far, inflated.
+    #[cfg(feature = "gameplay")]
+    collision: Option<solstice_asset::CollisionIndex>,
+    #[cfg(feature = "gameplay")]
+    collision_data_offset: u64,
+    #[cfg(feature = "gameplay")]
+    collision_pieces: Vec<Vec<u8>>,
     #[cfg(feature = "gameplay")]
     play: Option<crate::play::PlayMode>,
     /// What scripts logged, and errors, for the page to take.
@@ -118,6 +125,12 @@ impl WebViewer {
             clock: DayClock::new(TimeOfDay::default(), DEFAULT_DAY_SECONDS),
             gpu_errors,
             gameplay: scene.gameplay,
+            #[cfg(feature = "gameplay")]
+            collision: scene.collision,
+            #[cfg(feature = "gameplay")]
+            collision_data_offset: scene.data_offset,
+            #[cfg(feature = "gameplay")]
+            collision_pieces: Vec::new(),
             #[cfg(feature = "gameplay")]
             play: None,
             #[cfg(feature = "gameplay")]
@@ -438,13 +451,54 @@ impl WebViewer {
 #[cfg(feature = "gameplay")]
 #[wasm_bindgen]
 impl WebViewer {
-    /// Starts the scene's game. Rejects with every mistake in its files, one to a line.
+    /// Whether the scene was baked with collision, though everything in it may be `collide=none`.
+    pub fn has_collision(&self) -> bool {
+        self.collision.is_some()
+    }
+
+    /// The parts of the file holding the scene's collision shapes, fetched only to play: a flat
+    /// array of two numbers each, the first byte and one past the last. Each is deflated. Empty
+    /// for a scene with none.
+    pub fn collision_ranges(&self) -> Vec<f64> {
+        let Some(index) = &self.collision else {
+            return Vec::new();
+        };
+        index
+            .ranges()
+            .iter()
+            .flat_map(|&(offset, stored)| {
+                let start = self.collision_data_offset + offset;
+                [start as f64, (start + u64::from(stored)) as f64]
+            })
+            .collect()
+    }
+
+    /// The size each part of the collision unpacks to: no more should ever be unpacked.
+    pub fn collision_sizes(&self) -> Vec<f64> {
+        self.collision.as_ref().map_or_else(Vec::new, |index| {
+            index.raw_sizes().iter().map(|&s| s as f64).collect()
+        })
+    }
+
+    /// Takes one part of the collision, inflated, in the order of `collision_ranges`.
+    pub fn deliver_collision(&mut self, bytes: Vec<u8>) {
+        self.collision_pieces.push(bytes);
+    }
+
+    /// Starts the scene's game, with its collision delivered. Rejects with every mistake in its
+    /// files, one to a line.
     pub fn play(&mut self) -> Result<(), JsValue> {
         if self.gameplay.is_empty() {
             return Err(JsValue::from_str("this scene has no game to play"));
         }
-        let play = crate::play::PlayMode::start(&mut self.renderer, &self.gameplay)
-            .map_err(|errors| JsValue::from_str(&errors.join("\n")))?;
+        let pieces = std::mem::take(&mut self.collision_pieces);
+        let collision = match &self.collision {
+            Some(index) => Some(index.decode(&pieces).map_err(error_string)?),
+            None => None,
+        };
+        let play =
+            crate::play::PlayMode::start(&mut self.renderer, &self.gameplay, collision.as_ref())
+                .map_err(|errors| JsValue::from_str(&errors.join("\n")))?;
         self.play = Some(play);
         Ok(())
     }

@@ -8,13 +8,20 @@
 //! property open_seconds float 2.5      # editable per placement in the scene
 //! property locked bool false
 //! camera 0 1.6 0                       # the player's eye, for the actor the player plays
+//! collider box 3.9 3.5 0.2 at 0 1.75 0 # what it bumps into, placed relative to the actor
+//! character 0.3 1.8                    # walks, as a capsule of this radius and height
 //! ```
+//!
+//! `mesh PATH SCALE part=NAME` takes one named piece of the model, by its own origin. A collider
+//! is `box SX SY SZ` or `capsule RADIUS HEIGHT`, then optionally `at X Y Z`, then `sensor`, which
+//! blocks nothing and reports what enters and leaves it, or `dynamic MASS`, which physics moves.
 //!
 //! Paths are relative to the actor file. The mesh is placed by the bake, wherever the scene
 //! places the actor, and moves with it. Every line but `name` may be left out.
 
-use crate::{is_name, lines, number, FileError};
+use crate::{coordinate, is_name, lines, number, FileError};
 use glam::Vec3;
+use solstice_physics::{ActorCollider, BodyKind, Character, Shape};
 use solstice_script::ScriptValue;
 use std::fmt::Write;
 
@@ -121,6 +128,8 @@ pub struct Mesh {
     /// A glTF file, relative to the actor file.
     pub path: String,
     pub scale: f32,
+    /// One named piece of the model, placed by its own origin, rather than the whole of it.
+    pub part: Option<String>,
 }
 
 /// One kind of actor.
@@ -134,10 +143,61 @@ pub struct ActorFile {
     pub properties: Vec<Property>,
     /// Where the player's eye is, relative to the actor, if this is the actor the player plays.
     pub camera: Option<Vec3>,
+    /// What it bumps into, if anything.
+    pub collider: Option<ActorCollider>,
+    /// Makes it walk, on the ground, with the character controller.
+    pub character: Option<Character>,
 }
 
 /// Names `self` already has in a script, which a property can't take.
-const RESERVED: [&str; 5] = ["entity", "position", "yaw", "vars", "instances"];
+const RESERVED: [&str; 6] = ["entity", "position", "yaw", "walk", "vars", "instances"];
+
+/// Reads the words of a `collider` line.
+fn parse_collider(values: &[&str]) -> Result<ActorCollider, String> {
+    const FORM: &str =
+        "expected `collider box SX SY SZ` or `collider capsule RADIUS HEIGHT`, then optionally \
+         `at X Y Z`, then `sensor` or `dynamic MASS`";
+    let positive = |word: &str| {
+        let value = coordinate(word)?;
+        if value > 0.0 {
+            Ok(value)
+        } else {
+            Err(format!("a collider's size must be above 0, not {value}"))
+        }
+    };
+    let (shape, mut rest) = match values {
+        ["box", x, y, z, rest @ ..] => (
+            Shape::Box(Vec3::new(positive(x)?, positive(y)?, positive(z)?)),
+            rest,
+        ),
+        ["capsule", radius, height, rest @ ..] => {
+            let (radius, height) = (positive(radius)?, positive(height)?);
+            if height < radius * 2.0 {
+                return Err(format!(
+                    "a capsule's height must be at least twice its radius, not {radius} and {height}"
+                ));
+            }
+            (Shape::Capsule { radius, height }, rest)
+        }
+        _ => return Err(FORM.to_owned()),
+    };
+    let mut offset = Vec3::ZERO;
+    if let ["at", x, y, z, after @ ..] = rest {
+        offset = Vec3::new(coordinate(x)?, coordinate(y)?, coordinate(z)?);
+        rest = after;
+    }
+    let kind = match rest {
+        [] => BodyKind::Kinematic,
+        ["sensor"] => BodyKind::Sensor,
+        ["dynamic", mass] => BodyKind::Dynamic(positive(mass)?),
+        _ => return Err(FORM.to_owned()),
+    };
+    Ok(ActorCollider {
+        shape,
+        kind,
+        offset,
+    })
+}
 
 impl ActorFile {
     pub fn parse(text: &str) -> Result<Self, FileError> {
@@ -148,6 +208,8 @@ impl ActorFile {
             script: None,
             properties: Vec::new(),
             camera: None,
+            collider: None,
+            character: None,
         };
         for (line, words) in lines(text) {
             let error = |message: String| FileError { line, message };
@@ -179,12 +241,16 @@ impl ActorFile {
                     name = Some(values[0].to_owned());
                 }
                 "mesh" => {
-                    count(1..=2, "PATH [SCALE]")?;
+                    count(1..=3, "PATH [SCALE] [part=NAME]")?;
                     once(actor.mesh.is_some())?;
-                    let scale = values
-                        .get(1)
-                        .map_or(Ok(1.0), |s| number(s))
-                        .map_err(error)?;
+                    let (mut scale, mut part) = (1.0, None);
+                    for word in &values[1..] {
+                        match word.strip_prefix("part=") {
+                            Some("") => return Err(error("`part=` needs a name".to_owned())),
+                            Some(name) => part = Some(name.to_owned()),
+                            None => scale = number(word).map_err(error)?,
+                        }
+                    }
                     if scale <= 0.0 {
                         return Err(error(format!(
                             "a mesh's scale must be above 0, not {scale}"
@@ -193,6 +259,7 @@ impl ActorFile {
                     actor.mesh = Some(Mesh {
                         path: values[0].to_owned(),
                         scale,
+                        part,
                     });
                 }
                 "script" => {
@@ -236,10 +303,27 @@ impl ActorFile {
                         z.map_err(error)?,
                     ));
                 }
+                "collider" => {
+                    once(actor.collider.is_some())?;
+                    actor.collider = Some(parse_collider(values).map_err(error)?);
+                }
+                "character" => {
+                    count(2..=2, "RADIUS HEIGHT")?;
+                    once(actor.character.is_some())?;
+                    let radius = coordinate(values[0]).map_err(error)?;
+                    let height = coordinate(values[1]).map_err(error)?;
+                    if radius <= 0.0 || height < radius * 2.0 {
+                        return Err(error(format!(
+                            "a character needs a radius above 0 and a height of at least twice \
+                             it, not {radius} and {height}"
+                        )));
+                    }
+                    actor.character = Some(Character { radius, height });
+                }
                 other => {
                     return Err(error(format!(
-                        "unknown line `{other}`: an actor file has name, mesh, script, property \
-                         and camera lines"
+                        "unknown line `{other}`: an actor file has name, mesh, script, property, \
+                         camera, collider and character lines"
                     )))
                 }
             }
@@ -248,6 +332,12 @@ impl ActorFile {
             line: 1,
             message: "an actor file needs a `name` line".to_owned(),
         })?;
+        if actor.collider.is_some() && actor.character.is_some() {
+            return Err(FileError {
+                line: 1,
+                message: "an actor is a collider or a character, not both".to_owned(),
+            });
+        }
         Ok(actor)
     }
 
@@ -255,7 +345,11 @@ impl ActorFile {
     pub fn to_text(&self) -> String {
         let mut text = format!("name {}\n", self.name);
         if let Some(mesh) = &self.mesh {
-            let _ = writeln!(text, "mesh {} {}", mesh.path, mesh.scale);
+            let _ = write!(text, "mesh {} {}", mesh.path, mesh.scale);
+            if let Some(part) = &mesh.part {
+                let _ = write!(text, " part={part}");
+            }
+            text.push('\n');
         }
         if let Some(script) = &self.script {
             let _ = writeln!(text, "script {script}");
@@ -271,6 +365,31 @@ impl ActorFile {
         }
         if let Some(eye) = self.camera {
             let _ = writeln!(text, "camera {} {} {}", eye.x, eye.y, eye.z);
+        }
+        if let Some(collider) = &self.collider {
+            match collider.shape {
+                Shape::Box(size) => {
+                    let _ = write!(text, "collider box {} {} {}", size.x, size.y, size.z);
+                }
+                Shape::Capsule { radius, height } => {
+                    let _ = write!(text, "collider capsule {radius} {height}");
+                }
+            }
+            let at = collider.offset;
+            if at != Vec3::ZERO {
+                let _ = write!(text, " at {} {} {}", at.x, at.y, at.z);
+            }
+            match collider.kind {
+                BodyKind::Kinematic => {}
+                BodyKind::Sensor => text.push_str(" sensor"),
+                BodyKind::Dynamic(mass) => {
+                    let _ = write!(text, " dynamic {mass}");
+                }
+            }
+            text.push('\n');
+        }
+        if let Some(character) = &self.character {
+            let _ = writeln!(text, "character {} {}", character.radius, character.height);
         }
         text
     }
@@ -295,6 +414,7 @@ property knocks int 0
 property sign text closed
 property hinge vec3 0 0 -1.7
 camera 0 1.6 0
+collider box 3.9 3.5 0.2 at 0 1.75 0
 ";
 
     #[test]
@@ -305,7 +425,8 @@ camera 0 1.6 0
             gate.mesh,
             Some(Mesh {
                 path: "../gate/gate.gltf".to_owned(),
-                scale: 1.15
+                scale: 1.15,
+                part: None,
             })
         );
         assert_eq!(gate.script.as_deref(), Some("gate.star"));
@@ -360,12 +481,150 @@ camera 0 1.6 0
                 "expected `property NAME KIND VALUE`",
             ),
             ("name g\ncamera 0 1", 2, "expected `camera X Y Z`"),
-            ("name g\ncollider box 1 2 3", 2, "unknown line `collider`"),
+            ("name g\nsword 1 2 3", 2, "unknown line `sword`"),
+            ("name g\ncollider cone 1 2", 2, "expected `collider box"),
+            ("name g\ncollider box 1 2", 2, "expected `collider box"),
+            ("name g\ncollider box 1 2 0", 2, "must be above 0"),
+            (
+                "name g\ncollider box 1 2 3 sensor loud",
+                2,
+                "expected `collider box",
+            ),
+            ("name g\ncollider box 1 2 3 dynamic 0", 2, "must be above 0"),
+            (
+                "name g\ncollider capsule 1 1",
+                2,
+                "at least twice its radius",
+            ),
+            (
+                "name g\ncollider box 1 2 3\ncollider box 1 2 3",
+                3,
+                "given twice",
+            ),
+            (
+                "name g\ncharacter 0.3",
+                2,
+                "expected `character RADIUS HEIGHT`",
+            ),
+            ("name g\ncharacter 0 2", 2, "at least twice"),
+            ("name g\ncharacter 1 1", 2, "at least twice"),
+            ("name g\nmesh a.gltf part=", 2, "`part=` needs a name"),
+            (
+                "name g\nproperty walk vec3 0 0 0",
+                2,
+                "can't be a property's name",
+            ),
+            (
+                "name g\ncollider box 1 2 3\ncharacter 0.3 1.8",
+                1,
+                "not both",
+            ),
         ];
         for (text, line, part) in cases {
             let error = ActorFile::parse(text).unwrap_err();
             assert_eq!(error.line, line, "{text:?}: {error}");
             assert!(error.message.contains(part), "{text:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn collider_and_character_numbers_too_big_for_physics_are_mistakes() {
+        for line in [
+            "collider box 1e30 1 1",
+            "collider box 1 1e30 1",
+            "collider box 1 1 1e30",
+            "collider capsule 1e30 1e31",
+            "collider capsule 1 1e30",
+            "collider box 1 1 1 at 1e30 0 0",
+            "collider box 1 1 1 at 0 1e30 0",
+            "collider box 1 1 1 at 0 0 1e30",
+            "collider box 1 1 1 dynamic 1e30",
+            "character 1e30 1e31",
+            "character 1 1e30",
+        ] {
+            assert!(
+                ActorFile::parse(&format!("name a\n{line}\n")).is_err(),
+                "{line}"
+            );
+        }
+        for line in [
+            "collider box 1e6 1 1 at 1e6 0 0 dynamic 1e6",
+            "character 1 1e6",
+        ] {
+            assert!(
+                ActorFile::parse(&format!("name a\n{line}\n")).is_ok(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn colliders_characters_and_parts_read_back_what_they_wrote() {
+        let cases = [
+            (
+                "name a\ncollider box 1 2 3\n",
+                Shape::Box(Vec3::new(1.0, 2.0, 3.0)),
+                BodyKind::Kinematic,
+                Vec3::ZERO,
+            ),
+            (
+                "name a\ncollider box 1 2 3 sensor\n",
+                Shape::Box(Vec3::new(1.0, 2.0, 3.0)),
+                BodyKind::Sensor,
+                Vec3::ZERO,
+            ),
+            (
+                "name a\ncollider capsule 0.5 2 dynamic 80\n",
+                Shape::Capsule {
+                    radius: 0.5,
+                    height: 2.0,
+                },
+                BodyKind::Dynamic(80.0),
+                Vec3::ZERO,
+            ),
+            (
+                "name a\ncollider box 1 2 3 at 0 1.5 -2\n",
+                Shape::Box(Vec3::new(1.0, 2.0, 3.0)),
+                BodyKind::Kinematic,
+                Vec3::new(0.0, 1.5, -2.0),
+            ),
+            (
+                "name a\ncollider box 1 2 3 at 1 0 0 dynamic 5\n",
+                Shape::Box(Vec3::new(1.0, 2.0, 3.0)),
+                BodyKind::Dynamic(5.0),
+                Vec3::X,
+            ),
+        ];
+        for (text, shape, kind, offset) in cases {
+            let actor = ActorFile::parse(text).unwrap();
+            assert_eq!(
+                actor.collider,
+                Some(ActorCollider {
+                    shape,
+                    kind,
+                    offset
+                }),
+                "{text}"
+            );
+            assert_eq!(actor.to_text(), text);
+        }
+        let hero = ActorFile::parse("name h\ncharacter 0.3 1.8\n").unwrap();
+        assert_eq!(
+            hero.character,
+            Some(Character {
+                radius: 0.3,
+                height: 1.8
+            })
+        );
+        assert_eq!(hero.to_text(), "name h\ncharacter 0.3 1.8\n");
+        for text in [
+            "mesh a.gltf 1.5 part=door_02",
+            "mesh a.gltf part=door_02 1.5",
+        ] {
+            let door = ActorFile::parse(&format!("name d\n{text}\n")).unwrap();
+            let mesh = door.mesh.as_ref().unwrap();
+            assert_eq!((mesh.scale, mesh.part.as_deref()), (1.5, Some("door_02")));
+            assert_eq!(door.to_text(), "name d\nmesh a.gltf 1.5 part=door_02\n");
         }
     }
 

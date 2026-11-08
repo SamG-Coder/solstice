@@ -10,6 +10,8 @@
 //! None of it touches the GPU. The viewers move the renderer's instances, and its camera, as
 //! [`play::Play::frame`] tells them.
 
+use solstice_asset::MAX_COORDINATE;
+
 pub mod actor;
 pub mod input;
 pub mod play;
@@ -18,7 +20,7 @@ pub mod scene;
 pub use actor::{ActorFile, Mesh, Property, PropertyKind};
 pub use input::{Binding, Device, Devices, InputMap};
 pub use play::{Message, Play, View};
-pub use scene::{ActorLine, SceneGame, GAME_FILE};
+pub use scene::{ActorLine, Blocker, SceneGame, GAME_FILE};
 
 use std::fmt;
 
@@ -57,6 +59,16 @@ pub(crate) fn number(word: &str) -> Result<f32, String> {
         .ok()
         .filter(|n| n.is_finite())
         .ok_or_else(|| format!("`{word}` is not a number"))
+}
+
+/// A number for a position or a size: one physics can work with, as a big enough one panics it.
+pub(crate) fn coordinate(word: &str) -> Result<f32, String> {
+    let value = number(word)?;
+    if value.abs() <= MAX_COORDINATE {
+        Ok(value)
+    } else {
+        Err(format!("`{word}` is too big: the most is {MAX_COORDINATE}"))
+    }
 }
 
 /// Whether a name can be used for an actor, a property or an action: letters, digits and `_`,
@@ -116,6 +128,8 @@ mod tests {
     fn numbers_and_names_are_checked() {
         assert_eq!(number("2.5"), Ok(2.5));
         assert!(number("inf").is_err() && number("x").is_err() && number("NaN").is_err());
+        assert_eq!(coordinate("-1000000"), Ok(-1.0e6));
+        assert!(coordinate("1000001").is_err() && coordinate("-1e30").is_err());
         assert!(is_name("open_seconds") && is_name("_a1"));
         assert!(!is_name("") && !is_name("1a") && !is_name("a-b") && !is_name("a.b"));
     }

@@ -645,5 +645,7 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
         }),
         sea: None,
         gameplay: Vec::new(),
+        collide: Vec::new(),
+        ground: None,
     }
 }

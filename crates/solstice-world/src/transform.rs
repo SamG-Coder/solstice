@@ -95,6 +95,11 @@ impl GlobalTransform {
     }
 }
 
+/// How a walking character wants to move, in metres a second across the ground. Set by its script
+/// each step, carried out by physics, and held until set again.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Walk(pub Vec3);
+
 /// Marks an entity id with no transform in [`Propagation::slots`].
 const NONE: u32 = u32::MAX;
 

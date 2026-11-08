@@ -11,6 +11,8 @@
 //! model rocks/rock.gltf 9 ground 0 45 2     # standing on the terrain at this spot
 //! model rocks/rock.gltf 9 ground:0.2 0 45 2 # with its lowest 20% buried, as rocks are
 //! part kit/kit.gltf wall_01 0 0 0 90 1  # one named piece of a model, by its own origin
+//! model plants/fern.gltf 3 ground 1 0 1 collide=none  # how it collides: none, hull or coarse
+//! blocker 40 2 0 1 4 90 0              # an invisible wall: x y z, full size, yaw_degrees
 //! actor cove/gate.actor 20.7 0 0 90 locked=true  # an actor, with its properties' values
 //! input cove/play.input                # the input actions, if not the built-in ones
 //! ```
@@ -23,9 +25,9 @@
 use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
-use solstice_asset::{GameFile, Instance, Light, Material, SceneAsset, Sea};
+use solstice_asset::{Collide, GameFile, Heightfield, Instance, Light, Material, SceneAsset, Sea};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
-use solstice_game::{resolve, ActorFile, ActorLine, InputMap, SceneGame, GAME_FILE};
+use solstice_game::{resolve, ActorFile, ActorLine, Blocker, InputMap, SceneGame, GAME_FILE};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
@@ -62,6 +64,7 @@ enum Command {
         seat: Option<f32>,
         yaw_degrees: f32,
         scale: f32,
+        collide: Collide,
     },
     Part {
         path: String,
@@ -69,8 +72,10 @@ enum Command {
         position: Vec3,
         yaw_degrees: f32,
         scale: f32,
+        collide: Collide,
     },
     Actor(ActorLine),
+    Blocker(Blocker),
     Input(String),
 }
 
@@ -80,7 +85,25 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let Some(keyword) = words.next() else {
         return Ok(None);
     };
-    let values: Vec<&str> = words.collect();
+    let mut values: Vec<&str> = words.collect();
+    // On a line that places geometry, a last word may say how it collides.
+    let mut collide = Collide::Auto;
+    if matches!(keyword, "model" | "part") {
+        if let Some(word) = values.last().and_then(|w| w.strip_prefix("collide=")) {
+            collide = match word {
+                "none" => Collide::None,
+                "hull" => Collide::Hull,
+                "coarse" => Collide::Coarse,
+                other => {
+                    return Err(format!(
+                        "'collide={other}': a line collides as none, hull or coarse"
+                    ))
+                }
+            };
+            values.pop();
+        }
+    }
+    let values = values;
     let number = |index: usize| -> Result<f32, String> {
         let text = values
             .get(index)
@@ -125,6 +148,7 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 position: Vec3::new(number(2)?, number(3)?, number(4)?),
                 yaw_degrees: number(5)?,
                 scale: number(6)?,
+                collide,
             }
         }
         "terrain" => {
@@ -162,9 +186,11 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 seat,
                 yaw_degrees: number(4)?,
                 scale: number(5)?,
+                collide,
             }
         }
         "actor" => Command::Actor(ActorLine::parse(&values)?),
+        "blocker" => Command::Blocker(Blocker::parse(&values)?),
         "input" => {
             expect(1)?;
             Command::Input(values[0].to_string())
@@ -273,6 +299,32 @@ fn terrain_height(x: f32, z: f32, amplitude: f32, shore_x: f32) -> f32 {
     broad + ripples - cove.max(island) * SEABED_DEPTH
 }
 
+/// The most samples a side the ground's collision has, and about how far apart, in metres.
+const GROUND_SAMPLES: u32 = 1025;
+const GROUND_SPACING: f32 = 1.0;
+
+/// The terrain as a grid of heights, for walking on: a metre or so apart.
+fn ground_heights(size: f32, amplitude: f32, shore_x: f32) -> Heightfield {
+    let cells = ((size / GROUND_SPACING).ceil() as u32).clamp(1, GROUND_SAMPLES - 1);
+    let spacing = size / cells as f32;
+    let origin = -size * 0.5;
+    let mut heights = Vec::with_capacity(((cells + 1) * (cells + 1)) as usize);
+    for row in 0..=cells {
+        let z = origin + row as f32 * spacing;
+        for column in 0..=cells {
+            let x = origin + column as f32 * spacing;
+            heights.push(terrain_height(x, z, amplitude, shore_x));
+        }
+    }
+    Heightfield {
+        columns: cells + 1,
+        rows: cells + 1,
+        origin: [origin, origin],
+        spacing: [spacing, spacing],
+        heights,
+    }
+}
+
 /// Adds the terrain as one mesh, with its own ground material and texture.
 fn add_terrain(scene: &mut SceneAsset, size: f32, cells: u32, height: f32, shore_x: f32) -> i32 {
     let mesh = meshes::terrain(size, cells, |x, z| terrain_height(x, z, height, shore_x));
@@ -362,14 +414,34 @@ fn placements_of<'a>(
     models.entry(full).or_default()
 }
 
+/// A placement that waits for its height: position, yaw, scale, buried share, how it collides.
+type Seated = (Vec3, f32, f32, f32, Collide);
+
+/// An actor's mesh: the model's path relative to the scene, its scale, and which named part.
+type ActorMesh = (String, f32, Option<String>);
+
+/// Which placement of a model something became.
+#[derive(Clone, Copy)]
+enum Placed {
+    Whole(usize),
+    Part(usize),
+}
+
+/// How each placement of a model collides, in the order placed.
+#[derive(Default)]
+struct PlacedCollision {
+    whole: Vec<Collide>,
+    parts: Vec<Collide>,
+}
+
 /// A scene's gameplay, gathered while its file is read.
 #[derive(Default)]
 struct Gameplay {
     game: SceneGame,
     /// Each actor file, script and input file, by name, once each.
     files: Vec<GameFile>,
-    /// For each actor with a mesh: which actor, which model, and which of its whole placements.
-    meshes: Vec<(usize, PathBuf, usize)>,
+    /// For each actor with a mesh: which actor, which model, and which of its placements.
+    meshes: Vec<(usize, PathBuf, Placed)>,
     /// Whether an actor has a camera already: only one can.
     has_player: bool,
 }
@@ -391,12 +463,8 @@ impl Gameplay {
     }
 
     /// Adds an actor, reading and checking its file, its settings and its script. Returns its
-    /// mesh, if it has one: the model's path relative to the scene, and its scale.
-    fn add_actor(
-        &mut self,
-        base: &Path,
-        mut line: ActorLine,
-    ) -> Result<Option<(String, f32)>, String> {
+    /// mesh, if it has one: the model's path relative to the scene, its scale, and which part.
+    fn add_actor(&mut self, base: &Path, mut line: ActorLine) -> Result<Option<ActorMesh>, String> {
         if line.instances.is_some() {
             return Err("`instances` is worked out by the bake, not written by hand".to_owned());
         }
@@ -433,10 +501,13 @@ impl Gameplay {
                 .load(&name, &source)
                 .map_err(|e| e.message)?;
         }
-        let mesh = actor
-            .mesh
-            .as_ref()
-            .map(|mesh| (resolve(&line.file, &mesh.path), mesh.scale));
+        let mesh = actor.mesh.as_ref().map(|mesh| {
+            (
+                resolve(&line.file, &mesh.path),
+                mesh.scale,
+                mesh.part.clone(),
+            )
+        });
         self.game.actors.push(line);
         Ok(mesh)
     }
@@ -453,7 +524,8 @@ impl Gameplay {
 
     /// The scene's gameplay files, with the list of its actors first, or none if it has none.
     fn finish(mut self) -> Vec<GameFile> {
-        if self.game.actors.is_empty() && self.game.input.is_none() {
+        if self.game.actors.is_empty() && self.game.blockers.is_empty() && self.game.input.is_none()
+        {
             return Vec::new();
         }
         self.files.insert(
@@ -482,8 +554,9 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     let mut order: Vec<PathBuf> = Vec::new();
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
     // Placed once the model has been imported, since its shape decides the height.
-    let mut seated: HashMap<PathBuf, Vec<(Vec3, f32, f32, f32)>> = HashMap::new();
+    let mut seated: HashMap<PathBuf, Vec<Seated>> = HashMap::new();
     let mut gameplay = Gameplay::default();
+    let mut collides: HashMap<PathBuf, PlacedCollision> = HashMap::new();
     for (number, line) in text.lines().enumerate() {
         let at = |e: String| format!("{}:{}: {e}", path.display(), number + 1);
         let command = parse_line(line).map_err(at)?;
@@ -521,20 +594,23 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 seat,
                 yaw_degrees,
                 scale,
+                collide,
             }) => {
                 let full = base.join(&model);
                 let placements = placements_of(&mut order, &mut models, base, model);
                 match seat {
-                    Some(buried) => {
-                        seated
-                            .entry(full)
-                            .or_default()
-                            .push((position, yaw_degrees, scale, buried))
-                    }
+                    Some(buried) => seated.entry(full).or_default().push((
+                        position,
+                        yaw_degrees,
+                        scale,
+                        buried,
+                        collide,
+                    )),
                     None => {
                         placements
                             .whole
-                            .push(placement_transform(position, yaw_degrees, scale))
+                            .push(placement_transform(position, yaw_degrees, scale));
+                        collides.entry(full).or_default().whole.push(collide);
                     }
                 }
             }
@@ -544,22 +620,40 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 position,
                 yaw_degrees,
                 scale,
+                collide,
             }) => {
                 let transform = placement_transform(position, yaw_degrees, scale);
+                let full = base.join(&model);
                 placements_of(&mut order, &mut models, base, model)
                     .parts
                     .push((name, transform));
+                collides.entry(full).or_default().parts.push(collide);
             }
             Some(Command::Actor(actor)) => {
                 let (position, yaw) = (actor.position, actor.yaw_degrees);
                 let index = gameplay.game.actors.len();
-                if let Some((model, scale)) = gameplay.add_actor(base, actor).map_err(at)? {
+                if let Some((model, scale, part)) = gameplay.add_actor(base, actor).map_err(at)? {
                     let full = base.join(&model);
-                    let whole = &mut placements_of(&mut order, &mut models, base, model).whole;
-                    gameplay.meshes.push((index, full, whole.len()));
-                    whole.push(placement_transform(position, yaw, scale));
+                    let placements = placements_of(&mut order, &mut models, base, model);
+                    let transform = placement_transform(position, yaw, scale);
+                    // An actor bumps into things with its own collider, not its mesh.
+                    let collide = collides.entry(full.clone()).or_default();
+                    let placed = match part {
+                        Some(name) => {
+                            placements.parts.push((name, transform));
+                            collide.parts.push(Collide::None);
+                            Placed::Part(placements.parts.len() - 1)
+                        }
+                        None => {
+                            placements.whole.push(transform);
+                            collide.whole.push(Collide::None);
+                            Placed::Whole(placements.whole.len() - 1)
+                        }
+                    };
+                    gameplay.meshes.push((index, full, placed));
                 }
             }
+            Some(Command::Blocker(blocker)) => gameplay.game.blockers.push(blocker),
             Some(Command::Input(input)) => gameplay.set_input(base, &input).map_err(at)?,
         }
     }
@@ -589,7 +683,7 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             let ground = |x: f32, z: f32| terrain_height(x, z, amplitude, shore_x).max(water_level);
             let points = model_points(&imported.scene);
             let placements = models.get_mut(model).expect("registered while parsing");
-            for &(position, yaw_degrees, scale, buried) in list {
+            for &(position, yaw_degrees, scale, buried, collide) in list {
                 let y = seat_height(&points, position, yaw_degrees, scale, buried, ground);
                 println!("  at {:.0} {:.0}: height {y:.2}", position.x, position.z);
                 placements.whole.push(placement_transform(
@@ -597,28 +691,45 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                     yaw_degrees,
                     scale,
                 ));
+                collides
+                    .entry(model.clone())
+                    .or_default()
+                    .whole
+                    .push(collide);
             }
         }
-        // Each whole placement adds the model's instances, in order, so an actor's are found by
-        // which placement it was.
-        let (first, per_placement) = (
-            scene.instances.len() as u32,
-            imported.scene.instances.len() as u32,
-        );
-        for (actor, _, placement) in gameplay.meshes.iter().filter(|(_, m, _)| m == model) {
-            let start = first + *placement as u32 * per_placement;
-            gameplay.game.actors[*actor].instances = Some(start..start + per_placement);
-        }
-        append_model(&mut scene, imported, &models[model])
+        let ranges = append_model(&mut scene, imported, &models[model])
             .map_err(|e| format!("{}: {e}", model.display()))?;
+        let whole_count = models[model].whole.len();
+        for (actor, _, placed) in gameplay.meshes.iter().filter(|(_, m, _)| m == model) {
+            let index = match placed {
+                Placed::Whole(i) => *i,
+                Placed::Part(i) => whole_count + i,
+            };
+            gameplay.game.actors[*actor].instances = Some(ranges[index].clone());
+        }
+        let collide = collides.remove(model).unwrap_or_default();
+        scene.collide.resize(scene.instances.len(), Collide::Auto);
+        for (range, how) in ranges
+            .iter()
+            .zip(collide.whole.iter().chain(&collide.parts))
+        {
+            for instance in range.clone() {
+                scene.collide[instance as usize] = *how;
+            }
+        }
     }
     scene.gameplay = gameplay.finish();
 
+    scene.collide.resize(scene.instances.len(), Collide::Auto);
     if let Some((size, cells, height, shore_x)) = terrain {
         let ground_layer = add_terrain(&mut scene, size, cells, height, shore_x);
         if let Some((level, color)) = water {
             add_water(&mut scene, level, color, ground_layer);
         }
+        // The ground collides as a grid of heights, and water not at all.
+        scene.collide.resize(scene.instances.len(), Collide::None);
+        scene.ground = Some(ground_heights(size, height, shore_x));
     }
     Ok((scene, warnings))
 }
@@ -644,6 +755,7 @@ mod tests {
                 seat: None,
                 yaw_degrees: 90.0,
                 scale: 0.5,
+                collide: Collide::Auto,
             })
         );
     }
@@ -704,6 +816,7 @@ mod tests {
                 position: Vec3::new(1.0, 2.0, 3.0),
                 yaw_degrees: 90.0,
                 scale: 2.0,
+                collide: Collide::Auto,
             })
         );
         assert_eq!(
@@ -807,7 +920,7 @@ mod tests {
             "asset": {"version": "2.0"},
             "scene": 0,
             "scenes": [{"nodes": [0, 1]}],
-            "nodes": [{"mesh": 0}, {"mesh": 0, "translation": [0, 2, 0]}],
+            "nodes": [{"name": "kit_door", "mesh": 0}, {"name": "kit_post", "mesh": 0, "translation": [0, 2, 0]}],
             "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
             "buffers": [{"uri": "tri.bin", "byteLength": 36}],
             "bufferViews": [{"buffer": 0, "byteLength": 36}],
@@ -858,9 +971,11 @@ mod tests {
 
         // And it plays: drawn first where it was baked.
         let instances = scene.instances.clone();
-        let mut play = solstice_game::Play::load(&scene.gameplay, |id| {
-            instances.get(id as usize).map(|i| i.transform)
-        })
+        let mut play = solstice_game::Play::load(
+            &scene.gameplay,
+            |id| instances.get(id as usize).map(|i| i.transform),
+            None,
+        )
         .unwrap();
         let mut placed = Vec::new();
         // One step in, before the script has turned it far.
@@ -876,6 +991,126 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn a_line_says_how_it_collides() {
+        let collide = |line: &str| match parse_line(line).unwrap().unwrap() {
+            Command::Model { collide, .. } | Command::Part { collide, .. } => collide,
+            _ => panic!("{line}"),
+        };
+        assert_eq!(collide("model a.gltf 1 2 3 0 1"), Collide::Auto);
+        assert_eq!(
+            collide("model a.gltf 1 2 3 0 1 collide=none"),
+            Collide::None
+        );
+        assert_eq!(
+            collide("part a.gltf b 1 2 3 0 1 collide=hull"),
+            Collide::Hull
+        );
+        assert_eq!(
+            collide("part a.gltf b 1 2 3 0 1 collide=coarse"),
+            Collide::Coarse
+        );
+        let error = parse_line("model a.gltf 1 2 3 0 1 collide=soft").unwrap_err();
+        assert!(error.contains("none, hull or coarse"), "{error}");
+        assert_eq!(
+            parse_line("blocker 1 2 3 4 5 6 90").unwrap(),
+            Some(Command::Blocker(Blocker {
+                centre: Vec3::new(1.0, 2.0, 3.0),
+                size: Vec3::new(4.0, 5.0, 6.0),
+                yaw_degrees: 90.0,
+            }))
+        );
+    }
+
+    #[test]
+    fn collision_is_baked_for_what_can_be_walked_on() {
+        let (gltf, bin) = two_triangles();
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"terrain 20 8 0.2 100\n\
+                  model tri.gltf 0 0 0 0 1\n\
+                  model tri.gltf 5 0 0 0 1 collide=none\n\
+                  part tri.gltf door 9 0 0 0 1 collide=hull\n\
+                  actor door.actor 2 0 0 0\n\
+                  actor post.actor 3 0 0 0\n\
+                  blocker 7 1 0 2 2 2 0\n",
+            ),
+            ("tri.gltf", &gltf),
+            ("tri.bin", &bin),
+            (
+                "door.actor",
+                b"name door\nmesh tri.gltf 1 part=door\ncollider box 1 2 0.1\n",
+            ),
+            ("post.actor", b"name post\nmesh tri.gltf 2\n"),
+        ]);
+        let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
+        // Whole placements first, each two instances; parts after, one each; terrain last.
+        let collide = &scene.collide;
+        assert_eq!(collide.len(), scene.instances.len());
+        assert_eq!(
+            &collide[0..2],
+            [Collide::Auto, Collide::Auto],
+            "the first model"
+        );
+        assert_eq!(
+            &collide[2..4],
+            [Collide::None, Collide::None],
+            "collide=none"
+        );
+        assert_eq!(
+            &collide[4..6],
+            [Collide::None, Collide::None],
+            "the post actor"
+        );
+        assert_eq!(collide[6], Collide::Hull, "the part");
+        assert_eq!(
+            collide[7],
+            Collide::None,
+            "the door actor: its collider does the work"
+        );
+        assert_eq!(
+            *collide.last().unwrap(),
+            Collide::None,
+            "the terrain: a heightfield instead"
+        );
+
+        let game = SceneGame::parse(&scene.gameplay[0].text).unwrap();
+        assert_eq!(game.actors[0].instances, Some(7..8), "a part's instance");
+        assert_eq!(game.actors[1].instances, Some(4..6), "the post's two");
+        assert_eq!(game.blockers.len(), 1);
+
+        let ground = scene.ground.as_ref().unwrap();
+        assert_eq!((ground.columns, ground.rows), (21, 21));
+        assert_eq!(ground.origin, [-10.0, -10.0]);
+        assert_eq!(ground.spacing, [1.0, 1.0]);
+        let (x, z) = (3.0, -2.0);
+        let row = 8;
+        let column = 13;
+        let expected = terrain_height(x, z, 0.2, 100.0);
+        assert_eq!(ground.heights[row * 21 + column], expected);
+
+        let collision = solstice_builder::collision::build_collision(&scene).unwrap();
+        assert_eq!(collision.heightfield.as_ref(), Some(ground));
+        assert_eq!(collision.instance_shapes[2], solstice_asset::NO_SHAPE);
+        assert_ne!(collision.instance_shapes[0], solstice_asset::NO_SHAPE);
+    }
+
+    #[test]
+    fn a_blocker_alone_is_gameplay() {
+        let (gltf, bin) = two_triangles();
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"model tri.gltf 0 0 0 0 1\nblocker 0 0 0 1 1 1 0\n",
+            ),
+            ("tri.gltf", &gltf),
+            ("tri.bin", &bin),
+        ]);
+        let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
+        assert_eq!(scene.gameplay.len(), 1);
     }
 
     #[test]

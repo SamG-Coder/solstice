@@ -108,6 +108,8 @@ pub struct PagedScene {
     pub sea: Option<Sea>,
     /// The scene's gameplay files, if it has any.
     pub gameplay: Vec<GameFile>,
+    /// Where its collision shapes are, if it has any: only those playing fetch them.
+    pub collision: Option<crate::collision::CollisionIndex>,
     /// Longest root-to-leaf path over all meshes, which sets the traversal dispatch count.
     pub hierarchy_depth: u32,
     /// Triangles drawn if every instance used its finest LOD.
@@ -185,6 +187,8 @@ pub struct LoadedScene {
     pub pages: Vec<Vec<u8>>,
     /// For each layer, the levels above the base, largest first.
     pub upper_textures: Vec<TextureLayer>,
+    /// The scene's collision, whole, if it has any.
+    pub collision: Option<crate::collision::Collision>,
 }
 
 impl LoadedScene {

@@ -18,6 +18,7 @@
 //! so no seam survives forever.
 
 mod bounds;
+pub mod collision;
 mod dag;
 mod group;
 mod hierarchy;

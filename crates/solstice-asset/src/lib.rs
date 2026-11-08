@@ -5,11 +5,16 @@
 //! * [`paged`] divides a scene into what stays resident and what loads on demand.
 //! * [`file`] stores a paged scene so that its pages can be read one at a time.
 
+pub mod collision;
 pub mod file;
 pub mod gpu;
 pub mod paged;
 pub mod scene;
 
+pub use collision::{
+    Collide, Collision, CollisionIndex, CollisionShape, Heightfield, MAX_COORDINATE,
+    MAX_HULL_POINTS, NO_SHAPE,
+};
 pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedVertex};
 pub use paged::{LoadedScene, PagedScene};
 pub use scene::{

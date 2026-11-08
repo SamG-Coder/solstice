@@ -2,7 +2,7 @@
 
 use glam::Vec3;
 use solstice_script::{api_reference, Name, Script, ScriptEvent, ScriptHost, ScriptValue};
-use solstice_world::{Entity, Game, Input, Schedule, Transform, World, STEP_SECONDS};
+use solstice_world::{Entity, Game, Input, Schedule, Transform, Walk, World, STEP_SECONDS};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -816,4 +816,96 @@ def on_tick(self, dt):
         var(&game, actor, "results"),
         Some(ScriptValue::List(expected.to_vec()))
     );
+}
+
+#[test]
+fn a_script_says_how_its_actor_walks() {
+    let source = r#"
+def on_tick(self, dt):
+    self.walk = vec3(1, 0, 2) * self.pace
+    self.vars.seen = self.walk
+"#;
+    let (mut game, host) = game_with(&[("walker", source)]);
+    let actor = game
+        .world
+        .spawn((Script::new("walker").with_property("pace", 1.5),));
+    steps(&mut game, 1);
+    assert!(host.borrow_mut().take_errors().is_empty());
+    let walk = |game: &Game| game.world.entities.get::<&Walk>(actor).unwrap().0;
+    assert_eq!(walk(&game), Vec3::new(1.5, 0.0, 3.0));
+    assert_eq!(
+        var(&game, actor, "seen"),
+        Some(ScriptValue::Vec3(Vec3::new(1.5, 0.0, 3.0)))
+    );
+    host.borrow_mut()
+        .load(
+            "walker",
+            "def on_tick(self, dt):\n    self.walk = vec3(0, 0, -1)\n",
+        )
+        .unwrap();
+    steps(&mut game, 1);
+    assert_eq!(
+        walk(&game),
+        Vec3::new(0.0, 0.0, -1.0),
+        "set again, not added again"
+    );
+}
+
+#[test]
+fn a_walk_must_be_a_finite_vector() {
+    let (mut game, host) = game_with(&[
+        ("word", "def on_tick(self, dt):\n    self.walk = 3\n"),
+        (
+            "wild",
+            "def on_tick(self, dt):\n    self.walk = vec3(1e39, 0, 0)\n",
+        ),
+    ]);
+    let word = game.world.spawn((Script::new("word"),));
+    let wild = game.world.spawn((Script::new("wild"),));
+    steps(&mut game, 1);
+    let errors = host.borrow_mut().take_errors();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("self.walk must be a vec3")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.message.contains("self.walk must be finite")),
+        "{errors:?}"
+    );
+    for actor in [word, wild] {
+        assert!(game.world.entities.get::<&Walk>(actor).is_err());
+    }
+}
+
+#[test]
+fn the_engines_touch_events_cant_be_sent_either() {
+    let source = "def on_tick(self, dt):\n    send(self.entity, \"enter\", self.entity)\n";
+    let (mut game, host) = game_with(&[("cheat", source)]);
+    game.world.spawn((Script::new("cheat"),));
+    steps(&mut game, 1);
+    let errors = host.borrow_mut().take_errors();
+    assert!(errors[0].message.contains("engine's own"), "{errors:?}");
+}
+
+#[test]
+fn self_walk_reads_how_the_actor_is_walking() {
+    let source = r#"
+def on_tick(self, dt):
+    self.vars.was = self.walk
+    self.walk = self.walk * 0.5
+"#;
+    let (mut game, _) = game_with(&[("slowing", source)]);
+    let actor = game
+        .world
+        .spawn((Script::new("slowing"), Walk(Vec3::new(4.0, 0.0, 0.0))));
+    steps(&mut game, 2);
+    assert_eq!(
+        var(&game, actor, "was"),
+        Some(ScriptValue::Vec3(Vec3::new(2.0, 0.0, 0.0)))
+    );
+    assert_eq!(game.world.entities.get::<&Walk>(actor).unwrap().0, Vec3::X);
 }

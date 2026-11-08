@@ -7,7 +7,7 @@
 //! each actor file and script, the input actions, and [`GAME_FILE`], which lists the actors in
 //! the same form, with the renderer instances the bake placed for each actor's mesh.
 
-use crate::{is_name, lines, number, FileError};
+use crate::{coordinate, is_name, lines, number, FileError};
 use glam::Vec3;
 use std::fmt::Write;
 use std::ops::Range;
@@ -36,7 +36,11 @@ impl ActorLine {
         }
         let mut actor = ActorLine {
             file: words[0].to_owned(),
-            position: Vec3::new(number(words[1])?, number(words[2])?, number(words[3])?),
+            position: Vec3::new(
+                coordinate(words[1])?,
+                coordinate(words[2])?,
+                coordinate(words[3])?,
+            ),
             yaw_degrees: number(words[4])?,
             settings: Vec::new(),
             instances: None,
@@ -84,10 +88,47 @@ impl ActorLine {
     }
 }
 
-/// A baked scene's [`GAME_FILE`]: its actors, and its input actions.
+/// An invisible wall: `blocker X Y Z SX SY SZ YAW`, a box by its centre, its full size in metres,
+/// and its yaw in degrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blocker {
+    pub centre: Vec3,
+    pub size: Vec3,
+    pub yaw_degrees: f32,
+}
+
+impl Blocker {
+    /// Reads the words of a `blocker` line, after `blocker` itself.
+    pub fn parse(words: &[&str]) -> Result<Self, String> {
+        let [x, y, z, sx, sy, sz, yaw] = words else {
+            return Err("expected `blocker X Y Z SX SY SZ YAW`".to_owned());
+        };
+        let size = Vec3::new(coordinate(sx)?, coordinate(sy)?, coordinate(sz)?);
+        if size.min_element() <= 0.0 {
+            return Err(format!("a blocker's size must be above 0, not {size}"));
+        }
+        Ok(Self {
+            centre: Vec3::new(coordinate(x)?, coordinate(y)?, coordinate(z)?),
+            size,
+            yaw_degrees: number(yaw)?,
+        })
+    }
+
+    /// The line, `blocker` and all.
+    pub fn to_text(&self) -> String {
+        let (c, s) = (self.centre, self.size);
+        format!(
+            "blocker {} {} {} {} {} {} {}",
+            c.x, c.y, c.z, s.x, s.y, s.z, self.yaw_degrees
+        )
+    }
+}
+
+/// A baked scene's [`GAME_FILE`]: its actors, its invisible walls, and its input actions.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SceneGame {
     pub actors: Vec<ActorLine>,
+    pub blockers: Vec<Blocker>,
     /// The `.input` file, relative to the scene's text file, or the built-in actions if none.
     pub input: Option<String>,
 }
@@ -98,6 +139,9 @@ impl SceneGame {
         for (line, words) in lines(text) {
             let error = |message: String| FileError { line, message };
             match words[0] {
+                "blocker" => game
+                    .blockers
+                    .push(Blocker::parse(&words[1..]).map_err(error)?),
                 "actor" => game
                     .actors
                     .push(ActorLine::parse(&words[1..]).map_err(error)?),
@@ -121,6 +165,10 @@ impl SceneGame {
         }
         for actor in &self.actors {
             text.push_str(&actor.to_text());
+            text.push('\n');
+        }
+        for blocker in &self.blockers {
+            text.push_str(&blocker.to_text());
             text.push('\n');
         }
         text
@@ -179,6 +227,53 @@ mod tests {
         for (line, part) in cases {
             let error = ActorLine::parse(&words(line)).unwrap_err();
             assert!(error.contains(part), "{line:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn numbers_too_big_for_physics_are_mistakes() {
+        for words in [
+            ["1e30", "0", "0", "1", "1", "1", "0"],
+            ["0", "1e30", "0", "1", "1", "1", "0"],
+            ["0", "0", "1e30", "1", "1", "1", "0"],
+            ["0", "0", "0", "1e30", "1", "1", "0"],
+            ["0", "0", "0", "1", "1e30", "1", "0"],
+            ["0", "0", "0", "1", "1", "1e30", "0"],
+        ] {
+            assert!(Blocker::parse(&words).is_err(), "{words:?}");
+        }
+        assert!(Blocker::parse(&["1e6", "0", "0", "1e6", "1", "1", "0"]).is_ok());
+        for words in [
+            ["a.actor", "1e30", "0", "0", "0"],
+            ["a.actor", "0", "1e30", "0", "0"],
+            ["a.actor", "0", "0", "1e30", "0"],
+        ] {
+            assert!(ActorLine::parse(&words).is_err(), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn blockers_read_back_what_they_wrote() {
+        let text = "actor a 0 0 0 0\nblocker 1 2 3 4 5 6.5 45\n";
+        let game = SceneGame::parse(text).unwrap();
+        assert_eq!(
+            game.blockers,
+            vec![Blocker {
+                centre: Vec3::new(1.0, 2.0, 3.0),
+                size: Vec3::new(4.0, 5.0, 6.5),
+                yaw_degrees: 45.0,
+            }]
+        );
+        assert_eq!(game.to_text(), text);
+        for (line, part) in [
+            ("blocker 1 2 3", "expected `blocker X Y Z"),
+            ("blocker 1 2 3 4 5 x 0", "`x` is not a number"),
+            ("blocker 1 2 3 4 0 6 0", "must be above 0"),
+            ("blocker 1 2 3 4 5 6 0 7", "expected `blocker X Y Z"),
+        ] {
+            let error = SceneGame::parse(line).unwrap_err();
+            assert_eq!(error.line, 1);
+            assert!(error.message.contains(part), "{line}: {error}");
         }
     }
 

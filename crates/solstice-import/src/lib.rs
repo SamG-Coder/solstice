@@ -207,6 +207,8 @@ pub fn import_gltf(
             viewpoint: Some(frame_bounds(&world_bounds)),
             sea: None,
             gameplay: Vec::new(),
+            collide: Vec::new(),
+            ground: None,
         },
         parts,
         warnings,
@@ -226,12 +228,13 @@ pub struct ModelPlacements {
 /// `placements` asks. A part's name may leave off a prefix: `wall_01` finds `kit_wall_01`.
 ///
 /// Textures in `target` and `model` must be the same size, since they share one array.
-/// Returns an error naming any part the model does not have.
+/// Returns the instances each placement became, the whole placements then the parts, or an error
+/// naming any part the model does not have.
 pub fn append_model(
     target: &mut SceneAsset,
     model: Imported,
     placements: &ModelPlacements,
-) -> Result<(), String> {
+) -> Result<Vec<std::ops::Range<u32>>, String> {
     let Imported {
         scene: source,
         parts,
@@ -264,12 +267,15 @@ pub fn append_model(
         material: instance.material + material_base,
         transform,
     };
+    let mut ranges = Vec::with_capacity(placements.whole.len() + placements.parts.len());
     for placement in &placements.whole {
+        let first = target.instances.len() as u32;
         for instance in &source.instances {
             target
                 .instances
                 .push(rebase(instance, *placement * instance.transform));
         }
+        ranges.push(first..target.instances.len() as u32);
     }
     for (name, placement) in &placements.parts {
         let suffix = format!("_{name}");
@@ -277,13 +283,15 @@ pub fn append_model(
             .iter()
             .find(|(candidate, _)| *candidate == name || candidate.ends_with(&suffix))
             .ok_or_else(|| format!("no part named '{name}'"))?;
+        let first = target.instances.len() as u32;
         for instance in found.1 {
             target
                 .instances
                 .push(rebase(instance, *placement * instance.transform));
         }
+        ranges.push(first..target.instances.len() as u32);
     }
-    Ok(())
+    Ok(ranges)
 }
 
 fn document_warnings(document: &Document) -> Vec<String> {
