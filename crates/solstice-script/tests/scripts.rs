@@ -890,3 +890,22 @@ fn the_engines_touch_events_cant_be_sent_either() {
     let errors = host.borrow_mut().take_errors();
     assert!(errors[0].message.contains("engine's own"), "{errors:?}");
 }
+
+#[test]
+fn self_walk_reads_how_the_actor_is_walking() {
+    let source = r#"
+def on_tick(self, dt):
+    self.vars.was = self.walk
+    self.walk = self.walk * 0.5
+"#;
+    let (mut game, _) = game_with(&[("slowing", source)]);
+    let actor = game
+        .world
+        .spawn((Script::new("slowing"), Walk(Vec3::new(4.0, 0.0, 0.0))));
+    steps(&mut game, 2);
+    assert_eq!(
+        var(&game, actor, "was"),
+        Some(ScriptValue::Vec3(Vec3::new(2.0, 0.0, 0.0)))
+    );
+    assert_eq!(game.world.entities.get::<&Walk>(actor).unwrap().0, Vec3::X);
+}

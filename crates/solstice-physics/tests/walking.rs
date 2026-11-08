@@ -617,3 +617,224 @@ fn a_run_comes_out_the_same_every_time() {
     };
     assert_eq!(run(), run());
 }
+
+/// A crate dropped from 3 m above the origin, where it ended up after a few seconds.
+fn dropped_on(collision: &Collision, instance: impl Fn(u32) -> Option<Mat4>) -> f32 {
+    let (mut game, physics) = with_collision(collision, instance);
+    assert!(
+        physics.borrow().warnings.is_empty(),
+        "{:?}",
+        physics.borrow().warnings
+    );
+    let crate_ = game.world.spawn((
+        Transform::from_translation(Vec3::new(0.5, 3.0, 0.5)),
+        ActorCollider {
+            shape: Shape::Box(Vec3::splat(1.0)),
+            kind: BodyKind::Dynamic(10.0),
+            offset: Vec3::ZERO,
+        },
+    ));
+    steps(&mut game, 240);
+    place(&game, crate_).y
+}
+
+#[test]
+fn a_dynamic_body_lands_on_either_side_of_a_mesh() {
+    // The floor's triangles face up, and then face down: scanned meshes are often open behind.
+    let up = floor();
+    let mut down = floor();
+    for t in &mut down.triangles {
+        t.swap(1, 2);
+    }
+    for shape in [up, down] {
+        let collision = Collision {
+            shapes: vec![shape],
+            instance_shapes: vec![0],
+            heightfield: None,
+        };
+        let y = dropped_on(&collision, |_| Some(Mat4::IDENTITY));
+        assert!((y - 0.5).abs() < 0.05, "{y}");
+    }
+}
+
+#[test]
+fn a_mirrored_instance_still_holds_things_up() {
+    let collision = Collision {
+        shapes: vec![floor()],
+        instance_shapes: vec![0],
+        heightfield: None,
+    };
+    let mirrored = Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
+    let y = dropped_on(&collision, |_| Some(mirrored));
+    assert!((y - 0.5).abs() < 0.05, "{y}");
+}
+
+#[test]
+fn degenerate_instances_and_far_flung_shapes_are_left_out_with_a_word() {
+    let far = CollisionShape {
+        hull: false,
+        vertices: vec![[1.0e7, 0.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        triangles: vec![[0, 1, 2]],
+    };
+    let collision = Collision {
+        shapes: vec![floor(), far],
+        instance_shapes: vec![0, 0, 1],
+        heightfield: None,
+    };
+    let flat = Mat4::from_scale(Vec3::new(1.0, 0.0, 1.0));
+    let transforms = [flat, Mat4::from_cols_array(&[f32::NAN; 16]), Mat4::IDENTITY];
+    let (_, physics) = with_collision(&collision, |i| transforms.get(i as usize).copied());
+    let physics = physics.borrow();
+    assert_eq!(physics.collider_count(), 0);
+    assert_eq!(physics.warnings.len(), 3, "{:?}", physics.warnings);
+}
+
+#[test]
+fn instances_at_other_turns_share_their_shape() {
+    // The same 2.4 scale at two yaws comes out of the matrices differing in the last bits.
+    let scale = Vec3::splat(2.4);
+    let at = |yaw: f32| {
+        Mat4::from_scale_rotation_translation(scale, Quat::from_rotation_y(yaw), Vec3::ZERO)
+    };
+    let transforms = [at(0.3), at(1.7), at(2.9)];
+    let collision = Collision {
+        shapes: vec![floor()],
+        instance_shapes: vec![0, 0, 0],
+        heightfield: None,
+    };
+    let (_, physics) = with_collision(&collision, |i| transforms.get(i as usize).copied());
+    assert_eq!(physics.borrow().distinct_shapes(), 1);
+}
+
+#[test]
+fn a_dynamic_actor_moved_by_a_script_stops_where_it_is_put() {
+    let (mut game, _) = world_of(vec![floor()]);
+    let crate_ = game.world.spawn((
+        Transform::from_translation(Vec3::new(0.0, 8.0, 0.0)),
+        ActorCollider {
+            shape: Shape::Box(Vec3::splat(1.0)),
+            kind: BodyKind::Dynamic(10.0),
+            offset: Vec3::ZERO,
+        },
+    ));
+    steps(&mut game, 40);
+    let turned = Quat::from_rotation_y(1.0);
+    {
+        let mut t = game.world.entities.get::<&mut Transform>(crate_).unwrap();
+        t.translation = Vec3::new(6.0, 5.0, 0.0);
+        t.rotation = turned;
+    }
+    steps(&mut game, 1);
+    let at = place(&game, crate_);
+    // Its falling speed was forgotten: it has fallen one step's worth, not many.
+    assert!(at.y > 4.95, "{at}");
+    assert!(at.abs_diff_eq(Vec3::new(6.0, 5.0, 0.0), 0.1), "{at}");
+    let rotation = game
+        .world
+        .entities
+        .get::<&Transform>(crate_)
+        .unwrap()
+        .rotation;
+    assert!(rotation.abs_diff_eq(turned, 1.0e-3), "{rotation}");
+}
+
+fn watching_sensors() -> (Game, Seen) {
+    let physics = Rc::new(RefCell::new(Physics::new()));
+    let mut schedule = Schedule::new();
+    Physics::install(&physics, &mut schedule);
+    let seen = Seen::default();
+    let log = seen.clone();
+    schedule.add(TickGroup::PostPhysics, "seen", move |world| {
+        for o in world.read_cloned::<Overlap>() {
+            log.0.borrow_mut().push((o.sensor, o.other, o.entered));
+        }
+    });
+    (Game::new(World::new(), schedule), seen)
+}
+
+fn sensor_at(game: &mut Game, x: f32) -> Entity {
+    game.world.spawn((
+        Transform::from_translation(Vec3::new(x, 0.0, 0.0)),
+        ActorCollider {
+            shape: Shape::Box(Vec3::splat(4.0)),
+            kind: BodyKind::Sensor,
+            offset: Vec3::ZERO,
+        },
+    ))
+}
+
+#[test]
+fn a_sensor_hears_of_an_actor_removed_inside_it() {
+    let (mut game, seen) = watching_sensors();
+    let plate = sensor_at(&mut game, 0.0);
+    let guest = sensor_guest(&mut game);
+    steps(&mut game, 3);
+    assert_eq!(*seen.0.borrow(), vec![(plate, guest, true)]);
+    game.world.entities.despawn(guest).unwrap();
+    steps(&mut game, 3);
+    assert_eq!(
+        *seen.0.borrow(),
+        vec![(plate, guest, true), (plate, guest, false)]
+    );
+}
+
+/// A kinematic box, standing still, that nothing but sensors will notice.
+fn sensor_guest(game: &mut Game) -> Entity {
+    game.world.spawn((
+        Transform::default(),
+        ActorCollider {
+            shape: Shape::Box(Vec3::splat(1.0)),
+            kind: BodyKind::Kinematic,
+            offset: Vec3::ZERO,
+        },
+    ))
+}
+
+#[test]
+fn two_sensors_that_overlap_each_hear_of_the_other() {
+    let (mut game, seen) = watching_sensors();
+    let a = sensor_at(&mut game, 0.0);
+    let b = sensor_at(&mut game, 1.0);
+    steps(&mut game, 3);
+    let mut heard = seen.0.borrow().clone();
+    heard.sort();
+    let mut expected = vec![(a, b, true), (b, a, true)];
+    expected.sort();
+    assert_eq!(heard, expected);
+}
+
+#[test]
+fn removing_and_adding_actors_comes_out_the_same_every_time() {
+    let run = || {
+        let (mut game, _) = world_of(vec![floor()]);
+        let drop_at = |game: &mut Game, x: f32| {
+            game.world.spawn((
+                Transform::from_translation(Vec3::new(x, 2.0, 0.3)),
+                ActorCollider {
+                    shape: Shape::Box(Vec3::splat(0.5)),
+                    kind: BodyKind::Dynamic(1.0),
+                    offset: Vec3::ZERO,
+                },
+            ))
+        };
+        let first: Vec<Entity> = (0..20)
+            .map(|i| drop_at(&mut game, i as f32 * 0.7))
+            .collect();
+        steps(&mut game, 30);
+        for entity in first {
+            game.world.entities.despawn(entity).unwrap();
+        }
+        let second: Vec<Entity> = (0..20)
+            .map(|i| drop_at(&mut game, i as f32 * 0.31))
+            .collect();
+        steps(&mut game, 120);
+        second
+            .iter()
+            .map(|&e| place(&game, e).to_array().map(f32::to_bits))
+            .collect::<Vec<_>>()
+    };
+    let first = run();
+    for _ in 0..5 {
+        assert_eq!(run(), first);
+    }
+}

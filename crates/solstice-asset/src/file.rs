@@ -449,6 +449,10 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         }
     }
 
+    if let Some(index) = &collision {
+        index.validate(instances.len(), data_offset)?;
+    }
+
     let scene = PagedScene {
         clusters,
         nodes,
@@ -525,10 +529,10 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedScene, DecodeError> {
         None => None,
         Some(index) => {
             let mut pieces = Vec::new();
-            for (offset, stored) in index.ranges() {
+            for ((offset, stored), raw) in index.ranges().into_iter().zip(index.raw_sizes()) {
                 let start = scene.data_offset + offset;
                 let packed = stored_range(bytes, (start, start + u64::from(stored)))?;
-                pieces.push(inflate(packed)?);
+                pieces.push(inflate_limited(packed, raw)?);
             }
             Some(index.decode(&pieces)?)
         }
@@ -575,6 +579,12 @@ fn stored_range(bytes: &[u8], (start, end): (u64, u64)) -> Result<&[u8], DecodeE
 /// Unpacks a deflated block.
 pub fn inflate(packed: &[u8]) -> Result<Vec<u8>, DecodeError> {
     miniz_oxide::inflate::decompress_to_vec(packed).map_err(|_| DecodeError::Truncated)
+}
+
+/// Unpacks a deflated block that should come to `limit` bytes, refusing to unpack more.
+pub fn inflate_limited(packed: &[u8], limit: u64) -> Result<Vec<u8>, DecodeError> {
+    miniz_oxide::inflate::decompress_to_vec_with_limit(packed, limit as usize)
+        .map_err(|_| DecodeError::BadCollision)
 }
 
 /// Unpacks a page and checks that it is the size the tables say.
@@ -920,7 +930,9 @@ mod tests {
     fn collision_travels_with_its_scene_and_stays_out_of_the_manifest() {
         let mut loaded = sample_scene();
         let plain = encode(&loaded);
-        loaded.collision = Some(sample_collision());
+        let mut collision = sample_collision();
+        collision.instance_shapes = vec![1; loaded.scene.instances.len()];
+        loaded.collision = Some(collision.clone());
         let bytes = encode(&loaded);
         let decoded = decode(&bytes).unwrap();
         assert_eq!(decoded.collision, loaded.collision);
@@ -932,7 +944,7 @@ mod tests {
             let start = (decoded.scene.data_offset + offset) as usize;
             pieces.push(inflate(&bytes[start..start + stored as usize]).unwrap());
         }
-        assert_eq!(index.decode(&pieces).unwrap(), sample_collision());
+        assert_eq!(index.decode(&pieces).unwrap(), collision);
         // The data shares nothing with the rest: pages and textures stay where they were.
         assert_eq!(decode(&plain).unwrap().scene.collision, None);
         assert_eq!(decoded.pages, sample_scene().pages);
@@ -974,8 +986,16 @@ mod tests {
         pieces[0][at..].copy_from_slice(&3u32.to_le_bytes());
         bad(&index, &pieces);
         pieces[0] = saved;
-        // A vertex that isn't a number.
+        // A vertex that isn't a number, or is further out than physics can work with.
+        let saved = pieces[1].clone();
         pieces[1][0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        bad(&index, &pieces);
+        pieces[1][0..4].copy_from_slice(&1.0e7_f32.to_le_bytes());
+        bad(&index, &pieces);
+        pieces[1] = saved;
+        // A height too high.
+        let at = pieces[2].len() - 4;
+        pieces[2][at..].copy_from_slice(&1.0e7_f32.to_le_bytes());
         bad(&index, &pieces);
         // A section cut short.
         let section = encode_collision_index(&index);
@@ -986,6 +1006,44 @@ mod tests {
                 "cut at {cut}"
             );
         }
+    }
+
+    #[test]
+    fn a_collision_index_is_checked_before_anything_is_fetched() {
+        let mut data = Vec::new();
+        let index = append_collision(&sample_collision(), &mut data);
+        assert_eq!(index.validate(1, 100), Ok(()));
+        assert_eq!(index.raw_sizes(), [48, 48, 24]);
+        let bad = |index: &CollisionIndex| {
+            assert_eq!(index.validate(1, 100), Err(DecodeError::BadCollision));
+        };
+        assert_eq!(
+            index.validate(2, 100),
+            Err(DecodeError::BadCollision),
+            "one too few"
+        );
+        let mut wrong = index.clone();
+        wrong.instance_shapes = vec![9];
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.shapes[0].vertices = u32::MAX;
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.shapes[0].stored_bytes = 1_000_000;
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.shapes[0].offset = u64::MAX;
+        bad(&wrong);
+        let mut wrong = index.clone();
+        wrong.heightfield.as_mut().unwrap().columns = u32::MAX;
+        bad(&wrong);
+        // Unpacking stops at the size it should be.
+        let packed = miniz_oxide::deflate::compress_to_vec(&[7; 1000], 6);
+        assert_eq!(inflate_limited(&packed, 1000).unwrap().len(), 1000);
+        assert_eq!(
+            inflate_limited(&packed, 999),
+            Err(DecodeError::BadCollision)
+        );
     }
 
     #[test]

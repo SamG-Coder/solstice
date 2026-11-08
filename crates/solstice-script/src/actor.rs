@@ -72,6 +72,10 @@ pub struct ActorValue<'v> {
     #[allocative(skip)]
     #[trace(static)]
     walk: Cell<Option<Vec3>>,
+    /// How it is walking already, which `self.walk` reads until the handler sets it.
+    #[allocative(skip)]
+    #[trace(static)]
+    walking: Vec3,
 }
 
 impl fmt::Display for ActorValue<'_> {
@@ -99,6 +103,7 @@ impl<'v> ActorValue<'v> {
         vars: &BTreeMap<String, ScriptValue>,
         position: Vec3,
         yaw: f32,
+        walking: Vec3,
     ) -> Value<'v> {
         let to_map = |values: &BTreeMap<String, ScriptValue>| {
             values
@@ -114,6 +119,7 @@ impl<'v> ActorValue<'v> {
             position: Cell::new(position),
             yaw: Cell::new(yaw),
             walk: Cell::new(None),
+            walking,
         })
     }
 
@@ -154,7 +160,7 @@ impl<'v> StarlarkValue<'v> for ActorValue<'v> {
             "entity" => Some(heap.alloc(EntityValue(self.entity))),
             "position" => Some(heap.alloc(Vec3Value(self.position.get()))),
             "yaw" => Some(heap.alloc(StarlarkFloat(f64::from(self.yaw.get())))),
-            "walk" => Some(heap.alloc(Vec3Value(self.walk.get().unwrap_or(Vec3::ZERO)))),
+            "walk" => Some(heap.alloc(Vec3Value(self.walk.get().unwrap_or(self.walking)))),
             _ => self.properties.borrow().get(attribute).copied(),
         }
     }

@@ -42,7 +42,7 @@ fn ground(samples: u32, spacing: f32) -> Heightfield {
 }
 
 /// A world of `meshes` placements of a mesh of `triangles`, on a metre-grid heightfield.
-fn world(meshes: u32, cells: u32, doors: u32, walkers: u32) -> (Game, Vec<solstice_world::Entity>) {
+fn world(meshes: u32, cells: u32, doors: u32, walkers: u32, crates: u32) -> (Game, Vec<solstice_world::Entity>) {
     let shape = sheet(60.0, cells);
     let collision = Collision {
         shapes: vec![shape],
@@ -63,6 +63,13 @@ fn world(meshes: u32, cells: u32, doors: u32, walkers: u32) -> (Game, Vec<solsti
             ActorCollider { shape: Shape::Box(Vec3::new(1.0, 3.0, 0.2)), kind: BodyKind::Kinematic, offset: Vec3::ZERO },
         ));
     }
+    // Crates dropped in a pile, so that the end state depends on real contact solving.
+    for i in 0..crates {
+        game.world.spawn((
+            Transform::from_translation(Vec3::new((i % 6) as f32 * 0.9, 3.0 + (i / 6) as f32 * 1.2, 20.0 + (i % 5) as f32 * 0.13)),
+            ActorCollider { shape: Shape::Box(Vec3::splat(0.8)), kind: BodyKind::Dynamic(20.0), offset: Vec3::ZERO },
+        ));
+    }
     let mut heroes = Vec::new();
     for i in 0..walkers {
         heroes.push(game.world.spawn((
@@ -77,13 +84,14 @@ fn world(meshes: u32, cells: u32, doors: u32, walkers: u32) -> (Game, Vec<solsti
 pub fn bench() -> String {
     let mut out = String::new();
     let input = Input::new();
-    for (meshes, cells, doors, walkers, what) in [
-        (40, 64, 8, 1, "cove-sized scene (330k triangles), the player, 8 doors"),
-        (40, 64, 8, 8, "the same, 8 walkers"),
-        (100, 100, 8, 1, "a large scene (2M triangles), the player, 8 doors"),
+    for (meshes, cells, doors, walkers, crates, what) in [
+        (40, 64, 8, 1, 0, "cove-sized scene (330k triangles), the player, 8 doors"),
+        (40, 64, 8, 8, 0, "the same, 8 walkers"),
+        (40, 64, 8, 1, 30, "the same, the player, 30 crates falling in a pile"),
+        (100, 100, 8, 1, 0, "a large scene (2M triangles), the player, 8 doors"),
     ] {
         let t = now_ms();
-        let (mut game, _) = world(meshes, cells, doors, walkers);
+        let (mut game, _) = world(meshes, cells, doors, walkers, crates);
         let build = now_ms() - t;
         for _ in 0..30 { game.step(&input); }
         let steps = 120;

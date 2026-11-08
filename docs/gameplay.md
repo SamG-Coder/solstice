@@ -531,8 +531,8 @@ rest. At 60 fps a frame runs one fixed step:
     themselves stay out of it: they are fetched only when *Play* is pressed, and a scene that is
     only looked at never downloads them.
 - **Moving actors** use primitives or convex hulls, from their `.actor` files.
-- **The character controller** is Rapier's kinematic one: steps, slopes, snapping to the ground,
-  pushing bodies.
+- **The character controller** is Rapier's kinematic one: steps, slopes and snapping to the
+  ground. It doesn't push dynamic bodies yet, and is stopped by them.
 - **Determinism.** Rapier's `enhanced-determinism` feature is measured in step 5, and kept if
   its cost fits the budget, so that tests and replays give the same result natively and on the
   web.
@@ -545,7 +545,13 @@ rest. At 60 fps a frame runs one fixed step:
   optional `COLL` section. *Play* fetches them, so a scene that is only looked at never does.
   - A mesh is a cut of its cluster DAG at 5 cm of error, in world space: an instance scaled up
     gets a finer cut in its own space. A mesh with a bounding radius under 0.75 m gets a convex
-    hull of the same cut, of at most about 512 points.
+    hull of the same cut, of at most 512 points, keeping those furthest out in every direction.
+  - Each is built once for each size it is used at, and shared by those instances. They are
+    two-sided, as scanned meshes are often open behind, and turned the right way for mirrored
+    instances.
+  - Everything is checked before use: sizes and offsets before anything is fetched, what unpacks
+    no larger than it says, and every coordinate within a million metres, as physics panics
+    on far larger ones and a scene file comes from outside.
   - A line that places geometry can end with `collide=none`, `collide=hull`, or `collide=coarse`,
     a 10 cm cut for very large meshes such as ground or cliffs.
   - Terrain becomes a heightfield, sampled about every metre. Water doesn't collide.
@@ -557,7 +563,7 @@ rest. At 60 fps a frame runs one fixed step:
   - `at X Y Z` moves the shape off the actor's origin: a door hinged at its origin has its box
     out along the door.
   - `sensor` blocks nothing, and calls the script's `on_enter(self, who)` and
-    `on_exit(self, who)`.
+    `on_exit(self, who)`, which also comes if what was inside is removed.
   - `dynamic MASS` is moved by physics.
   - `mesh PATH SCALE part=NAME` draws one named part of a model, by its own origin.
 - **Characters.** `character RADIUS HEIGHT` makes an actor walk, with Rapier's kinematic
@@ -573,8 +579,9 @@ rest. At 60 fps a frame runs one fixed step:
   with instead of how it looks, to view in either viewer: blue triangle meshes, green hull
   points, grey ground, red blockers. It needs no change to the renderer.
 - **Determinism.** Rapier's `enhanced-determinism` is on. It costs about 3% on a thousand
-  moving boxes, and 20% of a very small number for walking. A run of `tools/gameplay-bench/b_walk`
-  ends with the same bits natively and on the web.
+  moving boxes, and 20% of a very small number for walking. A run of `tools/gameplay-bench/b_walk`,
+  of walkers, doors and a pile of falling crates, ends with the same bits natively and on the
+  web. Actors are kept in a fixed order, so that adding and removing them repeats exactly too.
 - **The gameplay web build** turns on wasm SIMD. It has a target folder of its own, as different
   compiler flags can't share compiled crates.
 - **`glam` moved to 0.33.** It compiled unchanged, but deprecates the camera matrices the

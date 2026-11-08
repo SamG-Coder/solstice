@@ -158,11 +158,11 @@ mod native {
             };
             let mut file = std::fs::File::open(path)?;
             let mut pieces = Vec::new();
-            for (offset, stored) in index.ranges() {
+            for ((offset, stored), raw) in index.ranges().into_iter().zip(index.raw_sizes()) {
                 file.seek(SeekFrom::Start(paged.data_offset + offset))?;
                 let mut packed = vec![0; stored as usize];
                 file.read_exact(&mut packed)?;
-                pieces.push(solstice_asset::file::inflate(&packed)?);
+                pieces.push(solstice_asset::file::inflate_limited(&packed, raw)?);
             }
             Ok(Some(index.decode(&pieces)?))
         }

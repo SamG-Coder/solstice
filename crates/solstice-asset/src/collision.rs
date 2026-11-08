@@ -10,6 +10,14 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::file::DecodeError;
 
+/// The furthest a coordinate may be from the origin, in metres. Physics' arithmetic breaks down
+/// long before a float does, and a scene file comes from outside.
+pub const MAX_COORDINATE: f32 = 1.0e6;
+
+/// The most a piece of collision may hold unpacked, in bytes: a sanity limit on what a scene file
+/// can ask for.
+pub const MAX_PIECE_BYTES: u64 = 1 << 30;
+
 /// [`Collision::instance_shapes`] of an instance that nothing collides with.
 pub const NO_SHAPE: u32 = u32::MAX;
 
@@ -92,7 +100,66 @@ pub struct CollisionIndex {
     pub heightfield: Option<HeightfieldEntry>,
 }
 
+fn in_range(value: f32) -> bool {
+    value.abs() <= MAX_COORDINATE
+}
+
+impl ShapeEntry {
+    /// Its size unpacked: twelve bytes for each vertex and triangle.
+    fn raw_bytes(&self) -> u64 {
+        12 * (u64::from(self.vertices) + u64::from(self.triangles))
+    }
+}
+
+impl HeightfieldEntry {
+    /// Its size unpacked: four bytes a sample.
+    fn raw_bytes(&self) -> u64 {
+        4 * u64::from(self.columns) * u64::from(self.rows)
+    }
+}
+
 impl CollisionIndex {
+    /// Checks what the manifest says against what the scene has, before anything is fetched: its
+    /// sizes, where its pieces lie, and that it has a shape for each of `instances` instances.
+    pub fn validate(&self, instances: usize, data_offset: u64) -> Result<(), DecodeError> {
+        let sound = |offset: u64, stored: u32, raw: u64| {
+            // Deflate can grow incompressible data a little.
+            raw <= MAX_PIECE_BYTES
+                && u64::from(stored) <= raw + raw / 64 + 1024
+                && data_offset
+                    .checked_add(offset)
+                    .and_then(|o| o.checked_add(u64::from(stored)))
+                    .is_some()
+        };
+        let shapes_sound = self
+            .shapes
+            .iter()
+            .all(|s| sound(s.offset, s.stored_bytes, s.raw_bytes()));
+        let ground_sound = self
+            .heightfield
+            .is_none_or(|h| sound(h.offset, h.stored_bytes, h.raw_bytes()));
+        let references_sound = self.instance_shapes.len() == instances
+            && self
+                .instance_shapes
+                .iter()
+                .all(|&s| s == NO_SHAPE || (s as usize) < self.shapes.len());
+        if shapes_sound && ground_sound && references_sound {
+            Ok(())
+        } else {
+            Err(DecodeError::BadCollision)
+        }
+    }
+
+    /// The size each piece unpacks to, in the order of [`CollisionIndex::ranges`]: no more should
+    /// ever be unpacked.
+    pub fn raw_sizes(&self) -> Vec<u64> {
+        self.shapes
+            .iter()
+            .map(ShapeEntry::raw_bytes)
+            .chain(self.heightfield.iter().map(HeightfieldEntry::raw_bytes))
+            .collect()
+    }
+
     /// Where each piece of data to fetch is, from the start of the data area, as offset and
     /// stored size: every shape, then the heightfield if there is one. Each is deflated.
     pub fn ranges(&self) -> Vec<(u64, u32)> {
@@ -159,7 +226,7 @@ fn decode_shape(entry: &ShapeEntry, bytes: &[u8]) -> Result<CollisionShape, Deco
         vertices: pod_vec(vertex_bytes),
         triangles: pod_vec(triangle_bytes),
     };
-    let sound = shape.vertices.iter().flatten().all(|c| c.is_finite())
+    let sound = shape.vertices.iter().flatten().all(|c| in_range(*c))
         && shape
             .triangles
             .iter()
@@ -176,14 +243,14 @@ fn decode_heightfield(entry: &HeightfieldEntry, bytes: &[u8]) -> Result<Heightfi
     let samples = (entry.columns as usize).checked_mul(entry.rows as usize);
     let sound_grid = entry.columns >= 2
         && entry.rows >= 2
-        && entry.spacing.iter().all(|s| s.is_finite() && *s > 0.0)
-        && entry.origin.iter().all(|o| o.is_finite())
+        && entry.spacing.iter().all(|s| in_range(*s) && *s > 0.0)
+        && entry.origin.iter().all(|o| in_range(*o))
         && samples.and_then(|s| s.checked_mul(4)) == Some(bytes.len());
     if !sound_grid {
         return Err(DecodeError::BadCollision);
     }
     let heights: Vec<f32> = pod_vec(bytes);
-    if !heights.iter().all(|h| h.is_finite()) {
+    if !heights.iter().all(|h| in_range(*h)) {
         return Err(DecodeError::BadCollision);
     }
     Ok(Heightfield {

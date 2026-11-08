@@ -15,7 +15,7 @@ pub const MESH_ERROR: f32 = 0.05;
 pub const COARSE_ERROR: f32 = 0.10;
 /// Meshes with a bounding sphere smaller than this, in metres, get a convex hull.
 pub const SMALL_PROP_RADIUS: f32 = 0.75;
-/// The most points a hull is made from; beyond this it is thinned, keeping its shape closely.
+/// The most points a hull is made from; beyond this it is thinned, keeping its extremes.
 pub const MAX_HULL_POINTS: usize = 512;
 
 /// The triangles of a cut through a mesh's DAG at `error`, in the mesh's own space. Those
@@ -122,6 +122,54 @@ pub fn build_collision(scene: &SceneAsset) -> Option<Collision> {
     })
 }
 
+/// At most [`MAX_HULL_POINTS`] of these points, with those furthest out in every direction, which
+/// are what shape a hull, and the rest evenly from what is left.
+fn thin_hull(points: Vec<[f32; 3]>) -> Vec<[f32; 3]> {
+    if points.len() <= MAX_HULL_POINTS {
+        return points;
+    }
+    const DIRECTIONS: usize = MAX_HULL_POINTS / 2;
+    let mut keep = vec![false; points.len()];
+    // Directions spread over a sphere, along a spiral.
+    let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+    for i in 0..DIRECTIONS {
+        let y = 1.0 - 2.0 * (i as f32 + 0.5) / DIRECTIONS as f32;
+        let radius = (1.0 - y * y).max(0.0).sqrt();
+        let (sin, cos) = (golden * i as f32).sin_cos();
+        let direction = Vec3::new(cos * radius, y, sin * radius);
+        let furthest = points
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                let along = |p: &[f32; 3]| Vec3::from_array(*p).dot(direction);
+                along(a).total_cmp(&along(b))
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = furthest {
+            keep[index] = true;
+        }
+    }
+    let kept = keep.iter().filter(|k| **k).count();
+    let rest = points.len() - kept;
+    let stride = (rest / (MAX_HULL_POINTS - kept).max(1)).max(1);
+    let mut others = 0;
+    let mut extremes_left = kept;
+    let mut out = Vec::with_capacity(MAX_HULL_POINTS);
+    for (point, keep) in points.into_iter().zip(keep) {
+        if keep {
+            out.push(point);
+            extremes_left -= 1;
+        } else {
+            // Room is held for the extremes still to come.
+            if others % stride == 0 && out.len() + extremes_left < MAX_HULL_POINTS {
+                out.push(point);
+            }
+            others += 1;
+        }
+    }
+    out
+}
+
 fn make_shape(mesh: &VirtualMesh, kind: Kind, scale: f32) -> CollisionShape {
     let world_error = if kind == Kind::Coarse {
         COARSE_ERROR
@@ -130,9 +178,7 @@ fn make_shape(mesh: &VirtualMesh, kind: Kind, scale: f32) -> CollisionShape {
     };
     let (mut vertices, triangles) = cut(mesh, world_error / scale.max(1.0e-6));
     if kind == Kind::Hull {
-        // Every so many points: enough for a hull that hugs the prop.
-        let stride = (vertices.len() / MAX_HULL_POINTS).max(1);
-        vertices = vertices.into_iter().step_by(stride).collect();
+        vertices = thin_hull(vertices);
         return CollisionShape {
             hull: true,
             vertices,
@@ -334,8 +380,34 @@ mod tests {
             ..Default::default()
         };
         let collision = build_collision(&scene).unwrap();
-        assert!(collision.shapes[0].vertices.len() <= MAX_HULL_POINTS * 2);
+        assert!(collision.shapes[0].vertices.len() <= MAX_HULL_POINTS);
         assert!(collision.shapes[0].vertices.len() >= 4);
+    }
+
+    #[test]
+    fn thinning_a_hull_keeps_its_corners() {
+        // A grid of points, whose four corners shape its hull, buried among thousands.
+        let mut points = Vec::new();
+        for z in 0..100 {
+            for x in 0..100 {
+                points.push([x as f32 / 99.0, 0.0, z as f32 / 99.0]);
+            }
+        }
+        let thin = thin_hull(points);
+        assert!(thin.len() <= MAX_HULL_POINTS, "{}", thin.len());
+        for corner in [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+        ] {
+            assert!(thin.contains(&corner), "lost {corner:?}");
+        }
+        assert_eq!(
+            thin_hull(vec![[1.0; 3]; 3]).len(),
+            3,
+            "a few points are left alone"
+        );
     }
 
     #[test]

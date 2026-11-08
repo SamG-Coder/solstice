@@ -14,10 +14,11 @@ use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterCo
 use rapier3d::parry::shape::TriMeshFlags;
 use rapier3d::parry::utils::Array2;
 use rapier3d::prelude::*;
+use solstice_asset::collision::MAX_COORDINATE;
 use solstice_asset::{Collision, CollisionShape, Heightfield, NO_SHAPE};
 use solstice_world::{Entity, Schedule, TickGroup, Transform, Walk, World, STEP_SECONDS};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Receiver};
 
@@ -83,6 +84,9 @@ struct Body {
     character: Option<CharacterState>,
     /// Where physics last put it, to tell when something else has moved it.
     at: Vec3,
+    rotation: Quat,
+    /// Its colliders, to forget when it goes.
+    colliders: Vec<ColliderHandle>,
 }
 
 struct CharacterState {
@@ -105,7 +109,13 @@ pub struct Physics {
     ccd: CCDSolver,
     params: IntegrationParameters,
     controller: KinematicCharacterController,
-    actors: HashMap<Entity, Body>,
+    /// In a fixed order, so that a run comes out the same every time.
+    actors: BTreeMap<Entity, Body>,
+    /// Each actor's collider: whose it is, and whether it is a sensor. Kept until the step after
+    /// its actor goes, as a collider that has gone can still report that it stopped touching.
+    owners: HashMap<ColliderHandle, (Entity, bool)>,
+    /// The colliders of actors gone this step, to forget from `owners` once reported.
+    forgotten: Vec<ColliderHandle>,
     events: ChannelEventCollector,
     collisions: Receiver<CollisionEvent>,
     _forces: Receiver<ContactForceEvent>,
@@ -130,10 +140,6 @@ fn to_pose(position: Vec3, rotation: Quat) -> Pose {
 
 fn entity_data(entity: Entity) -> u128 {
     u128::from(entity.to_bits().get())
-}
-
-fn data_entity(data: u128) -> Option<Entity> {
-    Entity::from_bits(data as u64)
 }
 
 impl Default for Physics {
@@ -178,7 +184,9 @@ impl Physics {
             ccd: CCDSolver::new(),
             params,
             controller,
-            actors: HashMap::new(),
+            actors: BTreeMap::new(),
+            owners: HashMap::new(),
+            forgotten: Vec::new(),
             events: ChannelEventCollector::new(collision_sender, force_sender, tear_sender),
             collisions,
             _forces: forces,
@@ -190,7 +198,7 @@ impl Physics {
     /// Adds a scene's collision as the fixed world. `instance` gives where each of its instances
     /// is. A shape is built once for each size it is used at, and shared.
     pub fn add_scene(&mut self, collision: &Collision, instance: impl Fn(u32) -> Option<Mat4>) {
-        let mut built: HashMap<(u32, [u32; 3]), Option<SharedShape>> = HashMap::new();
+        let mut built: HashMap<(u32, [i32; 3]), Option<SharedShape>> = HashMap::new();
         for (index, &shape) in collision.instance_shapes.iter().enumerate() {
             if shape == NO_SHAPE {
                 continue;
@@ -202,7 +210,18 @@ impl Physics {
                 continue;
             };
             let (scale, rotation, translation) = transform.to_scale_rotation_translation();
-            let key = (shape, scale.to_array().map(f32::to_bits));
+            let sound = scale.is_finite()
+                && scale.abs().min_element() > 1.0e-6
+                && rotation.is_finite()
+                && translation.is_finite();
+            if !sound {
+                self.warnings.push(format!(
+                    "instance {index} can't collide: its transform is degenerate"
+                ));
+                continue;
+            }
+            // Rounded, as the same scale at another turn differs in its last bits.
+            let key = (shape, (scale * 1000.0).round().to_array().map(|s| s as i32));
             let warnings = &mut self.warnings;
             let built = built
                 .entry(key)
@@ -260,6 +279,18 @@ impl Physics {
         });
     }
 
+    /// How many distinct shapes the scene's colliders use: for tools and tests.
+    pub fn distinct_shapes(&self) -> usize {
+        let mut shapes: Vec<*const ()> = self
+            .colliders
+            .iter()
+            .map(|(_, c)| std::sync::Arc::as_ptr(&c.shared_shape().0).cast())
+            .collect();
+        shapes.sort_unstable();
+        shapes.dedup();
+        shapes.len()
+    }
+
     /// How many colliders there are: for tools and tests.
     pub fn collider_count(&self) -> usize {
         self.colliders.len()
@@ -314,6 +345,7 @@ impl Physics {
             .collect();
         for entity in gone {
             if let Some(body) = self.actors.remove(&entity) {
+                self.forgotten.extend(body.colliders.iter().copied());
                 self.bodies.remove(
                     body.handle,
                     &mut self.islands,
@@ -364,16 +396,21 @@ impl Physics {
         let attach = |shape: ColliderBuilder, kind: BodyKind| {
             let mut shape = shape.user_data(entity_data(entity));
             if kind == BodyKind::Sensor {
+                // Noticing what moves: not the fixed scene it may stand in.
                 shape = shape
                     .sensor(true)
                     .active_events(ActiveEvents::COLLISION_EVENTS)
-                    .active_collision_types(ActiveCollisionTypes::all());
+                    .active_collision_types(
+                        ActiveCollisionTypes::KINEMATIC_KINEMATIC
+                            | ActiveCollisionTypes::DYNAMIC_KINEMATIC,
+                    );
             }
             if let BodyKind::Dynamic(mass) = kind {
                 shape = shape.mass(mass);
             }
             shape
         };
+        let mut colliders = Vec::new();
         if let Some(collider) = collider {
             let shape = match collider.shape {
                 Shape::Box(size) => {
@@ -389,8 +426,12 @@ impl Physics {
                     ))
                 }
             };
-            self.colliders
-                .insert_with_parent(attach(shape, kind), handle, &mut self.bodies);
+            let inserted =
+                self.colliders
+                    .insert_with_parent(attach(shape, kind), handle, &mut self.bodies);
+            self.owners
+                .insert(inserted, (entity, kind == BodyKind::Sensor));
+            colliders.push(inserted);
         }
         let character = character.map(|character| {
             let half = (character.height * 0.5 - character.radius).max(0.0);
@@ -398,12 +439,12 @@ impl Physics {
             let collider = self.colliders.insert_with_parent(
                 ColliderBuilder::capsule_y(half, character.radius)
                     .translation(centre)
-                    .user_data(entity_data(entity))
-                    .active_collision_types(ActiveCollisionTypes::all())
-                    .active_events(ActiveEvents::COLLISION_EVENTS),
+                    .user_data(entity_data(entity)),
                 handle,
                 &mut self.bodies,
             );
+            self.owners.insert(collider, (entity, false));
+            colliders.push(collider);
             CharacterState {
                 collider,
                 vertical: 0.0,
@@ -416,57 +457,57 @@ impl Physics {
                 kind,
                 character,
                 at: transform.translation,
+                rotation: transform.rotation,
+                colliders,
             },
         );
     }
 
-    /// Moves kinematic actors to where their transforms say. A character moved by something
-    /// other than physics, such as a respawn, is put there at once.
+    /// Moves kinematic actors to where their transforms say. A character or dynamic actor moved
+    /// by something other than physics, such as a respawn, is put there at once. Those that
+    /// haven't moved cost nothing.
     fn follow_transforms(&mut self, world: &World) {
         for (&entity, body) in &mut self.actors {
             let Ok(transform) = world.entities.get::<&Transform>(entity) else {
                 continue;
             };
+            let moved = transform.translation != body.at;
+            let turned = transform.rotation != body.rotation;
+            if !moved && !turned {
+                continue;
+            }
             let Some(rigid) = self.bodies.get_mut(body.handle) else {
                 continue;
             };
-            let moved = transform.translation != body.at;
+            body.at = transform.translation;
+            body.rotation = transform.rotation;
             if let Some(character) = &mut body.character {
                 if moved {
                     rigid.set_translation(to_vector(transform.translation), true);
                     character.vertical = 0.0;
-                    body.at = transform.translation;
                 }
                 continue;
             }
+            let pose = to_pose(transform.translation, transform.rotation);
             match body.kind {
                 BodyKind::Dynamic(_) => {
-                    if moved {
-                        rigid.set_translation(to_vector(transform.translation), true);
-                        body.at = transform.translation;
-                    }
+                    rigid.set_position(pose, true);
+                    rigid.set_linvel(Vector::ZERO, true);
+                    rigid.set_angvel(Vector::ZERO, true);
                 }
-                BodyKind::Kinematic | BodyKind::Sensor => {
-                    rigid.set_next_kinematic_position(to_pose(
-                        transform.translation,
-                        transform.rotation,
-                    ));
-                    body.at = transform.translation;
-                }
+                BodyKind::Kinematic | BodyKind::Sensor => rigid.set_next_kinematic_position(pose),
             }
         }
     }
 
     fn walk_characters(&mut self, world: &World) {
         let dt = STEP_SECONDS as f32;
-        // Sorted, so that characters are walked in the same order every run.
-        let mut walkers: Vec<Entity> = self
+        let walkers: Vec<Entity> = self
             .actors
             .iter()
             .filter(|(_, b)| b.character.is_some())
             .map(|(e, _)| *e)
             .collect();
-        walkers.sort_by_key(|e| e.to_bits());
         for entity in walkers {
             let body = self.actors.get_mut(&entity).expect("listed just now");
             let state = body.character.as_mut().expect("filtered on it");
@@ -527,6 +568,7 @@ impl Physics {
                 transform.rotation =
                     Quat::from_xyzw(rotation.x, rotation.y, rotation.z, rotation.w);
                 body.at = translation;
+                body.rotation = transform.rotation;
             }
         }
     }
@@ -538,29 +580,23 @@ impl Physics {
                 CollisionEvent::Started(a, b, _) => (a, b, true),
                 CollisionEvent::Stopped(a, b, _) => (a, b, false),
             };
-            let (Some(first), Some(second)) =
-                (self.colliders.get(first), self.colliders.get(second))
+            // Through `owners`, as a collider that has just gone can still report this.
+            let (Some(&first), Some(&second)) = (self.owners.get(&first), self.owners.get(&second))
             else {
                 continue;
             };
-            let sensor_first = first.is_sensor();
-            if !sensor_first && !second.is_sensor() {
-                continue;
+            for (sensor, other) in [(first, second), (second, first)] {
+                if sensor.1 {
+                    world.send(Overlap {
+                        sensor: sensor.0,
+                        other: other.0,
+                        entered,
+                    });
+                }
             }
-            let (sensor, other) = if sensor_first {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            if let (Some(sensor), Some(other)) =
-                (data_entity(sensor.user_data), data_entity(other.user_data))
-            {
-                world.send(Overlap {
-                    sensor,
-                    other,
-                    entered,
-                });
-            }
+        }
+        for collider in self.forgotten.drain(..) {
+            self.owners.remove(&collider);
         }
     }
 }
@@ -576,6 +612,13 @@ fn build_shape(
         .iter()
         .map(|v| to_vector(Vec3::from_array(*v) * scale))
         .collect();
+    let out_of_range = vertices
+        .iter()
+        .any(|v| !(v.abs().max_element() <= MAX_COORDINATE));
+    if out_of_range {
+        warnings.push("a collision shape reaches too far out, and was left out".to_owned());
+        return None;
+    }
     if shape.hull {
         let built = SharedShape::convex_hull(&vertices);
         if built.is_none() {
@@ -583,10 +626,18 @@ fn build_shape(
         }
         return built;
     }
+    // A mirrored instance turns its triangles inside out; turn them back.
+    let mirrored = scale.x * scale.y * scale.z < 0.0;
+    let triangles = shape
+        .triangles
+        .iter()
+        .map(|&[a, b, c]| if mirrored { [a, c, b] } else { [a, b, c] })
+        .collect();
+    // Two-sided: scanned meshes are often open behind, and a body can touch them from there.
     match SharedShape::trimesh_with_flags(
         vertices,
-        shape.triangles.clone(),
-        TriMeshFlags::FIX_INTERNAL_EDGES,
+        triangles,
+        TriMeshFlags::FIX_INTERNAL_EDGES_TWO_SIDED,
     ) {
         Ok(built) => Some(built),
         Err(error) => {

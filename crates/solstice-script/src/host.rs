@@ -30,7 +30,7 @@
 use crate::actor::ActorValue;
 use crate::api::{engine, Context, Effects, ScriptTimer, TimerChange, Timers};
 use crate::value::ScriptValue;
-use glam::{EulerRot, Quat};
+use glam::{EulerRot, Quat, Vec3};
 use solstice_world::{
     steps_for, Entity, Schedule, TickGroup, Transform, Walk, World, STEP_SECONDS,
 };
@@ -428,6 +428,10 @@ impl ScriptHost {
                     &script.vars,
                     transform.translation,
                     yaw,
+                    world
+                        .entities
+                        .get::<&Walk>(entity)
+                        .map_or(Vec3::ZERO, |w| w.0),
                 )
             };
             let context = Context {

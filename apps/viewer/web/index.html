@@ -273,6 +273,38 @@ async function inflate(bytes) {
   return new Uint8Array(await new Response(unpacked).arrayBuffer());
 }
 
+/// Unpacks a block that should come to `limit` bytes, refusing to unpack more: a scene file comes
+/// from outside.
+async function inflateAtMost(bytes, limit) {
+  const unpacked = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  const reader = unpacked.getReader();
+  const out = new Uint8Array(limit);
+  let filled = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (filled + value.length > limit) {
+      await reader.cancel();
+      throw new Error("a part of the scene unpacks larger than it says");
+    }
+    out.set(value, filled);
+    filled += value.length;
+  }
+  return out.subarray(0, filled);
+}
+
+/// Reads part of a scene file, trying a few times before giving up.
+async function readWithRetries(file, start, end) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await file.read(start, end);
+    } catch (error) {
+      if (attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
+    }
+  }
+}
+
 /// Fetches what the viewer asks for, keeping the page responsive while it does.
 class Streamer {
   // Browsers run about six connections per host over HTTP/1.1, and more over HTTP/2.
@@ -635,11 +667,17 @@ async function startGame(viewer, file) {
     // Fetched only now: a scene that is only looked at never downloads its collision.
     const started = performance.now();
     const ranges = viewer.collision_ranges();
-    const parts = [];
-    for (let i = 0; i < ranges.length; i += 2) {
-      parts.push(file.read(ranges[i], ranges[i + 1]).then(inflate));
+    if (ranges.length === 0) {
+      show(["error: this scene has no collision to walk on: rebake it"]);
+    } else {
+      // The parts lie one after another, so they come as one request.
+      const first = ranges[0];
+      const whole = await readWithRetries(file, first, ranges[ranges.length - 1]);
+      const sizes = viewer.collision_sizes();
+      const parts = sizes.map((size, i) =>
+        inflateAtMost(whole.subarray(ranges[i * 2] - first, ranges[i * 2 + 1] - first), size));
+      for (const part of await Promise.all(parts)) viewer.deliver_collision(part);
     }
-    for (const part of await Promise.all(parts)) viewer.deliver_collision(part);
     const fetched = performance.now();
     viewer.play();
     console.info(`game loaded: collision fetched in ${(fetched - started).toFixed(0)} ms, ` +

@@ -468,6 +468,13 @@ impl WebViewer {
             .collect()
     }
 
+    /// The size each part of the collision unpacks to: no more should ever be unpacked.
+    pub fn collision_sizes(&self) -> Vec<f64> {
+        self.collision.as_ref().map_or_else(Vec::new, |index| {
+            index.raw_sizes().iter().map(|&s| s as f64).collect()
+        })
+    }
+
     /// Takes one part of the collision, inflated, in the order of `collision_ranges`.
     pub fn deliver_collision(&mut self, bytes: Vec<u8>) {
         self.collision_pieces.push(bytes);
