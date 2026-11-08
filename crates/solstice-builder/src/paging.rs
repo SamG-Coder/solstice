@@ -39,6 +39,7 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
         skeletons: scene.skeletons.clone(),
         poses: scene.poses.clone(),
         instance_poses: scene.instance_poses.clone(),
+        clips: scene.clips.clone(),
         ..Default::default()
     };
 

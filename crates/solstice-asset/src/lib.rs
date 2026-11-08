@@ -12,7 +12,7 @@ pub mod paged;
 pub mod scene;
 pub mod skeleton;
 
-pub use skeleton::{Bone, Skeleton, NO_POSE};
+pub use skeleton::{Bone, BoneTrack, Clip, Skeleton, CLIP_HZ, NO_POSE};
 
 pub use collision::{
     Collide, Collision, CollisionIndex, CollisionShape, Heightfield, MAX_COORDINATE,

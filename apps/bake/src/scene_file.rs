@@ -12,6 +12,7 @@
 //! model rocks/rock.gltf 9 ground:0.2 0 45 2 # with its lowest 20% buried, as rocks are
 //! part kit/kit.gltf wall_01 0 0 0 90 1  # one named piece of a model, by its own origin
 //! model plants/fern.gltf 3 ground 1 0 1 collide=none  # how it collides: none, hull or coarse
+//! model people/keeper.glb 2 0 3 0 1 skinned  # keeps its skeleton, so that it can bend
 //! blocker 40 2 0 1 4 90 0              # an invisible wall: x y z, full size, yaw_degrees
 //! actor cove/gate.actor 20.7 0 0 90 locked=true  # an actor, with its properties' values
 //! input cove/play.input                # the input actions, if not the built-in ones
@@ -65,6 +66,8 @@ enum Command {
         yaw_degrees: f32,
         scale: f32,
         collide: Collide,
+        /// Whether it bends: it keeps its skeleton and follows a pose.
+        skinned: bool,
     },
     Part {
         path: String,
@@ -88,7 +91,12 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let mut values: Vec<&str> = words.collect();
     // On a line that places geometry, a last word may say how it collides.
     let mut collide = Collide::Auto;
+    let mut skinned = false;
     if matches!(keyword, "model" | "part") {
+        if values.last() == Some(&"skinned") {
+            skinned = true;
+            values.pop();
+        }
         if let Some(word) = values.last().and_then(|w| w.strip_prefix("collide=")) {
             collide = match word {
                 "none" => Collide::None,
@@ -100,6 +108,11 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                     ))
                 }
             };
+            values.pop();
+        }
+        // It may come after how it collides as well.
+        if values.last() == Some(&"skinned") {
+            skinned = true;
             values.pop();
         }
     }
@@ -187,6 +200,7 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 yaw_degrees: number(4)?,
                 scale: number(5)?,
                 collide,
+                skinned,
             }
         }
         "actor" => Command::Actor(ActorLine::parse(&values)?),
@@ -556,6 +570,7 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     // Placed once the model has been imported, since its shape decides the height.
     let mut seated: HashMap<PathBuf, Vec<Seated>> = HashMap::new();
     let mut gameplay = Gameplay::default();
+    let mut skinned_models: std::collections::HashSet<PathBuf> = Default::default();
     let mut collides: HashMap<PathBuf, PlacedCollision> = HashMap::new();
     for (number, line) in text.lines().enumerate() {
         let at = |e: String| format!("{}:{}: {e}", path.display(), number + 1);
@@ -595,8 +610,12 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 yaw_degrees,
                 scale,
                 collide,
+                skinned,
             }) => {
                 let full = base.join(&model);
+                if skinned {
+                    skinned_models.insert(full.clone());
+                }
                 let placements = placements_of(&mut order, &mut models, base, model);
                 match seat {
                     Some(buried) => seated.entry(full).or_default().push((
@@ -668,6 +687,10 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     let mut warnings = Vec::new();
     for model in &order {
         println!("importing {}...", model.display());
+        let options = ImportOptions {
+            skinned: skinned_models.contains(model),
+            ..options
+        };
         let imported =
             import_gltf(model, &options).map_err(|e| format!("{}: {e}", model.display()))?;
         let name = model

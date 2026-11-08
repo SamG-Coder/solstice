@@ -140,6 +140,8 @@ pub struct PagedScene {
     pub poses: Vec<u32>,
     /// See [`crate::SceneAsset::instance_poses`].
     pub instance_poses: Vec<u32>,
+    /// See [`crate::SceneAsset::clips`].
+    pub clips: Vec<crate::skeleton::Clip>,
 }
 
 impl PagedScene {

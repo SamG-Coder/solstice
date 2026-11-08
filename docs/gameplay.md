@@ -908,6 +908,29 @@ older files and readers are unaffected. The importer keeps a skin only when aske
   does, within the 1 ms budget.
 - **Ragdolls,** from Rapier joints, blended in and out of animation, come in a later step.
 
+**As built (step 8, the runtime).** `solstice-anim` holds clips, poses, blends, blend spaces and
+state machines. The rest of step 8 arrives with the character playing them. So far:
+
+- Clips are quantised as planned: a rotation in 48 bits (three smallest components) and a
+  translation in its track's range, with one sample kept for what doesn't move. A scene carries
+  them in an optional `CLIP` section. Sampling isn't batched for SIMD: it wasn't needed, as the
+  cost below shows.
+- Blends, per-bone masks and additive poses work on whole poses. A state plays a clip or a 1D or
+  2D blend space. Every clip in a blend shares one phase, weighted by its share of the blend, so
+  blended walk and run cycles keep their feet in step.
+- `.anim` files list where the clips come from, the parameters, the states and the transitions.
+  Transitions cross-fade between states, and notifies fire as their time is crossed, from the
+  clip with the largest share of a blend.
+- `solstice_import::animation` reads a glTF's animations at 30 Hz. Bones that match by name need
+  nothing more; different rigs go through a role file on each side, with rotations carried in
+  each bone's rest frame and the pelvis's travel scaled by leg length.
+- Clips come from `tools/blender/make_clips.py`, which writes idle, walk and run for the keeper's
+  rig as hand-keyed motion, in place of the Universal Animation Library until that is
+  downloaded: 102 KB for all three.
+- Cost, on a Ryzen 7 9800X3D: 20 characters of 53 bones, each blending two clips in which every
+  bone moves every frame, take 0.06 ms a frame natively and 0.10 ms on the web, in Node. 100
+  characters take 0.3 and 0.4 ms. So the 1.0 ms budget line holds easily.
+
 ## Gameplay and the world around it
 
 The renderer already eases the weather and the ocean. Gameplay gets them, with the time of day
