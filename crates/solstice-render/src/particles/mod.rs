@@ -17,15 +17,15 @@
 pub mod effect;
 pub mod reference;
 
-pub use effect::{Blend, Curve, Effect, Emitter, Follow, Shape, Value};
+pub use effect::{Blend, Curve, Effect, Emitter, Follow, Shading, Shape, Value};
 
 use crate::gpu::{Gpu, LayoutBuilder};
 use crate::shaders;
 use effect::CURVE_ENTRIES;
 use glam::{Mat4, Vec3};
 use reference::{
-    EmitterRecord, EmitterState, Particle, FLAG_ADD, FLAG_LIVE, FLAG_SURFACE, SHAPE_BOX,
-    SHAPE_POINT, SHAPE_SPHERE,
+    EmitterRecord, EmitterState, Particle, FLAG_ADD, FLAG_GLOW, FLAG_LIT, FLAG_LIVE, FLAG_SURFACE,
+    SHAPE_BOX, SHAPE_POINT, SHAPE_SPHERE,
 };
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,8 +42,13 @@ pub const POOL_LOW: u32 = 65_536;
 const CURVE_STRIDE: usize = CURVE_ENTRIES + CURVE_ENTRIES / 4;
 /// Draws read their emitter's record at this stride, the uniform offset alignment WebGPU allows.
 const DRAW_STRIDE: u64 = 256;
-/// Where the draws' indirect arguments start, after those of the spawn and update dispatches.
-const DRAWS_OFFSET: u64 = 32;
+/// Where the dispatches' indirect arguments are: spawn, update and light, then the draws'.
+const SPAWN_ARGS: u64 = 0;
+const UPDATE_ARGS: u64 = 12;
+const LIGHT_ARGS: u64 = 24;
+const DRAWS_OFFSET: u64 = 48;
+/// Bytes of light each particle holds: twin of `ParticleLight` in `particles/light_common.wgsl`.
+const LIGHT_BYTES: u64 = 32;
 const INDIRECT_BYTES: u64 = DRAWS_OFFSET + MAX_EMITTERS as u64 * 16;
 const STATE_BYTES: u64 = (MAX_EMITTERS * std::mem::size_of::<EmitterState>()) as u64;
 /// Seconds a stopped emitter's slice is held after its longest-lived particle should have died.
@@ -58,7 +63,9 @@ struct SimUniform {
     seconds: f32,
     parity: u32,
     capacity: u32,
-    _pad: u32,
+    light_interval: u32,
+    ray_steps: u32,
+    _pad: [u32; 3],
 }
 
 /// A running effect.
@@ -108,6 +115,16 @@ struct LiveEffect {
     serial: u32,
 }
 
+/// What the light pass reads of the rest of the renderer, besides the environment group: the
+/// scene's local lights and the sun's shadow maps.
+#[derive(Clone)]
+pub struct LightInputs {
+    pub lights: wgpu::Buffer,
+    pub shadow_uniform: wgpu::Buffer,
+    pub shadow_maps: wgpu::TextureView,
+    pub shadow_sampler: wgpu::Sampler,
+}
+
 /// Size-dependent targets: the depth attachment particles test against, made from the scene's
 /// depth each frame.
 pub struct ParticleTargets {
@@ -131,18 +148,31 @@ struct Pool {
     indirect: wgpu::Buffer,
     sim: wgpu::Buffer,
     draws: wgpu::Buffer,
+    /// The light each particle receives, by slot.
+    // Held by the bind groups.
+    #[allow(dead_code)]
+    light: wgpu::Buffer,
     plan_group: wgpu::BindGroup,
     simulate_group: wgpu::BindGroup,
+    light_group: wgpu::BindGroup,
     draw_group: wgpu::BindGroup,
+}
+
+/// The layouts a pool's bind groups are made with.
+struct PoolLayouts {
+    plan: wgpu::BindGroupLayout,
+    simulate: wgpu::BindGroupLayout,
+    light: wgpu::BindGroupLayout,
+    draw: wgpu::BindGroupLayout,
 }
 
 /// Every effect running, the pool their particles live in, and the passes that move and draw
 /// them.
 pub struct Particles {
     pool: Pool,
-    plan_layout: wgpu::BindGroupLayout,
-    simulate_layout: wgpu::BindGroupLayout,
-    pool_draw_layout: wgpu::BindGroupLayout,
+    layouts: PoolLayouts,
+    inputs: LightInputs,
+    light: wgpu::ComputePipeline,
     scene_layout: wgpu::BindGroupLayout,
     copy_layout: wgpu::BindGroupLayout,
     plan: wgpu::ComputePipeline,
@@ -164,13 +194,24 @@ pub struct Particles {
     serial: u32,
     /// Whether this frame simulates and draws anything.
     active: bool,
+    /// Each particle's light is worked out afresh once in this many frames, with ambient rays
+    /// of this many steps.
+    light_interval: u32,
+    ray_steps: u32,
     stats: StatsReadback,
 }
 
 impl Particles {
     /// Creates the passes and a pool of `capacity` particles, or as many as the device can
-    /// bind. `frame` is the renderer's frame uniform, which the draw reads.
-    pub fn new(gpu: &Gpu, frame: &wgpu::Buffer, capacity: u32) -> Self {
+    /// bind. `frame` is the renderer's frame uniform, which the draw reads; the light pass reads
+    /// the environment group, made with `environment`, and `inputs`.
+    pub fn new(
+        gpu: &Gpu,
+        frame: &wgpu::Buffer,
+        capacity: u32,
+        environment: &wgpu::BindGroupLayout,
+        inputs: LightInputs,
+    ) -> Self {
         let plan_layout = LayoutBuilder::new()
             .uniform()
             .storage_read()
@@ -185,6 +226,17 @@ impl Particles {
             .storage_write()
             .storage_write()
             .build(gpu, "particle simulate");
+        let light_layout = crate::shadow::ShadowMaps::add_to_layout(
+            LayoutBuilder::new()
+                .uniform()
+                .storage_read()
+                .storage_write()
+                .storage_read()
+                .storage_read()
+                .storage_write()
+                .storage_read(),
+        )
+        .build(gpu, "particle light");
         let frame_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::VERTEX_FRAGMENT)
             .uniform()
@@ -199,6 +251,8 @@ impl Particles {
             .storage_read()
             .visibility(wgpu::ShaderStages::VERTEX_FRAGMENT)
             .uniform_dynamic()
+            .visibility(wgpu::ShaderStages::VERTEX)
+            .storage_read()
             .build(gpu, "particle draw");
         let scene_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::FRAGMENT)
@@ -225,6 +279,12 @@ impl Particles {
             &simulate_module,
             "update",
             &[&simulate_layout],
+        );
+        let light = gpu.compute_pipeline(
+            "particle light",
+            &shaders::module(&gpu.device, "particles/light.wgsl"),
+            "main",
+            &[&light_layout, environment],
         );
 
         let draw_module = shaders::module(&gpu.device, "particles/draw.wgsl");
@@ -335,18 +395,18 @@ impl Particles {
             &[frame.as_entire_binding()],
         );
         let capacity = fitted_capacity(gpu, capacity);
-        let pool = Pool::new(
-            gpu,
-            capacity,
-            &plan_layout,
-            &simulate_layout,
-            &pool_draw_layout,
-        );
+        let layouts = PoolLayouts {
+            plan: plan_layout,
+            simulate: simulate_layout,
+            light: light_layout,
+            draw: pool_draw_layout,
+        };
+        let pool = Pool::new(gpu, capacity, &layouts, &inputs);
         Self {
             pool,
-            plan_layout,
-            simulate_layout,
-            pool_draw_layout,
+            layouts,
+            inputs,
+            light,
             scene_layout,
             copy_layout,
             plan,
@@ -364,8 +424,23 @@ impl Particles {
             parity: 0,
             serial: 0,
             active: false,
+            light_interval: 1,
+            ray_steps: 16,
             stats: StatsReadback::new(gpu),
         }
+    }
+
+    /// Works out each particle's light afresh once in `frames` frames, staggered across them,
+    /// keeping what it had in between: the light pass's cost is divided by about as much, for
+    /// light that lags a moving particle by as many frames. New particles are always lit at once.
+    pub fn set_light_interval(&mut self, frames: u32) {
+        self.light_interval = frames.max(1);
+    }
+
+    /// Steps each ambient ray takes through the GI volume, over its 30 m reach: fewer are
+    /// cheaper, and miss more of what is near.
+    pub fn set_ray_steps(&mut self, steps: u32) {
+        self.ray_steps = steps.max(1);
     }
 
     /// Particles the pool holds.
@@ -380,13 +455,7 @@ impl Particles {
         if capacity == self.pool.capacity {
             return;
         }
-        self.pool = Pool::new(
-            gpu,
-            capacity,
-            &self.plan_layout,
-            &self.simulate_layout,
-            &self.pool_draw_layout,
-        );
+        self.pool = Pool::new(gpu, capacity, &self.layouts, &self.inputs);
         self.ranges = vec![(0, capacity)];
         self.slots = [false; MAX_EMITTERS];
         self.pending.clear();
@@ -675,7 +744,9 @@ impl Particles {
             seconds,
             parity: self.parity,
             capacity,
-            _pad: 0,
+            light_interval: self.light_interval.max(1),
+            ray_steps: self.ray_steps.max(1),
+            _pad: [0; 3],
         };
         queue.write_buffer(&self.pool.sim, 0, bytemuck::bytes_of(&sim));
         self.stats.live = self.slots;
@@ -698,12 +769,29 @@ impl Particles {
         pass.dispatch_workgroups(1, 1, 1);
         pass.set_bind_group(0, &pool.simulate_group, &[]);
         pass.set_pipeline(&self.spawn);
-        pass.dispatch_workgroups_indirect(&pool.indirect, 0);
+        pass.dispatch_workgroups_indirect(&pool.indirect, SPAWN_ARGS);
         pass.set_pipeline(&self.update);
-        pass.dispatch_workgroups_indirect(&pool.indirect, 12);
+        pass.dispatch_workgroups_indirect(&pool.indirect, UPDATE_ARGS);
         pass.set_pipeline(&self.finish);
         pass.set_bind_group(0, &pool.plan_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
+    }
+
+    /// Records the light each live particle receives this frame, after the simulation, with
+    /// the renderer's environment group: the sun, its shadows, the sky, the GI volume and the
+    /// scene's lights.
+    pub fn record_light(&self, encoder: &mut wgpu::CommandEncoder, environment: &wgpu::BindGroup) {
+        if !self.active {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("particle light"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.light);
+        pass.set_bind_group(0, &self.pool.light_group, &[]);
+        pass.set_bind_group(1, environment, &[]);
+        pass.dispatch_workgroups_indirect(&self.pool.indirect, LIGHT_ARGS);
     }
 
     /// The depth target and bind groups for drawing at one size, over a scene whose depth is
@@ -835,13 +923,7 @@ fn fitted_capacity(gpu: &Gpu, wanted: u32) -> u32 {
 }
 
 impl Pool {
-    fn new(
-        gpu: &Gpu,
-        capacity: u32,
-        plan_layout: &wgpu::BindGroupLayout,
-        simulate_layout: &wgpu::BindGroupLayout,
-        draw_layout: &wgpu::BindGroupLayout,
-    ) -> Self {
+    fn new(gpu: &Gpu, capacity: u32, layouts: &PoolLayouts, inputs: &LightInputs) -> Self {
         let copy = wgpu::BufferUsages::COPY_DST;
         let cap = u64::from(capacity);
         let particles = gpu.storage_buffer(
@@ -879,6 +961,11 @@ impl Pool {
             INDIRECT_BYTES,
             wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC,
         );
+        let light = gpu.storage_buffer(
+            "particle light",
+            cap * LIGHT_BYTES,
+            wgpu::BufferUsages::COPY_SRC,
+        );
         let sim = gpu.uniform_buffer("particle sim", std::mem::size_of::<SimUniform>() as u64);
         let draws = gpu.uniform_buffer("particle draws", MAX_EMITTERS as u64 * DRAW_STRIDE);
         fn whole(b: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
@@ -886,7 +973,7 @@ impl Pool {
         }
         let plan_group = gpu.bind_group(
             "particle plan",
-            plan_layout,
+            &layouts.plan,
             &[
                 whole(&sim),
                 whole(&emitters),
@@ -894,9 +981,25 @@ impl Pool {
                 whole(&indirect),
             ],
         );
+        let light_group = gpu.bind_group(
+            "particle light",
+            &layouts.light,
+            &[
+                whole(&sim),
+                whole(&emitters),
+                whole(&state),
+                whole(&particles),
+                whole(&alive),
+                whole(&light),
+                whole(&inputs.lights),
+                whole(&inputs.shadow_uniform),
+                wgpu::BindingResource::TextureView(&inputs.shadow_maps),
+                wgpu::BindingResource::Sampler(&inputs.shadow_sampler),
+            ],
+        );
         let simulate_group = gpu.bind_group(
             "particle simulate",
-            simulate_layout,
+            &layouts.simulate,
             &[
                 whole(&sim),
                 whole(&emitters),
@@ -908,7 +1011,7 @@ impl Pool {
         );
         let draw_group = gpu.bind_group(
             "particle draw",
-            draw_layout,
+            &layouts.draw,
             &[
                 whole(&particles),
                 whole(&alive),
@@ -919,6 +1022,7 @@ impl Pool {
                     offset: 0,
                     size: NonZeroU64::new(16),
                 }),
+                whole(&light),
             ],
         );
         Self {
@@ -932,8 +1036,10 @@ impl Pool {
             indirect,
             sim,
             draws,
+            light,
             plan_group,
             simulate_group,
+            light_group,
             draw_group,
         }
     }
@@ -1044,9 +1150,16 @@ fn emitter_record(
     let [life_low, life_high] = desc.lifetime.map(|l| v(&l).max(1.0e-3));
     let [size_low, size_high] = desc.size.map(|s| v(&s).max(0.0));
     let brightness = v(&desc.brightness).max(0.0);
+    let [hot_low, hot_high] = desc.temperature.map(|t| v(&t).max(0.0));
     let mut flags = FLAG_LIVE;
     if desc.blend == Blend::Add {
         flags |= FLAG_ADD;
+    }
+    if desc.shading == Shading::Lit {
+        flags |= FLAG_LIT;
+    }
+    if hot_high.max(hot_low) > 0.0 {
+        flags |= FLAG_GLOW;
     }
     if surface {
         flags |= FLAG_SURFACE;
@@ -1087,6 +1200,13 @@ fn emitter_record(
         flags,
         soft: v(&desc.soft).max(0.0),
         scale: transform.x_axis.truncate().length(),
+        temperature_glow: [
+            hot_low,
+            hot_high.max(hot_low),
+            v(&desc.cooling).max(0.0),
+            v(&desc.glow).clamp(0.0, 1.0),
+        ],
+        phase: [v(&desc.phase).clamp(-0.95, 0.95), 0.0, 0.0, 0.0],
     }
 }
 

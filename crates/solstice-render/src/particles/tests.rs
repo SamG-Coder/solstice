@@ -41,7 +41,38 @@ impl Rig {
                 sink.lock().unwrap().push(error.to_string());
             }));
         let frame = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
-        let particles = Particles::new(&gpu, &frame, capacity);
+        // The light pass is not run here, but its inputs are bound with the pool.
+        let shadow_maps = gpu
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no shadows"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 2,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+        let inputs = LightInputs {
+            lights: gpu.storage_buffer("no lights", 32, wgpu::BufferUsages::empty()),
+            shadow_uniform: gpu.uniform_buffer("no shadows", 1024),
+            shadow_maps,
+            shadow_sampler: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+                compare: Some(wgpu::CompareFunction::GreaterEqual),
+                ..Default::default()
+            }),
+        };
+        let environment = crate::lighting::environment_layout(&gpu);
+        let particles = Particles::new(&gpu, &frame, capacity, &environment, inputs);
         Some(Self {
             gpu,
             particles,
@@ -149,6 +180,8 @@ const BALLISTIC: &str = "
       size 0.1 0.2
       gravity
       drag 0.35
+      temperature 900 1400
+      cooling 0.5
 ";
 
 /// Frame times that vary as a real frame rate does.
@@ -203,6 +236,8 @@ fn gpu_trajectories_match_the_reference() {
         );
         assert!((p.age - expected.age).abs() < 1.0e-5);
         assert!((p.size - expected.size).abs() < 1.0e-6);
+        assert!((p.temperature - expected.temperature).abs() < 1.0e-3);
+        assert!((900.0..=1400.0).contains(&p.temperature));
         assert!((p.lifetime - expected.lifetime).abs() < 1.0e-5);
     }
     // They really moved: a few metres up and out over a third of a second.
@@ -620,7 +655,11 @@ fn shader_records_match_their_rust_twins() {
             update_start,
         ]
     );
-    twin!("SimParams", SimUniform, [seconds, parity, capacity]);
+    twin!(
+        "SimParams",
+        SimUniform,
+        [seconds, parity, capacity, light_interval, ray_steps]
+    );
 }
 
 #[test]

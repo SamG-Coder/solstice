@@ -2321,7 +2321,7 @@ fn wall(albedo: f32) -> SceneAsset {
 /// enough on screen that the resolve filter does not soften their middles.
 fn still_particles(count: u32, soft: f32) -> Effect {
     Effect::parse(&format!(
-        "emitter e\n budget {count}\n spawn burst={count}\n lifetime 1000\n size 3\n color 1 1 1 1\n render sprite soft={soft}"
+        "emitter e\n budget {count}\n spawn burst={count}\n lifetime 1000\n size 3\n color 1 1 1 1\n render sprite soft={soft} shading=unlit"
     ))
     .unwrap()
 }
@@ -2538,7 +2538,7 @@ fn additive_particles_add_light_and_alpha_particles_cover() {
  lifetime 1000
  size 3
  color 0.25 0.25 0.25 1
- render sprite soft=0 blend={blend}"
+ render sprite soft=0 blend={blend} shading=unlit"
         ))
         .unwrap();
         let pixels = render_particles(
@@ -2581,4 +2581,285 @@ fn the_overdraw_view_is_black_with_no_particles() {
         size,
     );
     assert_eq!(brightness(patch(&pixels, size, size / 2, size / 2, 4)), 0.0);
+}
+
+/// One still particle of radius `size`, lit, scattering by `phase`, from a single burst.
+fn lit_particle(size: f32, phase: f32) -> Effect {
+    Effect::parse(&format!(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size {size}\n color 1 1 1 1\n render sprite soft=0 phase={phase}"
+    ))
+    .unwrap()
+}
+
+/// A stage whose settings show what tests of light need: no history, and a fixed view.
+fn light_stage(gpu: &Gpu, scene: &SceneAsset, debug: DebugView, size: u32) -> Stage {
+    let settings = RendererSettings {
+        debug_view: debug,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    Stage::new(gpu, scene, settings, size)
+}
+
+/// Linear brightness of the pixel where `world` lands.
+fn linear_at(pixels: &[u8], camera: &Camera, size: u32, world: Vec3) -> [f32; 3] {
+    let (x, y) = pixel_of(camera, size, world);
+    patch(pixels, size, x, y, 0).map(srgb_to_linear)
+}
+
+/// A particle in the ball's shadow takes less light than one in the sun, by about the sun's
+/// share.
+#[test]
+fn a_particle_in_shadow_is_darker_than_one_in_the_sun() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 128;
+    let camera = over_the_floor();
+    let effect = lit_particle(0.35, 0.0);
+    // The sun is low over +X, so the ball shades the air on its -X side.
+    let shaded = Vec3::new(-1.2, 0.2, 0.0);
+    let sunlit = Vec3::new(2.5, 0.2, 0.0);
+    // The light alone, and the final image, where the same light lights the particle's colour.
+    for (view, most) in [(DebugView::ParticleLight, 0.5), (DebugView::Lit, 0.7)] {
+        let mut stage = light_stage(&gpu, &ball_on_floor(), view, size);
+        for at in [shaded, sunlit] {
+            stage
+                .renderer
+                .particles()
+                .spawn(&effect, Mat4::from_translation(at))
+                .unwrap();
+        }
+        // A dim sun keeps the light view's values below 1, where it would clip.
+        let environment = Environment {
+            sun_illuminance: 1.0,
+            ..low_sun()
+        };
+        stage.frames(&gpu, &camera, &environment, 12);
+        let pixels = stage.pixels(&gpu);
+        let dark = brightness(linear_at(&pixels, &camera, size, shaded));
+        let lit = brightness(linear_at(&pixels, &camera, size, sunlit));
+        assert!(lit > 0.1, "{view:?}: the sunlit particle: {lit}");
+        assert!(
+            dark < lit * most,
+            "{view:?}: shaded {dark} against sunlit {lit}"
+        );
+        assert!(
+            dark > 0.0,
+            "{view:?}: the shaded particle still has the sky: {dark}"
+        );
+    }
+}
+
+/// When the sun moves, a particle's light follows within a few frames at every quality, however
+/// seldom each particle's light is worked out afresh there.
+#[test]
+fn particle_light_follows_a_moving_sun_at_every_quality() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 128;
+    let camera = over_the_floor();
+    let at = Vec3::new(-1.2, 0.2, 0.0);
+    for quality in [Quality::Low, Quality::Medium, Quality::High] {
+        let mut settings = RendererSettings {
+            debug_view: DebugView::ParticleLight,
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        settings.apply_quality(quality);
+        settings.render_scale = 1.0;
+        let mut stage = Stage::new(&gpu, &ball_on_floor(), settings, size);
+        stage
+            .renderer
+            .particles()
+            .spawn(&lit_particle(0.35, 0.0), Mat4::from_translation(at))
+            .unwrap();
+        // First the ball shades it from a sun over +X; then the sun swings round to -X.
+        let shaded = Environment {
+            sun_illuminance: 1.0,
+            ..low_sun()
+        };
+        let open = Environment {
+            sun_direction: Vec3::new(-1.0, 1.0, 0.0).normalize(),
+            ..shaded
+        };
+        stage.frames(&gpu, &camera, &shaded, 12);
+        let before = brightness(linear_at(&stage.pixels(&gpu), &camera, size, at));
+        stage.frames(&gpu, &camera, &open, 8);
+        let after = brightness(linear_at(&stage.pixels(&gpu), &camera, size, at));
+        assert!(after > before * 2.0, "{quality:?}: {before} then {after}");
+    }
+}
+
+/// With the sun behind it, a particle that scatters onward glows far brighter than with the sun
+/// behind the eye.
+#[test]
+fn onward_scattering_particles_glow_against_the_sun() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 0.0),
+        ..Default::default()
+    };
+    let at = Vec3::new(0.0, 2.0, -6.0);
+    let seen = |sun: Vec3| {
+        let mut stage = light_stage(&gpu, &ball_on_floor(), DebugView::ParticleLight, size);
+        stage
+            .renderer
+            .particles()
+            .spawn(&lit_particle(0.8, 0.8), Mat4::from_translation(at))
+            .unwrap();
+        let environment = Environment {
+            sun_direction: sun.normalize(),
+            sun_illuminance: 0.02,
+            ..Default::default()
+        };
+        stage.frames(&gpu, &camera, &environment, 6);
+        brightness(linear_at(&stage.pixels(&gpu), &camera, size, at))
+    };
+    // The camera looks along -Z: a sun low to -Z is ahead, beyond the particle.
+    let ahead = seen(Vec3::new(0.0, 0.3, -1.0));
+    let behind = seen(Vec3::new(0.0, 0.3, 1.0));
+    assert!(ahead > behind * 4.0, "ahead {ahead}, behind {behind}");
+}
+
+/// Far off, a particle fades into the haze exactly as a surface beside it does.
+#[test]
+fn distant_particles_fade_into_the_haze_as_surfaces_do() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    // A glowing wall 600 m off, and a particle 5 m in front of it, glowing the same.
+    let mut wall = Mesh::default();
+    for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        wall.vertices.push(Vertex {
+            position: Vec3::new(x * 800.0, y * 800.0, -600.0),
+            normal: Vec3::Z,
+            uv: Vec2::new(x, y),
+        });
+    }
+    wall.indices = vec![0, 1, 2, 0, 2, 3];
+    let scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&wall, &BuildOptions::default())],
+        materials: vec![Material {
+            base_color: [0.0, 0.0, 0.0, 1.0],
+            emissive: [2.0; 3],
+            flags: Material::TWO_SIDED,
+            ..Default::default()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let mut stage = light_stage(&gpu, &scene, DebugView::Lit, size);
+    let effect = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 60\n color 2 2 2 1\n render sprite soft=0 shading=unlit",
+    )
+    .unwrap();
+    let at = Vec3::new(0.0, 0.0, -595.0);
+    stage
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::from_translation(at))
+        .unwrap();
+    stage.frames(&gpu, &camera, &Environment::default(), 8);
+    let pixels = stage.pixels(&gpu);
+    let particle = brightness(patch(&pixels, size, size / 2, size / 2, 0));
+    let surface = brightness(patch(&pixels, size, 6, size / 2, 0));
+    assert!(surface > 10.0, "the wall shows: {surface}");
+    // Within a few levels: the two are seen in slightly different directions through the air.
+    assert!(
+        (particle - surface).abs() <= 5.0,
+        "particle {particle} against the wall beside it {surface}"
+    );
+}
+
+/// Beside a sunlit red ball, a particle's light turns red, from light the GI volume has bounced
+/// off the ball.
+#[test]
+fn particles_take_the_colour_of_light_bounced_off_the_scene() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 128;
+    let camera = over_the_floor();
+    // Just off the ball's sunlit side.
+    let at = Vec3::new(1.7, 1.0, 0.0);
+    let redness = |scene: &SceneAsset| {
+        let mut stage = light_stage(&gpu, scene, DebugView::ParticleLight, size);
+        stage
+            .renderer
+            .particles()
+            .spawn(&lit_particle(0.6, 0.0), Mat4::from_translation(at))
+            .unwrap();
+        let environment = Environment {
+            sun_illuminance: 0.5,
+            ..low_sun()
+        };
+        stage.frames(&gpu, &camera, &environment, 40);
+        let [r, g, _] = linear_at(&stage.pixels(&gpu), &camera, size, at);
+        r / g.max(1.0e-4)
+    };
+    let white = redness(&ball_on_floor());
+    let red = redness(&red_ball_on_floor());
+    // The ball fills about a quarter of the particle's surroundings, and the sun lights the
+    // particle directly too, so the bounce adds a few percent of red, not more.
+    assert!(red > white * 1.03, "red ball {red}, white ball {white}");
+}
+
+/// A hot particle glows by its temperature, orange as a black body at 2,400 K is, and its
+/// light spreads into bloom around it.
+#[test]
+fn hot_particles_glow_as_black_bodies_and_bloom() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 96;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let glow = |temperature: f32| {
+        let mut stage = light_stage(&gpu, &wall(0.0), DebugView::Lit, size);
+        let effect = Effect::parse(&format!(
+            "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 0.6\n color 0 0 0 1\n temperature {temperature}\n render sprite soft=0 shading=unlit"
+        ))
+        .unwrap();
+        stage
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::from_translation(Vec3::new(0.0, 0.0, -8.0)))
+            .unwrap();
+        // Night: no sun, but exposure still knows what daylight is.
+        let environment = Environment {
+            sun_illuminance: 0.0,
+            sky_intensity: 0.0,
+            daylight_illuminance: 10.0,
+            ..Default::default()
+        };
+        stage.frames(&gpu, &camera, &environment, 30);
+        stage.pixels(&gpu)
+    };
+    let hot = glow(2400.0);
+    let cold = glow(0.0);
+    // Its core clips to white, as fire does on camera; its halo keeps its colour.
+    assert!(brightness(patch(&hot, size, size / 2, size / 2, 1)) > 200.0);
+    let [r, g, b] = patch(&hot, size, size / 2 + 8, size / 2, 0);
+    assert!(
+        r > g && g > b,
+        "a black body at 2,400 K is orange: {r} {g} {b}"
+    );
+    // Beyond the sprite, bloom; with no glow, nothing.
+    let around = brightness(patch(&hot, size, size / 2 + 14, size / 2, 1));
+    let dark = brightness(patch(&cold, size, size / 2 + 14, size / 2, 1));
+    assert!(around > dark + 2.0, "bloom {around} against {dark}");
+    // Without a temperature, nothing but the film grain.
+    assert!(brightness(patch(&cold, size, size / 2, size / 2, 1)) < 3.0);
 }
