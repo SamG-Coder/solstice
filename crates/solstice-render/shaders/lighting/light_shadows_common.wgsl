@@ -48,10 +48,11 @@ fn light_shadow(index: u32, from_light: vec3f, distance: f32, voxel: f32, normal
         let weight = select(1.0 - f.x, f.x, corner.x == 1) * select(1.0 - f.y, f.y, corner.y == 1);
         let texel = light_shadow_texel(base + corner);
         let ray = oct_decode((vec2f(texel) + 0.5) / size * 2.0 - 1.0);
-        // Where this texel's ray meets the plane; the point's own distance where the ray runs
-        // along the plane or away from it.
+        // Where this texel's ray meets the plane, but never past the point itself: at a slant
+        // that meeting can lie far beyond it, behind whatever stands there. The point's own
+        // distance where the ray runs along the plane or away from it.
         let towards = -dot(ray, normal);
-        let along = select(distance, plane / towards, towards > 0.05);
+        let along = select(distance, min(distance, plane / towards), towards > 0.001);
         let far = textureLoad(light_shadows, texel, i32(index), 0).r;
         lit += weight * select(0.0, 1.0, far >= along - voxel * 2.0);
     }

@@ -3432,3 +3432,139 @@ fn a_lamp_is_shadowed_through_its_map() {
         "the floor at a steep slant to the low lamp is {slant} with it and {slant_unlit} without: it shadows itself"
     );
 }
+
+/// A night with only a lamp's direct light on the bare floor, seen from 8 m above the origin: the
+/// camera of the tests below, which read how the floor's brightness runs along X.
+fn lamp_on_bare_floor(position: [f32; 3]) -> (SceneAsset, Camera, Environment) {
+    let mut scene = ball_on_floor();
+    scene.instances.remove(0);
+    scene.lights = vec![Light {
+        position,
+        range: 30.0,
+        intensity: [600.0; 3],
+        _pad: 0,
+    }];
+    let camera = Camera {
+        position: Vec3::new(0.0, 8.0, 0.0),
+        pitch: -1.5,
+        ..Default::default()
+    };
+    let night = Environment {
+        sun_illuminance: 0.0,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        daylight_illuminance: 10.0,
+        ..Default::default()
+    };
+    (scene, camera, night)
+}
+
+/// The floor's brightness in `pixels`, a 256-texel render, at (x, 0, z).
+fn floor_brightness(pixels: &[u8], camera: &Camera, x: f32, z: f32) -> f32 {
+    let (px, py) = pixel_of(camera, 256, Vec3::new(x, 0.0, z));
+    brightness(patch(pixels, 256, px, py, 1))
+}
+
+/// A low lamp's light fades smoothly along the floor. Comparing a ray that skims the floor at a
+/// fixed distance rather than where it meets the plane, or falling back to the point's distance
+/// well before the ray runs along the floor, breaks the curve into a cliff.
+#[test]
+fn a_low_lamp_fades_smoothly_along_the_floor() {
+    let Some(gpu) = request_gpu() else { return };
+    // A metre up, the map's slanted rays reach the floor well past what the camera sees; 0.6 m
+    // up, they reach it in view, where a fallback too eager to give up on the plane shows.
+    for height in [1.0, 0.6] {
+        let (scene, camera, night) = lamp_on_bare_floor([-8.0, height, 0.0]);
+        let settings = RendererSettings::default();
+        let pixels = render_in(&gpu, &scene, &camera, settings, 256, &night).pixels;
+        let run: Vec<f32> = (-16..16)
+            .map(|i| floor_brightness(&pixels, &camera, i as f32 * 0.25, 0.0))
+            .collect();
+        let worst = run
+            .windows(3)
+            .map(|w| (w[1] - (w[0] + w[2]) * 0.5).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            worst < 8.0,
+            "a step of {worst} in the falloff from {height} m up: {run:?}"
+        );
+    }
+}
+
+/// A lamp outside the volume's finest level still lights the floor near the camera. Its rays
+/// must trace that floor at the finest level's voxels, or its coarse level's threshold stops
+/// them short of the floor, which then goes black.
+#[test]
+fn a_lamp_in_a_coarser_level_lights_the_floor_near_the_camera() {
+    let Some(gpu) = request_gpu() else { return };
+    let (scene, camera, night) = lamp_on_bare_floor([-11.0, 1.2, -3.0]);
+    let settings = RendererSettings::default();
+    let pixels = render_in(&gpu, &scene, &camera, settings, 256, &night).pixels;
+    let under = floor_brightness(&pixels, &camera, 0.0, 0.0);
+    assert!(under > 100.0, "the floor under the camera is {under}");
+}
+
+/// A wall just beyond a point of the floor, as seen from a low lamp, does not shadow the point:
+/// the map's rays stop at the wall, and a ray skimming the floor would meet the floor's plane
+/// past it. The floor 0.5 m before the wall stays near the same floor with the wall gone. The
+/// wall is black, or the light on it would turn the exposure down across the whole image; the
+/// margin covers what its shape still does to the exposure.
+#[test]
+fn a_wall_beyond_the_floor_does_not_shadow_it() {
+    let Some(gpu) = request_gpu() else { return };
+    let (mut scene, camera, night) = lamp_on_bare_floor([-8.0, 1.0, 0.0]);
+    let settings = RendererSettings::default;
+    let open = render_in(&gpu, &scene, &camera, settings(), 256, &night).pixels;
+    // A metre and a half thick, for the volume's 0.2 m voxels; the camera sees over it to the
+    // floor in front.
+    let block = build_virtual_mesh(
+        &solid_box(Vec3::new(0.75, 1.5, 6.0)),
+        &BuildOptions::default(),
+    );
+    scene.meshes.push(block);
+    scene.materials.push(Material {
+        base_color: [0.0, 0.0, 0.0, 1.0],
+        ..Default::default()
+    });
+    scene.instances.push(Instance {
+        mesh: scene.meshes.len() as u32 - 1,
+        material: 1,
+        transform: Mat4::from_translation(Vec3::new(2.25, 1.5, 0.0)),
+    });
+    let walled = render_in(&gpu, &scene, &camera, settings(), 256, &night).pixels;
+    for z in [-1.0, 0.0, 1.0] {
+        let (near, far) = (
+            floor_brightness(&walled, &camera, 1.0, z),
+            floor_brightness(&open, &camera, 1.0, z),
+        );
+        assert!(
+            (near - far).abs() < 30.0,
+            "the floor 0.5 m before the wall, at z {z}, is {near} with it and {far} without"
+        );
+    }
+}
+
+/// A closed box of the given half extents around the origin, with flat faces.
+fn solid_box(half: Vec3) -> Mesh {
+    let mut mesh = Mesh::default();
+    for (normal, u, v) in [
+        (Vec3::X, Vec3::Y, Vec3::Z),
+        (Vec3::NEG_X, Vec3::Z, Vec3::Y),
+        (Vec3::Y, Vec3::Z, Vec3::X),
+        (Vec3::NEG_Y, Vec3::X, Vec3::Z),
+        (Vec3::Z, Vec3::X, Vec3::Y),
+        (Vec3::NEG_Z, Vec3::Y, Vec3::X),
+    ] {
+        let base = mesh.vertices.len() as u32;
+        for (a, b) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            mesh.vertices.push(Vertex {
+                position: (normal + u * a + v * b) * half,
+                normal,
+                uv: Vec2::new(a, b),
+            });
+        }
+        mesh.indices
+            .extend([0, 1, 2, 0, 2, 3].map(|i: u32| base + i));
+    }
+    mesh
+}

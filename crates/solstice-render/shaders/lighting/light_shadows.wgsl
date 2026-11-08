@@ -27,7 +27,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let level = volume_level_at(light.position, 0u);
     if level < VOLUME_LEVELS {
         let voxel = volume_params.levels[level].w;
-        let hit = trace_volume(light.position, direction, voxel * CLEAR_VOXELS, light.range, STEPS);
+        let hit = trace_volume_inwards(light.position, direction, voxel * CLEAR_VOXELS, light.range, STEPS);
         // A ray that ran out of steps while still inside the volume has seen nothing beyond
         // where it stopped, so the light is taken to stop there rather than leak through
         // whatever stands further on; one that left the volume has nothing left to meet.

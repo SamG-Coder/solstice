@@ -177,13 +177,27 @@ fn trace_volume(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_ste
 // `hit_voxels` is how close counts as a hit, in voxels. Lighting uses a generous value, so that
 // thin walls stop light. Reflections can use less, so that thin objects look thin.
 fn trace_volume_with(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32, hit_voxels: f32) -> VolumeHit {
+    return trace_volume_levels(origin, direction, start, max_t, max_steps, hit_voxels, false);
+}
+
+// For rays that may head towards the camera, as a lamp's do when it stands further out than
+// the camera. Each step looks for the finest level from the top: a ray keeping the level it
+// started in would judge everything near the camera by that level's coarse voxels, and its
+// threshold would stop it well short of a floor it only skims.
+fn trace_volume_inwards(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32) -> VolumeHit {
+    return trace_volume_levels(origin, direction, start, max_t, max_steps, 0.85, true);
+}
+
+// `any_level` looks for the finest level at every step; otherwise a ray only ever moves out to
+// coarser ones, which is all a ray starting by the camera needs.
+fn trace_volume_levels(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32, hit_voxels: f32, any_level: bool) -> VolumeHit {
     var t = start;
     var level = 0u;
     var measured_level = VOLUME_LEVELS;
     var previous_distance = 0.0;
     for (var step = 0u; step < max_steps && t < max_t; step++) {
         let p = origin + direction * t;
-        level = volume_level_at(p, level);
+        level = volume_level_at(p, select(level, 0u, any_level));
         if level >= VOLUME_LEVELS {
             break;
         }
