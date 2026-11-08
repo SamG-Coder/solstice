@@ -6,7 +6,8 @@
 //! stay put while the camera moves. When several cascades are stale, the far ones take turns.
 //!
 //! Movable instances are drawn every frame into a map of their own, through the same view as
-//! the cascade they fall in, and shading takes the darker of the two. The four cascades share
+//! the cascade they fall in, and shading multiplies the light the two let through. The four
+//! cascades share
 //! one more layer of the array for this, a quarter each, at half their resolution: a moving
 //! thing's shadow is a little softer, but it costs one layer rather than four, and no new
 //! binding. Shaders that sample the shadows are already at WebGPU's limit of 16 textures. A
@@ -75,6 +76,8 @@ pub struct ShadowMaps {
     next_far_cascade: usize,
     /// Cascades that must redraw because the geometry on the GPU has improved.
     outdated: [bool; CASCADE_COUNT],
+    /// Redraw every stale cascade next frame, rather than the far ones taking turns.
+    redraw_all: bool,
 }
 
 impl ShadowMaps {
@@ -173,12 +176,21 @@ impl ShadowMaps {
             extents: [(Vec3::ZERO, 1.0); CASCADE_COUNT],
             next_far_cascade: 1,
             outdated: [false; CASCADE_COUNT],
+            redraw_all: false,
         }
     }
 
     /// Makes every cascade redraw in turn, as finer geometry has arrived.
     pub fn mark_stale(&mut self) {
         self.outdated = [true; CASCADE_COUNT];
+    }
+
+    /// Makes every cascade redraw next frame, as instances in them have changed: shown or
+    /// hidden, or made movable or static. Taking turns would leave the far cascades showing the
+    /// change late, as a shadow left behind or a missing one.
+    pub fn mark_stale_now(&mut self) {
+        self.mark_stale();
+        self.redraw_all = true;
     }
 
     /// Finds the stale cascades and writes the views of those to redraw to slots from
@@ -210,7 +222,10 @@ impl ShadowMaps {
         });
         let never_drawn: [bool; CASCADE_COUNT] =
             std::array::from_fn(|cascade| self.drawn[cascade].is_none());
-        let due = choose_due(stale, never_drawn, &mut self.next_far_cascade);
+        let mut due = choose_due(stale, never_drawn, &mut self.next_far_cascade);
+        if std::mem::take(&mut self.redraw_all) {
+            due = stale;
+        }
 
         for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
             self.outdated[cascade] = false;

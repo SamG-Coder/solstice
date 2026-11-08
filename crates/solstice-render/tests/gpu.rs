@@ -1900,56 +1900,124 @@ fn low_sun() -> Environment {
     }
 }
 
-fn place(x: f32) -> Mat4 {
-    Mat4::from_translation(Vec3::new(x, 1.0, 0.0))
+/// The ball at `x` along the floor, `scale` times its size, standing on the floor.
+fn place_scaled(x: f32, scale: f32) -> Mat4 {
+    Mat4::from_scale_rotation_translation(
+        Vec3::splat(scale),
+        glam::Quat::IDENTITY,
+        Vec3::new(x, scale, 0.0),
+    )
 }
 
-#[test]
-fn a_moved_ball_is_drawn_where_it_went_with_its_shadow_and_none_is_left_behind() {
-    let Some(gpu) = request_gpu() else { return };
-    let size = 192;
-    let camera = over_the_floor();
-    let sun = low_sun();
-    let mut stage = Stage::new(
-        &gpu,
-        &red_ball_on_floor(),
-        RendererSettings::default(),
-        size,
-    );
+fn place(x: f32) -> Mat4 {
+    place_scaled(x, 1.0)
+}
 
-    // Brightness of the floor in a ball's shadow, if the ball were at x, against open floor.
-    let shade_at = |pixels: &[u8], x: f32| {
-        let (px, py) = pixel_of(&camera, size, Vec3::new(x - 1.6, 0.0, 0.0));
-        let (ox, oy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
-        brightness(patch(pixels, size, px, py, 1)) / brightness(patch(pixels, size, ox, oy, 2))
-    };
-    let red_at = |pixels: &[u8], x: f32| {
-        let (px, py) = pixel_of(&camera, size, Vec3::new(x, 1.0, 0.0));
-        let [r, g, _] = patch(pixels, size, px, py, 1);
+/// Settings for tests that look at a frame or two after a change: no temporal accumulation,
+/// which would blend old frames in and hide a late change.
+fn untemporal() -> RendererSettings {
+    RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    }
+}
+
+/// The ball and the light on the floor its shadow falls on, seen by a camera `scale` times as
+/// far away as [`over_the_floor`], with the ball `scale` times as large.
+struct ShadowProbe {
+    camera: Camera,
+    size: u32,
+    scale: f32,
+}
+
+impl ShadowProbe {
+    fn new(scale: f32, size: u32) -> Self {
+        let mut camera = over_the_floor();
+        camera.position *= scale;
+        Self {
+            camera,
+            size,
+            scale,
+        }
+    }
+
+    /// Light on the floor where the shadow of a ball at `x` falls, against open floor.
+    fn shade(&self, pixels: &[u8], x: f32) -> f32 {
+        let at = |p: Vec3| {
+            let (px, py) = pixel_of(&self.camera, self.size, p * self.scale);
+            brightness(patch(pixels, self.size, px, py, 1))
+        };
+        at(Vec3::new(x - 1.6, 0.0, 0.0)) / at(Vec3::new(-4.0, 0.0, 3.0))
+    }
+
+    /// Whether the ball is drawn at `x`.
+    fn red(&self, pixels: &[u8], x: f32) -> bool {
+        let (px, py) = pixel_of(&self.camera, self.size, Vec3::new(x, 1.0, 0.0) * self.scale);
+        let [r, g, _] = patch(pixels, self.size, px, py, 1);
         r > 2.0 * g
-    };
+    }
+}
 
-    stage.frames(&gpu, &camera, &sun, 30);
+/// Moves a ball twice, `scale` times as large and seen from `scale` times as far, and checks
+/// that it is drawn where it went with its shadow, and that no shadow is left behind.
+fn check_moving_shadows(scale: f32) {
+    let Some(gpu) = request_gpu() else { return };
+    let probe = ShadowProbe::new(scale, 192);
+    let sun = low_sun();
+    let mut scene = red_ball_on_floor();
+    scene.instances[0].transform = place_scaled(0.0, scale);
+    let mut stage = Stage::new(&gpu, &scene, untemporal(), probe.size);
+
+    stage.frames(&gpu, &probe.camera, &sun, 8);
     let pixels = stage.pixels(&gpu);
-    assert!(red_at(&pixels, 0.0), "the ball isn't where it stands");
+    assert!(probe.red(&pixels, 0.0), "the ball isn't where it stands");
     assert!(
-        shade_at(&pixels, 0.0) < 0.6,
+        probe.shade(&pixels, 0.0) < 0.6,
         "the standing ball casts no shadow"
     );
 
     for (from, to) in [(0.0, 3.0), (3.0, 6.0)] {
-        assert!(stage.renderer.move_instance(0, place(to)));
-        stage.frames(&gpu, &camera, &sun, 30);
+        assert!(stage
+            .renderer
+            .move_instance(0, place_scaled(to * scale, scale)));
+        // Two frames: the first draws the move, and by the second every cached cascade must
+        // have caught up, not just the near one.
+        stage.frames(&gpu, &probe.camera, &sun, 2);
         let pixels = stage.pixels(&gpu);
-        assert!(red_at(&pixels, to), "the ball isn't drawn at {to}");
-        assert!(!red_at(&pixels, from), "the ball is still drawn at {from}");
-        let (new, old) = (shade_at(&pixels, to), shade_at(&pixels, from));
+        assert!(probe.red(&pixels, to), "the ball isn't drawn at {to}");
+        assert!(
+            !probe.red(&pixels, from),
+            "the ball is still drawn at {from}"
+        );
+        let (new, old) = (probe.shade(&pixels, to), probe.shade(&pixels, from));
         assert!(
             new < 0.6,
             "the ball moved to {to} casts no shadow there: {new}"
         );
         assert!(old > 0.85, "a shadow is left behind at {from}: {old}");
     }
+
+    // Static again where it stands: its shadow comes back from the cached cascades, at once.
+    assert!(stage.renderer.set_instance_movable(0, false));
+    stage.frames(&gpu, &probe.camera, &sun, 2);
+    let shade = probe.shade(&stage.pixels(&gpu), 6.0);
+    assert!(
+        shade < 0.6,
+        "the ball made static again lost its shadow: {shade}"
+    );
+}
+
+/// The near cascades, about 15 m away.
+#[test]
+fn a_moved_ball_is_drawn_where_it_went_with_its_shadow_and_none_is_left_behind() {
+    check_moving_shadows(1.0);
+}
+
+/// The same, six times as large and far: about 90 m away, in the far cascades, which have the
+/// lower row of the movable layer.
+#[test]
+fn a_distant_moved_ball_casts_its_shadow_from_the_far_cascades() {
+    check_moving_shadows(6.0);
 }
 
 #[test]
@@ -1959,7 +2027,7 @@ fn moving_things_show_their_motion_and_stop_showing_it_when_they_stop() {
     let camera = over_the_floor();
     let settings = RendererSettings {
         debug_view: DebugView::Motion,
-        ..Default::default()
+        ..untemporal()
     };
     let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
     let environment = low_sun();
@@ -1991,44 +2059,48 @@ fn moving_things_show_their_motion_and_stop_showing_it_when_they_stop() {
         "the ball moving across the screen shows motion up or down: {ball:?} against {floor:?}"
     );
 
-    // Still from here on: the frame after it stops, its motion must be gone.
-    stage.frames(&gpu, &camera, &environment, 2);
+    // Still from here on: the very next frame must show no motion.
+    stage.frames(&gpu, &camera, &environment, 1);
     let (ball, floor) = colours(&stage.pixels(&gpu), x);
     assert!(
         (ball[0] - floor[0]).abs() < 10.0,
         "the ball still shows motion after it stopped: {ball:?} against {floor:?}"
+    );
+
+    // A jump shows no motion at all, even a long one.
+    x += 2.0;
+    stage.renderer.place_instance(0, place(x));
+    stage.frames(&gpu, &camera, &environment, 1);
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        (ball[0] - floor[0]).abs() < 10.0,
+        "the ball that jumped shows motion: {ball:?} against {floor:?}"
     );
 }
 
 #[test]
 fn a_hidden_ball_is_not_drawn_and_casts_no_shadow() {
     let Some(gpu) = request_gpu() else { return };
-    let size = 128;
-    let camera = over_the_floor();
+    let probe = ShadowProbe::new(1.0, 128);
     let sun = low_sun();
-    let mut stage = Stage::new(
-        &gpu,
-        &red_ball_on_floor(),
-        RendererSettings::default(),
-        size,
-    );
-    stage.frames(&gpu, &camera, &sun, 4);
-    // Hidden while static, then shown and hidden again while movable: both paths.
+    let mut stage = Stage::new(&gpu, &red_ball_on_floor(), untemporal(), probe.size);
+    stage.frames(&gpu, &probe.camera, &sun, 6);
+    // Hidden while static, then while movable, after the movable layer has drawn it.
     for movable in [false, true] {
         assert!(stage.renderer.set_instance_movable(0, movable));
-        assert!(stage.renderer.set_instance_hidden(0, true));
-        stage.frames(&gpu, &camera, &sun, 30);
-        let pixels = stage.pixels(&gpu);
-        let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
-        let [r, g, _] = patch(&pixels, size, bx, by, 1);
+        stage.frames(&gpu, &probe.camera, &sun, 3);
         assert!(
-            r < g * 1.3,
-            "the hidden ball is drawn, movable {movable}: {r} {g}"
+            probe.shade(&stage.pixels(&gpu), 0.0) < 0.6,
+            "no shadow, movable {movable}"
         );
-        let (sx, sy) = pixel_of(&camera, size, Vec3::new(-1.6, 0.0, 0.0));
-        let (ox, oy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
-        let shade = brightness(patch(&pixels, size, sx, sy, 1))
-            / brightness(patch(&pixels, size, ox, oy, 2));
+        assert!(stage.renderer.set_instance_hidden(0, true));
+        stage.frames(&gpu, &probe.camera, &sun, 2);
+        let pixels = stage.pixels(&gpu);
+        assert!(
+            !probe.red(&pixels, 0.0),
+            "the hidden ball is drawn, movable {movable}"
+        );
+        let shade = probe.shade(&pixels, 0.0);
         assert!(
             shade > 0.85,
             "the hidden ball casts a shadow, movable {movable}: {shade}"
@@ -2094,19 +2166,34 @@ fn a_movable_ball_is_in_the_gi_voxels_only_if_it_stays_in_them() {
     };
     let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
     // How red the voxels look where the ball stands.
-    let redness = |stays: bool| {
-        let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
-        stage.renderer.set_instance_movable(0, true);
-        stage.renderer.set_instance_stays_in_gi(0, stays);
-        stage.frames(&gpu, &camera, &low_sun(), 12);
+    let redness = |stage: &Stage| {
         let [r, g, _] = patch(&stage.pixels(&gpu), size, bx, by, 1);
         r / g.max(1.0)
     };
-    let (kept, left_out) = (redness(true), redness(false));
+    let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    stage.renderer.set_instance_movable(0, true);
+    stage.renderer.set_instance_stays_in_gi(0, true);
+    stage.frames(&gpu, &camera, &low_sun(), 12);
+    let kept = redness(&stage);
     assert!(
         kept > 2.0,
         "the ball that stays in GI isn't in the voxels: {kept}"
     );
+
+    // Hidden, it must leave the voxels too, once they have been rebuilt.
+    stage.renderer.set_instance_hidden(0, true);
+    stage.frames(&gpu, &camera, &low_sun(), 40);
+    let hidden = redness(&stage);
+    assert!(
+        hidden < 1.3,
+        "the hidden ball is still in the voxels: {hidden}"
+    );
+
+    // Shown again, but left out of GI.
+    stage.renderer.set_instance_hidden(0, false);
+    stage.renderer.set_instance_stays_in_gi(0, false);
+    stage.frames(&gpu, &camera, &low_sun(), 40);
+    let left_out = redness(&stage);
     assert!(
         left_out < 1.3,
         "the movable ball is in the voxels: {left_out}"

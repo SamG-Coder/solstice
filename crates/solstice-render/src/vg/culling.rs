@@ -454,7 +454,7 @@ impl CullPipelines {
                 pass.set_pipeline(&self.seed);
                 pass.set_bind_group(0, scene_group, &offset);
                 pass.set_bind_group(1, work_group, &[]);
-                pass.dispatch_workgroups(groups_for(scene.instance_count, 64), 1, 1);
+                pass.dispatch_workgroups(groups_for(scene.gpu_instance_count, 64), 1, 1);
             }
             CullPhase::Second => {
                 pass.set_pipeline(&self.begin_second_phase);

@@ -7,7 +7,9 @@
 //!
 //! An instance that moves becomes movable: it is drawn afresh every frame, and the cached views
 //! leave it out, so they never keep it where it was. Making an instance movable, or changing a
-//! static one, changes what those views hold, so they are drawn again once.
+//! static one, changes what those views hold, so they are drawn again once. Only the views that
+//! hold what changed are: a lamp's glow is in the GI voxels, but not in the shadows. Something
+//! that changes often is better made movable, so that the cached views needn't be redrawn.
 //!
 //! Motion vectors need where each instance was drawn last frame. One moved this frame keeps
 //! last frame's transform as its previous one. One that moved last frame but not this frame
@@ -27,23 +29,28 @@ pub struct InstanceTable {
     gpu_index: Vec<Option<u32>>,
     /// Each instance's object-space bounding sphere, by position in `data`.
     spheres: Vec<(Vec3, f32)>,
-    /// New transforms for the next frame, by position in `data`, in the order they were set.
-    moves: Vec<(u32, Mat4)>,
+    /// New transforms for the next frame, by position in `data`, in the order they were set,
+    /// and whether each is a jump rather than a motion.
+    moves: Vec<(u32, Mat4, bool)>,
     /// What moved last frame, whose previous transform must catch up this frame.
     moved_last_frame: Vec<u32>,
     /// What has changed in other ways since the last upload.
     changed: Vec<u32>,
     /// Every movable instance, by position in `data`, in no particular order.
     movable: Vec<u32>,
-    cached_views_changed: bool,
+    shadows_changed: bool,
+    gi_changed: bool,
 }
 
-/// What a frame changed: the runs of instances to upload, and whether the cached views must be
-/// drawn again.
+/// What a frame changed: the runs of instances to upload, and which cached views must be drawn
+/// again.
 #[derive(Debug, Default, PartialEq)]
 pub struct FrameChanges {
     pub ranges: Vec<Range<usize>>,
-    pub cached_views_changed: bool,
+    /// What the shadow cascades and the seabed map hold has changed.
+    pub shadows_changed: bool,
+    /// What the GI voxels hold has changed.
+    pub gi_changed: bool,
 }
 
 /// Changed instances closer than this to the run before them are uploaded with it, since one
@@ -68,7 +75,8 @@ impl InstanceTable {
             moved_last_frame: Vec::new(),
             changed: Vec::new(),
             movable,
-            cached_views_changed: false,
+            shadows_changed: false,
+            gi_changed: false,
         }
     }
 
@@ -90,13 +98,14 @@ impl InstanceTable {
     }
 
     /// Moves an instance to `world` from the next frame on, making it movable if it was not.
-    /// If it is moved more than once before a frame, the last move counts.
-    pub fn set_transform(&mut self, instance: u32, world: Mat4) -> bool {
+    /// If it is moved more than once before a frame, the last move counts. A `jump` puts it
+    /// there with no motion, as for a respawn, rather than moving it there over the frame.
+    pub fn set_transform(&mut self, instance: u32, world: Mat4, jump: bool) -> bool {
         let Some(i) = self.index(instance) else {
             return false;
         };
         self.make_movable(i, true);
-        self.moves.push((i as u32, world));
+        self.moves.push((i as u32, world, jump));
         true
     }
 
@@ -120,7 +129,8 @@ impl InstanceTable {
             self.movable.retain(|&m| m as usize != i);
         }
         self.changed.push(i as u32);
-        self.cached_views_changed = true;
+        self.shadows_changed = true;
+        self.gi_changed = true;
     }
 
     /// Hides an instance, or shows it again.
@@ -130,7 +140,9 @@ impl InstanceTable {
         };
         if self.data[i].has_flag(INSTANCE_HIDDEN) != hidden {
             self.data[i].set_flag(INSTANCE_HIDDEN, hidden);
-            self.changed_in_place(i);
+            self.changed.push(i as u32);
+            self.shadows_changed |= !self.data[i].has_flag(INSTANCE_MOVABLE);
+            self.gi_changed |= self.in_gi(i);
         }
         true
     }
@@ -145,9 +157,7 @@ impl InstanceTable {
             self.data[i].set_flag(INSTANCE_STAYS_IN_GI, stays);
             self.changed.push(i as u32);
             // Only a movable instance's place in the voxels changes.
-            if self.data[i].has_flag(INSTANCE_MOVABLE) {
-                self.cached_views_changed = true;
-            }
+            self.gi_changed |= self.data[i].has_flag(INSTANCE_MOVABLE);
         }
         true
     }
@@ -160,18 +170,16 @@ impl InstanceTable {
         let glow = glow.max(0.0);
         if self.data[i].glow() != glow {
             self.data[i].set_glow(glow);
-            self.changed_in_place(i);
+            self.changed.push(i as u32);
+            // Glow is only in the voxels, as light; shadows don't hold it.
+            self.gi_changed |= self.in_gi(i);
         }
         true
     }
 
-    /// Notes a change that leaves the instance where it is. A static instance is in the cached
-    /// views, which then hold it as it was, so they must be drawn again.
-    fn changed_in_place(&mut self, i: usize) {
-        self.changed.push(i as u32);
-        if !self.data[i].has_flag(INSTANCE_MOVABLE) {
-            self.cached_views_changed = true;
-        }
+    /// Whether the GI voxels hold an instance: if it is static, or movable but stays in them.
+    fn in_gi(&self, i: usize) -> bool {
+        !self.data[i].has_flag(INSTANCE_MOVABLE) || self.data[i].has_flag(INSTANCE_STAYS_IN_GI)
     }
 
     /// Where an instance will be drawn next frame: its latest move, or where it is.
@@ -220,16 +228,21 @@ impl InstanceTable {
         let mut moves = std::mem::take(&mut self.moves);
         moves.sort_by_key(|m| m.0);
         let mut moved = Vec::new();
-        for (k, &(i, world)) in moves.iter().enumerate() {
+        for (k, &(i, world, jump)) in moves.iter().enumerate() {
             if moves.get(k + 1).is_some_and(|next| next.0 == i) {
                 continue;
             }
             let instance = &mut self.data[i as usize];
             instance.settle();
             instance.set_world(world);
-            moved.push(i);
+            touched.push(i);
+            if jump {
+                // Already caught up: it shows no motion.
+                instance.settle();
+            } else {
+                moved.push(i);
+            }
         }
-        touched.extend_from_slice(&moved);
         self.moved_last_frame = moved;
         // Reuse the allocation for the next frame's moves.
         moves.clear();
@@ -237,7 +250,8 @@ impl InstanceTable {
 
         FrameChanges {
             ranges: runs(touched),
-            cached_views_changed: std::mem::take(&mut self.cached_views_changed),
+            shadows_changed: std::mem::take(&mut self.shadows_changed),
+            gi_changed: std::mem::take(&mut self.gi_changed),
         }
     }
 
@@ -294,7 +308,7 @@ mod tests {
     #[test]
     fn a_moved_instance_remembers_where_it_was_then_catches_up() {
         let mut table = table();
-        assert!(table.set_transform(1, at(10.0)));
+        assert!(table.set_transform(1, at(10.0), false));
         table.advance();
         assert_eq!(worlds(&table, 1), (Vec3::X * 10.0, Vec3::X));
         // Not moved this frame: it must stop showing motion.
@@ -310,7 +324,7 @@ mod tests {
         let mut table = table();
         for x in [5.0, 6.0, 8.0] {
             let before = worlds(&table, 0).0;
-            table.set_transform(0, at(x));
+            table.set_transform(0, at(x), false);
             table.advance();
             assert_eq!(worlds(&table, 0), (Vec3::X * x, before));
         }
@@ -319,9 +333,9 @@ mod tests {
     #[test]
     fn the_last_move_before_a_frame_counts() {
         let mut table = table();
-        table.set_transform(0, at(3.0));
-        table.set_transform(3, at(7.0));
-        table.set_transform(0, at(4.0));
+        table.set_transform(0, at(3.0), false);
+        table.set_transform(3, at(7.0), false);
+        table.set_transform(0, at(4.0), false);
         assert_eq!(table.transform(0), Some(at(4.0)));
         table.advance();
         assert_eq!(worlds(&table, 0).0, Vec3::X * 4.0);
@@ -332,7 +346,7 @@ mod tests {
     #[test]
     fn instances_without_geometry_or_out_of_range_are_refused() {
         let mut table = table();
-        assert!(!table.set_transform(2, at(1.0)));
+        assert!(!table.set_transform(2, at(1.0), false));
         assert!(!table.set_hidden(2, true));
         assert!(!table.set_glow(9, 0.5));
         assert!(!table.set_movable(6, true));
@@ -340,49 +354,86 @@ mod tests {
         assert_eq!(table.advance(), FrameChanges::default());
     }
 
-    #[test]
-    fn moving_a_static_instance_redraws_the_cached_views_once() {
-        let mut table = table();
-        table.set_transform(0, at(1.0));
-        assert!(table.advance().cached_views_changed);
-        table.set_transform(0, at(2.0));
-        assert!(!table.advance().cached_views_changed);
-        // Making it static again puts it back in them.
-        table.set_movable(0, false);
-        assert!(table.advance().cached_views_changed);
+    /// Which cached views a frame says to redraw: (shadows, GI).
+    fn redraws(table: &mut InstanceTable) -> (bool, bool) {
+        let changes = table.advance();
+        (changes.shadows_changed, changes.gi_changed)
     }
 
     #[test]
-    fn changes_to_static_instances_redraw_the_cached_views_and_to_movable_ones_do_not() {
+    fn moving_a_static_instance_redraws_the_cached_views_once() {
         let mut table = table();
-        table.set_hidden(0, true);
-        assert!(table.advance().cached_views_changed);
-        table.set_glow(1, 0.0);
-        assert!(table.advance().cached_views_changed);
+        table.set_transform(0, at(1.0), false);
+        assert_eq!(redraws(&mut table), (true, true));
+        table.set_transform(0, at(2.0), false);
+        assert_eq!(redraws(&mut table), (false, false));
+        // Making it static again puts it back in them.
+        table.set_movable(0, false);
+        assert_eq!(redraws(&mut table), (true, true));
+    }
 
+    #[test]
+    fn each_change_redraws_only_the_views_that_hold_it() {
+        let mut table = table();
+        // Static: hidden changes both; glow is only in GI.
+        table.set_hidden(0, true);
+        assert_eq!(redraws(&mut table), (true, true));
+        table.set_glow(1, 0.0);
+        assert_eq!(redraws(&mut table), (false, true));
+
+        // Movable, and out of GI: in no cached view.
         table.set_movable(4, true);
         table.advance();
         table.set_hidden(4, true);
         table.set_glow(4, 2.0);
         let changes = table.advance();
-        assert!(!changes.cached_views_changed);
+        assert_eq!(
+            (changes.shadows_changed, changes.gi_changed),
+            (false, false)
+        );
         assert_eq!(changes.ranges, vec![3..4]);
+
+        // Movable but staying in GI: in the voxels only.
+        table.set_stays_in_gi(4, true);
+        assert_eq!(redraws(&mut table), (false, true));
+        table.set_hidden(4, false);
+        assert_eq!(redraws(&mut table), (false, true));
+        table.set_glow(4, 1.0);
+        assert_eq!(redraws(&mut table), (false, true));
     }
 
     #[test]
-    fn staying_in_gi_redraws_the_cached_views_only_for_movable_instances() {
+    fn staying_in_gi_redraws_the_voxels_only_for_movable_instances() {
         let mut table = table();
         assert!(table.set_stays_in_gi(0, true));
         let changes = table.advance();
-        assert!(!changes.cached_views_changed);
+        assert_eq!(
+            (changes.shadows_changed, changes.gi_changed),
+            (false, false)
+        );
         assert_eq!(changes.ranges, vec![0..1]);
         table.set_movable(1, true);
         table.advance();
         table.set_stays_in_gi(1, true);
-        assert!(table.advance().cached_views_changed);
+        assert_eq!(redraws(&mut table), (false, true));
         table.set_stays_in_gi(1, true);
         assert_eq!(table.advance(), FrameChanges::default());
         assert!(!table.set_stays_in_gi(2, true));
+    }
+
+    #[test]
+    fn a_jump_shows_no_motion() {
+        let mut table = table();
+        table.set_transform(0, at(50.0), true);
+        let changes = table.advance();
+        assert_eq!(worlds(&table, 0), (Vec3::X * 50.0, Vec3::X * 50.0));
+        assert_eq!(changes.ranges, vec![0..1]);
+        // Nothing to catch up afterwards.
+        assert_eq!(table.advance(), FrameChanges::default());
+        // A motion after the jump starts from where it jumped to.
+        table.set_transform(0, at(51.0), false);
+        table.advance();
+        assert_eq!(worlds(&table, 0), (Vec3::X * 51.0, Vec3::X * 50.0));
     }
 
     #[test]
@@ -414,8 +465,8 @@ mod tests {
         let mut table = table();
         let mut scaled = Mat4::from_scale(Vec3::splat(3.0));
         scaled.w_axis = Vec3::new(1.0, 2.0, 3.0).extend(1.0);
-        table.set_transform(0, scaled);
-        table.set_transform(1, at(5.0));
+        table.set_transform(0, scaled, false);
+        table.set_transform(1, at(5.0), false);
         table.set_hidden(1, true);
         table.advance();
         assert_eq!(

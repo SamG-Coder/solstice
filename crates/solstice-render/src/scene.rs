@@ -5,7 +5,7 @@
 //! live in a fixed pool of page slots filled by [`crate::streaming`].
 
 use crate::gpu::Gpu;
-use crate::motion::InstanceTable;
+use crate::motion::{FrameChanges, InstanceTable};
 use crate::streaming::textures::TierPlan;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
@@ -130,7 +130,8 @@ pub struct GpuScene {
     pub textures: TextureArrays,
     pub texture_summary: String,
     pub material_sampler: wgpu::Sampler,
-    pub instance_count: u32,
+    /// Instances on the GPU: those of the scene's instances that have geometry.
+    pub gpu_instance_count: u32,
     /// The CPU's copy of `instances`, and what has changed in it.
     pub instance_table: InstanceTable,
     pub light_count: u32,
@@ -183,7 +184,7 @@ impl GpuScene {
             textures,
             texture_summary,
             material_sampler,
-            instance_count: instances.len() as u32,
+            gpu_instance_count: instances.len() as u32,
             instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
             light_count: scene.lights.len() as u32,
             max_hierarchy_depth: scene.hierarchy_depth,
@@ -192,9 +193,9 @@ impl GpuScene {
         }
     }
 
-    /// Applies this frame's changes to instances and uploads them. Returns whether anything the
-    /// cached views draw has changed, so that they must be drawn again.
-    pub fn update_instances(&mut self, gpu: &Gpu) -> bool {
+    /// Applies this frame's changes to instances and uploads them. Returns what changed, so that
+    /// the cached views holding it can be drawn again.
+    pub fn update_instances(&mut self, gpu: &Gpu) -> FrameChanges {
         let changes = self.instance_table.advance();
         for range in &changes.ranges {
             let offset = (range.start * std::mem::size_of::<GpuInstance>()) as u64;
@@ -204,7 +205,7 @@ impl GpuScene {
                 bytemuck::cast_slice(self.instance_table.gpu_data(range.clone())),
             );
         }
-        changes.cached_views_changed
+        changes
     }
 }
 
@@ -245,6 +246,11 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
             continue;
         };
         index.push(Some(out.len() as u32));
+        // The bits above hold the INSTANCE_ flags.
+        debug_assert!(
+            instance.material < INSTANCE_STAYS_IN_GI,
+            "too many materials"
+        );
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());

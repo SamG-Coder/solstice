@@ -326,11 +326,25 @@ impl Renderer {
         self.scene.instance_table.len() as u32
     }
 
-    /// Moves an instance to `world` from the next frame on. An instance that moves becomes
-    /// movable, as [`Self::set_instance_movable`] makes it, if it was not already. Returns false,
-    /// and does nothing, for an instance that has no geometry or does not exist.
+    /// Moves an instance to `world` from the next frame on, as motion over the frame, which
+    /// motion blur and temporal anti-aliasing follow. An instance that moves becomes movable, as
+    /// [`Self::set_instance_movable`] makes it, if it was not already. Returns false, and does
+    /// nothing, for an instance that has no geometry or does not exist.
+    ///
+    /// `world` must be invertible. To make something vanish, hide it with
+    /// [`Self::set_instance_hidden`] rather than scaling it to nothing.
     pub fn move_instance(&mut self, instance: u32, world: Mat4) -> bool {
-        self.scene.instance_table.set_transform(instance, world)
+        self.scene
+            .instance_table
+            .set_transform(instance, world, false)
+    }
+
+    /// Puts an instance at `world` from the next frame on, as a jump rather than a motion, as
+    /// for a respawn: it shows no motion getting there. Otherwise as [`Self::move_instance`].
+    pub fn place_instance(&mut self, instance: u32, world: Mat4) -> bool {
+        self.scene
+            .instance_table
+            .set_transform(instance, world, true)
     }
 
     /// Makes an instance movable, or static again. A movable instance is drawn afresh every
@@ -566,7 +580,7 @@ impl Renderer {
             clusters: stats.clusters(),
             software_clusters: stats.software_clusters(),
             triangles: stats.triangles(),
-            instances: self.scene.instance_count,
+            instances: self.scene.gpu_instance_count,
             source_triangles: self.scene.source_triangles,
             unique_triangles: self.scene.unique_triangles,
             streaming: self.streamer.stats(),
@@ -621,13 +635,21 @@ impl Renderer {
         // Everything below draws what's installed from here on, with instances where they are
         // this frame.
         self.streamer.update(gpu, &self.scene);
-        let instances_changed = self.scene.update_instances(gpu);
-        if self.streamer.should_refresh_cached_views() || instances_changed {
+        let changes = self.scene.update_instances(gpu);
+        let streamed = self.streamer.should_refresh_cached_views();
+        if streamed {
             self.shadows.mark_stale();
-            self.volume.mark_stale();
+        }
+        if changes.shadows_changed {
+            self.shadows.mark_stale_now();
+        }
+        if streamed || changes.shadows_changed {
             if let Some(water) = &mut self.water {
                 water.seabed.mark_stale();
             }
+        }
+        if streamed || changes.gi_changed {
+            self.volume.mark_stale();
         }
 
         let aspect = render_size.0 as f32 / render_size.1 as f32;

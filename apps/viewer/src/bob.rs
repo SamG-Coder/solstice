@@ -69,11 +69,12 @@ impl Bobbing {
 
 /// How a hull rides a gentle swell at `seconds`, scaled by `amplitude`: rising and falling,
 /// rolling and pitching a little, each with its own period so the motion never quite repeats.
+/// It starts level, where the scene put it.
 pub fn rocking(pivot: Vec3, seconds: f32, amplitude: f32) -> Mat4 {
     use std::f32::consts::TAU;
     let heave = amplitude * 0.25 * (seconds * TAU / 7.0).sin();
     let roll = amplitude * 3.0_f32.to_radians() * (seconds * TAU / 9.0).sin();
-    let pitch = amplitude * 1.5_f32.to_radians() * (seconds * TAU / 6.0 + 1.0).sin();
+    let pitch = amplitude * 1.5_f32.to_radians() * (seconds * TAU / 6.0).sin();
     Mat4::from_translation(pivot + Vec3::Y * heave)
         * Mat4::from_quat(Quat::from_rotation_z(roll) * Quat::from_rotation_x(pitch))
         * Mat4::from_translation(-pivot)
@@ -108,6 +109,11 @@ mod tests {
             tilts.iter().all(|&t| t < 4.0_f32.to_radians()),
             "it rocks too far"
         );
+    }
+
+    #[test]
+    fn it_starts_where_the_scene_put_it() {
+        assert!(rocking(Vec3::new(3.0, 1.0, 2.0), 0.0, 1.0).abs_diff_eq(Mat4::IDENTITY, 1.0e-6));
     }
 
     #[test]
