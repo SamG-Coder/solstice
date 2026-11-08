@@ -206,14 +206,19 @@ it.
 ```text
  1. Input        gather keys, mouse, pads and touch; map them to actions
  2. Fixed steps  0 to 3 steps of 1/60 s, each one:
-      a. Events       this step's input actions and due timers, delivered to scripts
+      a. Start        the step's input is taken; timers due on it deliver their events
       b. PrePhysics   Rust systems, root motion, then script ticks for the actors that tick
       c. Physics      one Rapier step; contacts and triggers are queued
       d. PostPhysics  hits and overlaps delivered to scripts
+      e. Transforms   every entity's place in the world, keeping the step before
  3. Animation    state machines read gameplay's values; sample, blend, IK
  4. Late         the camera follows
  5. Extract      changed transforms, bone palettes, lights and environment go to the renderer
 ```
+
+As built (step 2, `crates/solstice-world`): `Game::frame` runs items 1 to 4 of this list.
+Extraction (item 5) comes with roadmap step 4, *Scenes, actors and play mode*. Items 3 and 4
+are the per-frame tick groups `Animation` and `Late`.
 
 - **Fixed steps.** Everything that decides what happens runs inside the steps, at 60 Hz from an
   accumulator: events, script ticks, Rust gameplay systems and physics. Input is gathered per
@@ -232,7 +237,27 @@ it.
   react to events: an overlap, an input action, a timer, the hour changing.
 - **Events are queued** and delivered between tick groups. A handler never runs halfway through
   another system, so the order is always the same and replays give the same result.
+  - Each event is stamped with the step and group that sent it. Every fixed-step group sees it
+    exactly once, within a step: what was sent before it in this step, and what was sent from
+    its own place on in the step before. So a script's event in PrePhysics reaches handlers in
+    PostPhysics of the same step, and in PrePhysics of the next.
+  - Events sent before a step (while setting up, or by timers as the step starts) are seen by
+    all of that step's groups.
+  - The per-frame groups see everything sent since they last ran, once, however many steps the
+    frame held. They send no events, set no timers and spawn nothing, and that is checked: they
+    run as often as frames come, which differs from run to run, and a replay doesn't run them.
+    They may write only what is drawn (poses, the camera).
+- **Input** is the frame's values, plus the actions pressed since the last step, so a tap
+  between two steps isn't lost. The per-frame groups also see the frame's own input, for a
+  camera that turns even in frames with no step.
+- **Replays are exact on the same build and platform.** Native and web builds may round some
+  maths differently, such as sines in `glam` and `libm`.
 - **Spawning and destroying** are deferred to the end of the tick group that asks for them.
+- **Timers** count steps, not seconds, so they fire on the same step in every run.
+- **Teleports** mark the entity `Snap`, so it is drawn at its new place at once, not sliding there.
+- **Later steps will need:** animation notifies (footsteps, hit frames) worked out in the fixed
+  step, alongside root motion, since the per-frame groups can't send events; and, for physics,
+  places worked out again before the physics group when something moved earlier in the step.
 
 ### Where work runs
 
@@ -696,7 +721,7 @@ Each step is its own PR, with mutation-tested tests, measured costs (natively an
 clippy clean on native and wasm32, and a review by a separate AI agent. It is merged only with
 your go-ahead, and nothing is published without asking.
 
-1. **Things that move.** *In review.* The renderer API for moving instances, with `prev_world`
+1. **Things that move.** *Done.* The renderer API for moving instances, with `prev_world`
    set to the transform each was drawn with last frame; hiding instances and scaling their glow;
    the moving flag, with moving instances left out of the cached shadows, the seabed map and the
    GI voxels, and drawn into per-cascade shadow maps of their own.
@@ -709,10 +734,17 @@ your go-ahead, and nothing is published without asking.
    - Tests: a moved instance's motion vectors and shadow follow it; cached shadows of static
      geometry stay as they were; nothing static is redrawn; nothing moving is left behind in a
      cache.
-2. **The world.** `solstice-world`: entities and components on `hecs`, the transform tree, tick
-   groups, events, timers, and the fixed clock with input per step. Headless.
+2. **The world.** *In review.* `solstice-world`: entities and components on `hecs`, the
+   transform tree, tick groups, events, timers, and the fixed clock with input per step.
+   Headless.
    - Tests: tick order; event order; a recorded run replays to the same state; the clock under
      slow and uneven frames.
+   - Cost: a step of the benchmark (`tools/gameplay-bench/b_world`: turning a thousand roots,
+     working out every place, and an event per root) takes about 16 ns an entity on the web
+     (wasm with SIMD, 9800X3D) and 13 ns natively. So 9,000 entities with transforms take
+     0.15 ms a step on the web; perhaps 0.3 ms on an integrated-GPU laptop, within the world's
+     line of the budget. Every entity with a transform is worked out every step. If scenes grow
+     past that, skipping what hasn't moved comes next.
 3. **Scripting.** `solstice-script` with Starlark: actor scripts, properties and `self.vars`,
    events, timers, the engine API table and its generated bindings, hot reload, step and memory
    caps, and errors with file and line. The benchmarks are run again in place.
