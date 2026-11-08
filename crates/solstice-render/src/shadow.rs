@@ -27,6 +27,12 @@ const SNAP_TEXELS: f32 = 64.0;
 /// Extra radius that covers the furthest a slice can be from its snapped centre, which is
 /// half a snap step on each of three axes. The bounds test in this module checks that it is enough.
 const SNAP_PADDING: f32 = 1.07;
+/// Where along a cascade receivers begin to dither into the next one, as a fraction of its
+/// span. Twin of the blend in `lighting/sun_shadow.wgsl`.
+const BLEND_START: f32 = 0.85;
+/// How far receivers are moved along their normal before sampling, in texels, at most. Twin
+/// of the offset in `lighting/sun_shadow.wgsl`: 1.2 + 0.8 × a slope of up to 8.
+const SAMPLE_OFFSET_TEXELS: f32 = 7.6;
 
 /// Twin of `Shadows` in `lighting/deferred.wgsl`.
 #[repr(C)]
@@ -45,8 +51,9 @@ pub struct ShadowMaps {
     layer_views: Vec<wgpu::TextureView>,
     pipeline: wgpu::RenderPipeline,
     data: ShadowUniform,
-    /// What each cascade last drew, to tell when it has gone stale.
-    drawn: [Option<(Mat4, f32)>; CASCADE_COUNT],
+    /// What each cascade last drew, to tell when it has gone stale: its view, and the LOD
+    /// threshold and camera LOD scale it was drawn with.
+    drawn: [Option<(Mat4, f32, f32)>; CASCADE_COUNT],
     next_far_cascade: usize,
     /// Cascades that must redraw because the geometry on the GPU has improved.
     outdated: [bool; CASCADE_COUNT],
@@ -165,6 +172,7 @@ impl ShadowMaps {
         aspect: f32,
         sun_direction: Vec3,
         lod_threshold: f32,
+        eye_lod_scale: f32,
     ) -> [bool; CASCADE_COUNT] {
         let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] = std::array::from_fn(|cascade| {
             let near = if cascade == 0 {
@@ -175,7 +183,8 @@ impl ShadowMaps {
             fit_cascade(camera, aspect, sun_direction, near, SPLITS[cascade])
         });
         let stale: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
-            self.outdated[cascade] || self.drawn[cascade] != Some((fits[cascade].0, lod_threshold))
+            self.outdated[cascade]
+                || self.drawn[cascade] != Some((fits[cascade].0, lod_threshold, eye_lod_scale))
         });
         let never_drawn: [bool; CASCADE_COUNT] =
             std::array::from_fn(|cascade| self.drawn[cascade].is_none());
@@ -184,15 +193,42 @@ impl ShadowMaps {
         for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
             self.outdated[cascade] = false;
             let (view_proj, center, radius) = fits[cascade];
-            self.drawn[cascade] = Some((view_proj, lod_threshold));
+            self.drawn[cascade] = Some((view_proj, lod_threshold, eye_lod_scale));
             self.data.view_proj[cascade] = view_proj;
             self.data.texel_size[cascade] = 2.0 * radius / RESOLUTION as f32;
+            // Whatever this cascade draws shadows receivers no nearer than where it begins,
+            // so detail the camera could not see there is left out. Receivers near the end of
+            // the previous cascade dither into this one, so it begins where that blend does.
+            let nearest = if cascade == 0 {
+                camera.near
+            } else {
+                let previous = if cascade == 1 {
+                    0.0
+                } else {
+                    SPLITS[cascade - 2]
+                };
+                previous + (SPLITS[cascade - 1] - previous) * BLEND_START
+            };
             let view = PassView::orthographic(
                 view_proj,
                 center,
                 Vec2::splat(RESOLUTION as f32),
                 RESOLUTION as f32 / (2.0 * radius),
                 lod_threshold,
+            )
+            .seen_from(camera.position, eye_lod_scale, nearest)
+            // Only casters whose shadow can fall on this cascade's slice of the view are drawn.
+            // The sphere the cascade is fitted to covers far more than the slice, especially
+            // beside and behind the camera.
+            .shadowing(
+                &slice_planes(
+                    camera,
+                    aspect,
+                    nearest,
+                    SPLITS[cascade],
+                    SAMPLE_OFFSET_TEXELS * self.data.texel_size[cascade],
+                ),
+                sun_direction,
             );
             slots.write(gpu, first_slot + cascade as u32, &view);
         }
@@ -263,6 +299,19 @@ fn choose_due(
         }
     }
     due
+}
+
+/// The planes of the camera's frustum holding every point between `near` and `far` from the
+/// camera, facing inwards, each moved outwards by `padding` metres so that points sampled a
+/// little off a receiver still count. Cascades are chosen by distance from the camera, not
+/// depth along its axis, so the near plane is drawn back to where the nearest point at that
+/// distance, in the frustum's corner, lies in depth.
+fn slice_planes(camera: &Camera, aspect: f32, near: f32, far: f32, padding: f32) -> [Vec4; 6] {
+    let tan_y = (camera.fov_y * 0.5).tan();
+    let corner = (1.0 + (1.0 + aspect * aspect) * tan_y * tan_y).sqrt();
+    // A finite, forward-depth projection: `frustum_planes` reads a far plane from it too.
+    let projection = Mat4::perspective_rh(camera.fov_y, aspect, near / corner, far);
+    PassView::frustum_planes(projection * camera.view()).map(|plane| plane + Vec4::W * padding)
 }
 
 /// Fits an orthographic view around a slice of the camera frustum.
@@ -367,6 +416,101 @@ mod tests {
             unchanged >= 40,
             "only {unchanged} of 50 small moves kept the cascade"
         );
+    }
+
+    /// Points at `distance` from the camera, across its field of view: the centre, the four
+    /// corners, and a few between.
+    fn points_at(camera: &Camera, aspect: f32, distance: f32) -> Vec<Vec3> {
+        let tan_y = (camera.fov_y * 0.5).tan();
+        let right = camera.right();
+        let up = right.cross(camera.forward());
+        let mut points = Vec::new();
+        for (sx, sy) in [
+            (0.0, 0.0),
+            (-1.0, -1.0),
+            (1.0, -1.0),
+            (-1.0, 1.0),
+            (1.0, 1.0),
+            (0.5, -0.3),
+            (-0.7, 0.9),
+        ] {
+            let direction =
+                (camera.forward() + right * sx * tan_y * aspect + up * sy * tan_y).normalize();
+            points.push(camera.position + direction * distance);
+        }
+        points
+    }
+
+    fn inside(planes: &[Vec4], point: Vec3) -> bool {
+        planes
+            .iter()
+            .all(|plane| plane.truncate().dot(point) + plane.w >= -1.0e-3)
+    }
+
+    #[test]
+    fn a_slice_holds_every_point_between_its_distances() {
+        let camera = test_camera();
+        let aspect = 16.0 / 9.0;
+        let planes = slice_planes(&camera, aspect, 38.0, 120.0, 0.0);
+        for distance in [38.0, 50.0, 100.0, 119.9] {
+            for point in points_at(&camera, aspect, distance) {
+                assert!(inside(&planes, point), "{point} at {distance} is outside");
+            }
+        }
+        // Nearer than the slice, in its corner, is outside; so is beyond it.
+        let corner = points_at(&camera, aspect, 20.0)[1];
+        assert!(!inside(&planes, corner), "{corner} at 20 m is inside");
+        let beyond = points_at(&camera, aspect, 130.0)[0];
+        assert!(!inside(&planes, beyond), "{beyond} at 130 m is inside");
+    }
+
+    #[test]
+    fn padding_moves_every_plane_outwards() {
+        let camera = test_camera();
+        let planes = slice_planes(&camera, 1.5, 38.0, 120.0, 0.0);
+        let padded = slice_planes(&camera, 1.5, 38.0, 120.0, 3.0);
+        for (plane, wide) in planes.iter().zip(&padded) {
+            assert_eq!(plane.truncate(), wide.truncate());
+            assert!((wide.w - plane.w - 3.0).abs() < 1.0e-4);
+        }
+        // Just beyond the far end is now inside.
+        let beyond = points_at(&camera, 1.5, 122.0)[0];
+        assert!(!inside(&planes, beyond) && inside(&padded, beyond));
+    }
+
+    #[test]
+    fn every_caster_that_can_shadow_the_slice_passes_the_receiver_planes() {
+        let camera = test_camera();
+        let aspect = 1.5;
+        let planes = slice_planes(&camera, aspect, 38.0, 120.0, 0.0);
+        for sun in [sun(), Vec3::new(-0.7, 0.3, 0.1).normalize(), Vec3::Y] {
+            let view = PassView::orthographic(Mat4::IDENTITY, Vec3::ZERO, Vec2::ONE, 1.0, 1.0)
+                .shadowing(&planes, sun);
+            let kept = &view.receiver_planes[..view.receiver_plane_count as usize];
+            assert!(
+                !kept.is_empty() && kept.len() < 6,
+                "{} planes kept",
+                kept.len()
+            );
+            // A caster anywhere between a receiver in the slice and the sun passes.
+            for distance in [38.0, 80.0, 119.0] {
+                for receiver in points_at(&camera, aspect, distance) {
+                    for t in [0.0, 1.0, 50.0, 900.0] {
+                        let caster = receiver + sun * t;
+                        assert!(
+                            inside(kept, caster),
+                            "{caster} fails, {t} m towards the sun"
+                        );
+                    }
+                }
+            }
+            // One well beyond the slice, away from the sun, cannot shadow it and does not pass.
+            let shadowed_side = points_at(&camera, aspect, 80.0)[0] - sun * 400.0;
+            assert!(
+                !inside(kept, shadowed_side),
+                "{shadowed_side} passes for sun {sun}"
+            );
+        }
     }
 
     #[test]
