@@ -80,6 +80,12 @@ compile away. The masked entry points compute perspective-correct UVs, pick one 
 triangle's UV gradient and call `textureSampleLevel` once. Hardware masked draws have a fragment
 stage that does the same. The opaque hardware shadow pipeline still has no fragment stage.
 
+**Passes.** The masked software rasterizers run in a compute pass of their own. Directly after the
+opaque dispatch in one pass, the device is lost a few frames in on the integrated Radeon under
+Vulkan, even with an empty masked list; DX12 and the RTX 5080 are fine, and validation layers report
+nothing. The cause in the driver isn't known. No automated test covers this, as it needs that
+GPU: a head with hair was run on the Radeon from five camera positions, three times each.
+
 **Binding limit.** The renderer requires only 8 storage buffers per stage, and the raster passes
 already use all 8 once `materials` is added. `vertices` and `triangles` are the same buffer bound
 twice, so they merge into one `array<u32>` binding, which leaves room. Masked passes bind
@@ -117,23 +123,50 @@ hair and brows keep their shape at 0.3 m and 2 m, and the hair is still a full h
 
 ## Costs
 
-Estimates, to be replaced with measurements.
+Measured on the RTX 5080 and on the integrated Radeon at Low, both at 1920x1080, median of 4 runs.
+The Radeon throttles: the same build's total moved by 5 ms or more between runs, so only
+differences larger than that mean anything in its totals. Raster times hold steadier.
 
-- **Scenes with no masked material:** no extra passes, no extra memory, and the same shaders apart
-  from the merged binding. Expected to be within noise.
-- **Scenes with masked material, opaque work:** two empty-capable indirect passes per view, and a
-  larger visible list, 8 bytes per extra entry.
-- **Masked work:** one trilinear fetch and a barycentric solve per covered pixel in software. In
-  hardware, a fragment stage with helper invocations, on clusters that are large on screen by
-  construction. Overdraw from layered hair cards is the main risk, on the integrated Radeon most of
-  all.
-- **Shadow cascades:** masked hardware clusters gain a fragment stage. Cascades are cached, so this
-  is paid when they are redrawn.
-- **Bake:** coverage search and dilation on masked layers only.
+**Scenes with no masked material** run no extra passes. The plants scene, before this work and #49
+against after:
 
-To be measured and reported for sizing scenes: milliseconds per million covered masked pixels, on
-each rasterizer path and in shadows, and how that grows with layers of overdraw. The harbour's
-leaves depend on these figures on the integrated Radeon.
+| | Raster (ms) | Resolve (ms) | Total (ms) |
+| --- | --- | --- | --- |
+| RTX 5080, before | 0.30 | 0.14 | 1.59 |
+| RTX 5080, after | 0.30 | 0.14 | 1.59 |
+| Radeon Low, before | 5.48 | 5.26 | 71.0 |
+| Radeon Low, after | 5.23 | 4.38 | 66.2 |
+
+The `select` #49 added to resolve doesn't show on either GPU. An earlier run on the Radeon had the
+total 1.5 ms higher after, this one 4.8 ms lower, so any change is smaller than its noise.
+
+**Masked raster.** Test scenes are 4 m cards of fine stripes, half solid, compared with the same
+cards opaque. "Tested" counts every pixel a card covers, hole or not.
+
+| Radeon Low | Opaque raster (ms) | Masked raster (ms) | Extra, per million pixels tested |
+| --- | --- | --- | --- |
+| Hardware, 1 layer, 2.07 M pixels | 6.35 | 5.55 | none: holes write nothing |
+| Hardware, 4 layers | 9.42 | 8.65 | none |
+| Small hardware clusters, 4 layers, 5.6 M pixels | 14.82 | 17.50 | 0.5 ms |
+| Software, 1 layer, 1.40 M pixels | 8.75 | 12.19 | 2.5 ms |
+
+On the RTX 5080 masked raster is within 0.02 ms of opaque in every case.
+
+**For sizing a scene on the Radeon:** each layer of large hardware clusters adds about 0.5 ms per
+million pixels, the same as opaque. Small clusters add a further 0.5 ms per million in hardware and
+2 to 2.5 ms per million in software, which is the case to watch with leaves. Cost grows in line with
+layers of overdraw, with no point where it turns worse, so there is no overdraw limit as such: count
+pixels tested. A hole costs its test but no shading, so totals fall where holes are many.
+
+**Shadows.** A whole cascade redraw of the same cards costs 0.1 ms more than opaque on the Radeon in
+software (2.34 against 2.22 ms) and 0.02 ms more in hardware. Cascades are cached, so this is paid
+when they are redrawn.
+
+**A head with hair**, the keeper at 0.7 m: raster goes from 0.17 to 0.19 ms on the RTX 5080 and from
+2.20 to 2.35 ms on the Radeon. The totals don't move beyond noise.
+
+**Memory:** 4 MB per cull list in scenes that have masked materials, 24 bytes of cull state in those
+that don't.
 
 ## Visible changes
 
@@ -149,6 +182,7 @@ GPU tests in `crates/solstice-render/tests/gpu.rs`, each failing without the fix
 
 - holes in the primary view, on both the hardware and software paths;
 - holes in sun shadows, on both paths;
+- holes in the shadows of moving cards, with one cull for all cascades and with one each;
 - a masked wall admits light in GI where a solid one does not;
 - a two-sided card shows from behind and a one-sided one does not;
 - a surface behind a masked card is not culled by occlusion;

@@ -3731,7 +3731,11 @@ fn what_stands_behind_a_hole_is_not_occluded() {
     scene
         .meshes
         .push(build_virtual_mesh(&sphere(4), &BuildOptions::default()));
-    scene.materials.push(white_material());
+    // Red, as the card is grey: bright alone would pass with the card drawn over the ball.
+    scene.materials.push(Material {
+        base_color: [1.0, 0.0, 0.0, 1.0],
+        ..Default::default()
+    });
     let ball = Vec3::new(-0.75, 0.0, -3.0);
     scene.instances.push(Instance {
         mesh: 1,
@@ -3740,8 +3744,11 @@ fn what_stands_behind_a_hole_is_not_occluded() {
     });
     let (pixels, camera, _) = card_albedo(&gpu, &scene, 5.0);
     let (px, py) = pixel_of(&camera, 256, ball);
-    let seen = brightness(patch(&pixels, 256, px, py, 1));
-    assert!(seen > 100.0, "the ball behind the hole shows {seen}");
+    let [red, green, _] = patch(&pixels, 256, px, py, 1);
+    assert!(
+        red > green + 100.0,
+        "the ball behind the hole shows red {red} and green {green}"
+    );
 }
 
 /// A two-sided cut-out card placed by `card` above a wide floor at y = 0.
