@@ -10,6 +10,7 @@
 #include "common/environment.wgsl"
 #include "common/brdf.wgsl"
 #include "ocean/surface_params.wgsl"
+#include "lighting/sun_shadow.wgsl"
 
 // The opaque scene, lit, with its depth and motion.
 @group(0) @binding(0) var lit: texture_2d<f32>;
@@ -26,6 +27,10 @@
 @group(0) @binding(9) var out_color: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(10) var out_depth: texture_storage_2d<r32float, write>;
 @group(0) @binding(11) var out_motion: texture_storage_2d<rg32float, write>;
+// The sun's shadows, as the lighting pass has them.
+@group(0) @binding(12) var<uniform> shadows: Shadows;
+@group(0) @binding(13) var shadow_maps: texture_depth_2d_array;
+@group(0) @binding(14) var shadow_sampler: sampler_comparison;
 
 const DEBUG_OCEAN: u32 = 10u;
 // Water's reflectance looking straight down: from its index of refraction, 1.33.
@@ -148,6 +153,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
         let reflected = sky_radiance(toward_horizon(reflect(-view, normal)));
 
+        // Sunlight at the water, after the clouds, and the shadows of what stands in its way:
+        // cliffs, the fort, the ship. Shadows show on water by dimming its highlight and the
+        // light it scatters from within; the sky it reflects is untouched.
+        let noise = interleaved_gradient_noise(vec2f(id.xy), frame.frame_index);
+        let shadow = sun_shadow(world, vec3f(0.0, 1.0, 0.0), distance, noise);
+        let sun_light = sun_irradiance_at(world) * shadow;
+
         // The sun's highlight off the waves.
         let sun = frame.sun_direction;
         let n_dot_l = dot(normal, sun);
@@ -157,7 +169,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let h = normalize(view + sun);
             let specular = d_ggx(max(dot(normal, h), 0.0), a) * v_smith(n_dot_v, n_dot_l, a)
                 * f_schlick(vec3f(WATER_F0), max(dot(view, h), 0.0));
-            highlight = specular * n_dot_l * sun_irradiance_at(world);
+            highlight = specular * n_dot_l * sun_light;
         }
 
         // Light scattered back out of the water's body: its share of what is not absorbed, of
@@ -165,7 +177,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let extinction = surface.absorption.rgb + surface.scattering.rgb;
         let albedo = surface.scattering.rgb / max(extinction, vec3f(1.0e-4));
         let skylight = clear_sky_radiance(vec3f(0.0, 1.0, 0.0)) * PI;
-        let sunlight = sun_irradiance_at(world) * max(sun.y, 0.0);
+        let sunlight = sun_light * max(sun.y, 0.0);
         let body = albedo * (skylight + sunlight) / PI * 0.5;
 
         let underwater = through_water(center, world, view, normal, water, scene_depth, body, extinction);

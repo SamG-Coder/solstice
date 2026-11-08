@@ -13,6 +13,7 @@ use super::waves::OceanWaves;
 use super::Ocean;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
 use crate::shaders;
+use crate::shadow::ShadowMaps;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
@@ -251,20 +252,22 @@ impl WaterSurface {
                 cache: None,
             });
 
-        let shade_layout = LayoutBuilder::new()
-            .texture()
-            .texture_unfilterable()
-            .texture_unfilterable()
-            .depth_texture()
-            .texture_unfilterable()
-            .texture_array()
-            .texture_array()
-            .sampler()
-            .uniform()
-            .storage_texture(COLOR_FORMAT)
-            .storage_texture(SCENE_DEPTH_FORMAT)
-            .storage_texture(MOTION_FORMAT)
-            .build(gpu, "ocean shade");
+        let shade_layout = ShadowMaps::add_to_layout(
+            LayoutBuilder::new()
+                .texture()
+                .texture_unfilterable()
+                .texture_unfilterable()
+                .depth_texture()
+                .texture_unfilterable()
+                .texture_array()
+                .texture_array()
+                .sampler()
+                .uniform()
+                .storage_texture(COLOR_FORMAT)
+                .storage_texture(SCENE_DEPTH_FORMAT)
+                .storage_texture(MOTION_FORMAT),
+        )
+        .build(gpu, "ocean shade");
         let shade = gpu.compute_pipeline(
             "ocean shade",
             &shaders::module(&gpu.device, "ocean/shade.wgsl"),
@@ -369,6 +372,7 @@ impl WaterSurface {
         waves: &OceanWaves,
         targets: &WaterTargets,
         scene: SceneViews,
+        shadows: &ShadowMaps,
     ) {
         let fresh = self
             .groups
@@ -402,6 +406,9 @@ impl WaterSurface {
                     tex(&targets.color.view),
                     tex(&targets.scene_depth.view),
                     tex(&targets.motion.view),
+                    shadows.uniform.as_entire_binding(),
+                    tex(&shadows.array_view),
+                    wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
                 ],
             );
             self.groups = Some((waves.generation(), targets.generation, raster, shade));

@@ -712,6 +712,7 @@ impl Renderer {
                     depth: &sized.gbuffer.depth.view,
                     motion: &sized.gbuffer.motion.view,
                 },
+                &self.shadows,
             );
         }
 
