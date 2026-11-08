@@ -1003,7 +1003,8 @@ fn tiled_lights_reach_what_is_in_their_range_and_nothing_else() {
             )
         })
         .collect();
-    let size = 128;
+    // Not a multiple of the tile size, so the tiles along two edges reach past the viewport.
+    let size = 120;
     let render_lights = |lights: Vec<Light>| {
         let mut scene = ball_on_floor();
         scene.lights = lights;
