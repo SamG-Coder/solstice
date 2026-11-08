@@ -34,7 +34,8 @@ struct Frame {
     // The sun's illuminance at noon, which night is measured against.
     daylight_illuminance: f32,
     star_equinox: vec3f,
-    _pad0: f32,
+    // Seconds since the previous frame, which temporal filters scale their blend by.
+    frame_seconds: f32,
     // Where the sun and moon are drawn: the true sun, whatever lights the scene, and the moon.
     sun_disc: vec3f,
     _pad1: f32,

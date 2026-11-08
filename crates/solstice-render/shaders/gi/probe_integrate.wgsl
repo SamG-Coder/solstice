@@ -124,7 +124,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         if frame.frame_index > 0u {
             // A moving view exposes new surfaces, which need history to fade out faster.
             let moved = length(motion * frame.viewport);
-            let blend = clamp(0.08 + moved * 0.03, 0.08, 0.5);
+            let settled = frame_rate_blend(0.08, frame.frame_seconds);
+            let blend = clamp(settled + moved * 0.03, settled, 0.5);
             current = mix(history, current, blend);
         }
     }

@@ -8,7 +8,7 @@ use crate::vg::GBuffer;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// Must match the constants of the same names in `gi/probe_common.wgsl`.
 const PROBE_SPACING: u32 = 16;
-const PROBE_RAYS: u32 = 6;
+const PROBE_RAYS: u32 = 8;
 /// Size of `Probe` in `gi/probe_common.wgsl`: nine SH vectors, position and normal.
 const PROBE_BYTES: u64 = 11 * 16;
 

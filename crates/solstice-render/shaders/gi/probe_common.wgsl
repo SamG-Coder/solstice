@@ -5,7 +5,7 @@
 // Each probe covers this many pixels on a side.
 const PROBE_SPACING: u32 = 16u;
 // Each probe traces this many rays on a side.
-const PROBE_RAYS: u32 = 6u;
+const PROBE_RAYS: u32 = 8u;
 
 struct Probe {
     // Spherical harmonics, order 2, RGB in xyz.

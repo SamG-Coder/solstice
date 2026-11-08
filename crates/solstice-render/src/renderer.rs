@@ -209,6 +209,8 @@ pub struct Renderer {
     history: Option<History>,
     frame_index: u32,
     time: f32,
+    /// Seconds since the previous frame.
+    frame_seconds: f32,
 }
 
 impl Renderer {
@@ -351,6 +353,7 @@ impl Renderer {
             history: None,
             frame_index: 0,
             time: 0.0,
+            frame_seconds: 1.0 / 60.0,
         }
     }
 
@@ -454,6 +457,7 @@ impl Renderer {
         );
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
+        self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
 
         // Everything below draws what's installed from here on.
         self.streamer.update(gpu, &self.scene);
@@ -751,7 +755,7 @@ impl Renderer {
             },
             star_pole: environment.star_pole,
             star_equinox: environment.star_equinox,
-            _pad0: 0.0,
+            frame_seconds: self.frame_seconds,
             sun_disc: environment.sun_disc.unwrap_or(environment.sun_direction),
             _pad1: 0.0,
             moon_disc: environment.moon_disc.unwrap_or(Vec3::NEG_Y),
