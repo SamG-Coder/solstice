@@ -23,7 +23,8 @@ const WET_FILM_ROUGHNESS: f32 = 0.07;
 // Wetness at which a porous surface's pores are full and a film starts to form.
 const WET_PORES_FULL: f32 = 0.6;
 // For now (docs/wetness.md, step 1), surfaces are wet from the calm sea's level up to this
-// height above it, drying towards the top; step 2 replaces this with where the water has been.
+// height above it, drying towards the top, anywhere in the world, and everything below the calm
+// level counts as under water, even inland. Step 2 replaces this with where the water has been.
 const WET_BAND: f32 = 0.3;
 
 // How porous a material is, 0 to 1, as it has no such value of its own: rough dielectrics,
@@ -49,6 +50,8 @@ struct WetSurface {
     albedo: vec3f,
     roughness: f32,
     normal: vec3f,
+    // How wet the material was taken to be, cavities included.
+    wetness: f32,
 }
 
 // The surface with base colour `albedo`, `roughness` and `metallic`, shading normal `normal` and
@@ -64,13 +67,14 @@ fn wet_surface(
     wetness: f32,
     submerged: f32,
 ) -> WetSurface {
-    var out = WetSurface(albedo, roughness, normal);
+    var out = WetSurface(albedo, roughness, normal, 0.0);
     if wetness <= 0.0 {
         return out;
     }
     let porous = porosity(roughness, metallic);
     // Hollows fill first, so a cavity is a little wetter than the surface around it.
     let w = clamp(wetness + (1.0 - cavity) * 0.25 * wetness, 0.0, 1.0);
+    out.wetness = w;
 
     // Pores filling.
     let pores = clamp(w / WET_PORES_FULL, 0.0, 1.0) * porous;

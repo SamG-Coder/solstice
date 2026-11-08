@@ -54,6 +54,7 @@ const DEBUG_NORMALS: u32 = 6u;
 const DEBUG_DIFFUSE_GI: u32 = 7u;
 const DEBUG_REFLECTIONS: u32 = 8u;
 const DEBUG_VOXELS: u32 = 9u;
+// 10 is DEBUG_OCEAN, in ocean/shade.wgsl.
 const DEBUG_WETNESS: u32 = 11u;
 
 fn pixel_to_ndc(pixel: vec2f, inv_viewport: vec2f) -> vec2f {

@@ -1,8 +1,9 @@
 # Wetness: design
 
 Surfaces the sea reaches get wet: the sand along the waterline, rocks standing in the surf, the
-ship's hull. They stay wet a while after the water draws back, then dry. This document is the plan,
-to be agreed before any of it is built. Foam waits until later.
+ship's hull. They stay wet a while after the water draws back, then dry. This document is the
+plan, agreed before any of it was built, and kept up to date as each step lands. Foam waits until
+later.
 
 ## Goals
 
@@ -14,12 +15,12 @@ to be agreed before any of it is built. Foam waits until later.
   last minute or so. Nothing is painted by hand for one scene.
 - **It joins the whole system.** It is decided once, where each pixel's material is resolved.
   Lighting, sun and moon shadows, reflections and screen GI then all see the wet surface. GI's
-  voxels see it too, so wet sand bounces darker light.
+  voxels see it too, so wet sand bounces darker light (from step 3; until then they stay dry).
 - **Dynamic.** A rougher sea wets higher. A calmer one leaves the wet band to dry. Moving the sea
   level moves all of it.
 - **Cheap.** Under 0.1 ms on the RTX 5080 at 1280×720, and modest on integrated GPUs.
 
-## What there is today
+## What there was before
 
 - No wetness anywhere.
 - The resolve pass (`vg/resolve.wgsl`) works out each pixel's albedo, roughness, metallic and
@@ -50,18 +51,22 @@ just before the G-buffer is written.
   painted wood and polished stone much less, and metal not at all. A per-material `porosity`
   value can come later through the scene file, if any material is judged wrong.
 - **Pores filling**, for `w` up to about 0.6:
-  - albedo darkens towards albedo² for porous materials, as Lekner and Dorf show, blended by
-    porosity;
+  - albedo darkens towards albedo^1.6 for porous materials, blended by porosity: between dry
+    (1) and the limit Lekner and Dorf give for highly porous ones (2), which puts sand of albedo
+    0.35 at about half, as Twomey et al. measured;
   - roughness falls by about a third.
 - **A film forming**, for `w` from about 0.6 to 1:
   - roughness goes to 0.07;
-  - the normal map's bumps flatten towards the surface's own normal, as water fills the hollows;
-  - F0 stays 0.02–0.04, since water's own reflectance takes over from the material's.
+  - on ground facing up, the normal map's bumps flatten towards the surface's own normal, as
+    water fills the hollows; on steep faces the film runs off thin and follows them;
+  - F0 is left as it is. A thin film over a dielectric reflects about as water does anyway, and
+    over metal the metal still shows through.
 - **Cavity.** Cavities stay wet longest, so they reach their wettest first.
 - **Under the water** there is no film. A film's gloss comes from its own surface against the
   air, and under the sea the sea's surface gives the reflection instead. The pores still fill, so
   the seabed is darkened but not glossy.
-- **Debug view `wetness`**, to see `w` on its own.
+- **Debug view `wetness`**, to see `w` on its own: how wet the material is taken to be,
+  cavities included.
 
 ## Where the water has been: the water-line map
 

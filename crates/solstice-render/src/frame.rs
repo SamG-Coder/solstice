@@ -285,7 +285,9 @@ mod tests {
             daylight_illuminance,
             star_equinox,
             moon_radiance,
+            frame_seconds,
             sun_disc,
+            sea_level,
             moon_disc
         );
         for (name, offset) in rust {

@@ -288,7 +288,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         case DEBUG_WETNESS: {
             let shade = max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);
-            emissive = mix(vec3f(0.12), vec3f(0.1, 0.45, 1.0), wetness) * shade;
+            emissive = mix(vec3f(0.12), vec3f(0.1, 0.45, 1.0), wet.wetness) * shade;
         }
         default: {}
     }
