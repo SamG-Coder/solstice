@@ -36,6 +36,9 @@
 @group(1) @binding(12) var top_color: texture_2d_array<f32>;
 @group(1) @binding(13) var top_normal: texture_2d_array<f32>;
 @group(1) @binding(14) var top_material: texture_2d_array<f32>;
+// Where the sea has been, for how wet each surface is.
+@group(2) @binding(0) var<uniform> waterline: WaterlineParams;
+@group(2) @binding(1) var waterline_map: texture_2d<f32>;
 
 const TIER_MIDDLE: u32 = 1u;
 const TIER_TOP: u32 = 2u;
@@ -247,9 +250,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
-    // Water on the surface, where it has been wetted (docs/wetness.md).
-    let wetness = wetness_at(world);
-    let wet = wet_surface(albedo, roughness, metallic, normal, surface_normal, cavity, wetness, submerged_at(world));
+    // Water on the surface, where the sea has been (docs/wetness.md).
+    let wet = wet_surface(albedo, roughness, metallic, normal, surface_normal, cavity, world);
     albedo = wet.albedo;
     roughness = wet.roughness;
     normal = wet.normal;

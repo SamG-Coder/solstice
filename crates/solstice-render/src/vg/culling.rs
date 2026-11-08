@@ -263,8 +263,10 @@ impl CullWork {
         self.stats.capture(encoder, &self.state);
     }
 
-    /// Starts reading back any counters captured this frame. Call after submitting.
+    /// Takes in any counters that have arrived and starts reading back any captured this
+    /// frame. Call after submitting, every frame, even ones that captured nothing.
     pub fn map_stats(&self) {
+        self.stats.collect();
         self.stats.request_map();
     }
 
@@ -311,13 +313,18 @@ impl CullStats {
     }
 
     fn capture(&self, encoder: &mut wgpu::CommandEncoder, state: &wgpu::Buffer) {
-        if self.shared.mapped.swap(false, Ordering::AcqRel) {
-            self.consume_mapped_data();
-            self.shared.busy.store(false, Ordering::Release);
-        }
+        self.collect();
         if !self.shared.busy.load(Ordering::Acquire) {
             encoder.copy_buffer_to_buffer(state, 0, &self.staging, 0, STATE_SIZE);
             self.shared.copied.store(true, Ordering::Release);
+        }
+    }
+
+    /// Reads the counters once the buffer has mapped, freeing it for the next capture.
+    fn collect(&self) {
+        if self.shared.mapped.swap(false, Ordering::AcqRel) {
+            self.consume_mapped_data();
+            self.shared.busy.store(false, Ordering::Release);
         }
     }
 
