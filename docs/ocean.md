@@ -156,6 +156,23 @@ true horizon, shaded exactly as the near water.
 The opaque scene is untouched. The visibility buffer, G-buffer and lighting run as now, and the
 seabed, rocks and the ship's hull are lit as usual, under water or not.
 
+**The seabed map.** Waves feel the bottom: as the water shoals they stand up and break, and no
+crest stands taller than about 0.78 of the depth beneath it (McCowan). Over dry land there are no
+waves at all. A depth map of the scene seen from straight above, 1024² over 1 km around the
+camera, tells the water how deep it is everywhere (`ocean/seabed.rs`). It is drawn by the shadow
+maps' depth-only pass through the same cluster culling, from 2 m above the sea down 64 m, so
+decks and cliff tops are cut away. The scene is static, so the map is redrawn only when the camera
+has moved 128 m, the sea's level has changed, or finer geometry has streamed in.
+
+The waves' height is squeezed smoothly within 0.4 of the depth, by `tanh`, and their sideways sway
+fades in the last 2 m; the water pass scales their slopes to match. So:
+- the sea meets the shore along its calm waterline, and does not cut through the sand wherever a
+  crest happens to rise;
+- the sea never surfaces in hollows inland, however low the land lies;
+- deep water is untouched.
+
+Shore foam (step 4) reads the same map.
+
 ## Shading: the water pass
 
 A compute pass after deferred lighting and before post. On each pixel where the water is nearer

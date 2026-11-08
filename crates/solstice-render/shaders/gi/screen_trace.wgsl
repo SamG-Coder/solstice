@@ -10,8 +10,7 @@
 // The including shader declares, in group 0:
 //   depth_pyramid: texture_2d<f32>   the closest-depth pyramid
 //   normal_tex: texture_2d<f32>      G-buffer normals, to reject back faces
-//   motion_tex: texture_2d<f32>      G-buffer motion, to find a hit in last frame's image
-//   scene_history: texture_2d<f32>   last frame's final colour
+// gi/screen_history.wgsl finds a hit's colour in last frame's image.
 
 const SCREEN_EDGE_FADE: f32 = 0.08;
 
@@ -141,10 +140,3 @@ fn trace_screen(origin: vec3f, direction: vec3f, max_distance: f32, max_steps: u
     return ScreenHit(true, t * distance, position.xy, smoothstep(0.0, SCREEN_EDGE_FADE, edge));
 }
 
-// Last frame's lit colour at a hit, found through the hit pixel's motion so that it stays
-// put while the camera moves.
-fn screen_hit_radiance(uv: vec2f) -> vec3f {
-    let pixel = min(vec2i(uv * frame.viewport), vec2i(frame.viewport) - vec2i(1));
-    let previous = uv + textureLoad(motion_tex, pixel, 0).xy;
-    return textureSampleLevel(scene_history, clamp_sampler, clamp(previous, vec2f(0.0), vec2f(1.0)), 0.0).rgb;
-}

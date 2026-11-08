@@ -5,6 +5,7 @@
 #include "common/environment.wgsl"
 #include "gi/probe_common.wgsl"
 #include "gi/screen_trace.wgsl"
+#include "gi/screen_history.wgsl"
 
 @group(0) @binding(0) var normal_tex: texture_2d<f32>;
 @group(0) @binding(1) var depth_tex: texture_2d<f32>;

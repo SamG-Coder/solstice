@@ -1,7 +1,7 @@
 // The sea's surface, drawn into the water layer: patches of a grid fixed in the world, finer near
 // the camera. Each vertex blends onto the coarser grid by its distance, then rises and shifts
-// with the waves. The colour target keeps where each pixel's water lay on the calm sea, from
-// which the water pass reads the waves' slopes. Mirrors crates/solstice-render/src/ocean/grid.rs.
+// with the waves, which shrink as the water over the seabed shoals. The colour target keeps where
+// each pixel's water lay on the calm sea, from which the water pass reads the waves' slopes. Mirrors crates/solstice-render/src/ocean/grid.rs.
 
 #include "common/frame.wgsl"
 #include "ocean/surface_params.wgsl"
@@ -10,6 +10,9 @@
 @group(0) @binding(1) var<uniform> surface: SurfaceParams;
 @group(0) @binding(2) var displacement: texture_2d_array<f32>;
 @group(0) @binding(3) var wave_sampler: sampler;
+@group(0) @binding(4) var seabed_map: texture_depth_2d;
+
+#include "ocean/seabed.wgsl"
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -49,6 +52,7 @@ fn vs_main(
         let level_of_detail = max(log2(spacing * (1.0 + morph) / (tile / surface.grid.x)), 0.0);
         offset += textureSampleLevel(displacement, wave_sampler, calm / tile, cascade, level_of_detail).xyz;
     }
+    offset = shoal(offset, water_depth_at(calm));
     let choppiness = surface.grid.y;
     let world = vec3f(calm.x + choppiness * offset.x, sea_level + offset.y, calm.y + choppiness * offset.z);
 
