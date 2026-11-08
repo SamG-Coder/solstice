@@ -663,6 +663,7 @@ impl Renderer {
         }
         // Where the sea stands and has stood, from the waves over the seabed, before the
         // surfaces it wets are resolved.
+        mark(&self.profiler, &mut encoder, section::WATERLINE);
         if let (Some(sea), Some(water)) = (&self.sea, &self.water) {
             let waves = sea.waves();
             self.waterline.record(

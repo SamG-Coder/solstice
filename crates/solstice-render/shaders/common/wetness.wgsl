@@ -25,6 +25,9 @@ const WET_PORE_SMOOTHING: f32 = 0.7;
 const WET_FILM_ROUGHNESS: f32 = 0.07;
 // Wetness at which a porous surface's pores are full and a film starts to form.
 const WET_PORES_FULL: f32 = 0.6;
+// Over the last few metres of the water-line map's window, what it holds fades into the calm sea's
+// level that lies beyond it, so the wet line has no edge where the map ends.
+const WATERLINE_EDGE_FADE: f32 = 8.0;
 // Above the highest the water has reached, water still creeps up through the pores: a few
 // centimetres on rock, more through sand. How far, in metres, for a surface without pores and
 // for the most porous.
@@ -57,27 +60,26 @@ fn water_heights(xz: vec2f) -> vec2f {
             corners[i] = textureLoad(waterline_map, waterline_index(texel), 0).rg;
         }
     }
-    return mix(mix(corners[0], corners[1], f.x), mix(corners[2], corners[3], f.x), f.y);
+    let held = mix(mix(corners[0], corners[1], f.x), mix(corners[2], corners[3], f.x), f.y);
+    let size = waterline.grid.x * waterline.grid.y;
+    let from_edge = min(xz - waterline.window.xy * waterline.grid.x, waterline.window.xy * waterline.grid.x + size - xz);
+    let inside = clamp(min(from_edge.x, from_edge.y) / WATERLINE_EDGE_FADE, 0.0, 1.0);
+    return mix(vec2f(frame.sea_level), held, inside);
 }
 
-// How wet the surface at `world`, as porous as `porous`, is: soaked wherever the water has
-// reached lately, and above that over a fringe that porous surfaces wick higher. Without a sea,
-// the sea's level lies far below everything, and nothing is wet.
-fn wetness_at(world: vec3f, porous: f32) -> f32 {
-    if frame.sea_level <= -1.0e29 {
-        return 0.0;
-    }
-    let reached = water_heights(world.xz).x;
+// How wet the surface at height `y`, as porous as `porous`, is, under `heights` from
+// `water_heights`: soaked wherever the water has reached lately, and above that over a fringe
+// that porous surfaces wick higher.
+fn wetness_at(y: f32, heights: vec2f, porous: f32) -> f32 {
     let fringe = mix(WET_FRINGE, WET_FRINGE_POROUS, porous);
-    return 1.0 - smoothstep(0.0, fringe, world.y - reached);
+    return 1.0 - smoothstep(0.0, fringe, y - heights.x);
 }
 
-// How far below the water the surface at `world` lies now, 0 to 1. A film's gloss comes from
-// its own surface against the air; under the sea there is none, and the sea's surface above
-// gives the reflection instead. The pores still fill.
-fn submerged_at(world: vec3f) -> f32 {
-    let water = water_heights(world.xz).y;
-    return 1.0 - smoothstep(-0.1, 0.0, world.y - water);
+// How far below the water the surface at height `y` lies now, 0 to 1, under `heights`. A film's
+// gloss comes from its own surface against the air; under the sea there is none, and the sea's
+// surface above gives the reflection instead. The pores still fill.
+fn submerged_at(y: f32, heights: vec2f) -> f32 {
+    return 1.0 - smoothstep(-0.1, 0.0, y - heights.y);
 }
 
 struct WetSurface {
@@ -101,12 +103,17 @@ fn wet_surface(
     world: vec3f,
 ) -> WetSurface {
     var out = WetSurface(albedo, roughness, normal, 0.0);
+    // Without a sea, its level lies far below everything, and nothing is wet.
+    if frame.sea_level <= -1.0e29 {
+        return out;
+    }
     let porous = porosity(roughness, metallic);
-    let wetness = wetness_at(world, porous);
+    let heights = water_heights(world.xz);
+    let wetness = wetness_at(world.y, heights, porous);
     if wetness <= 0.0 {
         return out;
     }
-    let submerged = submerged_at(world);
+    let submerged = submerged_at(world.y, heights);
     // Hollows fill first, so a cavity is a little wetter than the surface around it.
     let w = clamp(wetness + (1.0 - cavity) * 0.25 * wetness, 0.0, 1.0);
     out.wetness = w;

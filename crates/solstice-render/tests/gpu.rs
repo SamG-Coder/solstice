@@ -1594,7 +1594,7 @@ fn water_darkens_porous_surfaces_but_not_metal_or_what_stands_above_it() {
     );
 
     // Metal has no pores to fill: water only films it, which leaves its colour alone. Its
-    // fringe is thin, so the sea comes within a centimetre of the floor to wet it.
+    // fringe is thin, so the sea comes up level with the floor to wet it.
     let metal = Material {
         base_color: [0.6, 0.55, 0.5, 1.0],
         roughness: 0.6,
@@ -1602,7 +1602,7 @@ fn water_darkens_porous_surfaces_but_not_metal_or_what_stands_above_it() {
         ..Default::default()
     };
     let dry = brightness_at(&render_albedo(&gpu, metal, None), floor.0, floor.1);
-    let wet = brightness_at(&render_albedo(&gpu, metal, Some(-0.01)), floor.0, floor.1);
+    let wet = brightness_at(&render_albedo(&gpu, metal, Some(0.0)), floor.0, floor.1);
     assert!(
         (dry - wet).abs() < 2.0,
         "wet metal changed colour: {dry} dry, {wet} wet"
@@ -1723,10 +1723,89 @@ fn a_falling_sea_leaves_a_wet_line_that_dries() {
         (back - just_left).abs() < 3.0,
         "the line moved with the camera: {back} on coming back, {just_left} before"
     );
+    // Going further than the map reaches, it forgets the line: coming back, the spot starts
+    // afresh from where the water is now, well below it.
+    let far = Camera {
+        position: camera.position + Vec3::new(300.0, 0.0, 0.0),
+        ..camera
+    };
+    let mut wandering = renderer_at(1.2);
+    run(&mut wandering, 30, 1.0 / 60.0);
+    wandering.set_sea_level(0.6);
+    run_from(&mut wandering, &far, 4, 1.0 / 60.0);
+    let returned = run(&mut wandering, 2, 1.0 / 60.0);
+    assert!(
+        (returned - never_reached).abs() < 3.0,
+        "a spot the map left behind kept its line: {returned}, against {never_reached} never wetted"
+    );
     // Ten minutes on, twenty half-lives of drying.
     let dried = run(&mut ebbing, 2, 300.0);
     assert!(
         (dried - never_reached).abs() < 3.0,
         "after ten minutes the line is still wet: {dried}, against {never_reached} never wetted"
+    );
+    // A rising sea wets the ball in the very frame it rises: resolve reads the map written
+    // that frame, not the one before.
+    let mut rising = renderer_at(0.6);
+    run(&mut rising, 30, 1.0 / 60.0);
+    rising.set_sea_level(1.2);
+    let risen = run(&mut rising, 1, 1.0 / 60.0);
+    assert!(
+        risen < never_reached * 0.85,
+        "the frame the sea rose, its new water was not yet wet: {risen}, against {never_reached} dry"
+    );
+}
+
+#[test]
+fn waves_wet_the_faces_they_break_against() {
+    let Some(gpu) = request_gpu() else { return };
+    // The ball stands in a metre of water under the open ocean's swell, which the shallows
+    // hold to crests about 38 cm high. Its side 30 cm above the calm sea gets wet from the
+    // crests that break against it, though the ground under that side, the ball itself, stands
+    // above the sea. Fifteen seconds take in more than a whole swell period.
+    let size = 128;
+    let sand = Material {
+        base_color: [0.45, 0.38, 0.28, 1.0],
+        roughness: 0.95,
+        ..Default::default()
+    };
+    let mut scene = ball_on_floor();
+    scene.materials = vec![sand];
+    let scene = paginate(&scene);
+    let camera = Camera {
+        position: Vec3::new(0.0, 1.3, 4.0),
+        ..Default::default()
+    };
+    let target = test_target(&gpu, size);
+    let view = target.create_view(&Default::default());
+    let side_at = |sea_level: f32| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Albedo,
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        let mut renderer = Renderer::new(&gpu, &scene, FORMAT, settings);
+        renderer.set_ocean(Some(Ocean::by_name("ocean").unwrap()), 0.0);
+        renderer.set_sea_level(sea_level);
+        for _ in 0..60 {
+            renderer.render(
+                &gpu,
+                &camera,
+                &Environment::default(),
+                &view,
+                (size, size),
+                0.25,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        brightness_at(&read_pixels(&gpu, &target, size), 64, 64)
+    };
+    let dry = side_at(-3.0);
+    let washed = side_at(1.0);
+    assert!(
+        washed < dry * 0.85,
+        "the side the waves break against is dry: {washed}, against {dry} with no sea near"
     );
 }
