@@ -16,9 +16,9 @@ pub mod transform;
 pub mod world;
 
 pub use clock::{FixedClock, FrameSteps, MAX_STEPS_PER_FRAME, STEPS_PER_SECOND, STEP_SECONDS};
-pub use events::{TimerId, Timers};
+pub use events::{steps_for, TimerId};
 pub use game::{Game, Schedule, TickGroup};
 pub use hecs::{self, Entity};
 pub use input::{Input, Recording};
-pub use transform::{GlobalTransform, Parent, Transform};
+pub use transform::{GlobalTransform, Parent, Snap, Transform};
 pub use world::World;

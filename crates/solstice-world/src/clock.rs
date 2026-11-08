@@ -1,11 +1,13 @@
 //! The fixed clock: turns frames of any length into whole steps of the same length.
 //!
 //! Gameplay and physics advance only in steps of [`STEP_SECONDS`], so a run gives the same
-//! result at any frame rate, natively and on the web. Each frame adds its time to an
-//! accumulator and takes out as many whole steps as it holds. What is left over is how far the
-//! frame is between the last step and the next, for drawing things in between.
+//! result at any frame rate. Each frame adds its time to an accumulator and takes out as many
+//! whole steps as it holds. What is left over is how far the frame is between the last step and
+//! the next, for drawing things in between.
 //!
-//! Time is counted in whole microseconds, so that adding up frames never drifts.
+//! Time is counted in ticks of a sixty-millionth of a second, so that a step is exactly a
+//! million ticks. A frame's length is rounded to the nearest tick, under 10 ns, so the steps
+//! keep pace with real time to well under a part per million.
 
 /// Steps a second.
 pub const STEPS_PER_SECOND: u32 = 60;
@@ -15,16 +17,15 @@ pub const STEP_SECONDS: f64 = 1.0 / STEPS_PER_SECOND as f64;
 /// slower for it, rather than falling further behind with every frame.
 pub const MAX_STEPS_PER_FRAME: u32 = 3;
 
-const MICROS_PER_SECOND: u64 = 1_000_000;
-/// Microseconds in a step, rounded: 16,667. Steps are counted, not timed, so the rounding never
-/// adds up: a run's simulated time is its step count times [`STEP_SECONDS`].
-const STEP_MICROS: u64 =
-    (MICROS_PER_SECOND + STEPS_PER_SECOND as u64 / 2) / STEPS_PER_SECOND as u64;
+/// Ticks in a step.
+pub const STEP_TICKS: u64 = 1_000_000;
+/// Ticks in a second.
+pub const TICKS_PER_SECOND: u64 = STEP_TICKS * STEPS_PER_SECOND as u64;
 
 /// Turns frame times into steps.
 #[derive(Clone, Debug, Default)]
 pub struct FixedClock {
-    /// Time received but not yet stepped through, in microseconds.
+    /// Time received but not yet stepped through, in ticks.
     pending: u64,
 }
 
@@ -44,28 +45,28 @@ impl FixedClock {
         Self::default()
     }
 
-    /// Adds a frame of `seconds` and says how many steps it holds. Negative or not-a-number
-    /// frame times count as nothing.
+    /// Adds a frame of `seconds` and says how many steps it holds. Negative, infinite or
+    /// not-a-number frame times count as nothing.
     pub fn advance(&mut self, seconds: f64) -> FrameSteps {
-        let micros = if seconds.is_finite() && seconds > 0.0 {
+        let ticks = if seconds.is_finite() && seconds > 0.0 {
             // A frame of over an hour is a paused tab coming back, and is cut short anyway.
-            (seconds.min(3600.0) * MICROS_PER_SECOND as f64).round() as u64
+            (seconds.min(3600.0) * TICKS_PER_SECOND as f64).round() as u64
         } else {
             0
         };
-        self.pending += micros;
-        let wanted = self.pending / STEP_MICROS;
+        self.pending += ticks;
+        let wanted = self.pending / STEP_TICKS;
         let steps = wanted.min(u64::from(MAX_STEPS_PER_FRAME));
         let slowed = wanted > steps;
         if slowed {
             // Keep only what is left over from the last step that runs: the rest is dropped.
-            self.pending %= STEP_MICROS;
+            self.pending %= STEP_TICKS;
         } else {
-            self.pending -= steps * STEP_MICROS;
+            self.pending -= steps * STEP_TICKS;
         }
         FrameSteps {
             steps: steps as u32,
-            alpha: self.pending as f32 / STEP_MICROS as f32,
+            alpha: self.pending as f32 / STEP_TICKS as f32,
             slowed,
         }
     }
@@ -77,32 +78,48 @@ mod tests {
 
     #[test]
     fn a_second_of_frames_is_sixty_steps_whatever_their_length() {
-        for frame in [1.0 / 30.0, 1.0 / 60.0, 1.0 / 144.0, 1.0 / 75.0] {
+        for rate in [30, 60, 75, 90, 120, 144, 165, 240] {
             let mut clock = FixedClock::new();
-            let frames = (1.0_f64 / frame).round() as u32;
-            let steps: u32 = (0..frames).map(|_| clock.advance(frame).steps).sum();
+            let frame = 1.0 / f64::from(rate);
+            let steps: u32 = (0..rate).map(|_| clock.advance(frame).steps).sum();
+            // The sixtieth falls right at the end of the second, so a frame rounded down by a
+            // fraction of a tick leaves it for the next frame.
             assert!(
                 (59..=60).contains(&steps),
-                "{steps} steps in a second of {frame} s frames"
+                "{steps} at {rate} frames a second"
+            );
+            // A microsecond more completes it.
+            assert_eq!(
+                steps + clock.advance(1.0e-6).steps,
+                60,
+                "at {rate} frames a second"
             );
         }
     }
 
     #[test]
-    fn uneven_frames_add_up_without_drift() {
-        // An hour of frames that alternate between short and long: none of the time is lost.
+    fn an_hour_of_frames_keeps_pace_with_real_time() {
+        // Steady rates whose frames are no whole number of ticks, and uneven frames.
+        for rate in [144.0, 165.0, 59.94] {
+            let mut clock = FixedClock::new();
+            let frames = (3600.0 * rate) as u64;
+            let steps: u64 = (0..frames)
+                .map(|_| u64::from(clock.advance(1.0 / rate).steps))
+                .sum();
+            let real = frames as f64 / rate * f64::from(STEPS_PER_SECOND);
+            assert!(
+                (steps as f64 - real).abs() <= 1.0,
+                "{steps} against {real} at {rate}"
+            );
+        }
         let mut clock = FixedClock::new();
         let mut steps = 0_u64;
-        for i in 0..216_000 {
-            let frame = if i % 2 == 0 { 0.009 } else { 0.0243 };
+        for i in 0..200_000 {
+            let frame = if i % 2 == 0 { 0.0091 } else { 0.0243 };
             steps += u64::from(clock.advance(frame).steps);
         }
-        let seconds = 108_000.0 * (0.009 + 0.0243);
-        let expected = seconds * f64::from(STEPS_PER_SECOND) * 16_666.666 / STEP_MICROS as f64;
-        assert!(
-            (steps as f64 - expected).abs() < 2.0,
-            "{steps} against {expected}"
-        );
+        let real = 100_000.0 * (0.0091 + 0.0243) * f64::from(STEPS_PER_SECOND);
+        assert!((steps as f64 - real).abs() <= 1.0, "{steps} against {real}");
     }
 
     #[test]
@@ -111,6 +128,7 @@ mod tests {
         let frame = clock.advance(0.5);
         assert_eq!(frame.steps, MAX_STEPS_PER_FRAME);
         assert!(frame.slowed);
+        assert!(frame.alpha < 1.0);
         // The dropped time doesn't come back as a burst of steps afterwards.
         let next = clock.advance(1.0 / 60.0);
         assert!(next.steps <= 1 && !next.slowed);
@@ -121,11 +139,13 @@ mod tests {
         let mut clock = FixedClock::new();
         let frame = clock.advance(STEP_SECONDS * 1.5);
         assert_eq!(frame.steps, 1);
-        assert!((frame.alpha - 0.5).abs() < 1.0e-3, "{}", frame.alpha);
+        assert!((frame.alpha - 0.5).abs() < 1.0e-6, "{}", frame.alpha);
         let frame = clock.advance(STEP_SECONDS * 0.25);
         assert_eq!(frame.steps, 0);
-        assert!((frame.alpha - 0.75).abs() < 1.0e-3, "{}", frame.alpha);
-        assert!(clock.advance(STEP_SECONDS * 0.25).alpha < 1.0e-3);
+        assert!((frame.alpha - 0.75).abs() < 1.0e-6, "{}", frame.alpha);
+        let frame = clock.advance(STEP_SECONDS * 0.25);
+        assert_eq!(frame.steps, 1);
+        assert!(frame.alpha < 1.0e-6);
     }
 
     #[test]

@@ -36,7 +36,7 @@ fn game(roots: usize, children: usize) -> Game {
         }
     });
     schedule.add(TickGroup::Physics, "read", |world: &mut World| {
-        std::hint::black_box(world.read::<Tick>().len());
+        std::hint::black_box(world.read::<Tick>().count());
     });
     Game::new(world, schedule)
 }
