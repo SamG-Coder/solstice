@@ -161,8 +161,6 @@ fn local_velocity(e: Emitter, index: u32) -> vec3f {
     return direction * speed;
 }
 
-// A particle born from an event: at the hit, leaving the surface, with the emitter's velocity
-// turned so that its up is the surface's normal.
 // A particle in touch with a surface remembers so in its flags, with that surface's normal in the
 // top 24 bits: the distance field holds no sign, and under the ridge of a coarser level its
 // gradient points down, the way a particle leaves.
@@ -179,6 +177,8 @@ fn unpack_contact(flags: u32) -> vec3f {
     return oct_decode(e * 2.0 - 1.0);
 }
 
+// A particle born from an event: at the hit, leaving the surface, with the emitter's velocity
+// turned so that its up is the surface's normal.
 fn event_particle(e: Emitter, index: u32, event: Event) -> Particle {
     var p = spawn_particle(e, index);
     let up = normalize(event.normal);

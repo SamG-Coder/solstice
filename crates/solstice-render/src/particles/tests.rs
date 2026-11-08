@@ -1742,6 +1742,100 @@ fn particles_born_on_a_surface_know_which_side_is_open() {
     assert!(lowest > -0.25, "a child went down to {lowest} m");
 }
 
+/// A particle born within reach of one surface still meets the next one in its path.
+#[test]
+fn particles_born_near_a_surface_still_hit_the_next() {
+    let Some(mut ground) = Ground::with_wall(1.5) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter e\n budget 40\n spawn burst=20\n lifetime 100\n shape box 0.02 0.02 0.5\n offset 1.45 0.45 0\n velocity -20 -40 0\n size 0.02\n collide field kill",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..30 {
+        ground.frame();
+    }
+    let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+    assert!(live.is_empty(), "{} went through the floor", live.len());
+}
+
+/// A particle that remembers a floor, up beside a wall, isn't held up by the wall: it falls back
+/// to the floor.
+#[test]
+fn a_neighbouring_surface_holds_nothing_up() {
+    let Some(mut ground) = Ground::with_wall(1.5) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter drops
+          budget 20
+          spawn burst=20
+          lifetime 100
+          shape box 0.02 0 2
+          offset 1.42 1 0
+          size 0.01
+          gravity
+          collide depth kill event=hit
+        emitter child
+          budget 40
+          spawn event=hit count=1
+          lifetime 100
+          velocity 0 3 0
+          size 0.02
+          gravity
+          collide field bounce restitution=0
+        ",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..150 {
+        ground.frame();
+    }
+    let emitters = ground.emitters();
+    assert_eq!(emitters[1].1.len(), 20);
+    let highest = emitters[1]
+        .1
+        .iter()
+        .map(|p| p.position[1])
+        .fold(f32::MIN, f32::max);
+    assert!(highest < 0.35, "a particle hung at {highest} m");
+}
+
+/// A particle born just above a floor and falling, where the field's gradient is up, lands.
+#[test]
+fn falling_from_just_above_a_floor_lands() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    // Above the field's ridge, 0.1 to 0.2 m up here, and within reach of it.
+    let effect = Effect::parse(
+        "emitter e\n budget 40\n spawn burst=20\n lifetime 100\n shape box 1 0 1\n offset 0 0.25 -1\n velocity 0 -1 0\n size 0.02\n gravity\n collide field bounce restitution=0",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..60 {
+        ground.frame();
+    }
+    let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+    assert_eq!(live.len(), 20);
+    let lowest = live.iter().map(|p| p.position[1]).fold(f32::MAX, f32::min);
+    assert!(lowest > -0.2, "a particle fell to {lowest} m");
+}
+
 /// A particle sliding along the floor still finds a wall in its way.
 #[test]
 fn sliding_particles_stop_at_a_wall() {
@@ -1763,12 +1857,9 @@ fn sliding_particles_stop_at_a_wall() {
     let [(_, live)] = ground.emitters().try_into().ok().unwrap();
     assert_eq!(live.len(), 10);
     let furthest = live.iter().map(|p| p.position[0]).fold(f32::MIN, f32::max);
-    // Sliding on at 12 m/s would have taken them to x = 9. Within a voxel of the wall's foot the
-    // field is blurred, and one may slip a little further.
-    assert!(furthest < 3.0, "a particle reached x = {furthest}");
+    // Sliding on at 12 m/s would have taken them to x = 9. The field finds the wall to a voxel.
+    assert!(furthest < 1.9, "a particle reached x = {furthest}");
     assert!(furthest > 0.5, "they never got there: {furthest}");
-    let stopped = live.iter().filter(|p| p.position[0] < 1.9).count();
-    assert!(stopped >= 8, "only {stopped} of 10 stopped at the wall");
 }
 
 /// Hits past what an emitter takes in a frame are counted as dropped, not lost unseen.

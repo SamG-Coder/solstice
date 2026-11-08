@@ -38,11 +38,15 @@
 // How far under the water's surface a particle may have begun the frame and still land on it.
 const WATER_DEPTH_TOLERANCE: f32 = 0.25;
 
-// Normals this much apart, or more, are a different surface from the one a particle is sliding
-// on, rather than that surface rising. (Either sign: the gradient flips under a level's ridge.)
-const SAME_SURFACE: f32 = 0.5;
-// How nearly the field's gradient must agree with a surface remembered to update it.
-const SAME_DIRECTION: f32 = 0.9;
+// Normals that agree this well (about 26 degrees, either sign, as the gradient flips under a
+// level's ridge) are one surface curving. Past that it is another, or a corner's blur.
+const SAME_SURFACE: f32 = 0.9;
+// A gradient this far up is off a floor, on the open side of it whatever the field's ridge does.
+const OFF_A_FLOOR: f32 = 0.5;
+// The gradient agreeing less than this with the surface known, what is in reach is beside it.
+const BESIDE: f32 = 0.3;
+// Levels above this have voxels too large to search three of them off a surface.
+const FINEST_LEVEL_SEARCHED: u32 = 1u;
 // The shallowest view of a surface allowed for in how far along the view a particle may be from it.
 const GRAZING: f32 = 0.05;
 
@@ -100,29 +104,39 @@ fn field_contact(x: vec3f, level: u32, distance: f32, remembered: vec3f) -> Cont
 // started, in steps no longer than that distance, which cannot pass through a surface, and it
 // touches where the distance first falls within its reach.
 //
-// One that began the frame already within reach, and remembers touching, is resting or sliding
-// on that surface. It keeps its movement along the surface and loses any into it, by the normal
-// on the side remembered, and its path, lifted off that surface, is still marched for any other
-// surface ahead of it. It
-// isn't moved nearer: to a voxel's resolution, the field's distance may put the surface below
-// the true one, and under that the gradient would send it further down.
+// One that began the frame within reach, and knows which side it is on, is resting or sliding on
+// that surface. It keeps its movement along the surface and loses any into it, by the normal on
+// the side it knows. It isn't moved nearer: to a voxel's resolution, the field's distance may put
+// the surface below the true one, and under that the gradient would send it further down. If
+// what is within reach is something beside it instead, such as a wall by a ledge it has slid off,
+// nothing holds it up.
 //
-// One within reach that remembers nothing was born there, and which side it is on can't be told:
-// it may be under the ridge, where the gradient points down. So it is left alone until it is out
-// of reach. (Particles spawned by an event remember the surface they were born on.)
+// Its side is the surface it remembers touching. One that remembers nothing was born within
+// reach, and can only be trusted when the gradient points up, off a floor: anywhere else it may
+// be under the field's ridge, where the gradient points the wrong way. Then it is left alone
+// until it has come out of reach, and what it meets after that counts. (So a particle born under
+// the ridge of a floor and moving down passes through it. Particles spawned by an event remember
+// the surface they were born on.)
+//
+// On the two finest levels the sliding particle's path is still marched for any other surface
+// ahead of it, offset three voxels from the one it slides on, across its motion, so that what is
+// found is something else, with a clean normal: nearer the surface the field is too blurred in a
+// corner to tell the two apart. What stands lower than that offset isn't seen.
 fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Contact {
     let path = end - start;
     let length_of_path = length(path);
     let direction = select(vec3f(0.0, -1.0, 0.0), path / length_of_path, length_of_path > 1.0e-6);
-    // The normal of the surface the particle began the frame on, if it did.
+    // The normal of the surface the particle began the frame on, if it knows it.
     var resting_on = vec3f(0.0);
-    // How far off that surface the rest of the path is marched, three voxels, so that what is
-    // found is something else, with a clean normal: nearer the surface the field is too blurred
-    // in a corner to tell the two apart. What stands lower than that isn't seen.
-    var lift = 0.0;
+    // Whether that surface is what is within reach, so that it can hold the particle.
+    var holding = false;
+    // Where the rest of the path is marched from, relative to the particle's own.
+    var offset = vec3f(0.0);
+    // Born within reach, not knowing its side, and not yet out of reach.
+    var unsure = false;
     var t = 0.0;
     for (var step = 0u; step < 12u; step++) {
-        let x = start + resting_on * lift + direction * t;
+        let x = start + offset + direction * t;
         let level = volume_level_at(x, 0u);
         if level >= VOLUME_LEVELS {
             break;
@@ -133,17 +147,35 @@ fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Co
         if distance < reach {
             let contact = field_contact(x, level, distance, remembered);
             if step == 0u {
-                if !contact.hit || dot(remembered, remembered) == 0.0 {
+                if !contact.hit {
                     return no_contact();
                 }
-                // The gradient follows the surface as it curves, on the side remembered. A sudden
-                // change is the blur of a corner, not this surface: what's there is found below.
-                let facing = contact.normal * select(1.0, -1.0, dot(contact.normal, remembered) < 0.0);
-                resting_on = select(remembered, facing, dot(facing, remembered) > SAME_DIRECTION);
-                lift = voxel * 3.0;
-            } else if contact.hit && abs(dot(contact.normal, resting_on)) < SAME_SURFACE {
-                return Contact(true, contact.point - resting_on * lift, contact.normal, false);
+                var side = remembered;
+                if dot(side, side) == 0.0 && contact.normal.y > OFF_A_FLOOR {
+                    side = contact.normal;
+                }
+                if dot(side, side) == 0.0 {
+                    unsure = true;
+                } else {
+                    // The gradient follows the surface as it curves, on the side known. A sudden
+                    // change is the blur of a corner, not this surface.
+                    let facing = contact.normal * select(1.0, -1.0, dot(contact.normal, side) < 0.0);
+                    resting_on = select(side, facing, dot(facing, side) > SAME_SURFACE);
+                    holding = abs(dot(contact.normal, resting_on)) > BESIDE;
+                    if level > FINEST_LEVEL_SEARCHED {
+                        break;
+                    }
+                    let across = resting_on - direction * dot(resting_on, direction);
+                    let away_from_path = select(resting_on, normalize(across), length(across) > 1.0e-3);
+                    offset = away_from_path * voxel * 3.0;
+                }
+            } else if !unsure && contact.hit && abs(dot(contact.normal, resting_on)) < SAME_SURFACE {
+                // On the surface's own plane, at the particle's path rather than the offset one.
+                let point = contact.point - offset + contact.normal * dot(offset, contact.normal);
+                return Contact(true, point, contact.normal, false);
             }
+        } else {
+            unsure = false;
         }
         if t >= length_of_path {
             break;
@@ -151,12 +183,12 @@ fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Co
         t = min(t + max(distance - reach * 0.5, voxel * 0.25), length_of_path);
     }
     let n = resting_on;
-    let away = dot(path, n);
     if dot(n, n) == 0.0 {
         return no_contact();
     }
-    if away >= 0.0 {
-        // Leaving, but still within reach: it may come back, and will need to know its side.
+    let away = dot(path, n);
+    if away >= 0.0 || !holding {
+        // Not held, but still within reach: it may come back, and will need to know its side.
         var leaving = no_contact();
         leaving.within_reach = true;
         return leaving;

@@ -481,13 +481,16 @@ picks the ones it needs, as `collide depth field water` then `bounce`, `stick` o
     falls within its reach: its radius, or half a voxel.
   - The normal is the field's gradient. A particle in touch with a surface remembers that normal
     in its flags, because under the ridge of a coarser level the gradient points the wrong way.
-  - One that began the frame within reach, and remembers touching, keeps its movement along the
-    surface and loses any into it. Its path, lifted three voxels off the surface, is still marched
-    for another surface ahead of it, so a wall stops it and anything lower than that doesn't.
-    At the foot of a thin wall the field is blurred by a voxel, and a fast particle can slip
-    through there.
-  - One within reach that remembers nothing was born there, and is left alone until it is out of
-    reach. Particles spawned by an event remember the surface they were born on.
+  - One that began the frame within reach, and knows its side, keeps its movement along the
+    surface and loses any into it. If what is within reach is beside it instead, such as a wall
+    by a ledge it has slid off, nothing holds it up.
+  - On the two finest levels its path, offset three voxels from the surface across its motion, is
+    still marched for another surface ahead, so a wall stops it and anything lower than that
+    doesn't. On coarser levels it isn't.
+  - One within reach that remembers nothing was born there. It is trusted when the gradient points
+    up, off a floor; otherwise it is left alone until it has come out of reach, and what it meets
+    after that counts. So a particle born under the field's ridge, within half a voxel of a floor,
+    and moving down passes through it. Particles spawned by an event remember their surface.
 - **`water`.** The water's height now, from the water-line map within 64 m and the calm level
   beyond it. A particle more than 25 cm under it when the frame began stays under.
 - **What a hit does.** Only a particle moving into the surface bounces, sticks, dies or sends an
@@ -728,7 +731,7 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
        gusts; curl noise, buoyancy, attract and vortex.
      - Collision against depth, the distance field and the water, with bounce, stick and kill.
      - Events between emitters.
-     - Tests, each mutation-checked: 31 bugs were put back in turn, and each made a test fail.
+     - Tests, each mutation-checked: 36 bugs were put back in turn, and each made a test fail.
        - Under every force at once, the GPU's particles are where the CPU reference puts them,
          to within 0.1 mm (2 µm measured).
        - Curl noise has no divergence, and the noise's gradient matches finite differences.
@@ -741,6 +744,8 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
        - A resting particle sends no more events, at a shallow view or pressed by other forces.
        - What is born on a surface can leave it, and an event's child knows the open side.
        - A sliding particle still stops at a wall.
+       - A particle born near a surface still hits the next, one falling from just above a floor
+         lands, and a wall beside a particle holds nothing up.
        - Events past the limit count as dropped.
        - What is already behind a surface, or under the water, stays there.
        - An effect with events lasts until its last child could have died.
