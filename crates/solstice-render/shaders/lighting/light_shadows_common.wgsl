@@ -25,21 +25,35 @@ fn light_shadow_texel(texel: vec2i) -> vec2i {
 }
 
 // How much of light `index` reaches the point `from_light` away from it, `distance` off, on a
-// surface the volume resolves with voxels `voxel` across: 1 in full view, 0 behind something,
-// in between across a texel of the map. The point's own surface stands in the volume, and the
-// trace stops most of a voxel short of any surface, so the light must fall two voxels short
-// of the point before the point counts as shadowed.
-fn light_shadow(index: u32, from_light: vec3f, distance: f32, voxel: f32) -> f32 {
-    let p = (oct_encode(from_light / distance) * 0.5 + 0.5) * f32(LIGHT_SHADOW_SIZE) - 0.5;
+// surface with `normal` that the volume resolves with voxels `voxel` across: 1 in full view, 0
+// behind something, in between across a texel of the map. Each of the four texels around the
+// point's direction is compared where its own ray meets the point's surface, taken as a
+// plane, so that a surface seen at a slant does not shadow itself where a neighbouring texel
+// reaches it nearer the light. The point's own surface stands in the volume, and the trace
+// stops most of a voxel short of any surface, so the light must fall two voxels short of the
+// plane before the point counts as shadowed. Lights beyond the map's layers are never shadowed.
+fn light_shadow(index: u32, from_light: vec3f, distance: f32, voxel: f32, normal: vec3f) -> f32 {
+    if index >= textureNumLayers(light_shadows) {
+        return 1.0;
+    }
+    let size = f32(LIGHT_SHADOW_SIZE);
+    let p = (oct_encode(from_light / distance) * 0.5 + 0.5) * size - 0.5;
     let base = vec2i(floor(p));
     let f = p - vec2f(base);
-    let reach = distance - voxel * 2.0;
+    // The plane's distance from the light along its normal.
+    let plane = dot(from_light, normal);
     var lit = 0.0;
     for (var i = 0; i < 4; i++) {
         let corner = vec2i(i % 2, i / 2);
         let weight = select(1.0 - f.x, f.x, corner.x == 1) * select(1.0 - f.y, f.y, corner.y == 1);
-        let far = textureLoad(light_shadows, light_shadow_texel(base + corner), i32(index), 0).r;
-        lit += weight * select(0.0, 1.0, far >= reach);
+        let texel = light_shadow_texel(base + corner);
+        let ray = oct_decode((vec2f(texel) + 0.5) / size * 2.0 - 1.0);
+        // Where this texel's ray meets the plane; the point's own distance where the ray runs
+        // along the plane or away from it.
+        let towards = dot(ray, normal);
+        let along = select(distance, plane / towards, towards > 0.05);
+        let far = textureLoad(light_shadows, texel, i32(index), 0).r;
+        lit += weight * select(0.0, 1.0, far >= along - voxel * 2.0);
     }
     return lit;
 }

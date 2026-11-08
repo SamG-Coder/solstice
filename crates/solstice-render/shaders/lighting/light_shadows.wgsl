@@ -14,7 +14,8 @@ const LIGHT_SHADOW_SIZE: u32 = 64u;
 // A light sits in or on its own fixture, which must not shadow everything: the trace starts
 // this many voxels out, as the per-pixel trace this replaces stopped that short of the light.
 const CLEAR_VOXELS: f32 = 2.5;
-const STEPS: u32 = 32u;
+// Enough for a ray to skim along a surface in sub-voxel steps for several metres.
+const STEPS: u32 = 48u;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
@@ -27,7 +28,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if level < VOLUME_LEVELS {
         let voxel = volume_params.levels[level].w;
         let hit = trace_volume(light.position, direction, voxel * CLEAR_VOXELS, light.range, STEPS);
-        if hit.hit {
+        // A ray that ran out of steps while still inside the volume has seen nothing beyond
+        // where it stopped, so the light is taken to stop there rather than leak through
+        // whatever stands further on; one that left the volume has nothing left to meet.
+        let stopped_inside = hit.t < light.range
+            && volume_level_at(light.position + direction * hit.t, 0u) < VOLUME_LEVELS;
+        if hit.hit || stopped_inside {
             reach = hit.t;
         }
     }
