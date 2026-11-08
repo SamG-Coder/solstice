@@ -198,7 +198,7 @@ impl Physics {
     /// Adds a scene's collision as the fixed world. `instance` gives where each of its instances
     /// is. A shape is built once for each size it is used at, and shared.
     pub fn add_scene(&mut self, collision: &Collision, instance: impl Fn(u32) -> Option<Mat4>) {
-        let mut built: HashMap<(u32, [i32; 3]), Option<SharedShape>> = HashMap::new();
+        let mut built: HashMap<(u32, [u32; 3]), Option<SharedShape>> = HashMap::new();
         for (index, &shape) in collision.instance_shapes.iter().enumerate() {
             if shape == NO_SHAPE {
                 continue;
@@ -220,8 +220,7 @@ impl Physics {
                 ));
                 continue;
             }
-            // Rounded, as the same scale at another turn differs in its last bits.
-            let key = (shape, (scale * 1000.0).round().to_array().map(|s| s as i32));
+            let key = (shape, scale_key(scale));
             let warnings = &mut self.warnings;
             let built = built
                 .entry(key)
@@ -264,6 +263,12 @@ impl Physics {
 
     /// Adds an invisible wall: a box of this full size, centred here, turned by `yaw` radians.
     pub fn add_blocker(&mut self, centre: Vec3, size: Vec3, yaw: f32) {
+        if !reachable(centre) || !sound_size(size) || !yaw.is_finite() {
+            self.warnings.push(format!(
+                "a blocker at {centre} of size {size} is out of bounds, and was left out"
+            ));
+            return;
+        }
         let half = size * 0.5;
         self.colliders.insert(
             ColliderBuilder::cuboid(half.x, half.y, half.z)
@@ -377,7 +382,17 @@ impl Physics {
             .map(|(e, t, collider, character)| (e, *t, collider.copied(), character.copied()))
             .collect();
         for (entity, transform, collider, character) in new {
-            self.add_actor(entity, &transform, collider, character);
+            if sound_actor(&transform, collider.as_ref(), character.as_ref()) {
+                self.add_actor(entity, &transform, collider, character);
+            } else {
+                self.warnings.push(format!(
+                    "an actor at {} is out of bounds, and collides with nothing",
+                    transform.translation
+                ));
+                // So that it isn't looked at again.
+                let _ = world.entities.remove_one::<ActorCollider>(entity);
+                let _ = world.entities.remove_one::<Character>(entity);
+            }
         }
     }
 
@@ -604,6 +619,57 @@ impl Physics {
             self.owners.remove(&collider);
         }
     }
+}
+
+/// Whether physics can work with a position this far out.
+fn reachable(position: Vec3) -> bool {
+    position.is_finite() && position.abs().max_element() <= MAX_COORDINATE
+}
+
+/// Whether physics can build something this size.
+fn sound_size(size: Vec3) -> bool {
+    reachable(size) && size.min_element() > 0.0
+}
+
+/// Whether physics can build this actor. A big enough number panics inside Rapier, and these come
+/// from files.
+fn sound_actor(
+    transform: &Transform,
+    collider: Option<&ActorCollider>,
+    character: Option<&Character>,
+) -> bool {
+    let collider_sound = collider.is_none_or(|collider| {
+        let shape = match collider.shape {
+            Shape::Box(size) => sound_size(size),
+            Shape::Capsule { radius, height } => sound_size(Vec3::new(radius, height, radius)),
+        };
+        let mass = match collider.kind {
+            BodyKind::Dynamic(mass) => mass.is_finite() && mass > 0.0 && mass <= MAX_COORDINATE,
+            _ => true,
+        };
+        shape && mass && reachable(collider.offset)
+    });
+    let character_sound = character.is_none_or(|character| {
+        sound_size(Vec3::new(
+            character.radius,
+            character.height,
+            character.radius,
+        ))
+    });
+    reachable(transform.translation)
+        && transform.rotation.is_finite()
+        && collider_sound
+        && character_sound
+}
+
+/// The same for a scale at any turn, as it differs in its last bits from one to another, and
+/// different for sizes that differ by more than a part in a few thousand, however small they are.
+fn scale_key(scale: Vec3) -> [u32; 3] {
+    /// How many low bits of a float's 23 to ignore, rounding to the nearest.
+    const IGNORED: u32 = 11;
+    scale
+        .to_array()
+        .map(|s| s.to_bits().wrapping_add(1 << (IGNORED - 1)) >> IGNORED)
 }
 
 /// Builds a shape at a size, or says why it can't be.

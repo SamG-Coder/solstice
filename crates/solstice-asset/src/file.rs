@@ -1047,11 +1047,95 @@ mod tests {
     }
 
     #[test]
+    fn a_collision_index_cannot_ask_for_too_much() {
+        use crate::collision::{ShapeEntry, MAX_COLLISION_BYTES, MAX_HULL_POINTS};
+        let mesh = |vertices: u32| ShapeEntry {
+            vertices,
+            ..ShapeEntry::default()
+        };
+        let index = |shapes: Vec<ShapeEntry>| CollisionIndex {
+            shapes,
+            ..CollisionIndex::default()
+        };
+        // As much as is allowed, then one vertex more, spread over two pieces.
+        assert_eq!(
+            MAX_COLLISION_BYTES,
+            1 << 30,
+            "what a browser is asked to set aside"
+        );
+        let most = (MAX_COLLISION_BYTES / 12) as u32;
+        assert_eq!(index(vec![mesh(most)]).validate(0, 0), Ok(()));
+        assert_eq!(
+            index(vec![mesh(most), mesh(1)]).validate(0, 0),
+            Err(DecodeError::BadCollision),
+            "too much in all, though each piece would fit"
+        );
+        // Hulls are limited, at what the bake can make. Meshes are not.
+        let hull = |vertices: u32| ShapeEntry {
+            hull: 1,
+            ..mesh(vertices)
+        };
+        let most = MAX_HULL_POINTS as u32;
+        assert_eq!(index(vec![hull(most)]).validate(0, 0), Ok(()));
+        assert_eq!(
+            index(vec![hull(most + 1)]).validate(0, 0),
+            Err(DecodeError::BadCollision)
+        );
+        assert_eq!(index(vec![mesh(most + 1)]).validate(0, 0), Ok(()));
+        // A grid whose size wraps round to nothing in 64 bits.
+        let ground = CollisionIndex {
+            heightfield: Some(crate::collision::HeightfieldEntry {
+                columns: 1 << 31,
+                rows: 1 << 31,
+                ..Default::default()
+            }),
+            ..CollisionIndex::default()
+        };
+        assert_eq!(ground.validate(0, 0), Err(DecodeError::BadCollision));
+    }
+
+    /// A scene with collision, written to a file.
+    fn scene_with_collision() -> (LoadedScene, Vec<u8>) {
+        let mut loaded = sample_scene();
+        let mut collision = sample_collision();
+        collision.instance_shapes = vec![1; loaded.scene.instances.len()];
+        loaded.collision = Some(collision);
+        let bytes = encode(&loaded);
+        (loaded, bytes)
+    }
+
+    #[test]
+    fn a_manifest_with_a_bad_collision_index_is_refused_when_it_is_read() {
+        let (_, bytes) = scene_with_collision();
+        let scene = decode(&bytes).unwrap().scene;
+        assert!(decode_manifest(&encode_manifest(&scene), 0).is_ok());
+        let mut bad = scene;
+        bad.collision.as_mut().unwrap().shapes[0].vertices = u32::MAX;
+        assert_eq!(
+            decode_manifest(&encode_manifest(&bad), 0).err(),
+            Some(DecodeError::BadCollision)
+        );
+    }
+
+    #[test]
+    fn a_collision_piece_is_unpacked_with_its_limit_when_a_whole_file_is_read() {
+        let (_, mut bytes) = scene_with_collision();
+        let scene = decode(&bytes).unwrap().scene;
+        let (offset, stored) = scene.collision.as_ref().unwrap().ranges()[0];
+        let start = (scene.data_offset + offset) as usize;
+        // Not deflate at all. Only the limited way of unpacking calls that bad collision, as
+        // the plain one would say the file was truncated.
+        bytes[start..start + stored as usize].fill(0xff);
+        assert_eq!(decode(&bytes).err(), Some(DecodeError::BadCollision));
+    }
+
+    #[test]
     fn a_scene_without_gameplay_is_written_exactly_as_before() {
         // No section at all, so viewers from before gameplay read it as they always did.
         let plain = sample_scene();
         let manifest = encode_manifest(&plain.scene);
         assert!(!manifest.windows(4).any(|w| w == GAME_TAG));
+        assert!(!manifest.windows(4).any(|w| w == COLLISION_TAG));
         let mut with = sample_scene();
         with.scene.gameplay = vec![GameFile {
             name: "a".to_string(),
@@ -1060,6 +1144,15 @@ mod tests {
         let longer = encode_manifest(&with.scene);
         assert_eq!(&longer[..manifest.len()], &manifest[..]);
         assert_eq!(decode_manifest(&manifest, 0).unwrap().gameplay, vec![]);
+        // Collision only adds a section too, so what comes before it is unchanged.
+        let (with_collision, _) = scene_with_collision();
+        let mut index = sample_scene().scene;
+        index.collision = Some(append_collision(
+            with_collision.collision.as_ref().unwrap(),
+            &mut Vec::new(),
+        ));
+        let longer = encode_manifest(&index);
+        assert_eq!(&longer[..manifest.len()], &manifest[..]);
     }
 
     #[test]

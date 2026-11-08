@@ -548,9 +548,11 @@ rest. At 60 fps a frame runs one fixed step:
     hull of the same cut, of at most 512 points, keeping those furthest out in every direction.
   - Each is built once for each size it is used at, and shared by those instances. They are
     two-sided, as scanned meshes are often open behind and mirrored instances are inside out.
-  - Everything is checked before use: sizes and offsets before anything is fetched, what unpacks
-    no larger than it says, and every coordinate within a million metres, as physics panics
-    on far larger ones and a scene file comes from outside.
+  - Everything is checked before use, as a scene file comes from outside: sizes and offsets
+    before anything is fetched, at most 1 GiB unpacked in all and 512 points to a hull, what
+    unpacks no larger than it says, and every coordinate within a million metres, as physics
+    panics on far larger ones. Sizes and positions in `.actor` files and `actor` and `blocker`
+    lines have the same limit.
   - A line that places geometry can end with `collide=none`, `collide=hull`, or `collide=coarse`,
     a 10 cm cut for very large meshes such as ground or cliffs.
   - Terrain becomes a heightfield, sampled about every metre. Water doesn't collide.

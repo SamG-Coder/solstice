@@ -19,7 +19,7 @@
 //! Paths are relative to the actor file. The mesh is placed by the bake, wherever the scene
 //! places the actor, and moves with it. Every line but `name` may be left out.
 
-use crate::{is_name, lines, number, FileError};
+use crate::{coordinate, is_name, lines, number, FileError};
 use glam::Vec3;
 use solstice_physics::{ActorCollider, BodyKind, Character, Shape};
 use solstice_script::ScriptValue;
@@ -158,7 +158,7 @@ fn parse_collider(values: &[&str]) -> Result<ActorCollider, String> {
         "expected `collider box SX SY SZ` or `collider capsule RADIUS HEIGHT`, then optionally \
          `at X Y Z`, then `sensor` or `dynamic MASS`";
     let positive = |word: &str| {
-        let value = number(word)?;
+        let value = coordinate(word)?;
         if value > 0.0 {
             Ok(value)
         } else {
@@ -183,7 +183,7 @@ fn parse_collider(values: &[&str]) -> Result<ActorCollider, String> {
     };
     let mut offset = Vec3::ZERO;
     if let ["at", x, y, z, after @ ..] = rest {
-        offset = Vec3::new(number(x)?, number(y)?, number(z)?);
+        offset = Vec3::new(coordinate(x)?, coordinate(y)?, coordinate(z)?);
         rest = after;
     }
     let kind = match rest {
@@ -310,8 +310,8 @@ impl ActorFile {
                 "character" => {
                     count(2..=2, "RADIUS HEIGHT")?;
                     once(actor.character.is_some())?;
-                    let radius = number(values[0]).map_err(error)?;
-                    let height = number(values[1]).map_err(error)?;
+                    let radius = coordinate(values[0]).map_err(error)?;
+                    let height = coordinate(values[1]).map_err(error)?;
                     if radius <= 0.0 || height < radius * 2.0 {
                         return Err(error(format!(
                             "a character needs a radius above 0 and a height of at least twice \
@@ -524,6 +524,37 @@ collider box 3.9 3.5 0.2 at 0 1.75 0
             let error = ActorFile::parse(text).unwrap_err();
             assert_eq!(error.line, line, "{text:?}: {error}");
             assert!(error.message.contains(part), "{text:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn collider_and_character_numbers_too_big_for_physics_are_mistakes() {
+        for line in [
+            "collider box 1e30 1 1",
+            "collider box 1 1e30 1",
+            "collider box 1 1 1e30",
+            "collider capsule 1e30 1e31",
+            "collider capsule 1 1e30",
+            "collider box 1 1 1 at 1e30 0 0",
+            "collider box 1 1 1 at 0 1e30 0",
+            "collider box 1 1 1 at 0 0 1e30",
+            "collider box 1 1 1 dynamic 1e30",
+            "character 1e30 1e31",
+            "character 1 1e30",
+        ] {
+            assert!(
+                ActorFile::parse(&format!("name a\n{line}\n")).is_err(),
+                "{line}"
+            );
+        }
+        for line in [
+            "collider box 1e6 1 1 at 1e6 0 0 dynamic 1e6",
+            "character 1 1e6",
+        ] {
+            assert!(
+                ActorFile::parse(&format!("name a\n{line}\n")).is_ok(),
+                "{line}"
+            );
         }
     }
 

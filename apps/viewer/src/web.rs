@@ -451,6 +451,11 @@ impl WebViewer {
 #[cfg(feature = "gameplay")]
 #[wasm_bindgen]
 impl WebViewer {
+    /// Whether the scene was baked with collision, though everything in it may be `collide=none`.
+    pub fn has_collision(&self) -> bool {
+        self.collision.is_some()
+    }
+
     /// The parts of the file holding the scene's collision shapes, fetched only to play: a flat
     /// array of two numbers each, the first byte and one past the last. Each is deflated. Empty
     /// for a scene with none.

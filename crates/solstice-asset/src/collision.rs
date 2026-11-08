@@ -14,9 +14,13 @@ use crate::file::DecodeError;
 /// long before a float does, and a scene file comes from outside.
 pub const MAX_COORDINATE: f32 = 1.0e6;
 
-/// The most a piece of collision may hold unpacked, in bytes: a sanity limit on what a scene file
-/// can ask for.
-pub const MAX_PIECE_BYTES: u64 = 1 << 30;
+/// The most a scene's collision may hold unpacked, in bytes, all its pieces together: a sanity
+/// limit on what a scene file can ask a browser to set aside.
+pub const MAX_COLLISION_BYTES: u64 = 1 << 30;
+
+/// The most points a convex hull may have. The bake thins hulls to this, and building one costs
+/// far more than its size suggests.
+pub const MAX_HULL_POINTS: usize = 512;
 
 /// [`Collision::instance_shapes`] of an instance that nothing collides with.
 pub const NO_SHAPE: u32 = u32::MAX;
@@ -112,9 +116,10 @@ impl ShapeEntry {
 }
 
 impl HeightfieldEntry {
-    /// Its size unpacked: four bytes a sample.
+    /// Its size unpacked: four bytes a sample. Saturates, so that a grid too big to count is
+    /// still too big, rather than wrapping round to something small.
     fn raw_bytes(&self) -> u64 {
-        4 * u64::from(self.columns) * u64::from(self.rows)
+        (4 * u64::from(self.columns)).saturating_mul(u64::from(self.rows))
     }
 }
 
@@ -122,19 +127,26 @@ impl CollisionIndex {
     /// Checks what the manifest says against what the scene has, before anything is fetched: its
     /// sizes, where its pieces lie, and that it has a shape for each of `instances` instances.
     pub fn validate(&self, instances: usize, data_offset: u64) -> Result<(), DecodeError> {
+        // First, as what follows does sums with these sizes.
+        let total = self
+            .raw_sizes()
+            .iter()
+            .fold(0u64, |total, &raw| total.saturating_add(raw));
+        if total > MAX_COLLISION_BYTES {
+            return Err(DecodeError::BadCollision);
+        }
         let sound = |offset: u64, stored: u32, raw: u64| {
             // Deflate can grow incompressible data a little.
-            raw <= MAX_PIECE_BYTES
-                && u64::from(stored) <= raw + raw / 64 + 1024
+            u64::from(stored) <= raw + raw / 64 + 1024
                 && data_offset
                     .checked_add(offset)
                     .and_then(|o| o.checked_add(u64::from(stored)))
                     .is_some()
         };
-        let shapes_sound = self
-            .shapes
-            .iter()
-            .all(|s| sound(s.offset, s.stored_bytes, s.raw_bytes()));
+        let shapes_sound = self.shapes.iter().all(|s| {
+            sound(s.offset, s.stored_bytes, s.raw_bytes())
+                && (s.hull == 0 || s.vertices as usize <= MAX_HULL_POINTS)
+        });
         let ground_sound = self
             .heightfield
             .is_none_or(|h| sound(h.offset, h.stored_bytes, h.raw_bytes()));

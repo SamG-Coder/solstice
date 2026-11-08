@@ -7,7 +7,7 @@
 //! each actor file and script, the input actions, and [`GAME_FILE`], which lists the actors in
 //! the same form, with the renderer instances the bake placed for each actor's mesh.
 
-use crate::{is_name, lines, number, FileError};
+use crate::{coordinate, is_name, lines, number, FileError};
 use glam::Vec3;
 use std::fmt::Write;
 use std::ops::Range;
@@ -36,7 +36,11 @@ impl ActorLine {
         }
         let mut actor = ActorLine {
             file: words[0].to_owned(),
-            position: Vec3::new(number(words[1])?, number(words[2])?, number(words[3])?),
+            position: Vec3::new(
+                coordinate(words[1])?,
+                coordinate(words[2])?,
+                coordinate(words[3])?,
+            ),
             yaw_degrees: number(words[4])?,
             settings: Vec::new(),
             instances: None,
@@ -99,12 +103,12 @@ impl Blocker {
         let [x, y, z, sx, sy, sz, yaw] = words else {
             return Err("expected `blocker X Y Z SX SY SZ YAW`".to_owned());
         };
-        let size = Vec3::new(number(sx)?, number(sy)?, number(sz)?);
+        let size = Vec3::new(coordinate(sx)?, coordinate(sy)?, coordinate(sz)?);
         if size.min_element() <= 0.0 {
             return Err(format!("a blocker's size must be above 0, not {size}"));
         }
         Ok(Self {
-            centre: Vec3::new(number(x)?, number(y)?, number(z)?),
+            centre: Vec3::new(coordinate(x)?, coordinate(y)?, coordinate(z)?),
             size,
             yaw_degrees: number(yaw)?,
         })
@@ -223,6 +227,28 @@ mod tests {
         for (line, part) in cases {
             let error = ActorLine::parse(&words(line)).unwrap_err();
             assert!(error.contains(part), "{line:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn numbers_too_big_for_physics_are_mistakes() {
+        for words in [
+            ["1e30", "0", "0", "1", "1", "1", "0"],
+            ["0", "1e30", "0", "1", "1", "1", "0"],
+            ["0", "0", "1e30", "1", "1", "1", "0"],
+            ["0", "0", "0", "1e30", "1", "1", "0"],
+            ["0", "0", "0", "1", "1e30", "1", "0"],
+            ["0", "0", "0", "1", "1", "1e30", "0"],
+        ] {
+            assert!(Blocker::parse(&words).is_err(), "{words:?}");
+        }
+        assert!(Blocker::parse(&["1e6", "0", "0", "1e6", "1", "1", "0"]).is_ok());
+        for words in [
+            ["a.actor", "1e30", "0", "0", "0"],
+            ["a.actor", "0", "1e30", "0", "0"],
+            ["a.actor", "0", "0", "1e30", "0"],
+        ] {
+            assert!(ActorLine::parse(&words).is_err(), "{words:?}");
         }
     }
 

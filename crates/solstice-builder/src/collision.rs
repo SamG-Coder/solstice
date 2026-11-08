@@ -6,7 +6,9 @@
 
 use glam::Vec3;
 use solstice_asset::gpu::unpack_triangle;
-use solstice_asset::{Collide, Collision, CollisionShape, SceneAsset, VirtualMesh, NO_SHAPE};
+use solstice_asset::{
+    Collide, Collision, CollisionShape, SceneAsset, VirtualMesh, MAX_HULL_POINTS, NO_SHAPE,
+};
 use std::collections::HashMap;
 
 /// How far a collision mesh may be from what is drawn, in metres.
@@ -15,8 +17,6 @@ pub const MESH_ERROR: f32 = 0.05;
 pub const COARSE_ERROR: f32 = 0.10;
 /// Meshes with a bounding sphere smaller than this, in metres, get a convex hull.
 pub const SMALL_PROP_RADIUS: f32 = 0.75;
-/// The most points a hull is made from; beyond this it is thinned, keeping its extremes.
-pub const MAX_HULL_POINTS: usize = 512;
 
 /// The triangles of a cut through a mesh's DAG at `error`, in the mesh's own space. Those
 /// clusters are exactly the ones fine enough, whose parents are not: together they make one

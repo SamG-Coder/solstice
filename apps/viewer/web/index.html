@@ -219,9 +219,9 @@ class SceneFile {
   #whole = null;
   #etag = null;
 
-  async read(start, end) {
+  async read(start, end, signal) {
     if (this.#whole) return this.#whole.subarray(start, end);
-    const response = await fetch(sceneUrl, { headers: { Range: `bytes=${start}-${end - 1}` } });
+    const response = await fetch(sceneUrl, { headers: { Range: `bytes=${start}-${end - 1}` }, signal });
     if (!response.ok) {
       throw new Error(`Could not load ${sceneUrl} (HTTP ${response.status}).`);
     }
@@ -293,11 +293,14 @@ async function inflateAtMost(bytes, limit) {
   return out.subarray(0, filled);
 }
 
+/// How long one try at reading part of a scene file may take, stalled or not.
+const READ_TIMEOUT_MS = 60000;
+
 /// Reads part of a scene file, trying a few times before giving up.
 async function readWithRetries(file, start, end) {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await file.read(start, end);
+      return await file.read(start, end, AbortSignal.timeout(READ_TIMEOUT_MS));
     } catch (error) {
       if (attempt === 3) throw error;
       await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
@@ -667,9 +670,9 @@ async function startGame(viewer, file) {
     // Fetched only now: a scene that is only looked at never downloads its collision.
     const started = performance.now();
     const ranges = viewer.collision_ranges();
-    if (ranges.length === 0) {
-      show(["error: this scene has no collision to walk on: rebake it"]);
-    } else {
+    // Baked before scenes had collision. One that has it may still have none to fetch.
+    if (!viewer.has_collision()) show(["this scene has no collision: rebake it to walk on it"]);
+    if (ranges.length > 0) {
       // The parts lie one after another, so they come as one request.
       const first = ranges[0];
       const whole = await readWithRetries(file, first, ranges[ranges.length - 1]);

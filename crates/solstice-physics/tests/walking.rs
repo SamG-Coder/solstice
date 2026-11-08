@@ -843,3 +843,135 @@ fn removing_and_adding_actors_comes_out_the_same_every_time() {
         assert_eq!(run(), first);
     }
 }
+
+#[test]
+fn a_blocker_out_of_bounds_is_left_out_with_a_warning() {
+    let (_, physics) = world_of(vec![floor()]);
+    let mut physics = physics.borrow_mut();
+    let before = physics.collider_count();
+    let big = Vec3::splat(1.0e30);
+    physics.add_blocker(Vec3::ZERO, big, 0.0);
+    physics.add_blocker(big, Vec3::ONE, 0.0);
+    physics.add_blocker(Vec3::ZERO, Vec3::new(1.0, -1.0, 1.0), 0.0);
+    physics.add_blocker(Vec3::ZERO, Vec3::ONE, f32::NAN);
+    assert_eq!(physics.collider_count(), before);
+    assert_eq!(physics.warnings.len(), 4, "{:?}", physics.warnings);
+    // As big and as far out as is allowed.
+    physics.add_blocker(Vec3::splat(1.0e6), Vec3::splat(1.0e6), 0.0);
+    assert_eq!(physics.collider_count(), before + 1);
+}
+
+#[test]
+fn an_actor_out_of_bounds_collides_with_nothing_and_says_so_once() {
+    let at = Transform::from_translation(Vec3::ZERO);
+    let huge = 1.0e30;
+    let far = Transform::from_translation(Vec3::new(huge, 0.0, 0.0));
+    let boxed = |shape, kind, offset| ActorCollider {
+        shape,
+        kind,
+        offset,
+    };
+    let unit = Shape::Box(Vec3::ONE);
+    let (mut game, physics) = world_of(vec![floor()]);
+    let turned = Transform {
+        rotation: Quat::NAN,
+        ..at
+    };
+    let entities = [
+        game.world
+            .spawn((turned, boxed(unit, BodyKind::Kinematic, Vec3::ZERO))),
+        game.world.spawn((
+            at,
+            boxed(
+                Shape::Box(Vec3::splat(huge)),
+                BodyKind::Kinematic,
+                Vec3::ZERO,
+            ),
+        )),
+        game.world.spawn((
+            at,
+            boxed(
+                Shape::Capsule {
+                    radius: huge,
+                    height: huge * 2.0,
+                },
+                BodyKind::Sensor,
+                Vec3::ZERO,
+            ),
+        )),
+        game.world
+            .spawn((at, boxed(unit, BodyKind::Kinematic, Vec3::splat(huge)))),
+        game.world
+            .spawn((at, boxed(unit, BodyKind::Dynamic(huge), Vec3::ZERO))),
+        game.world.spawn((
+            at,
+            Character {
+                radius: huge,
+                height: huge * 2.0,
+            },
+        )),
+        game.world
+            .spawn((far, boxed(unit, BodyKind::Kinematic, Vec3::ZERO))),
+    ];
+    steps(&mut game, 5);
+    let physics = physics.borrow();
+    assert_eq!(physics.tracked_colliders(), 0);
+    assert_eq!(
+        physics.warnings.len(),
+        entities.len(),
+        "{:?}",
+        physics.warnings
+    );
+}
+
+#[test]
+fn an_actor_at_the_very_edge_of_the_bounds_is_built() {
+    let most = 1.0e6;
+    let (mut game, physics) = world_of(vec![floor()]);
+    game.world.spawn((
+        Transform::from_translation(Vec3::splat(most)),
+        ActorCollider {
+            shape: Shape::Box(Vec3::splat(most)),
+            kind: BodyKind::Dynamic(most),
+            offset: Vec3::splat(most),
+        },
+    ));
+    game.world.spawn((
+        Transform::from_translation(Vec3::new(-most, 0.0, 0.0)),
+        Character {
+            radius: most,
+            height: most,
+        },
+    ));
+    steps(&mut game, 5);
+    let physics = physics.borrow();
+    assert_eq!(physics.tracked_colliders(), 2);
+    assert_eq!(physics.warnings, Vec::<String>::new());
+}
+
+#[test]
+fn close_scales_share_a_shape_and_tiny_ones_do_not() {
+    let scaled = |s: f32| Mat4::from_scale(Vec3::splat(s));
+    let distinct = |scales: Vec<f32>| {
+        let collision = Collision {
+            shapes: vec![floor()],
+            instance_shapes: vec![0; scales.len()],
+            heightfield: None,
+        };
+        let (_, physics) =
+            with_collision(&collision, |i| scales.get(i as usize).map(|s| scaled(*s)));
+        let shapes = physics.borrow().distinct_shapes();
+        shapes
+    };
+    assert_eq!(
+        distinct(vec![1.0, 1.000_000_1, 0.999_999_9]),
+        1,
+        "the last bits"
+    );
+    assert_eq!(
+        distinct(vec![0.000_1, 0.000_4]),
+        2,
+        "small, and four times the size"
+    );
+    assert_eq!(distinct(vec![1.0, 1.1]), 2);
+}
