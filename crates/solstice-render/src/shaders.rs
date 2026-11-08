@@ -30,6 +30,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "gi/probe_common.wgsl",
     "gi/radiance_codec.wgsl",
     "gi/screen_trace.wgsl",
+    "gi/screen_history.wgsl",
     "vg/cull.wgsl",
     "vg/cull_control.wgsl",
     "vg/raster_hw_fragment.wgsl",

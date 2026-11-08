@@ -11,6 +11,7 @@
 #include "common/brdf.wgsl"
 #include "ocean/surface_params.wgsl"
 #include "lighting/sun_shadow.wgsl"
+#include "gi/screen_trace.wgsl"
 
 // The opaque scene, lit, with its depth and motion.
 @group(0) @binding(0) var lit: texture_2d<f32>;
@@ -31,6 +32,9 @@
 @group(0) @binding(12) var<uniform> shadows: Shadows;
 @group(0) @binding(13) var shadow_maps: texture_depth_2d_array;
 @group(0) @binding(14) var shadow_sampler: sampler_comparison;
+// For reflections of the scene: the opaque scene's closest-depth pyramid, and its normals.
+@group(0) @binding(15) var depth_pyramid: texture_2d<f32>;
+@group(0) @binding(16) var normal_tex: texture_2d<f32>;
 
 const DEBUG_OCEAN: u32 = 10u;
 // Water's reflectance looking straight down: from its index of refraction, 1.33.
@@ -38,6 +42,10 @@ const WATER_F0: f32 = 0.02;
 // Roughness of the water's surface between its drawn waves, for the sun's highlight. The
 // spectrum's finer ripples will set this properly (step 3).
 const WATER_ROUGHNESS: f32 = 0.08;
+// How far reflections are traced across the screen, and how thick a surface they can hit.
+const REFLECTION_DISTANCE: f32 = 300.0;
+const REFLECTION_STEPS: u32 = 64u;
+const REFLECTION_THICKNESS: f32 = 0.5;
 // Depth of water over which the sea fades into the shore, in metres.
 const SHORE_FADE: f32 = 0.25;
 
@@ -61,6 +69,33 @@ fn wave_normal(calm: vec2f, footprint: f32) -> vec3f {
     var normal = cross(along_z, along_x);
     normal.y = max(normal.y, 0.05);
     return normalize(normal);
+}
+
+// What the water at `world`, facing `normal`, reflects along `direction`: the scene where the
+// screen shows it, then the scene's voxels, then the sky. As the reflections pass traces, but
+// a hit's colour is this frame's, as the water is shaded after the scene is lit.
+fn reflection(world: vec3f, normal: vec3f, direction: vec3f) -> vec3f {
+    let sky = sky_radiance(toward_horizon(direction));
+    // A ray reflected down into the water reflects nothing but the sky above the waves.
+    if direction.y <= 0.0 {
+        return sky;
+    }
+    let origin = world + normal * 0.05;
+    let screen = trace_screen(origin, direction, REFLECTION_DISTANCE, REFLECTION_STEPS, REFLECTION_THICKNESS);
+    var seen = vec3f(0.0);
+    if screen.hit {
+        seen = textureSampleLevel(lit, clamp_sampler, screen.uv, 0.0).rgb;
+    }
+    if screen.weight >= 1.0 {
+        return seen;
+    }
+    // Off the screen: the volume of voxels around the camera, then the sky beyond it.
+    let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
+    let voxel = volume_params.levels[level].w;
+    let hit = trace_volume_with(origin + normal * voxel, direction, voxel * 0.5, 320.0, 48u, 0.55);
+    let hit_point = origin + direction * hit.t;
+    let far = mix(sky, select(sky, hit.radiance, hit.hit), volume_edge_fade(hit_point) * volume_edge_fade(world));
+    return mix(far, seen, screen.weight);
 }
 
 // What is seen through the water at `world`: the lit scene behind it, bent by refraction where
@@ -151,7 +186,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     } else {
         let n_dot_v = max(dot(normal, view), 1.0e-3);
         let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
-        let reflected = sky_radiance(toward_horizon(reflect(-view, normal)));
+        let reflected = reflection(world, normal, reflect(-view, normal));
 
         // Sunlight at the water, after the clouds, and the shadows of what stands in its way:
         // cliffs, the fort, the ship. Shadows show on water by dimming its highlight and the

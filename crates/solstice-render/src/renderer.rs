@@ -711,6 +711,8 @@ impl Renderer {
                     lit: &sized.hdr.view,
                     depth: &sized.gbuffer.depth.view,
                     motion: &sized.gbuffer.motion.view,
+                    depth_pyramid: sized.screen_gi.depth_pyramid_view(),
+                    normals: &sized.gbuffer.normal.view,
                 },
                 &self.shadows,
             );

@@ -160,6 +160,9 @@ pub struct SceneViews<'a> {
     pub lit: &'a wgpu::TextureView,
     pub depth: &'a wgpu::TextureView,
     pub motion: &'a wgpu::TextureView,
+    /// The opaque scene's closest-depth pyramid and normals, for tracing reflections.
+    pub depth_pyramid: &'a wgpu::TextureView,
+    pub normals: &'a wgpu::TextureView,
 }
 
 /// Draws and shades the sea's surface.
@@ -267,6 +270,8 @@ impl WaterSurface {
                 .storage_texture(SCENE_DEPTH_FORMAT)
                 .storage_texture(MOTION_FORMAT),
         )
+        .texture_unfilterable()
+        .texture()
         .build(gpu, "ocean shade");
         let shade = gpu.compute_pipeline(
             "ocean shade",
@@ -409,6 +414,8 @@ impl WaterSurface {
                     shadows.uniform.as_entire_binding(),
                     tex(&shadows.array_view),
                     wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
+                    tex(scene.depth_pyramid),
+                    tex(scene.normals),
                 ],
             );
             self.groups = Some((waves.generation(), targets.generation, raster, shade));
