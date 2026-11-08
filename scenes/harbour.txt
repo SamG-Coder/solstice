@@ -1,0 +1,19 @@
+# A harbour town on an Atlantic coast, about 1860. The design and its map are in docs/harbour.md.
+# Generate the kit first: cargo run --release -p townkit
+#
+# The origin is the middle of the quay's edge, at sea level. North is -Z, east is +X, and the sea
+# lies to the west, so that the sun sets over the harbour mouth.
+
+texture_size 1024
+ocean 0 coastal
+camera -150 3 -20 -1.4 0.02
+
+# ---- The land and the seabed, placed whole: the kit holds them at their place in the world.
+model ../target/town/ground.gltf 0 0 0 0 1
+
+# ---- The stonework.
+part ../target/town/town.gltf quay 0 0 0 0 1
+part ../target/town/town.gltf mole 0 0 0 0 1
+
+# ---- Plain shapes for everything later steps replace, to judge scale and composition.
+part ../target/town/town.gltf massing 0 0 0 0 1
