@@ -175,7 +175,8 @@ pub struct FrameStats {
     pub source_triangles: u64,
     pub unique_triangles: u64,
     pub streaming: StreamingStats,
-    /// What the last shadow cascade to be redrawn selected.
+    /// What the most recently read back shadow cascade redraw selected. Counters take a few
+    /// frames to arrive, and a redraw is skipped over while the last is still in flight.
     pub shadow_clusters: u32,
     pub shadow_triangles: u32,
 }
@@ -1020,6 +1021,8 @@ impl Renderer {
             receiver_plane_count: 0,
             _pad: [0; 2],
             receiver_planes: [Vec4::ZERO; 6],
+            eye_light: Vec3::Y,
+            _pad2: 0.0,
         };
         self.view_slots.write(
             gpu,

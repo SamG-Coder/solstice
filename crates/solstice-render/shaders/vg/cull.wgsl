@@ -90,10 +90,15 @@ fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
     if view.is_ortho != 0u {
         var pixels = error * view.lod_scale;
         // Drawn for a camera: error that camera cannot see is not worth drawing here either.
-        // Its nearest point to the camera keeps this conservative and monotonic up the DAG, as
-        // below; the view's own measure already is, so the smaller of the two is as well.
+        // A caster's error shows where its shadow lands, anywhere along the line from it away
+        // from the light, so the camera's distance to that line bounds how near the error can
+        // be seen. A parent's line sweeps a volume holding its children's, so this stays
+        // monotonic up the DAG, as the view's own measure is; the smaller of the two is too.
         if view.eye_lod_scale > 0.0 {
-            let distance = max(length(center - view.eye_position) - radius, view.eye_near);
+            let to_eye = view.eye_position - center;
+            let along = max(dot(to_eye, -view.eye_light), 0.0);
+            let nearest = sqrt(max(dot(to_eye, to_eye) - along * along, 0.0));
+            let distance = max(nearest - radius, view.eye_near);
             pixels = min(pixels, error * view.eye_lod_scale / distance);
         }
         return pixels;

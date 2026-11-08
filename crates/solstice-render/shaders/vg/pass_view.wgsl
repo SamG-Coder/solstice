@@ -31,6 +31,8 @@ struct PassView {
     // view, the bounds of what it shadows, open towards the light.
     receiver_plane_count: u32,
     receiver_planes: array<vec4f, 6>,
+    // Towards the light, for a shadow view.
+    eye_light: vec3f,
 }
 
 // Written by the cull passes. Atomic view of `CullStateRead`.

@@ -41,6 +41,10 @@ pub struct PassView {
     /// whose shadows this view supplies, swept towards the light, so that casters whose shadow
     /// falls outside it are not drawn.
     pub receiver_planes: [Vec4; 6],
+    /// Towards the light, for a shadow view: a caster's error shows where its shadow lands,
+    /// anywhere along the line from it away from the light.
+    pub eye_light: Vec3,
+    pub _pad2: f32,
 }
 
 impl PassView {
@@ -93,6 +97,8 @@ impl PassView {
             receiver_plane_count: 0,
             _pad: [0; 2],
             receiver_planes: [Vec4::ZERO; 6],
+            eye_light: Vec3::Y,
+            _pad2: 0.0,
         }
     }
 
@@ -113,11 +119,13 @@ impl PassView {
         self
     }
 
-    /// Bounds an orthographic view's level of detail by what a camera at `eye`, with
-    /// `lod_scale` pixels per world unit at unit distance, can see of it: nothing it draws is
-    /// seen nearer than `nearest` from that camera.
-    pub fn seen_from(mut self, eye: Vec3, lod_scale: f32, nearest: f32) -> Self {
+    /// Bounds a light's view's level of detail by what a camera at `eye`, with `lod_scale`
+    /// pixels per world unit at unit distance, can see of the shadows it draws: a caster's
+    /// error shows wherever its shadow lands, along the line from it away from `light`, and
+    /// nothing this view draws is seen nearer than `nearest` from that camera.
+    pub fn seen_from(mut self, eye: Vec3, light: Vec3, lod_scale: f32, nearest: f32) -> Self {
         self.eye_position = eye;
+        self.eye_light = light;
         self.eye_lod_scale = lod_scale;
         self.eye_near = nearest.max(1.0e-3);
         self
@@ -516,7 +524,8 @@ mod tests {
     fn pass_view_size_matches_the_shader_layout() {
         // The receiver planes follow a vec3 and four scalars, so WGSL pads them to 16 bytes.
         assert_eq!(std::mem::offset_of!(PassView, receiver_planes), 320);
-        assert_eq!(std::mem::size_of::<PassView>(), 416);
+        assert_eq!(std::mem::offset_of!(PassView, eye_light), 416);
+        assert_eq!(std::mem::size_of::<PassView>(), 432);
     }
 
     #[test]
