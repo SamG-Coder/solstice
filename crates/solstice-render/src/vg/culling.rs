@@ -299,6 +299,7 @@ struct StatsShared {
     clusters: AtomicU32,
     software_clusters: AtomicU32,
     triangles: AtomicU32,
+    dropped: AtomicU32,
     /// Set when a copy was recorded and still needs its map request.
     copied: AtomicBool,
     /// Set from the map request until the data has been consumed.
@@ -346,7 +347,7 @@ impl CullStats {
                 .expect("the map has completed");
             let words: &[u32] = bytemuck::cast_slice(&data);
             // Word positions follow `CullState` in `vg/pass_view.wgsl`.
-            let (software, hardware, triangles) = (words[4], words[5], words[8]);
+            let (software, hardware, triangles, dropped) = (words[4], words[5], words[8], words[9]);
             self.shared
                 .clusters
                 .store(software + hardware, Ordering::Release);
@@ -354,6 +355,7 @@ impl CullStats {
                 .software_clusters
                 .store(software, Ordering::Release);
             self.shared.triangles.store(triangles, Ordering::Release);
+            self.shared.dropped.store(dropped, Ordering::Release);
         }
         self.staging.unmap();
     }
@@ -385,6 +387,12 @@ impl CullStats {
     /// Clusters sent to the software rasterizer in the most recently read-back frame.
     pub fn software_clusters(&self) -> u32 {
         self.shared.software_clusters.load(Ordering::Acquire)
+    }
+
+    /// Queue entries and clusters lost for want of room in the most recently read-back frame.
+    /// Anything but zero means that view's lists are too small for the scene.
+    pub fn dropped(&self) -> u32 {
+        self.shared.dropped.load(Ordering::Acquire)
     }
 }
 
