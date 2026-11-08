@@ -1,0 +1,758 @@
+//! Effects as data: emitters built from small modules, with a text form (docs/particles.md).
+//!
+//! An effect is written one module per line, like a weather or an ocean:
+//!
+//! ```text
+//! # A fountain: a jet of water that arcs up and falls back.
+//! param strength 1
+//!
+//! emitter jet
+//!   budget 4000
+//!   spawn rate=600*strength
+//!   shape sphere 0.05
+//!   lifetime 1.6 2.0
+//!   velocity 0 6 0 cone=8 spread=0.1
+//!   size 0.02 0.035
+//!   gravity
+//!   drag 0.3
+//!   color 0.7 0.8 0.9 0.6
+//!   color life 0=1 1 1 0 0.1=1 1 1 1 1=1 1 1 0
+//!   render sprite soft=0.2
+//! ```
+//!
+//! Every number may instead be a parameter's name, or a number times one (`600*strength`), which
+//! is how the weather or a script drives an effect while it runs. Two numbers where one would do
+//! are a range, each particle taking its own value uniformly between them. Options are
+//! `key=value`, and take the numbers that follow them too (`offset=0 1 0`).
+//!
+//! Every module has a default, so an emitter names only what differs. The built-in effects are
+//! files of exactly this kind, in `particles/` beside this crate.
+
+/// The most emitters one effect may have.
+pub const MAX_EMITTERS_PER_EFFECT: usize = 8;
+/// Entries each curve is baked to on the GPU.
+pub const CURVE_ENTRIES: usize = 32;
+
+/// The built-in effects, by name, as text.
+const BUILT_IN: [(&str, &str); 1] = [(
+    "fountain",
+    include_str!("../../particles/fountain.particles"),
+)];
+
+/// A number, or a number times one of its effect's parameters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Value {
+    pub number: f32,
+    /// Index into [`Effect::params`].
+    pub param: Option<usize>,
+}
+
+impl Value {
+    pub const fn constant(number: f32) -> Self {
+        Self {
+            number,
+            param: None,
+        }
+    }
+
+    /// Its value under the parameters' current values.
+    pub fn eval(&self, params: &[f32]) -> f32 {
+        match self.param {
+            Some(p) => self.number * params.get(p).copied().unwrap_or(0.0),
+            None => self.number,
+        }
+    }
+}
+
+/// Where new particles appear, in the effect's own space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Shape {
+    Point,
+    /// Within a sphere of this radius, or on its surface only.
+    Sphere {
+        radius: Value,
+        surface: bool,
+    },
+    /// Within a box of these full sizes, centred on the origin.
+    Box {
+        size: [Value; 3],
+    },
+}
+
+/// How a particle is blended over what is behind it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Blend {
+    /// Covers what is behind by its opacity: smoke, dust, water.
+    #[default]
+    Alpha,
+    /// Adds its light and hides nothing: sparks, glows.
+    Add,
+}
+
+/// Where a moving effect keeps its emitter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Follow {
+    /// Where the effect is placed.
+    #[default]
+    Effect,
+    /// Around the camera, wherever it goes: rain and snow. Rotation is the effect's.
+    Camera,
+}
+
+/// A value over a particle's life, as keys from 0 (born) to 1 (dies), linear between them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Curve<const N: usize> {
+    pub keys: Vec<(f32, [f32; N])>,
+}
+
+impl<const N: usize> Curve<N> {
+    /// A curve that is `value` throughout.
+    pub fn constant(value: [f32; N]) -> Self {
+        Self {
+            keys: vec![(0.0, value)],
+        }
+    }
+
+    /// Its value at `t` in `0..1`.
+    pub fn at(&self, t: f32) -> [f32; N] {
+        let Some(first) = self.keys.first() else {
+            return [1.0; N];
+        };
+        if t <= first.0 {
+            return first.1;
+        }
+        for pair in self.keys.windows(2) {
+            let ((t0, a), (t1, b)) = (pair[0], pair[1]);
+            if t <= t1 {
+                let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 1.0 };
+                return std::array::from_fn(|i| a[i] + (b[i] - a[i]) * f);
+            }
+        }
+        self.keys.last().expect("not empty").1
+    }
+
+    /// Its values at [`CURVE_ENTRIES`] evenly spaced times from 0 to 1, as the GPU holds it.
+    pub fn bake(&self) -> [[f32; N]; CURVE_ENTRIES] {
+        std::array::from_fn(|i| self.at(i as f32 / (CURVE_ENTRIES - 1) as f32))
+    }
+}
+
+/// One emitter of an effect: how its particles are born, move, and look.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Emitter {
+    pub name: String,
+    /// The most particles it may have alive at once.
+    pub budget: u32,
+    pub follow: Follow,
+    /// New particles per second.
+    pub rate: Value,
+    /// Particles at once when the effect starts, and again every `every` seconds if that is
+    /// above zero.
+    pub burst: Value,
+    pub every: Value,
+    pub shape: Shape,
+    /// Where the shape is centred, in the effect's space.
+    pub offset: [Value; 3],
+    /// Seconds each particle lives, between the two.
+    pub lifetime: [Value; 2],
+    /// Initial direction and speed, in metres per second, in the effect's space.
+    pub velocity: [Value; 3],
+    /// Half-angle of the cone the initial direction is spread over, in degrees.
+    pub cone: Value,
+    /// Speed varies by up to this fraction either way.
+    pub spread: Value,
+    /// Radius of each particle in metres, between the two.
+    pub size: [Value; 2],
+    /// Linear colour and opacity.
+    pub color: [Value; 4],
+    /// Radiance of a white particle, in the scene's units: 1 is a white surface lit by a sun
+    /// of illuminance π.
+    pub brightness: Value,
+    /// Downward acceleration in m/s².
+    pub gravity: Value,
+    /// Linear drag: the share of its velocity relative to still air a particle loses, per
+    /// second, as a rate (`dv/dt = -drag · v`).
+    pub drag: Value,
+    pub color_life: Curve<4>,
+    pub size_life: Curve<1>,
+    pub blend: Blend,
+    /// Distance over which a particle fades into the surfaces behind it, in metres.
+    pub soft: Value,
+    pub opacity: Value,
+}
+
+impl Emitter {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            budget: 1000,
+            follow: Follow::Effect,
+            rate: Value::constant(0.0),
+            burst: Value::constant(0.0),
+            every: Value::constant(0.0),
+            shape: Shape::Point,
+            offset: [Value::constant(0.0); 3],
+            lifetime: [Value::constant(1.0); 2],
+            velocity: [Value::constant(0.0); 3],
+            cone: Value::constant(0.0),
+            spread: Value::constant(0.0),
+            size: [Value::constant(0.05); 2],
+            color: [Value::constant(1.0); 4],
+            brightness: Value::constant(1.0),
+            gravity: Value::constant(0.0),
+            drag: Value::constant(0.0),
+            color_life: Curve::constant([1.0; 4]),
+            size_life: Curve::constant([1.0]),
+            blend: Blend::Alpha,
+            soft: Value::constant(0.25),
+            opacity: Value::constant(1.0),
+        }
+    }
+}
+
+/// An effect: named parameters and the emitters they drive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Effect {
+    /// Each parameter's name and default value.
+    pub params: Vec<(String, f32)>,
+    pub emitters: Vec<Emitter>,
+}
+
+/// Standard gravity, for `gravity` with no value.
+pub const STANDARD_GRAVITY: f32 = 9.81;
+
+impl Effect {
+    /// Names of the built-in effects.
+    pub fn names() -> impl Iterator<Item = &'static str> {
+        BUILT_IN.iter().map(|(name, _)| *name)
+    }
+
+    /// A built-in effect, or `None` if there is none of that name.
+    pub fn by_name(name: &str) -> Option<Self> {
+        let (_, text) = BUILT_IN.iter().find(|(n, _)| *n == name)?;
+        Some(Self::parse(text).unwrap_or_else(|e| panic!("built-in effect {name}: {e}")))
+    }
+
+    /// The index of the parameter called `name`.
+    pub fn param(&self, name: &str) -> Option<usize> {
+        self.params.iter().position(|(n, _)| n == name)
+    }
+
+    /// Reads an effect from its text form. Errors name the line at fault.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut effect = Effect {
+            params: Vec::new(),
+            emitters: Vec::new(),
+        };
+        for (index, raw) in text.lines().enumerate() {
+            let words: Vec<&str> = raw
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect();
+            let Some((&keyword, rest)) = words.split_first() else {
+                continue;
+            };
+            let at = |e: String| format!("line {}: {e}", index + 1);
+            effect.line(keyword, rest).map_err(at)?;
+        }
+        if effect.emitters.is_empty() {
+            return Err("an effect needs at least one emitter".into());
+        }
+        Ok(effect)
+    }
+
+    fn line(&mut self, keyword: &str, rest: &[&str]) -> Result<(), String> {
+        match keyword {
+            "param" => {
+                if !self.emitters.is_empty() {
+                    return Err("parameters come before the first emitter".into());
+                }
+                let [name, default] = rest else {
+                    return Err("param takes a name and a default value".into());
+                };
+                if !is_name(name) {
+                    return Err(format!("{name:?} is not a valid parameter name"));
+                }
+                if self.param(name).is_some() {
+                    return Err(format!("parameter {name} is declared twice"));
+                }
+                self.params.push(((*name).to_owned(), number(default)?));
+                Ok(())
+            }
+            "emitter" => {
+                let [name] = rest else {
+                    return Err("emitter takes a name".into());
+                };
+                if self.emitters.len() == MAX_EMITTERS_PER_EFFECT {
+                    return Err(format!(
+                        "an effect may have at most {MAX_EMITTERS_PER_EFFECT} emitters"
+                    ));
+                }
+                if self.emitters.iter().any(|e| e.name == *name) {
+                    return Err(format!("emitter {name} is declared twice"));
+                }
+                self.emitters.push(Emitter::new(name));
+                Ok(())
+            }
+            _ => {
+                let Some(emitter) = self.emitters.last() else {
+                    return Err(format!("{keyword} must come after an emitter"));
+                };
+                let mut emitter = emitter.clone();
+                let words = Words::split(rest)?;
+                module(&mut emitter, keyword, &words, &self.params)?;
+                *self.emitters.last_mut().expect("checked above") = emitter;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A line's words after its keyword: plain words, then `key=value` options, each with the
+/// plain words that follow it.
+struct Words<'a> {
+    plain: Vec<&'a str>,
+    options: Vec<(&'a str, Vec<&'a str>)>,
+}
+
+impl<'a> Words<'a> {
+    fn split(rest: &[&'a str]) -> Result<Self, String> {
+        let mut words = Words {
+            plain: Vec::new(),
+            options: Vec::new(),
+        };
+        for word in rest {
+            match word.split_once('=') {
+                Some((key, value)) => {
+                    if key.is_empty() {
+                        return Err(format!("{word:?} has no name before its ="));
+                    }
+                    let values = if value.is_empty() {
+                        vec![]
+                    } else {
+                        vec![value]
+                    };
+                    words.options.push((key, values));
+                }
+                None => match words.options.last_mut() {
+                    Some((_, values)) => values.push(word),
+                    None => words.plain.push(word),
+                },
+            }
+        }
+        Ok(words)
+    }
+
+    /// Checks every option is one of `known`.
+    fn only(&self, keyword: &str, known: &[&str]) -> Result<(), String> {
+        for (key, _) in &self.options {
+            if !known.contains(key) {
+                return Err(format!("{keyword} has no option {key}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn option(&self, key: &str) -> Option<&[&'a str]> {
+        self.options
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_slice())
+    }
+}
+
+fn is_name(word: &str) -> bool {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn number(word: &str) -> Result<f32, String> {
+    word.parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("{word:?} is not a number"))
+}
+
+/// A number, a parameter, or a number times a parameter.
+fn value(word: &str, params: &[(String, f32)]) -> Result<Value, String> {
+    let param = |name: &str| {
+        params
+            .iter()
+            .position(|(n, _)| n == name)
+            .ok_or_else(|| format!("{name:?} is neither a number nor a parameter"))
+    };
+    if let Some((left, right)) = word.split_once('*') {
+        let (scale, name) = match (number(left), number(right)) {
+            (Ok(n), Err(_)) => (n, right),
+            (Err(_), Ok(n)) => (n, left),
+            _ => return Err(format!("{word:?} must be a number times a parameter")),
+        };
+        return Ok(Value {
+            number: scale,
+            param: Some(param(name)?),
+        });
+    }
+    match number(word) {
+        Ok(n) => Ok(Value::constant(n)),
+        Err(_) if is_name(word) => Ok(Value {
+            number: 1.0,
+            param: Some(param(word)?),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+fn values<const N: usize>(
+    words: &[&str],
+    params: &[(String, f32)],
+    what: &str,
+) -> Result<[Value; N], String> {
+    if words.len() != N {
+        return Err(format!("{what} takes {N} values, not {}", words.len()));
+    }
+    let mut out = [Value::constant(0.0); N];
+    for (slot, word) in out.iter_mut().zip(words) {
+        *slot = value(word, params)?;
+    }
+    Ok(out)
+}
+
+/// One value, or two for a range.
+fn range(words: &[&str], params: &[(String, f32)], what: &str) -> Result<[Value; 2], String> {
+    match words {
+        [one] => {
+            let v = value(one, params)?;
+            Ok([v, v])
+        }
+        [low, high] => Ok([value(low, params)?, value(high, params)?]),
+        _ => Err(format!("{what} takes one value or two for a range")),
+    }
+}
+
+fn single(words: &[&str], params: &[(String, f32)], what: &str) -> Result<Value, String> {
+    let [v] = values::<1>(words, params, what)?;
+    Ok(v)
+}
+
+/// Keys of a curve: `T=A B C ...`, with N values each.
+fn curve<const N: usize>(words: &Words, what: &str) -> Result<Curve<N>, String> {
+    if !words.plain.is_empty() {
+        return Err(format!(
+            "{what} takes keys such as 0=…, not {:?}",
+            words.plain[0]
+        ));
+    }
+    let mut keys: Vec<(f32, [f32; N])> = Vec::new();
+    for (time, numbers) in &words.options {
+        let t = number(time)?;
+        if !(0.0..=1.0).contains(&t) {
+            return Err(format!("{what}: key {t} lies outside 0 to 1"));
+        }
+        if keys.last().is_some_and(|(last, _)| *last >= t) {
+            return Err(format!("{what}: keys must be in order of time"));
+        }
+        if numbers.len() != N {
+            return Err(format!("{what}: each key takes {N} values"));
+        }
+        let mut v = [0.0; N];
+        for (slot, word) in v.iter_mut().zip(numbers) {
+            *slot = number(word)?;
+        }
+        keys.push((t, v));
+    }
+    if keys.is_empty() {
+        return Err(format!("{what} needs at least one key"));
+    }
+    Ok(Curve { keys })
+}
+
+fn module(
+    emitter: &mut Emitter,
+    keyword: &str,
+    words: &Words,
+    params: &[(String, f32)],
+) -> Result<(), String> {
+    let plain = words.plain.as_slice();
+    let no_options = |w: &Words| w.only(keyword, &[]);
+    match keyword {
+        "budget" => {
+            no_options(words)?;
+            let [count] = plain else {
+                return Err("budget takes a count".into());
+            };
+            emitter.budget = count
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or_else(|| format!("{count:?} is not a count above zero"))?;
+        }
+        "follow" => {
+            no_options(words)?;
+            emitter.follow = match plain {
+                ["camera"] => Follow::Camera,
+                ["effect"] => Follow::Effect,
+                _ => return Err("follow takes camera or effect".into()),
+            };
+        }
+        "spawn" => {
+            words.only(keyword, &["rate", "burst", "every"])?;
+            if !plain.is_empty() {
+                return Err("spawn takes rate=, burst= and every=".into());
+            }
+            if let Some(v) = words.option("rate") {
+                emitter.rate = single(v, params, "rate")?;
+            }
+            if let Some(v) = words.option("burst") {
+                emitter.burst = single(v, params, "burst")?;
+            }
+            if let Some(v) = words.option("every") {
+                emitter.every = single(v, params, "every")?;
+            }
+        }
+        "shape" => {
+            no_options(words)?;
+            emitter.shape = match plain {
+                ["point"] => Shape::Point,
+                ["sphere", radius] => Shape::Sphere {
+                    radius: value(radius, params)?,
+                    surface: false,
+                },
+                ["sphere", radius, "surface"] => Shape::Sphere {
+                    radius: value(radius, params)?,
+                    surface: true,
+                },
+                ["box", sizes @ ..] => Shape::Box {
+                    size: values(sizes, params, "box")?,
+                },
+                _ => return Err("shape takes point, sphere RADIUS [surface] or box X Y Z".into()),
+            };
+        }
+        "offset" => {
+            no_options(words)?;
+            emitter.offset = values(plain, params, "offset")?;
+        }
+        "lifetime" => {
+            no_options(words)?;
+            emitter.lifetime = range(plain, params, "lifetime")?;
+        }
+        "velocity" => {
+            words.only(keyword, &["cone", "spread"])?;
+            emitter.velocity = values(plain, params, "velocity")?;
+            if let Some(v) = words.option("cone") {
+                emitter.cone = single(v, params, "cone")?;
+            }
+            if let Some(v) = words.option("spread") {
+                emitter.spread = single(v, params, "spread")?;
+            }
+        }
+        "size" => match plain.first() {
+            Some(&"life") => {
+                let rest = Words {
+                    plain: plain[1..].to_vec(),
+                    options: words.options.clone(),
+                };
+                emitter.size_life = curve(&rest, "size life")?;
+            }
+            _ => {
+                no_options(words)?;
+                emitter.size = range(plain, params, "size")?;
+            }
+        },
+        "color" => match plain.first() {
+            Some(&"life") => {
+                let rest = Words {
+                    plain: plain[1..].to_vec(),
+                    options: words.options.clone(),
+                };
+                emitter.color_life = curve(&rest, "color life")?;
+            }
+            _ => {
+                no_options(words)?;
+                emitter.color = match plain.len() {
+                    3 => {
+                        let [r, g, b] = values(plain, params, "color")?;
+                        [r, g, b, Value::constant(1.0)]
+                    }
+                    _ => values(plain, params, "color")?,
+                };
+            }
+        },
+        "brightness" => {
+            no_options(words)?;
+            emitter.brightness = single(plain, params, "brightness")?;
+        }
+        "gravity" => {
+            no_options(words)?;
+            emitter.gravity = match plain {
+                [] => Value::constant(STANDARD_GRAVITY),
+                _ => single(plain, params, "gravity")?,
+            };
+        }
+        "drag" => {
+            no_options(words)?;
+            emitter.drag = single(plain, params, "drag")?;
+        }
+        "render" => {
+            words.only(keyword, &["blend", "soft", "opacity"])?;
+            match plain {
+                ["sprite"] => {}
+                _ => return Err("render takes sprite".into()),
+            }
+            if let Some(v) = words.option("blend") {
+                emitter.blend = match v {
+                    ["alpha"] => Blend::Alpha,
+                    ["add"] => Blend::Add,
+                    _ => return Err("blend takes alpha or add".into()),
+                };
+            }
+            if let Some(v) = words.option("soft") {
+                emitter.soft = single(v, params, "soft")?;
+            }
+            if let Some(v) = words.option("opacity") {
+                emitter.opacity = single(v, params, "opacity")?;
+            }
+        }
+        _ => return Err(format!("unknown module {keyword:?}")),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SMOKE: &str = "
+        # A test.
+        param heat 0.5
+        param wind 2
+
+        emitter puffs
+          budget 500
+          spawn rate=40*heat burst=10 every=2
+          shape box 1 2 heat
+          offset 0 0.5 0
+          lifetime 3 4
+          velocity 0 1 0 cone=20 spread=0.2
+          size 0.2 0.4
+          color 0.5 0.5 0.5 0.8
+          gravity -0.5
+          drag wind
+          color life 0=1 1 1 0 0.2=1 1 1 1 1=0.4 0.4 0.4 0
+          size life 0=0.5 1=2
+          render sprite blend=add soft=0.5 opacity=0.7
+        emitter embers
+          follow camera
+          shape sphere 2 surface
+    ";
+
+    #[test]
+    fn every_module_reads_back() {
+        let effect = Effect::parse(SMOKE).unwrap();
+        assert_eq!(
+            effect.params,
+            vec![("heat".into(), 0.5), ("wind".into(), 2.0)]
+        );
+        let e = &effect.emitters[0];
+        let params = [0.5, 2.0];
+        assert_eq!(e.budget, 500);
+        assert_eq!(e.rate.eval(&params), 20.0);
+        assert_eq!(e.burst.eval(&params), 10.0);
+        assert_eq!(e.every.eval(&params), 2.0);
+        let Shape::Box { size } = e.shape else {
+            panic!("expected a box")
+        };
+        assert_eq!(size.map(|v| v.eval(&params)), [1.0, 2.0, 0.5]);
+        assert_eq!(e.offset.map(|v| v.eval(&params)), [0.0, 0.5, 0.0]);
+        assert_eq!(e.lifetime.map(|v| v.eval(&params)), [3.0, 4.0]);
+        assert_eq!(e.velocity.map(|v| v.eval(&params)), [0.0, 1.0, 0.0]);
+        assert_eq!(e.cone.eval(&params), 20.0);
+        assert_eq!(e.spread.eval(&params), 0.2);
+        assert_eq!(e.size.map(|v| v.eval(&params)), [0.2, 0.4]);
+        assert_eq!(e.color.map(|v| v.eval(&params)), [0.5, 0.5, 0.5, 0.8]);
+        assert_eq!(e.gravity.eval(&params), -0.5);
+        assert_eq!(e.drag.eval(&params), 2.0);
+        let mid = e.color_life.at(0.6);
+        for (got, want) in mid.iter().zip([0.7, 0.7, 0.7, 0.5]) {
+            assert!((got - want).abs() < 1.0e-6, "{mid:?}");
+        }
+        assert_eq!(e.size_life.at(0.5), [1.25]);
+        assert_eq!(e.blend, Blend::Add);
+        assert_eq!(e.soft.eval(&params), 0.5);
+        assert_eq!(e.opacity.eval(&params), 0.7);
+
+        let embers = &effect.emitters[1];
+        assert_eq!(embers.follow, Follow::Camera);
+        assert!(matches!(embers.shape, Shape::Sphere { surface: true, .. }));
+        // Defaults for all it does not name.
+        assert_eq!(embers.budget, 1000);
+        assert_eq!(embers.gravity.eval(&params), 0.0);
+    }
+
+    #[test]
+    fn parameters_drive_values_as_they_change() {
+        let effect = Effect::parse(SMOKE).unwrap();
+        let rate = effect.emitters[0].rate;
+        assert_eq!(rate.eval(&[0.0, 2.0]), 0.0);
+        assert_eq!(rate.eval(&[1.0, 2.0]), 40.0);
+        // A number either side of the parameter.
+        let effect = Effect::parse("param p 1\nemitter e\n spawn rate=p*3").unwrap();
+        assert_eq!(effect.emitters[0].rate.eval(&[2.0]), 6.0);
+    }
+
+    #[test]
+    fn errors_name_the_line() {
+        let cases = [
+            ("emitter e\n  speed 3", "line 2: unknown module"),
+            ("emitter e\n  size 1 2 3", "line 2: size takes one value"),
+            (
+                "emitter e\n  spawn rate=heat",
+                "line 2: \"heat\" is neither",
+            ),
+            ("emitter e\nparam p 1", "line 2: parameters come before"),
+            ("budget 3", "line 1: budget must come after"),
+            (
+                "emitter e\n color life 0.5=1 1 1 1 0.2=1 1 1 1",
+                "line 2: color life: keys must",
+            ),
+            (
+                "emitter e\n render sprite glow=1",
+                "line 2: render has no option glow",
+            ),
+            ("emitter e\n budget 0", "line 2: \"0\" is not a count"),
+            (
+                "emitter e\nemitter e",
+                "line 2: emitter e is declared twice",
+            ),
+        ];
+        for (text, expected) in cases {
+            let error = Effect::parse(text).unwrap_err();
+            assert!(error.starts_with(expected), "{text:?} gave {error:?}");
+        }
+        assert!(Effect::parse("# nothing\n").is_err());
+    }
+
+    #[test]
+    fn curves_bake_their_ends_and_interpolate_between_keys() {
+        let curve = Curve::<1> {
+            keys: vec![(0.25, [2.0]), (0.75, [4.0])],
+        };
+        let baked = curve.bake();
+        assert_eq!(baked[0], [2.0]);
+        assert_eq!(baked[CURVE_ENTRIES - 1], [4.0]);
+        assert!((curve.at(0.5)[0] - 3.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn built_in_effects_parse() {
+        for name in Effect::names() {
+            assert!(Effect::by_name(name).is_some(), "{name}");
+        }
+        assert!(Effect::by_name("nothing").is_none());
+    }
+}

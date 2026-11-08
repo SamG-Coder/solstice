@@ -150,7 +150,8 @@ impl WaterTargets {
         Self {
             depth: depth.create_view(&Default::default()),
             calm: Target::new(gpu, "water calm", size, CALM_FORMAT, render),
-            color: Target::new(gpu, "scene with water", size, COLOR_FORMAT, none),
+            // Particles are drawn over it.
+            color: Target::new(gpu, "scene with water", size, COLOR_FORMAT, render),
             scene_depth: Target::new(
                 gpu,
                 "scene depth with water",

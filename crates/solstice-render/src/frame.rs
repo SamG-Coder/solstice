@@ -137,6 +137,8 @@ pub enum DebugView {
     /// How far each pixel moved since the last frame: grey where nothing moved, more red as it
     /// moved right on screen and more green as it moved up.
     Motion = 12,
+    /// How many layers of particles cover each pixel: dark red for one, through yellow to white.
+    Particles = 13,
 }
 
 impl DebugView {
@@ -156,6 +158,7 @@ impl DebugView {
             "ocean" => Self::Ocean,
             "wetness" => Self::Wetness,
             "motion" => Self::Motion,
+            "particles" => Self::Particles,
             _ => return None,
         })
     }

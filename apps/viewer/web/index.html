@@ -101,6 +101,7 @@
       <option value="ocean">Sea surface (normals)</option>
       <option value="wetness">Wetness</option>
       <option value="motion">Motion</option>
+      <option value="particles">Particle overdraw</option>
     </select>
   </label>
   <label>Weather
@@ -432,6 +433,13 @@ async function main() {
   if (params.has("live")) {
     el("live-weather").checked = true;
     weather.startLive();
+  }
+
+  // ?effect=NAME@x,y,z starts a built-in particle effect there; several are separated by ";".
+  for (const spec of (params.get("effect") ?? "").split(";").filter(Boolean)) {
+    const [name, at = "0,0,0"] = spec.split("@");
+    const [x, y, z] = at.split(",").map(Number);
+    if (!viewer.spawn_effect(name, x || 0, y || 0, z || 0)) console.warn(`no effect ${spec}`);
   }
 
   el("debug").addEventListener("change", (e) => viewer.set_debug_view(e.target.value));

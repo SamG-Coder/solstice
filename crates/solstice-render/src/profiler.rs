@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 20] = [
+pub const SECTIONS: [&str; 22] = [
     "sky",
     "clouds",
     "ocean",
@@ -30,6 +30,8 @@ pub const SECTIONS: [&str; 20] = [
     "screen gi",
     "lighting",
     "water",
+    "particles",
+    "particle draw",
     "post",
 ];
 /// Indices into [`SECTIONS`], for the marks that begin each one.
@@ -58,8 +60,12 @@ pub mod section {
     pub const LIGHTING: usize = 17;
     /// The sea's surface, drawn and shaded.
     pub const WATER: usize = 18;
-    pub const POST: usize = 19;
-    pub const END: usize = 20;
+    /// Spawning and moving particles.
+    pub const PARTICLES: usize = 19;
+    /// Drawing them over the scene.
+    pub const PARTICLE_DRAW: usize = 20;
+    pub const POST: usize = 21;
+    pub const END: usize = 22;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;
@@ -142,7 +148,9 @@ impl Profiler {
                     .slice(..)
                     .get_mapped_range()
                     .expect("the map has completed");
-                let ticks: &[u64] = bytemuck::cast_slice(&data);
+                // Copied out rather than cast in place: a mapped range is only promised
+                // 4-byte alignment, and the AMD integrated GPU gives no more.
+                let ticks: Vec<u64> = bytemuck::pod_collect_to_vec(&data);
                 let mut result = [0.0; SECTIONS.len()];
                 for (section, slot) in result.iter_mut().enumerate() {
                     let elapsed = ticks[section + 1].saturating_sub(ticks[section]);
