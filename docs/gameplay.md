@@ -128,8 +128,9 @@ Not in the first version, with room left for each:
   needs at the end of each frame. The viewers use it only when a scene has gameplay.
 - **The renderer gains general APIs only:** move an instance, hide it or change its glow, upload
   a skeleton's bone matrices. It never sees an actor.
-- **Two web builds.** The viewer stays as it is (319 KB gzipped today). A second build, with
-  gameplay, is loaded only for scenes that have it.
+- **Two web builds**, chosen on 8 November 2026. The viewer stays as it is (319 KB gzipped
+  today). A second build, with gameplay, is loaded only for scenes that have it, when *Play* is
+  pressed.
 
 ## The gameplay framework
 
@@ -172,7 +173,8 @@ A scene places it with its own settings: `actor gate.actor 20.7 0 0 90 locked=tr
   every few months.
 
 The framework only needs fixed tick groups on one thread, which is a few hundred lines on top of
-`hecs`. So the recommendation is `hecs`, with Solstice's own framework over it.
+`hecs`. So the choice, made on 8 November 2026, is `hecs`, with Solstice's own framework over
+it.
 
 ### A frame
 
