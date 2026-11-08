@@ -23,6 +23,10 @@
 @group(0) @binding(11) var cloud_tex: texture_2d<f32>;
 // The Milky Way over the celestial sphere, worked out once by sky/milky_way_bake.wgsl.
 @group(0) @binding(12) var milky_way_tex: texture_2d<f32>;
+// Which lights reach each tile of the screen, from lighting/light_tiles.wgsl.
+@group(0) @binding(13) var<storage, read> light_tiles: array<u32>;
+
+#include "lighting/light_tiles_common.wgsl"
 
 // Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.
 // Measured leaf spectra transmit about as much as they reflect across visible light (Jacquemoud
@@ -158,9 +162,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         color += transmitted * sun_irradiance_at(world) * shadow;
     }
 
-    // Local lights.
-    for (var i = 0u; i < frame.light_count; i++) {
-        color += local_light(lights[i], surface, view, world);
+    // Local lights: those that reach this pixel's tile.
+    let tile = light_tile_base(id.xy / TILE_SIZE, size);
+    let tile_lights = light_tiles[tile];
+    for (var i = 0u; i < tile_lights; i++) {
+        color += local_light(lights[light_tiles[tile + 1u + i]], surface, view, world);
     }
 
     // Indirect diffuse. Cavity darkens crevices the probes are too coarse to resolve.
