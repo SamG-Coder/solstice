@@ -125,7 +125,8 @@ fn cloud_shadow(p: vec3f) -> f32 {
     let mapped = textureSampleLevel(cloud_shadow_map, clamp_sampler, clamp(uv, vec2f(0.0), vec2f(1.0)), 0.0).r;
     // Beyond the map, its mean stands in, blended in across its outer band. From a height the
     // horizon lies far past the map's edge, and that edge's texels, held out to the horizon,
-    // would stretch into streaks across the sea.
+    // would stretch into streaks across the sea. The far field is the same in every direction:
+    // one mean for the whole horizon, as a stand-in for clouds the map does not reach.
     let edge = max(abs(uv.x - 0.5), abs(uv.y - 0.5)) * 2.0;
     let mean = textureLoad(cloud_shadow_mean, vec2i(0), 0).r;
     return mix(mapped, mean, smoothstep(0.75, 1.0, edge));
