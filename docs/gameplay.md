@@ -10,7 +10,7 @@ it will be kept up to date as each step lands.
 - **Built like Unreal.** A world of actors made of components, ticked in a fixed order of tick
   groups, talking through events. Engine systems are written in Rust where speed matters, and
   game logic is written in scripts. Unreal splits its work the same way: C++ beneath, with
-  Blueprint and Verse above.
+  Blueprint above (and Verse, so far only in Unreal Editor for Fortnite).
 - **Python-like scripting**, the same language natively and on the web, with:
   - hot reload while the game runs, keeping each actor's state;
   - a sandbox: a script can reach only what the engine hands it, and a runaway script is
@@ -19,13 +19,18 @@ it will be kept up to date as each step lands.
 - **Modular.** Each part is its own crate and can be tested without a GPU. The renderer knows
   nothing about gameplay: it gains a few small, general APIs (things that move, skinned meshes),
   and nothing more. A scene without gameplay loads and costs exactly what it does today.
-- **Fast on the web, integrated GPUs included.** The web build has one thread: GitHub Pages
-  cannot send the headers that wasm threads need. The budget below assumes that, and every step
-  measures against it.
-- **Deterministic simulation.** Physics and gameplay advance in fixed steps, so a test can run a
-  scene for N steps and check where everything ended up, and the native and web builds agree.
+- **Fast on the web, integrated GPUs included.** The web build has one thread. Wasm threads
+  need the page to be cross-origin isolated, and GitHub Pages cannot send the headers for that.
+  The usual workaround, a service worker that adds them, reloads the page on the first visit and
+  blocks cross-origin fetches, and the scenes are fetched from their own Pages sites. The budget
+  below assumes one thread, and every step measures against it.
+- **Deterministic simulation.** Physics, script ticks and gameplay events advance in fixed
+  steps, from input recorded per step. So a test can run a scene for N steps and check where
+  everything ended up, a replay gives the same result, and the native and web builds agree.
+  Only what is drawn (animation poses, the camera) follows the frame rate.
 - **Gameplay drives the world.** Scripts can set the time of day, the weather and the sea, and
-  react to them. The renderer already eases all three; gameplay only sets where they should go.
+  react to them. The renderer already eases the weather and the ocean; gameplay sets where they
+  should go, and eases the rest itself.
 
 Not in the first version, with room left for each:
 - networking and multiplayer;
@@ -46,27 +51,36 @@ Not in the first version, with room left for each:
   - sun shadow cascades are cached and only redrawn when their view moves (`shadow.rs`);
   - GI voxel levels are rebuilt only when the camera has moved far enough (`gi/volume.rs`);
   - the seabed map is redrawn only when the camera moves 128 m or the sea level changes;
-  - the wetness work, in progress on its own branch, keeps a water-line map in the world.
+  - wetness (`docs/wetness.md`, `ocean/waterline.rs`) remembers how high the water has stood
+    at each spot, in a map fixed in the world. It draws no geometry, but the wetness it gives
+    belongs to a place, not to an object: a hull that sails away leaves its wet band behind.
 
   Each of these has to be told when something moves, or ignore things that move.
 - **Two-phase occlusion culling** (`vg/culling.rs`) already copes with motion: anything the old
   depth hid wrongly is retried against the new depth in the same frame.
-- **Vertices** are 16 bytes on one 16-bit grid per mesh: position, a packed normal, UV. There are
-  no bone weights. The importer warns that it ignores skins and animations
+- **Vertices** are 16 bytes on one 16-bit grid per mesh: position, a packed normal, UV, and one
+  spare 16-bit value (`x y z nx ny u v _`, `solstice-asset/src/gpu.rs`). There are no bone
+  weights. The importer warns that it ignores skins and animations
   (`solstice-import/src/lib.rs`), and imports models in their rest pose.
-- **Dynamic attributes**, each eased by the renderer over a given number of seconds:
-  - `set_weather(Weather, seconds)`, a weather cycle (`set_weather_changing`), and reports from
-    real observations (`Weather::observed`);
-  - `set_ocean(Option<Ocean>, seconds)` and `set_sea_level`;
-  - `TimeOfDay`: `advance(hours)`, and from it the sun, moon, stars and `Environment`;
-  - each has a text form (`.weather`, `.ocean` files) with `parse` and `to_text`.
+- **Dynamic attributes:**
+  - `set_weather(Weather, seconds)`, eased by the renderer over that many seconds, a weather
+    cycle (`set_weather_changing`), and reports from real observations (`Weather::observed`);
+  - `set_ocean(Option<Ocean>, seconds)`, eased the same way;
+  - `set_sea_level(level)`, which takes effect at once;
+  - `TimeOfDay`: `advance(hours)`, which just adds hours, and from it the sun, moon, stars and
+    `Environment`;
+  - the weather and the ocean have text forms (`.weather`, `.ocean` files) with `parse` and
+    `to_text`. The time of day is read from the viewers' flags (`parse_time` in
+    `apps/viewer/src/lib.rs`).
 - **The viewers** drive these directly. The native viewer has command-line flags, and the web
   page calls `set_time`, `set_weather` and the rest from JavaScript (`apps/viewer/src/web.rs`,
   `apps/viewer/web/index.html`). The camera is a free-flying viewer camera. There is no input
   system beyond it.
-- **The ocean exists only on the GPU.** `spectrum.rs` has a CPU reference: the spectrum, its
-  seeded amplitudes (`pcg`, `gaussian_pair`) and `direct_sum`. Tests use it to check that the GPU
-  draws exactly the waves the reference does. Nothing reads wave heights back during play.
+- **The ocean exists only on the GPU.** `spectrum.rs` has a CPU reference: the spectrum, the
+  seeded starting amplitudes (`pcg`, `gaussian_pair`, `initial_amplitude`) and `direct_sum`.
+  Tests use it to check that the GPU draws exactly the waves the reference does (`waves.rs`).
+  Waves shrink over the seabed in `shoal()`, which exists only in WGSL
+  (`shaders/ocean/seabed.wgsl`). Nothing reads wave heights back during play.
 - **Scene files** take optional tagged sections, such as `SEA `, which older readers skip. So
   actors, collision and scripts can be added without a new file version.
 
@@ -77,13 +91,14 @@ Not in the first version, with room left for each:
   `TG_PostUpdateWork`), tick intervals, timers and delegates, GameMode, PlayerController and
   Pawn, and Enhanced Input. Also Mass, Unreal's ECS for crowds; Blueprints, a visual language
   run by a VM and slower than C++, which is why Epic advises keeping heavy loops out of
-  Blueprint ticks; Verse, a language Epic designed itself; and the Animation Blueprint, blend
-  spaces, Control Rig, IK Rig and the Animation Budget Allocator.
-- **Nanite skinning.** Unreal 5.5 and later draw skeletal meshes through Nanite. The cluster
-  hierarchy is built in bind pose, and bounds are computed from the bones' transforms, so the
-  hardware rasterizer can be used (Epic's *Nanite Foliage* documentation). Epic has published
-  little more, so the skinning design here is our own, and step 6 proves it out before anything
-  depends on it.
+  Blueprint ticks; Verse, a language Epic designed itself, so far only in Unreal Editor for
+  Fortnite; and the Animation Blueprint, blend spaces, Control Rig, IK Rig, IK Retargeter and
+  the Animation Budget Allocator.
+- **Nanite skinning.** Unreal 5.5 added experimental support for drawing skeletal meshes
+  through Nanite. Epic's documentation on Nanite foliage, which is animated by the same
+  skinning, says that bounds can be computed from the skinning matrices, so the hardware
+  rasterizer can be used. Epic has published little more, so the skinning design here is our
+  own, and step 7 proves it out before anything depends on it.
 - **Godot.** A tree of nodes, signals for events, and GDScript: a Python-like language written
   for the engine, with optional static types and hot reload. It is the clearest example of an
   engine building its own language, and of what that costs: years of work on the language, its
@@ -92,8 +107,8 @@ Not in the first version, with room left for each:
   from Meta. **Monty**, Pydantic's sandboxed Python subset in Rust. **RustPython**. **Pyodide**,
   CPython compiled to wasm. **Rhai**. **Luau**, Roblox's sandboxed Lua.
 - **Rapier**, from Dimforge: rigid bodies, joints, character controllers and scene queries in
-  pure Rust. It compiles to `wasm32-unknown-unknown`, and its npm builds are what most web games
-  use.
+  pure Rust. It compiles to `wasm32-unknown-unknown`, and Dimforge also publishes it to npm
+  for JavaScript games.
 - **Animation.** Kavan et al., *Skinning with Dual Quaternions* (2007). Frechette's Animation
   Compression Library, for quantising clips. ozz-animation's sampling and blending. Aristidou and
   Lasenby, *FABRIK* (2011). Clavet, *Motion Matching* (GDC 2016), for later.
@@ -165,12 +180,22 @@ property open_seconds float 2.5      # editable per placement in the scene
 property locked bool false
 ```
 
-A scene places it with its own settings: `actor gate.actor 20.7 0 0 90 locked=true`.
+A scene places it as it places models, at x, y, z and a yaw in degrees, with its own settings:
+`actor gate.actor 20.7 0 0 90 locked=true`.
 
-**Which ECS.** Both candidates were measured (below). They run at about the same speed:
-- `hecs` is small and stable: 31 KB gzipped on wasm;
-- `bevy_ecs` brings schedules, change detection and observers, at 160 KB, and breaks its API
-  every few months.
+**Which ECS.** Both candidates were measured, by moving 10,000 entities by their velocity 100
+times, natively and on the web, set up as for the scripting benchmarks below (one run each):
+
+| | Download (gz) | Native, per entity | Web, per entity |
+|---|---|---|---|
+| `hecs` 0.11 | 31 KB | 0.90 ns | 1.58 ns |
+| `bevy_ecs` 0.20, a plain query | 160 KB | 0.67 ns | 1.85 ns |
+| `bevy_ecs` 0.20, a system in a schedule | | 0.92 ns | 1.28 ns |
+
+They run at about the same speed:
+- `hecs` is small and stable;
+- `bevy_ecs` brings schedules, change detection and observers, and breaks its API every few
+  months.
 
 The framework only needs fixed tick groups on one thread, which is a few hundred lines on top of
 `hecs`. So the choice, made on 8 November 2026, is `hecs`, with Solstice's own framework over
@@ -180,19 +205,29 @@ it.
 
 ```text
  1. Input        gather keys, mouse, pads and touch; map them to actions
- 2. Events       deliver input actions and due timers to scripts
- 3. PrePhysics   Rust systems, then script ticks for the actors that tick
- 4. Physics      0 to 3 fixed 60 Hz steps; contacts and triggers are queued
- 5. PostPhysics  deliver hits and overlaps to scripts
- 6. Animation    state machines read gameplay's values; sample, blend, IK
- 7. Late         the camera follows, and environment targets are set
- 8. Extract      changed transforms, bone palettes, lights and environment go to the renderer
+ 2. Fixed steps  0 to 3 steps of 1/60 s, each one:
+      a. Events       this step's input actions and due timers, delivered to scripts
+      b. PrePhysics   Rust systems, root motion, then script ticks for the actors that tick
+      c. Physics      one Rapier step; contacts and triggers are queued
+      d. PostPhysics  hits and overlaps delivered to scripts
+ 3. Animation    state machines read gameplay's values; sample, blend, IK
+ 4. Late         the camera follows
+ 5. Extract      changed transforms, bone palettes, lights and environment go to the renderer
 ```
 
-- **Fixed steps.** Physics and fixed ticks run at 60 Hz from an accumulator. Rendering
-  interpolates between the last two physics states, which also gives each instance its
-  `prev_world` for motion vectors. A frame runs at most three steps; past that, the game slows
-  down rather than falling behind in a spiral.
+- **Fixed steps.** Everything that decides what happens runs inside the steps, at 60 Hz from an
+  accumulator: events, script ticks, Rust gameplay systems and physics. Input is gathered per
+  frame but handed out per step, and recorded that way for replays. A frame runs at most three
+  steps; past that, the game slows down rather than falling behind in a spiral.
+- **Per frame.** Animation, the camera and extraction run once per frame, at the frame's own
+  time. They only affect what is drawn, so they need not be deterministic.
+- **Interpolation.** Rendering draws each body between its last two physics states, at the
+  accumulator's fraction. Each instance's `prev_world` is the transform it was actually drawn
+  with last frame, kept by the extract step, not the previous physics state: the two differ
+  whenever a frame runs no step or several.
+- **Root motion** is sampled in PrePhysics, for the step's length, and drives the character
+  controller in that step's physics, as Unreal does for characters. The full pose is still
+  sampled per frame.
 - **Most actors never tick.** As in Unreal, ticking is opt-in, with an interval. Scripts mostly
   react to events: an overlap, an input action, a timer, the hour changing.
 - **Events are queued** and delivered between tick groups. A handler never runs halfway through
@@ -219,13 +254,14 @@ Each candidate ran the same three scripts:
 
 Setup:
 - **Native:** Rust 1.98 release builds with thin LTO, on a Ryzen 7 9800X3D under Windows 11.
+  Starlark 0.14, Rapier 0.36 and `hecs` 0.11 also build with the project's pinned Rust 1.95.
 - **Web:** the same code built for `wasm32-unknown-unknown`, run in Node 24 on the same machine.
   Node uses V8, Chrome's engine.
 - **Sizes:** the wasm after `wasm-bindgen`, with name sections removed, gzipped. There is no
   `wasm-opt` pass, which would shrink them a little. Pyodide's are its release files, gzipped.
 - **Runs:** each figure is the best of three, and each benchmark was run two or three times;
-  where the runs differed, the table gives the range. The benchmark's code is kept with this
-  session's notes, and moves into the repository in step 3.
+  where the runs differed, the table gives the range. The code is in `tools/gameplay-bench`,
+  with how to run it.
 - **Start-up** on the web includes V8 compiling the module on its first run.
 
 | | Download (gz) | Start-up | Empty call | `tick`, 2 Rust calls | Loop, per iteration | Python |
@@ -269,7 +305,7 @@ What each one means:
   - Its interface between Rust and scripts is built for an AI agent's tool calls, not a game
     loop. Each call from Rust compiles a small snippet, at 2.4 µs or more on the web. Each call
     from a script back into Rust suspends the interpreter and resumes it, at 2–4 µs on the
-    web. That is 70 to 130 times Starlark's cost.
+    web. A whole `tick` costs 70 to 130 times as much as Starlark's.
   - It is 3 MB, calls itself experimental, and needs Rust 1.96, newer than the project's
     pinned 1.95.
 - **Starlark** is the fastest at every crossing and has the best tools.
@@ -277,9 +313,12 @@ What each one means:
     0.09 ms a frame on the web, and on the web its loops are as fast as Pyodide's CPython.
   - It has optional type annotations with a checker, and a language server (the `starlark_lsp`
     crate) for editor support.
-  - Its sandbox is complete. There is no I/O, no clock and no randomness unless the engine
-    provides them, and `Evaluator::set_check_cancelled` lets the engine stop a script that
-    runs too long.
+  - It is sealed off from the system: there is no I/O, no clock and no randomness unless the
+    engine provides them. The engine can cap each call's work with `set_max_tick_count`, which
+    counts steps and so stops a script at the same point natively and on the web, and its memory
+    with `set_max_heap_size`. `starlark-rust` does not claim to be safe against hostile code,
+    which is fine here: the scripts ship with the scene, written like the rest of it, and are
+    not uploads from strangers.
   - It is not full Python. Checked against `starlark-rust` 0.14: no `class`, `while`, `try` or
     `global`. Recursion, lambdas, list comprehensions, type annotations and (with a dialect
     flag) f-strings all work. Values made at load time are frozen: a script cannot keep state in
@@ -300,7 +339,8 @@ What each one means:
 **Starlark, through `starlark-rust`.** Chosen on 8 November 2026, from the measurements above.
 - It is Python to read and write: `def`, indentation, lists, dicts, comprehensions, `if`, `for`.
 - It is the fastest at the crossings a game makes all the time.
-- It is fully sandboxed, can be stopped, and has types and an editor language server.
+- It is sealed off from the system, can be stopped, and has types and an editor language
+  server.
 - It behaves the same natively and on the web.
 
 Its gaps fit the framework, and are filled by it:
@@ -310,8 +350,8 @@ Its gaps fit the framework, and are filled by it:
 - **No mutable globals:** an actor's state lives in its components, as typed `property` values
   declared in its `.actor` file, and in a per-actor `self.vars` for anything else. This is also
   what makes hot reload keep state: none of it lives in the script.
-- **No `while`:** loops run over ranges, lists and queries, so every handler finishes. The
-  cancellation check catches the rest.
+- **No `while`:** loops run over ranges, lists and queries. Recursion is allowed, so a handler
+  can still run away; the step cap stops it, and the error is reported like any other.
 - **No `try`:** a failing handler stops, its error and line go to the on-screen log, and the
   actor carries on with its next event.
 
@@ -340,7 +380,8 @@ def on_hour(self, hour):
   ends. So nothing a frame allocates can outlive it, and there is no garbage collector to tune.
   Step 3 confirms that frozen handlers run this way at the measured cost.
   Anything worth keeping goes into `self.vars` or a component, where it is stored as an engine
-  value (number, bool, string, vector, entity, list, dict).
+  value (number, bool, string, vector, entity, list, dict). Lists and dicts there are owned by
+  the engine and changed in place, so `self.vars.path.append(p)` keeps `p`.
 - **Hot reload.** When a file changes (a file watcher natively, a reload button on the web), it
   is reloaded and the actors switch to the new handlers on their next event. State stays,
   because it lives in components. If the new file fails to load, the old one keeps running and
@@ -383,48 +424,63 @@ seconds, while most are still moving (afterwards they fall asleep and cost almos
 
 On the web, a laptop with integrated graphics has perhaps half the 9800X3D's single-thread
 speed. To hold 60 fps there, gameplay gets 4 ms of each frame's CPU, and the renderer keeps the
-rest:
+rest. At 60 fps a frame runs one fixed step:
 
 | Part | Integrated-GPU laptop, web | This machine, web |
 |---|---|---|
-| Physics | 1.5 ms: about 300 moving bodies, any number asleep | 0.75 ms |
-| Animation | 1.0 ms: about 20 characters at full rate | 0.5 ms |
-| Scripts | 1.0 ms | 0.5 ms |
+| Physics, per step | 1.5 ms: about 300 moving boxes, any number asleep | 0.75 ms |
+| Scripts, per step | 1.0 ms | 0.5 ms |
+| Animation, per frame | 1.0 ms: perhaps 20 characters at full rate, an estimate until step 8 measures it | 0.5 ms |
 | World, events, extract | 0.5 ms | 0.25 ms |
 
-Every step that adds a system measures it against its line here, and adds it to the profiler's
-CPU sections.
+- **The per-step lines are paid per step.** A device that can't hold 60 fps runs two steps a
+  frame at 30 fps, and so pays them twice. The budget is set so the integrated-GPU tier holds 60.
+- **Boxes are a best case.** Contacts against the scene's triangle meshes cost more than box on
+  box. Step 5 measures the cove's own collision.
+- Every step that adds a system measures it against its line here, and adds it to the
+  profiler's CPU sections.
 
 ### Colliding with the scene
 
-- **The bake makes collision.** For each static instance it takes a coarse cut of the mesh's
-  cluster DAG, at about 2–5 cm of error, as a triangle mesh. Small props get convex hulls
-  instead. Terrain becomes a heightfield. All of it goes into a new tagged section, `COLL`, so
-  the shapes the player touches match what is drawn, without the full detail.
+- **The bake makes collision.** For each mesh it takes a coarse cut of the cluster DAG, at
+  about 2–5 cm of error, as a triangle mesh. Small props get convex hulls instead. Terrain
+  becomes a heightfield. So the shapes the player touches match what is drawn, without the full
+  detail.
+  - Shapes are made once per mesh and shared by every instance of it (Rapier's `SharedShape`).
+  - They are stored in the file's data area, where streamed pages are, and listed by a small
+    `COLL` section in the manifest. The manifest is read whole when a scene loads, so the shapes
+    themselves stay out of it: they are fetched only when *Play* is pressed, and a scene that is
+    only looked at never downloads them.
 - **Moving actors** use primitives or convex hulls, from their `.actor` files.
 - **The character controller** is Rapier's kinematic one: steps, slopes, snapping to the ground,
   pushing bodies.
-- **Interpolation.** Rendering interpolates each body between its last two steps.
 - **Determinism.** Rapier's `enhanced-determinism` feature is measured in step 5, and kept if
   its cost fits the budget, so that tests and replays give the same result natively and on the
   web.
-- **Versions.** Rapier 0.36 uses `glam` 0.33. Solstice is on 0.30, and moves to 0.33 so the two
-  share one copy.
+- **Versions.** Rapier 0.36 uses `glam` 0.33 (through `glamx`). Solstice is on 0.30, and moves
+  to 0.33 so the two share one copy.
 
 ### Floating on the sea
 
 A ship that floats must ride the waves that are drawn. The waves exist only on the GPU, but
-`spectrum.rs` already reproduces them exactly on the CPU, seeds and all, for its tests. So the
-sea gets a CPU height query:
-- a direct sum over the few hundred most energetic waves of the largest cascade, which hold
-  nearly all the height that moves a hull;
-- shrunk in the shallows by the same `shoal()` the surface uses, with the seabed depth read
-  from a small CPU copy of the seabed map.
+`spectrum.rs` already reproduces their starting amplitudes exactly on the CPU, seeds and all
+(`initial_amplitude`, checked against the GPU in `waves.rs`). So the sea gets a CPU height
+query:
+- **The waves:** a direct sum over the few hundred most energetic waves, advanced to the step's
+  time. Cascade 0 holds only waves longer than about 21 m, which is enough for the ship, but a
+  rowing boat also rides the shorter waves of cascade 1, so the query takes both.
+- **Sideways motion:** the waves move the water sideways as well as up, to sharpen their
+  crests. The height at a point is found by a few iterations that find which undisplaced point
+  moved there.
+- **The shallows:** heights shrink by a Rust twin of `shoal()`, tested against the WGSL one, with
+  the depth from a small CPU copy of the seabed map.
+- **Timing:** the query follows the same eased sea state the GPU draws, advanced by the fixed
+  steps' clock, so it stays deterministic.
 
 Buoyancy samples the query at a handful of points on each hull, and pushes each one up by the
-water it displaces, as Sea of Thieves does. It is deterministic and has no delay. Reading
-heights back from the GPU was the other option; it would arrive frames late and make the
-physics depend on the GPU's timing.
+water it displaces, as Sea of Thieves does. It has no delay. Reading heights back from the GPU
+was the other option; it would arrive frames late and make the physics depend on the GPU's
+timing. The query's cost counts in the physics line of the budget, and step 11 measures it.
 
 ## Rigging and animation
 
@@ -440,8 +496,7 @@ Animation Library.
   - The character is made by a Blender Python script kept in the repository, written like every
     other script here. Its body, clothes, rig and export settings are all in that script, so it
     can be remade or changed by editing it, the way scenes are made from `scenes/*.txt`.
-  - It is exported as glTF with MPFB 2's game-engine rig, with modifiers applied and PBR
-    materials, as its users advise.
+  - It is exported by Solstice's own export tool (below), with MPFB 2's game-engine rig.
   - Blender 5.2.1 LTS is installed at `D:\Blender`, and the script runs it headless
     (`blender --background --python`). MPFB 2 is not installed yet. Installing it from Blender's
     extensions site waits for your go-ahead when step 6 begins, and that step first checks that
@@ -458,11 +513,42 @@ Animation Library.
   - rotations are carried across in each bone's rest frame, so a difference in rest pose cancels
     out;
   - the pelvis's movement is scaled by the ratio of leg lengths, so feet don't slide;
-  - IK cleans up the hands and feet afterwards (step 8).
+  - IK cleans up the hands and feet afterwards (step 9).
 
   Doing it in the bake, in Rust, keeps it reproducible and tested. Changing the character later
   means changing its role file, and no clip needs touching.
 - **Licences** are recorded with each asset, as for the Poly Haven scans.
+
+### The export tool
+
+MakeHuman's glTF export has known rough edges, as its users report. Clothing's helper vertex
+groups come out unless modifiers are applied, and materials come out grey when Blender's shader
+nodes are too complex for its exporter. So Solstice gets its own export tool: a Blender Python
+script in the repository (`tools/blender/solstice_export.py`), run headless. It doesn't write
+glTF itself. It prepares the character, then hands it to Blender's own glTF writer with one fixed
+set of options, then checks the result with Solstice's importer.
+
+1. **Hidden geometry.** MPFB 2 hides the body under clothes with helper modifiers and vertex
+   groups. The tool applies them for real, keeping the armature live, deletes the hidden faces,
+   and drops every vertex group that isn't a bone.
+2. **Materials.** Each material is baked, with Cycles, down to the textures the importer reads:
+   base colour (with cavity), normal, and roughness and metallic. Every material then comes out
+   right, whatever its node graph.
+3. **Weights.** At most four bones per vertex, renormalised; tiny weights dropped; bones that
+   deform nothing removed, except those the retargeting role file names.
+4. **Space.** Metres, Y up, transforms and rest pose applied, so the import needs no
+   corrections.
+5. **Export** with fixed options, so every export of the same script comes out the same.
+6. **Checks,** by reading the file back with Solstice's importer. The tool fails loudly unless:
+   - no vertex group is left that isn't a bone;
+   - every material has its textures;
+   - every vertex has at most four weights, summing to one;
+   - every bone the role file names is present.
+
+It is a separate tool, so the engine only ever sees clean glTF, and it works for any rigged
+character, not just MakeHuman's. Its first job, before any of it is written, is to export a
+default MakeHuman character as it stands and see what actually goes wrong, since the reports
+above are secondhand.
 
 ### Skinning in virtual geometry
 
@@ -471,33 +557,53 @@ rasterizers, the visibility buffer and resolve. They do not get a separate path.
 
 - **Weights.** Each vertex gets up to four bone influences, as 8-bit bone indices into its
   cluster's own list of bones and 8-bit weights: 8 more bytes per vertex. They are stored only
-  for skinned meshes, in their own part of each page.
+  for skinned meshes, in their own part of each page. The vertex's spare 16 bits stay free.
 - **Building the DAG** in bind pose:
   - clusters are grouped by the bones they use as well as by position, so each cluster's list
-    stays short, mostly 8 bones or fewer;
+    stays short, mostly 8 bones or fewer, with a hard cap of 16. Coarse levels may want more,
+    such as a hand with all its fingers. There, the smallest influences are dropped and the rest
+    renormalised until the cluster fits, and that change counts in its simplification error;
   - simplification keeps the weights: collapsing an edge blends them, and the quadric error
     counts a change of weights, so joints aren't simplified away;
   - borders between clusters stay locked, as now, so a shared vertex keeps exactly the same
-    weights on both sides and skins to exactly the same place, and no cracks open.
+    weights on both sides.
+  - Equal weights are not quite enough for no cracks: the skinned position must come out the
+    same to the last bit. Two clusters can list the same bones in different orders, so each
+    vertex's influences are stored sorted by the skeleton's own bone numbers, and summed in that
+    order everywhere.
 - **Culling.** Each cluster stores its bounding sphere in each of its bones' bind space. Each
   frame, its bounds are the union of those spheres, moved by the current bones, which is cheap
-  for a list of 8. LOD error is measured in bind pose and scaled by the largest bone scale, with
-  a margin for bending.
+  for a list of 8. Hierarchy nodes get posed bounds the same way.
+- **LOD.** LOD error is measured in bind pose and scaled by the largest bone scale, with a
+  margin for bending. The cut stays free of holes and overlaps only if a group's clusters and
+  the clusters made from them decide from the same sphere. So each group's LOD sphere is posed
+  once, by one function over one set of bones stored with the group, and both sides of the
+  decision read that result.
 - **Rasterizing.** Both rasterizers, resolve and the shadow pass call one shared function,
   `skinned_position`. It applies linear blend skinning from a buffer of bone matrices: this
   frame's, and last frame's for motion vectors. Normals are skinned with the same matrices.
   - Vertices are skinned where they are used, as Unreal does: there is no pre-skinned copy, so
     no extra memory, and it works whatever the LOD cut and whatever has streamed in.
+  - Resolve skins each pixel's three vertices, with four bones each, for this frame and the
+    last: a real cost on integrated GPUs.
   - If the cost proves too high, the fallback is a compute pass that skins only the visible
-    clusters into a scratch buffer each frame. Step 6 measures both.
+    clusters into a scratch buffer each frame. Step 7 measures both.
   - Dual-quaternion skinning, for shoulders and wrists that would otherwise pinch, is an option
     to judge on real characters.
-- **Moving things in the rest of the renderer:**
-  - *Shadows:* cascades keep their cache for static geometry. Each frame, moving instances are
-    drawn over a copy of it.
-  - *GI voxels:* moving things are left out at first. They receive GI and appear in screen-space
+- **Moving things in the rest of the renderer** (step 1, for every moving instance, skinned or
+  not):
+  - *Marking them.* Each instance gets a "moving" flag. Culling for the cached views (the shadow
+    cascades' cache, the seabed map and GI voxelisation) skips flagged instances, so none of them
+    keeps a ghost of something at its old place.
+  - *Shadows.* The cached cascades keep only static geometry. Moving instances are drawn each
+    frame into a small depth map of their own for each cascade they touch, and the shadow test
+    takes the nearer of the two. Nothing is copied: copying all four 2048² cascades each frame
+    would move about 128 MB, too much for integrated GPUs.
+  - *GI voxels.* Moving things are left out at first. They receive GI and appear in screen-space
     GI, but don't occlude or bounce light in the voxels.
-  - *Seabed and water-line maps:* moving things are left out.
+  - *Wetness.* The water-line map draws no geometry, and needs nothing. But its wetness belongs
+    to places, so a moving hull would wrongly lose its wet band, and carry none. Moving things
+    get their own wetness later, with the rain work.
 
 ### The animation runtime
 
@@ -527,8 +633,10 @@ rasterizers, the visibility buffer and resolve. They do not get a separate path.
 
 ## Gameplay and the world around it
 
-The renderer already eases the time of day, the weather and the sea. Gameplay gets them as one
-`Environment` in the world, and sets targets, not values each frame:
+The renderer already eases the weather and the ocean. Gameplay gets them, with the time of day
+and the sea level, as one `Environment` in the world, and sets targets, not values each frame.
+The time of day and the sea level take effect at once in the renderer, so the `Environment`
+eases those itself, on the fixed steps' clock: a tide is a sea level eased over hours.
 
 ```python
 def on_begin(self):
@@ -551,7 +659,14 @@ def on_hour(self, hour):
 - **New renderer APIs** that gameplay needs, all general:
   - per instance: moving it, hiding it, and scaling its glow, for opening gates and lit
     windows;
-  - lights switched on and off, and moved. GI is fully dynamic, so it follows.
+  - lights switched on and off, and moved. GI's lighting is updated every few frames
+    (`LIGHT_SCHEDULE` in `gi/volume.rs`), so it follows a changed light.
+- **A moving sun breaks the shadow cache.** A cascade is redrawn whenever its view changes, and
+  its view includes the sun's direction. The 20-minute day above turns the sun about 0.3° a
+  second, so every cascade would be stale every frame, and the most expensive pass on small GPUs
+  would run all the time. So the sun's direction for shadows moves in small steps, a step every
+  second or so, and the cascades catch up over the frames after it, far ones taking turns, as
+  they already do. Step 10 measures how small a step looks smooth.
 - **Who is in charge.** While a game runs, it owns the environment. The web page's time and
   weather controls become debug overrides, marked as such, and hand control back when released.
   A scene file can still set the starting values.
@@ -571,52 +686,69 @@ Each step is its own PR, with mutation-tested tests, measured costs (natively an
 clippy clean on native and wasm32, and a review by a separate AI agent. It is merged only with
 your go-ahead, and nothing is published without asking.
 
-1. **Things that move.** The renderer API for moving instances, with `prev_world` filled in;
-   hiding instances and scaling their glow; moving instances drawn over the cached shadow
-   cascades; moving things left out of the GI voxels and the seabed map.
-   - Demo: the cove's ship bobs at anchor, driven by plain Rust for now.
+1. **Things that move.** The renderer API for moving instances, with `prev_world` set to the
+   transform each was drawn with last frame; hiding instances and scaling their glow; the moving
+   flag, with moving instances left out of the cached shadows, the seabed map and the GI voxels,
+   and drawn into per-cascade shadow maps of their own.
+   - Demo: the cove's ship bobs at anchor, driven by plain Rust for now. Its hull then leaves the
+     GI voxels, so the step checks that the cove's indirect light doesn't visibly change. If it
+     does, a bobbing ship keeps a voxel copy at its mean position.
    - Tests: a moved instance's motion vectors and shadow follow it; cached shadows of static
-     geometry stay as they were; nothing static is redrawn.
+     geometry stay as they were; nothing static is redrawn; nothing moving is left behind in a
+     cache.
 2. **The world.** `solstice-world`: entities and components on `hecs`, the transform tree, tick
-   groups, events, timers and the fixed clock. Headless.
-   - Tests: tick order; event order and replay; the clock under slow and uneven frames.
+   groups, events, timers, and the fixed clock with input per step. Headless.
+   - Tests: tick order; event order; a recorded run replays to the same state; the clock under
+     slow and uneven frames.
 3. **Scripting.** `solstice-script` with Starlark: actor scripts, properties and `self.vars`,
-   events, timers, the engine API table and its generated bindings, hot reload, time limits, and
-   errors with file and line. The benchmark above moves into the repository, so its numbers can
-   be checked again.
-   - Tests: hot reload keeps state; a runaway script is stopped and reported; a broken reload
-     keeps the old script running.
+   events, timers, the engine API table and its generated bindings, hot reload, step and memory
+   caps, and errors with file and line. The benchmarks are run again in place.
+   - Tests: hot reload keeps state; a runaway script is stopped and reported, at the same point
+     natively and on the web; a broken reload keeps the old script running.
 4. **Scenes, actors and play mode.** `.actor` files, `actor` lines in scene files and their
    tagged section, input actions, a player camera, and *Play* in both viewers, with the second
    web build.
-5. **Physics for walking.** `solstice-physics`: collision baked into `COLL`, bodies, sensors,
-   the character controller, a debug view of colliders, wasm SIMD, and determinism measured.
+   - Tests: actor files and scene lines read back what they wrote, and report mistakes clearly;
+     an action reaches a script from each kind of input; a scene without gameplay loads into the
+     plain viewer exactly as before.
+5. **Physics for walking.** `solstice-physics`: collision baked and fetched on *Play*, bodies,
+   sensors, the character controller, a debug view of colliders, wasm SIMD, and determinism
+   measured.
    - Demo: a capsule walks the fort, climbs the stair to the rampart, and opens the gate.
-6. **Skinned virtual geometry.** Importing skins, weights through the DAG, per-cluster bone
-   lists and bounds, and skinning in both rasterizers, resolve and shadows, with motion vectors.
-   - First the MakeHuman character in its bind pose, compared with the static import; then one
-     looping clip.
+6. **The character and the export tool.** The Blender script that makes the MakeHuman
+   character, and `tools/blender/solstice_export.py`. Installing MPFB 2 waits for your go-ahead.
+   - First, a default character exported as MPFB 2 does it, to see what goes wrong.
+   - Tests: the export's checks fail on a deliberately broken character, and pass on the real
+     one; two exports of the same script come out the same.
+7. **Skinned virtual geometry.** Importing skins, weights through the DAG, per-cluster bone
+   lists and bounds, posed node and group bounds, and skinning in both rasterizers, resolve and
+   shadows, with motion vectors.
+   - First the character in its bind pose, compared with the static import; then one looping
+     clip.
+   - Tests: no cracks between clusters in any pose; the LOD cut has no holes or overlaps while a
+     clip plays.
    - The cost is measured, against the scratch-buffer fallback.
-7. **Animation.** Clips and their compression, retargeting from the Universal Animation Library's
+8. **Animation.** Clips and their compression, retargeting from the Universal Animation Library's
    rig onto the character's, blends, blend spaces, state machines, root motion, notifies, and
-   animation LOD.
-   - Tests: a retargeted walk keeps its feet still on the ground while they bear weight; a clip
-     retargeted onto its own rig comes back unchanged.
+   animation LOD. Its budget line is measured.
+   - Tests: a clip retargeted onto its own rig comes back unchanged; a retargeted walk's feet
+     slide less than a set distance while they bear weight. IK in step 9 removes the rest.
    - Demo: the capsule becomes a character that idles, walks and runs.
-8. **IK and secondary motion.** Two-bone IK, foot placement, look-at, FABRIK, and spring chains.
+9. **IK and secondary motion.** Two-bone IK, foot placement, look-at, FABRIK, and spring chains.
    - Demo: feet planted on the stair and the uneven courtyard. This is the first playable
      milestone: a character in the fort.
-9. **Gameplay and the environment.** The `Environment` API and its events; lights switched by
-   gameplay; viewer controls as overrides.
-10. **The sea in physics.** The CPU wave query, checked against the GPU's waves, and buoyancy: the
-    ship floats, and a rowing boat can be pushed about.
-11. **A playable cove.** Walk a character through the fort, open the gate, row out to the ship,
+10. **Gameplay and the environment.** The `Environment` API and its events, with the time of day
+    and sea level eased by gameplay; the sun stepped for shadows; lights switched by gameplay;
+    viewer controls as overrides.
+11. **The sea in physics.** The CPU wave query, checked against the GPU's waves, with its Rust
+    `shoal()`; buoyancy: the ship floats, and a rowing boat can be pushed about.
+12. **A playable cove.** Walk a character through the fort, open the gate, row out to the ship,
     and see the lanterns lit at dusk. README, screenshots and costs on the RTX 5080 and on the
     integrated-GPU tier. Published only with your go-ahead.
 
 The steps run in this order. The first playable thing is a character in the fort (chosen on
-8 November 2026), so walking, skinning and animation (5–8) come before the environment and the
-sea (9–10).
+8 November 2026), so walking, the character, skinning and animation (5–9) come before the
+environment and the sea (10–11).
 
 ## Risks
 
@@ -631,15 +763,17 @@ sea (9–10).
 - **One thread on the web.** Everything in the budget shares one thread with the renderer's own
   CPU work. Physics on wasm, even with SIMD, ran about 1.3 times slower than native at 500 boxes,
   and its first frames are slow while V8 compiles.
-- **The renderer assumes a static world.** Shadow caching, the GI voxels, the seabed map and the
-  wetness water-line map all do. Step 1 handles each one, and anything new must say how it treats
-  moving things.
-- **Skinned virtual geometry is new ground.** Unreal only shipped it in 5.5, and has published
-  little about it. Step 6 starts with a bind-pose comparison, so any crack or LOD error shows up
-  before animation depends on it.
+- **The renderer assumes a static world.** Shadow caching, the GI voxels and the seabed map all
+  do, and wetness belongs to places rather than objects. Step 1 handles the first three, wetness
+  on moving things waits for the rain work, and anything new must say how it treats moving
+  things. A moving sun is the same problem in another form, handled in step 10.
+- **Skinned virtual geometry is new ground.** Unreal added it in 5.5, as an experimental
+  feature, and has published little about it. Step 7 starts with a bind-pose comparison, so any
+  crack or LOD error shows up before animation depends on it.
 - **Content.** MakeHuman's glTF export has rough edges: users report exporting every clothing
   vertex group unless modifiers are applied, and materials coming out grey when Blender's shader
-  nodes are too complex. Step 6 checks the export before anything depends on it. Retargeting
+  nodes are too complex. The export tool (step 6) exists to fix both, and checks its output
+  before anything depends on it. Retargeting
   between two different rigs can leave feet sliding or limbs twisted, which the retargeting
   tests and IK are there to catch.
 - **Determinism across native and the web** depends on Rapier's option and on avoiding

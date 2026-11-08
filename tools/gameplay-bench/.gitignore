@@ -1,0 +1,5 @@
+target/
+target_simd/
+js/
+js_strip/
+node_modules/
