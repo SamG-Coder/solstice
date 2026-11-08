@@ -434,6 +434,64 @@ mod tests {
         frames
     }
 
+    /// A glTF of one bone and one animation that moves it up a metre in 0.2 s, keys at 0.1 and
+    /// 0.3 s, as Blender writes them, its first frame a frame in.
+    fn write_clip(folder: &std::path::Path) -> std::path::PathBuf {
+        let mut bin = Vec::new();
+        for time in [0.1f32, 0.3] {
+            bin.extend_from_slice(&time.to_le_bytes());
+        }
+        for y in [0.0f32, 1.0] {
+            for v in [0.0f32, y, 0.0] {
+                bin.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        std::fs::write(folder.join("c.bin"), &bin).unwrap();
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "scene": 0, "scenes": [{{"nodes": [0]}}],
+            "nodes": [{{"name": "root"}}],
+            "animations": [{{
+                "name": "up",
+                "samplers": [{{"input": 0, "output": 1}}],
+                "channels": [{{"sampler": 0, "target": {{"node": 0, "path": "translation"}}}}]
+            }}],
+            "buffers": [{{"uri": "c.bin", "byteLength": {}}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 8}},
+                {{"buffer": 0, "byteOffset": 8, "byteLength": 24}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 2, "type": "SCALAR", "min": [0.1], "max": [0.3]}},
+                {{"bufferView": 1, "componentType": 5126, "count": 2, "type": "VEC3"}}
+            ]
+        }}"#,
+            bin.len()
+        );
+        let path = folder.join("c.gltf");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_clip_file_is_sampled_from_its_first_key() {
+        let folder = std::env::temp_dir().join(format!("solstice-clip-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let once = read_clips(write_clip(&folder), |_| false).unwrap();
+        let looping = read_clips(write_clip(&folder), |_| true).unwrap();
+        std::fs::remove_dir_all(&folder).ok();
+        assert_eq!(once.rig.bones[0].name, "root");
+        let (name, frames) = &once.clips[0];
+        assert_eq!(name, "up");
+        // 0.2 s at 30 Hz is 6 spans: 7 samples, or 6 if it loops.
+        assert_eq!(frames.translations.len(), 7);
+        assert_eq!(looping.clips[0].1.translations.len(), 6);
+        assert!(frames.translations[0][0].y.abs() < 1.0e-5);
+        assert!((frames.translations[3][0].y - 0.5).abs() < 1.0e-3);
+        assert!((frames.translations[6][0].y - 1.0).abs() < 1.0e-3);
+    }
+
     #[test]
     fn a_clip_retargeted_onto_its_own_rig_comes_back_unchanged() {
         let rig = biped(1.0, 0.0);

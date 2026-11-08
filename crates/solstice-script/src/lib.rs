@@ -10,6 +10,7 @@ mod api;
 pub mod host;
 pub mod value;
 
+pub use api::AnimCommand;
 pub use host::{
     api_reference, Limits, Script, ScriptError, ScriptEvent, ScriptHost, ScriptLog, RESERVED_EVENTS,
 };

@@ -612,3 +612,183 @@ fn the_world_comes_from_the_scenes_collision_and_nothing_else() {
     let play = walking_game(&[], "actor hero.actor 0 0.5 0 0\n");
     assert_eq!(play.physics().collider_count(), 1);
 }
+
+const WALKER_ACTOR: &str = "name walker\nmesh m.glb 1 yaw=180\nanimation a.anim\nscript w.star\n";
+const WALKER_GRAPH: &str = "
+clip idle I
+clip walk W
+notify walk 0.0 step
+param speed 0
+state idle clip idle
+state walking clip walk
+state dancing clip walk
+start idle
+transition idle walking speed > 0.1 fade 0
+transition walking idle speed < 0.1 fade 0
+";
+
+/// A skeleton of one bone, and two clips that stand it at different heights, as the bake names
+/// them for `cove/a.anim`.
+fn walker_assets() -> (Vec<solstice_asset::Skeleton>, Vec<solstice_asset::Clip>) {
+    use solstice_anim::{compress, Frames};
+    let clip = |name: &str, y: f32| {
+        let mut clip = compress(
+            name,
+            0,
+            &Frames {
+                rotations: vec![vec![Quat::IDENTITY]; 8],
+                translations: vec![vec![Vec3::Y * y]; 8],
+            },
+            true,
+        );
+        clip.name = solstice_game::animation::clip_key("cove/a.anim", name);
+        clip
+    };
+    (
+        vec![solstice_asset::Skeleton {
+            bones: vec![solstice_asset::Bone {
+                name: "root".to_owned(),
+                ..Default::default()
+            }],
+        }],
+        vec![clip("idle", 1.0), clip("walk", 2.0)],
+    )
+}
+
+fn walker_play(script: &str) -> Play {
+    let scene = files(&[
+        (GAME_FILE, "actor cove/walker.actor 0 0 0 0 instances=0+1\n"),
+        ("cove/walker.actor", WALKER_ACTOR),
+        ("cove/a.anim", WALKER_GRAPH),
+        ("cove/w.star", script),
+    ]);
+    let (skeletons, clips) = walker_assets();
+    let mut play = Play::load(&scene, baked, None).unwrap();
+    play.attach_animation(
+        &scene,
+        &solstice_game::animation::AnimationAssets {
+            skeletons: &skeletons,
+            clips: &clips,
+            poses: &[0],
+            instance_poses: &[0],
+        },
+    )
+    .unwrap();
+    play
+}
+
+/// Runs a few frames and returns the latest pose's height of its one bone.
+fn pose_height(play: &mut Play, devices: &mut Devices, frames: u32) -> Option<f32> {
+    let mut height = None;
+    for _ in 0..frames {
+        play.frame(STEP_SECONDS, devices, |_, _| {});
+        if let Some((_, bones)) = play.take_poses().pop() {
+            height = Some(bones[0].w_axis.y);
+        }
+    }
+    height
+}
+
+#[test]
+fn an_actor_that_walks_plays_its_walk_and_its_script_hears_the_footsteps() {
+    let mut play = walker_play(
+        r#"
+def on_tick(self, dt):
+    self.walk = vec3(1, 0, 0)
+
+def on_anim(self, name):
+    log("heard " + name)
+"#,
+    );
+    let mut devices = Devices::new();
+    let height = pose_height(&mut play, &mut devices, 30).unwrap();
+    assert!((height - 2.0).abs() < 0.01, "standing at {height}");
+    let messages = play.take_messages();
+    assert!(
+        messages.iter().any(|m| m.text.contains("heard step")),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn footsteps_come_at_the_same_steps_at_any_frame_rate() {
+    let script = r#"
+def on_tick(self, dt):
+    self.walk = vec3(1, 0, 0)
+
+def on_anim(self, name):
+    log("step at " + str(now()))
+"#;
+    let run = |frame_seconds: f64, frames: u32| {
+        let mut play = walker_play(script);
+        let mut devices = Devices::new();
+        for _ in 0..frames {
+            play.frame(frame_seconds, &mut devices, |_, _| {});
+        }
+        play.take_messages()
+    };
+    let fine = run(STEP_SECONDS, 240);
+    let coarse = run(STEP_SECONDS * 3.0, 80);
+    assert!(fine.len() > 4);
+    // The two runs may end a step apart: what they share must be the same.
+    let shared = fine.len().min(coarse.len());
+    assert!(fine.len().abs_diff(coarse.len()) <= 1);
+    assert_eq!(fine[..shared], coarse[..shared]);
+}
+
+#[test]
+fn a_script_can_set_parameters_and_force_a_state() {
+    let mut play = walker_play(
+        r#"
+def on_tick(self, dt):
+    anim_set("speed", 1.0)
+"#,
+    );
+    let mut devices = Devices::new();
+    let height = pose_height(&mut play, &mut devices, 10).unwrap();
+    assert!((height - 2.0).abs() < 0.01, "standing at {height}");
+
+    let mut play = walker_play(
+        r#"
+def on_tick(self, dt):
+    anim_play("dancing", 0.0)
+"#,
+    );
+    let height = pose_height(&mut play, &mut devices, 10).unwrap();
+    assert!((height - 2.0).abs() < 0.01, "standing at {height}");
+
+    // Wrong names for parameters and states change nothing, and aren't fatal.
+    let mut play = walker_play(
+        r#"
+def on_tick(self, dt):
+    anim_set("nothing", 1.0)
+    anim_play("nowhere")
+"#,
+    );
+    let height = pose_height(&mut play, &mut devices, 10).unwrap();
+    assert!((height - 1.0).abs() < 0.01, "standing at {height}");
+}
+
+#[test]
+fn an_animated_actor_with_no_skeleton_says_so() {
+    let scene = files(&[
+        (GAME_FILE, "actor cove/walker.actor 0 0 0 0 instances=0+1\n"),
+        ("cove/walker.actor", WALKER_ACTOR),
+        ("cove/a.anim", WALKER_GRAPH),
+        ("cove/w.star", "def on_tick(self, dt):\n    pass\n"),
+    ]);
+    let mut play = Play::load(&scene, baked, None).unwrap();
+    let (skeletons, clips) = walker_assets();
+    let errors = play
+        .attach_animation(
+            &scene,
+            &solstice_game::animation::AnimationAssets {
+                skeletons: &skeletons,
+                clips: &clips,
+                poses: &[0],
+                instance_poses: &[solstice_asset::NO_POSE],
+            },
+        )
+        .unwrap_err();
+    assert!(errors[0].contains("no skeleton"), "{errors:?}");
+}

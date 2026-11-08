@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+solstice-anim.workspace = true
 solstice-asset.workspace = true
 solstice-builder.workspace = true
 solstice-game.workspace = true

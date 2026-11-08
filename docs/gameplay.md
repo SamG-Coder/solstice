@@ -931,6 +931,22 @@ state machines. The rest of step 8 arrives with the character playing them. So f
   bone moves every frame, take 0.06 ms a frame natively and 0.10 ms on the web, in Node. 100
   characters take 0.3 and 0.4 ms. So the 1.0 ms budget line holds easily.
 
+**As built (step 8, actors).** An actor's `.actor` file can name a state machine with an
+`animation` line, which makes the bake keep its mesh's skeleton and read the clips its `.anim`
+file names. `yaw=180` on a `mesh` line turns a model made facing +Z, as MakeHuman's are, to face
+the way actors do.
+
+- A graph with a `speed` parameter is driven by how fast the actor walks, so idling and walking
+  follow the character without a script. `anim_set(param, value)` and `anim_play(state, fade)`
+  let a script do the rest, and clip notifies reach it as `on_anim(self, name)`.
+- Animations move on in fixed steps, so transitions and notifies replay exactly at any frame
+  rate; only working out what to draw follows the frame rate, and is smoothed between steps.
+- Animated characters update every frame within 15 m of the camera, every second frame to 40 m,
+  every fourth to 90 m, and every eighth beyond that.
+- `scenes/walker.txt` is the smallest scene with an animated actor. It needs
+  `tools/blender/make_character.py` and `tools/blender/make_clips.py` run first. Nothing draws a
+  skinned character yet; that is step 7's renderer work, which also wires play mode in the viewers.
+
 ## Gameplay and the world around it
 
 The renderer already eases the weather and the ocean. Gameplay gets them, with the time of day

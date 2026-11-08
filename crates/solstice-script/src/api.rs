@@ -37,10 +37,21 @@ pub(crate) struct Context<'w> {
     pub effects: RefCell<Effects>,
 }
 
+/// What a script told an actor's animation to do, carried out in the step it was made.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnimCommand {
+    pub actor: Entity,
+    /// A parameter to set, and its value.
+    pub param: Option<(String, f32)>,
+    /// A state to fade to, and over how many seconds.
+    pub state: Option<(String, f32)>,
+}
+
 /// What a handler asked of the world, to do if it succeeds.
 #[derive(Default)]
 pub(crate) struct Effects {
     pub sends: Vec<ScriptEvent>,
+    pub animation: Vec<AnimCommand>,
     pub timers: Vec<TimerChange>,
     pub log: Vec<String>,
     /// Lines past [`MAX_LOG_LINES`], dropped.
@@ -161,6 +172,43 @@ pub(crate) fn engine(builder: &mut GlobalsBuilder) {
             (Some(y), Some(x)) => Ok(y.atan2(x)),
             _ => anyhow::bail!("atan2 takes two numbers"),
         }
+    }
+
+    /// Sets a parameter of this actor's animation, which its state machine's transitions and
+    /// blends read: `anim_set("speed", 1.4)`.
+    fn anim_set<'v>(
+        param: &str,
+        value: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let value = number(value)
+            .ok_or_else(|| anyhow::anyhow!("an animation parameter is a number, not {value}"))?;
+        let context = context(eval)?;
+        context.effects.borrow_mut().animation.push(AnimCommand {
+            actor: context.actor,
+            param: Some((param.to_owned(), value as f32)),
+            state: None,
+        });
+        Ok(NoneType)
+    }
+
+    /// Fades this actor's animation to a state now, whatever its transitions say, over `fade`
+    /// seconds: `anim_play("sit", 0.4)`.
+    fn anim_play<'v>(
+        state: &str,
+        fade: Option<Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> anyhow::Result<NoneType> {
+        let fade = fade
+            .map_or(Some(0.2), number)
+            .ok_or_else(|| anyhow::anyhow!("a fade is a number of seconds"))?;
+        let context = context(eval)?;
+        context.effects.borrow_mut().animation.push(AnimCommand {
+            actor: context.actor,
+            param: None,
+            state: Some((state.to_owned(), fade as f32)),
+        });
+        Ok(NoneType)
     }
 
     /// The square root of a number, which must not be negative.
