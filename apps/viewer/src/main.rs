@@ -21,8 +21,8 @@ mod native {
     use solstice_asset::scene::Viewpoint;
     use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Environment, Gpu, Quality, Renderer, RendererSettings, StreamRequest,
-        StreamingBudget, TimeOfDay, Weather,
+        Camera, DebugView, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
+        StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
     use solstice_viewer::{
         default_environment, initial_camera, parse_time, CameraInput, DayClock, FlyCamera,
@@ -152,6 +152,7 @@ mod native {
                 ),
             };
             renderer.set_weather(options.weather, 0.0);
+            renderer.set_ocean(options.ocean, 0.0);
             (renderer, reader)
         }
     }
@@ -183,6 +184,8 @@ mod native {
         weather: Weather,
         /// When set, the sun and moon follow the time of day instead of `environment`.
         clock: Option<DayClock>,
+        /// An open sea to run, by name or file. Until the sea is drawn, only its waves run.
+        ocean: Option<Ocean>,
     }
 
     /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
@@ -212,6 +215,7 @@ mod native {
             flyover_out: PathBuf::from("screenshots/flyover"),
             stability: false,
             weather: Weather::default(),
+            ocean: None,
             clock: None,
         };
         // The time of day, built up from its options and made at the end.
@@ -276,6 +280,22 @@ mod native {
                 }
                 "--day-length" => {
                     day_seconds = value()?.parse().map_err(|e| format!("--day-length: {e}"))?;
+                }
+                "--ocean" => {
+                    let name = value()?;
+                    options.ocean = Some(match Ocean::by_name(&name) {
+                        Some(ocean) => ocean,
+                        None => {
+                            let text = std::fs::read_to_string(&name).map_err(|e| {
+                                let names: Vec<_> = Ocean::names().collect();
+                                format!(
+                                    "--ocean: {name} is neither {} nor a file: {e}",
+                                    names.join(", ")
+                                )
+                            })?;
+                            Ocean::parse(&text).map_err(|e| format!("{name}: {e}"))?
+                        }
+                    });
                 }
                 "--weather" => {
                     let name = value()?;
@@ -597,6 +617,7 @@ mod native {
 
         let mut renderer = Renderer::new(&gpu, scene, CAPTURE_FORMAT, options.settings);
         renderer.set_weather(options.weather, 0.0);
+        renderer.set_ocean(options.ocean, 0.0);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),
             size: wgpu::Extent3d {

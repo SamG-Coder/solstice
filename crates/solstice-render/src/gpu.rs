@@ -295,6 +295,14 @@ impl LayoutBuilder {
         )
     }
 
+    /// A non-filterable floating-point 2D texture array, such as `rgba32float`.
+    pub fn texture_array_unfilterable(self) -> Self {
+        self.texture_of(
+            wgpu::TextureSampleType::Float { filterable: false },
+            wgpu::TextureViewDimension::D2Array,
+        )
+    }
+
     pub fn texture_3d(self) -> Self {
         self.texture_of(
             wgpu::TextureSampleType::Float { filterable: true },
@@ -314,6 +322,14 @@ impl LayoutBuilder {
             access: wgpu::StorageTextureAccess::WriteOnly,
             format,
             view_dimension: wgpu::TextureViewDimension::D2,
+        })
+    }
+
+    pub fn storage_texture_array(self, format: wgpu::TextureFormat) -> Self {
+        self.push(wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
         })
     }
 

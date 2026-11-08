@@ -40,8 +40,14 @@ the water is opaque. It has no idea of the seabed below it, and it never moves.
 
 - Tessendorf, *Simulating Ocean Water* (2001): waves as a sum of many sinusoids, from a spectrum,
   summed by FFT, with horizontal displacement for sharp crests.
-- Hasselmann et al. (1973), the JONSWAP spectrum, and Horvath, *Empirical Directional Wave Spectra
-  for Computer Graphics* (DigiPro 2015): wind and fetch, directional spreading, and swell.
+- Elfouhaily, Chapron, Katsaros and Vandemark, *A unified directional spectrum for long and short
+  wind-driven waves* (1997): the wind sea, from the long waves the fetch allows to the ripples the
+  wind's friction raises.
+- Hasselmann et al. (1973), the JONSWAP spectrum, for the swell, and Horvath, *Empirical
+  Directional Wave Spectra for Computer Graphics* (DigiPro 2015), for Donelan and Banner's
+  directional spreading.
+- Cox and Munk (1954), the slopes of the sea measured from sun glitter; Monahan and O'Muircheartaigh
+  (1980), how much of the sea is whitecaps at each wind speed. Both are targets for the tests.
 - Bruneton, Neyret and Holzschuch, *Real-time Realistic Ocean Lighting using Seamless Transitions
   from Geometry to BRDF* (2010): waves too small to see become surface roughness, so distant water
   neither shimmers nor turns too dark, and glitter spreads correctly towards the horizon.
@@ -91,13 +97,21 @@ swell 0.6 11 250             # height (m), period (s), from (degrees)
 
 ## Waves
 
-**Spectrum.** JONSWAP for the wind sea, with fetch, and directional spreading after Horvath, plus
-a narrow swell spectrum from its own direction. The wind sea and the swell can come from different
-directions, as at a real coast. Calm water then keeps a long swell, and a storm's waves run with
-the wind.
+**Spectrum.** Elfouhaily's spectrum for the wind sea, with fetch, and Donelan and Banner's
+directional spreading, plus a narrow JONSWAP swell from its own direction. The wind sea and the
+swell can come from different directions, as at a real coast. Calm water then keeps a long swell,
+and a storm's waves run with the wind.
 
-**Cascades.** Three tiles, about 500 m, 85 m and 13 m across. Their ratios are irrational, so no
-repeat lines up, and each carries only the wavelengths the others don't, so none is counted twice.
+JONSWAP alone was the first choice and was tried. It gives the right wave heights, but above its
+peak its tail saturates at a level that hardly depends on the wind, so a breeze and a gale look
+equally rough close up. Elfouhaily's short waves grow with the wind's friction on the water, as
+real ripples do, and its wave heights still match measured seas. A fully developed sea is within
+5% of Pierson and Moskowitz, and fetch-limited seas are within 25% of JONSWAP's growth law.
+
+**Cascades.** Three tiles, 1000 m, 128 m and 17 m across. Their ratios are not whole numbers, so
+no repeat lines up. Each carries only the wavelengths the others don't, so none is counted twice:
+the three together hold 98–100% of the spectrum's energy at both resolutions. The first is large
+enough for a long swell.
 
 | Tier | Resolution per cascade |
 |---|---|
@@ -173,7 +187,11 @@ than the opaque scene, it works as follows.
    viewer, when the sun is behind it. This is single scattering, from the wave's height above the
    mean and the angle between sun and view.
 6. **Foam.**
-   - Whitecaps form where waves fold (Jacobian below one) and persist as they fade.
+   - Whitecaps form where waves fold (Jacobian below one) and persist as they fade. The fold is
+     judged from all three cascades together, not each alone: in a gale nearly all the energy is
+     in the largest cascade, whose long waves rarely fold by themselves. How readily foam forms is
+     calibrated so that the share of sea under whitecaps follows Monahan's measurements, about 1%
+     at 10 m/s and 5% at 16 m/s.
    - Shore foam forms where the water is shallow.
    - Foam is a rough, white diffuse layer, lit by the sun with its shadows and by the GI volume's
      light.
@@ -208,12 +226,18 @@ Each step is its own pull request, with renders, before-and-after measurements a
 starts until the last is right. Steps 1 and 2 touch nothing in lighting, so they can begin while the
 lighting flicker investigation finishes.
 
-1. **Waves.** Spectrum, cascades and FFT, shown in a debug view. Tests:
-   - The FFT matches a direct sum.
-   - The height variance matches the spectrum's integral.
-   - The significant wave height matches measured seas: about 2 m for a fully developed sea at
-     10 m/s.
-   - Cost is measured per tier.
+1. **Waves.** *Done.* Spectrum, cascades and FFT. Tests:
+   - The GPU draws exactly the waves the Rust reference does.
+   - The transform matches a direct sum over every wave.
+   - The height's variance is the waves' energy (Parseval).
+   - The cascades together carry the whole spectrum.
+   - Wave heights match Pierson and Moskowitz and JONSWAP's growth law.
+   - Drawn slopes stay within Cox and Munk.
+   - The sea follows a change of wind over about a minute, whatever the frame rate.
+
+   About 0.03 ms a frame at 256² on an RTX 5080, and 0.02 ms at 128². A picture test draws calm,
+   fresh and gale seas for review. The on-screen debug view comes with step 2, which gives the
+   waves a surface to show on.
 2. **Surface.** The grid, the water layer and the bake's `ocean` command, replacing the planes;
    the cove is rebaked. Simple shading at first. Tests:
    - no cracks;
