@@ -699,6 +699,7 @@ impl Renderer {
                 self.sea_level,
                 &sea.ocean(),
                 sea.waves(),
+                sea.slopes(),
             );
             water.record(
                 gpu,

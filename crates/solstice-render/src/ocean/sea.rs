@@ -1,7 +1,7 @@
 //! The sea as the renderer runs it: the ocean easing from one kind to another, the waves
 //! following the weather's wind as a real sea does, slowly, and the waves themselves.
 
-use super::spectrum::SeaState;
+use super::spectrum::{unresolved_slopes, SeaState, SLOPE_TABLE_SIZE};
 use super::waves::OceanWaves;
 use super::Ocean;
 use crate::clouds::Weather;
@@ -22,6 +22,11 @@ pub struct Sea {
     start: Ocean,
     /// The sea state the waves are drawn from, which lags the weather's wind.
     state: Option<SeaState>,
+    /// Slopes too fine for the waves to draw, for the surface's roughness, the state they were
+    /// worked out for, and how long ago.
+    slopes: [f32; SLOPE_TABLE_SIZE],
+    slopes_for: Option<SeaState>,
+    since_slopes: f32,
 }
 
 impl Sea {
@@ -34,6 +39,9 @@ impl Sea {
             elapsed: 0.0,
             start: ocean,
             state: None,
+            slopes: [0.0; SLOPE_TABLE_SIZE],
+            slopes_for: None,
+            since_slopes: 0.0,
         }
     }
 
@@ -62,6 +70,12 @@ impl Sea {
         &self.waves
     }
 
+    /// The mean square slope of the waves shorter than each wavenumber of the table in
+    /// `spectrum::unresolved_slopes`.
+    pub fn slopes(&self) -> &[f32; SLOPE_TABLE_SIZE] {
+        &self.slopes
+    }
+
     /// Moves the sea on by `seconds` under `weather`, with tiles of `resolution` texels.
     pub fn update(&mut self, gpu: &Gpu, weather: &Weather, seconds: f32, resolution: u32) {
         if self.waves.size() != resolution {
@@ -82,6 +96,16 @@ impl Sea {
             Some(previous) => follow_wind(previous, wanted, seconds),
         };
         self.state = Some(state);
+        // The roughness table takes an integral, so while the sea eases it follows a few times a
+        // second, as the waves' amplitudes do.
+        self.since_slopes += seconds.max(0.0);
+        if self.slopes_for != Some(state)
+            && (self.slopes_for.is_none() || self.since_slopes >= 0.25)
+        {
+            self.slopes = unresolved_slopes(&state.params());
+            self.slopes_for = Some(state);
+            self.since_slopes = 0.0;
+        }
         self.waves.update(gpu, &state, &self.ocean, seconds);
     }
 

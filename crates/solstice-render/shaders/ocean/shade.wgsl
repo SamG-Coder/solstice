@@ -39,9 +39,6 @@
 const DEBUG_OCEAN: u32 = 10u;
 // Water's reflectance looking straight down: from its index of refraction, 1.33.
 const WATER_F0: f32 = 0.02;
-// Roughness of the water's surface between its drawn waves, for the sun's highlight. The
-// spectrum's finer ripples will set this properly (step 3).
-const WATER_ROUGHNESS: f32 = 0.08;
 // How far reflections are traced across the screen, and how thick a surface they can hit.
 const REFLECTION_DISTANCE: f32 = 300.0;
 const REFLECTION_STEPS: u32 = 64u;
@@ -69,6 +66,22 @@ fn wave_normal(calm: vec2f, footprint: f32) -> vec3f {
     var normal = cross(along_z, along_x);
     normal.y = max(normal.y, 0.05);
     return normalize(normal);
+}
+
+// The surface's roughness, as GGX alpha, for a pixel `footprint` metres across: the slopes of
+// every wave too short to show in it, whether finer than the pixel or than the cascades draw,
+// from the spectrum (spectrum.rs, `unresolved_slopes`). Further off, more waves fall below a
+// pixel, so the water turns rougher and the sun's glitter spreads towards the horizon.
+fn surface_roughness(footprint: f32) -> f32 {
+    let shown = min(PI / max(footprint, 1.0e-4), surface.slope_range.z);
+    let at = clamp((log2(shown) / log2(10.0) - surface.slope_range.x) / surface.slope_range.y, 0.0, 31.0);
+    let i = u32(floor(at));
+    let j = min(i + 1u, 31u);
+    let below = surface.slopes[i / 4u][i % 4u];
+    let above = surface.slopes[j / 4u][j % 4u];
+    let mean_square_slope = mix(below, above, at - f32(i));
+    let smoothest = surface.slope_range.w;
+    return sqrt(smoothest * smoothest + mean_square_slope);
 }
 
 // What the water at `world`, facing `normal`, reflects along `direction`: the scene where the
@@ -186,7 +199,21 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     } else {
         let n_dot_v = max(dot(normal, view), 1.0e-3);
         let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
-        let reflected = reflection(world, normal, reflect(-view, normal));
+        let roughness = surface_roughness(footprint);
+        // One reflected ray per pixel, off a facet the ripples tilt at random by the surface's
+        // roughness; temporal accumulation gathers them into the blurred reflection.
+        let jitter = vec2f(
+            interleaved_gradient_noise(vec2f(id.xy), frame.frame_index),
+            interleaved_gradient_noise(vec2f(id.yx) + vec2f(31.0, 17.0), frame.frame_index),
+        );
+        let spread = sqrt(-2.0 * log(max(1.0 - jitter.x, 1.0e-4))) * roughness * 0.7071;
+        let basis = orthonormal_basis(normal);
+        let facet = normalize(normal + (basis[0] * cos(TAU * jitter.y) + basis[1] * sin(TAU * jitter.y)) * spread);
+        var direction = reflect(-view, facet);
+        if dot(direction, normal) <= 0.0 {
+            direction = reflect(-view, normal);
+        }
+        let reflected = reflection(world, normal, direction);
 
         // Sunlight at the water, after the clouds, and the shadows of what stands in its way:
         // cliffs, the fort, the ship. Shadows show on water by dimming its highlight and the
@@ -200,7 +227,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let n_dot_l = dot(normal, sun);
         var highlight = vec3f(0.0);
         if n_dot_l > 0.0 {
-            let a = WATER_ROUGHNESS * WATER_ROUGHNESS;
+            let a = roughness;
             let h = normalize(view + sun);
             let specular = d_ggx(max(dot(normal, h), 0.0), a) * v_smith(n_dot_v, n_dot_l, a)
                 * f_schlick(vec3f(WATER_F0), max(dot(view, h), 0.0));

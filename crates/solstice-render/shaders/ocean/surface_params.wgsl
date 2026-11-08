@@ -11,4 +11,9 @@ struct SurfaceParams {
     // How strongly the water absorbs and scatters red, green and blue light, per metre.
     absorption: vec4f,
     scattering: vec4f,
+    // Where the table of unresolved slopes starts and steps, in log10 of wavenumber; the
+    // shortest wave the cascades draw; and the smoothest the water ever is, as GGX alpha.
+    slope_range: vec4f,
+    // The mean square slope of all waves shorter than each wavenumber of the table.
+    slopes: array<vec4f, 8>,
 }

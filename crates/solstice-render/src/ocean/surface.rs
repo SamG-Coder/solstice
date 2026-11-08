@@ -8,7 +8,7 @@
 //! reads. The lit opaque scene stays untouched, for refraction to see through the water.
 
 use super::grid::{self, Patch, FINEST_PATCH};
-use super::spectrum::CASCADE_SIZES;
+use super::spectrum::{CASCADE_SIZES, SLOPE_TABLE_FIRST, SLOPE_TABLE_SIZE, SLOPE_TABLE_STEP};
 use super::waves::OceanWaves;
 use super::Ocean;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
@@ -23,6 +23,10 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const SCENE_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 
+/// The smoothest the water's surface ever is, as GGX alpha: still water is not a perfect
+/// mirror, for the drawn waves' own slopes vary across a pixel.
+const SMOOTHEST: f32 = 0.02;
+
 /// Patches the instance buffer holds. The tests in `grid` keep the selection well under this.
 const MAX_PATCHES: usize = 1024;
 
@@ -35,6 +39,8 @@ struct SurfaceUniform {
     morph: [f32; 4],
     absorption: [f32; 4],
     scattering: [f32; 4],
+    slope_range: [f32; 4],
+    slopes: [[f32; 4]; 8],
 }
 
 /// One patch, as the vertex shader reads it.
@@ -319,6 +325,7 @@ impl WaterSurface {
     }
 
     /// Chooses this frame's patches for a camera at `camera`, over a sea at `sea_level`.
+    /// `slopes` is the sea's table of unresolved slopes, from `spectrum::unresolved_slopes`.
     pub fn prepare(
         &mut self,
         gpu: &Gpu,
@@ -326,6 +333,7 @@ impl WaterSurface {
         sea_level: f32,
         ocean: &Ocean,
         waves: &OceanWaves,
+        slopes: &[f32; SLOPE_TABLE_SIZE],
     ) {
         let mut patches = grid::select(camera, sea_level, self.cells);
         patches.truncate(MAX_PATCHES);
@@ -361,6 +369,14 @@ impl WaterSurface {
             morph: [grid::morph_range(0).0 / grid::range(0), 0.0, 0.0, 0.0],
             absorption: [ar, ag, ab, 0.0],
             scattering: [sr, sg, sb, 0.0],
+            slope_range: [
+                SLOPE_TABLE_FIRST,
+                SLOPE_TABLE_STEP,
+                // The finest cascade's Nyquist wavenumber.
+                std::f32::consts::PI * waves.size() as f32 / CASCADE_SIZES[2],
+                SMOOTHEST,
+            ],
+            slopes: std::array::from_fn(|i| std::array::from_fn(|j| slopes[i * 4 + j])),
         };
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));

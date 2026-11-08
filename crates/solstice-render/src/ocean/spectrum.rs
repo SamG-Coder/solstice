@@ -210,6 +210,47 @@ fn omnidirectional_integral(params: &SpectrumParams, f: impl Fn(f32, f32) -> f32
     sum as f32
 }
 
+/// Entries in [`unresolved_slopes`]' table, one per step of wavenumber.
+pub const SLOPE_TABLE_SIZE: usize = 32;
+/// The table runs from 10^`SLOPE_TABLE_FIRST` to 10^(`SLOPE_TABLE_FIRST` + 31·`SLOPE_TABLE_STEP`)
+/// radians per metre: from waves 600 m long to ripples 6 mm long.
+pub const SLOPE_TABLE_FIRST: f32 = -2.0;
+pub const SLOPE_TABLE_STEP: f32 = 5.0 / 31.0;
+/// No ripple is shorter than about 3 mm; surface tension smooths anything finer.
+const SHORTEST_RIPPLE: f32 = 2000.0;
+
+/// For each wavenumber k in the table, the mean square slope of every wave shorter than k:
+/// what a pixel too large to show those waves sees only as roughness. After Bruneton, Neyret
+/// and Holzschuch (2010): the surface's slopes are carried by the waves drawn, or by roughness,
+/// never lost, so distant water is as rough as it should be and the sun's glitter widens
+/// towards the horizon.
+pub fn unresolved_slopes(params: &SpectrumParams) -> [f32; SLOPE_TABLE_SIZE] {
+    let mut table = [0.0; SLOPE_TABLE_SIZE];
+    // From the shortest ripples down, adding up as the wavenumber falls.
+    let steps = 4000;
+    let top = (SHORTEST_RIPPLE as f64).log10();
+    let bottom = SLOPE_TABLE_FIRST as f64;
+    let step = (top - bottom) / steps as f64;
+    let mut sum = 0.0_f64;
+    let mut entry = SLOPE_TABLE_SIZE as i64 - 1;
+    for i in 0..=steps {
+        let log_k = top - i as f64 * step;
+        while entry >= 0 && log_k <= bottom + entry as f64 * SLOPE_TABLE_STEP as f64 {
+            table[entry as usize] = sum as f32;
+            entry -= 1;
+        }
+        let k = 10f64.powf(log_k);
+        // Mean square slope: ∫ B(k)/k dk, here over log k, so dk = k ln(10) d(log k).
+        let dk = k * std::f64::consts::LN_10 * step;
+        sum += wind_curvature(k as f32, params) as f64 / k * dk;
+    }
+    while entry >= 0 {
+        table[entry as usize] = sum as f32;
+        entry -= 1;
+    }
+    table
+}
+
 /// JONSWAP's shape over angular frequency, without its scale: a steep rise below the peak, a
 /// sharper peak than Pierson and Moskowitz's by `enhancement`, and a fall as ω⁻⁵ above. For
 /// the swell.
@@ -523,6 +564,44 @@ mod tests {
             );
             previous = drawn;
         }
+    }
+
+    #[test]
+    fn unresolved_slopes_are_the_slopes_of_shorter_waves() {
+        for wind in [3.0, 9.0, 16.0] {
+            let state = sea(wind, 100.0);
+            let params = state.params();
+            let table = unresolved_slopes(&params);
+            // Never rising with wavenumber: shorter cut-offs leave fewer waves.
+            assert!(
+                table.windows(2).all(|w| w[0] >= w[1] - 1.0e-7),
+                "{wind}: {table:?}"
+            );
+            // At the start, nearly every wave is shorter: the whole sea's mean square slope.
+            let whole = mean_square_slope(&state, SHORTEST_RIPPLE);
+            assert!(
+                (table[0] / whole - 1.0).abs() < 0.03,
+                "{wind}: {} against {whole}",
+                table[0]
+            );
+            // At the cascades' finest drawn wave, what is left is what they cannot draw.
+            let k = 10f32.powf(SLOPE_TABLE_FIRST + 20.0 * SLOPE_TABLE_STEP);
+            let expected = whole - mean_square_slope(&state, k);
+            assert!(
+                (table[20] / expected - 1.0).abs() < 0.05,
+                "{wind}: {} against {expected}",
+                table[20]
+            );
+        }
+        // A gale's ripples make it rougher than a breeze, at every scale too fine to draw.
+        let breeze = unresolved_slopes(&sea(3.0, 100.0).params());
+        let gale = unresolved_slopes(&sea(16.0, 100.0).params());
+        assert!(
+            gale[25] > breeze[25] * 3.0,
+            "{} against {}",
+            gale[25],
+            breeze[25]
+        );
     }
 
     #[test]
