@@ -63,7 +63,28 @@ fn write_voxel(coord: vec3i, data: VoxelData) {
     atomicStore(&voxels[index * 3u + 2u], data.emissive);
 }
 
-fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
+// How a cut-out triangle maps to its colour map, for `voxel_solid`.
+struct VoxelMask {
+    enabled: bool,
+    uv0: vec2f,
+    uv1: vec2f,
+    uv2: vec2f,
+    layer: i32,
+    level: f32,
+}
+
+// Whether a voxel at grid position `coord`, and at texture position `uv`, is kept of a cut-out
+// triangle. A voxel is far larger than a strand, so the texture's coverage there is compared to
+// a value fixed to the voxel's place in the world: over an area the right share of voxels are
+// solid, and which ones doesn't change when the volume is drawn again.
+fn voxel_solid(mask: VoxelMask, uv: vec2f, coord: vec3i) -> bool {
+    let world = coord + vec3i(round(params.origin / params.voxel_size));
+    let hash = pcg(pcg(pcg(u32(world.x)) ^ u32(world.y)) ^ u32(world.z));
+    let threshold = (f32(hash >> 16u) + 0.5) / 65536.0;
+    return textureSampleLevel(color_textures, material_sampler, uv, mask.layer, mask.level).a > threshold;
+}
+
+fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData, mask: VoxelMask) {
     let normal = cross(v1 - v0, v2 - v0);
     let abs_normal = abs(normal);
 
@@ -115,6 +136,8 @@ fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
     let dw_dv = -normal[v_axis] / normal[w_axis];
     let w0 = v0[w_axis] - dw_du * a.x - dw_dv * a.y;
     let spread = 0.5 * (abs(dw_du) + abs(dw_dv));
+    // For texture positions, the inverse of twice the signed area in this projection.
+    let inverse_area = 1.0 / ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
 
     for (var y = lo.y; y <= hi.y; y += 1.0) {
         let py = y + 0.5;
@@ -132,12 +155,22 @@ fn voxelize_triangle(v0: vec3f, v1: vec3f, v2: vec3f, data: VoxelData) {
             let w = w0 + dw_du * (x + 0.5) + dw_dv * py;
             let first = i32(floor(w - spread));
             let last = i32(floor(w + spread));
+            var uv = vec2f(0.0);
+            if mask.enabled {
+                // The column's centre can lie just outside, as the edges were widened.
+                let p = vec2f(x + 0.5, py);
+                let weight1 = clamp(((p.x - a.x) * (c.y - a.y) - (p.y - a.y) * (c.x - a.x)) * inverse_area, 0.0, 1.0);
+                let weight2 = clamp(((b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)) * inverse_area, 0.0, 1.0 - weight1);
+                uv = mask.uv0 * (1.0 - weight1 - weight2) + mask.uv1 * weight1 + mask.uv2 * weight2;
+            }
             for (var z = first; z <= last; z++) {
                 var coord = vec3i(0);
                 coord[u_axis] = i32(x);
                 coord[v_axis] = i32(y);
                 coord[w_axis] = z;
-                write_voxel(coord, data);
+                if !mask.enabled || voxel_solid(mask, uv, coord) {
+                    write_voxel(coord, data);
+                }
             }
         }
     }
@@ -210,11 +243,23 @@ fn voxelize_cluster_triangle(item: u32, t: u32) {
             pack2x16snorm(oct_encode(face / face_length)),
             encode_emissive(material.emissive * instance.glow),
         );
-        voxelize_triangle(
-            (world0 - params.origin) * inv_voxel,
-            (world1 - params.origin) * inv_voxel,
-            (world2 - params.origin) * inv_voxel,
-            data,
-        );
+        let p0 = (world0 - params.origin) * inv_voxel;
+        let p1 = (world1 - params.origin) * inv_voxel;
+        let p2 = (world2 - params.origin) * inv_voxel;
+        var mask: VoxelMask;
+        mask.enabled = (material.flags & MATERIAL_MASKED) != 0u;
+        if mask.enabled {
+            mask.uv0 = decode_uv(instance, vertex0) * material.uv_scale;
+            mask.uv1 = decode_uv(instance, vertex1) * material.uv_scale;
+            mask.uv2 = decode_uv(instance, vertex2) * material.uv_scale;
+            mask.layer = material.texture_layer;
+            // Texels per voxel, from the triangle's areas in the texture and in voxels.
+            let uv_area = abs((mask.uv1.x - mask.uv0.x) * (mask.uv2.y - mask.uv0.y) - (mask.uv1.y - mask.uv0.y) * (mask.uv2.x - mask.uv0.x));
+            let voxel_area = max(length(cross(p1 - p0, p2 - p0)), 1.0e-6);
+            let edge = f32(textureDimensions(color_textures).x);
+            let lod = 0.5 * log2(max(uv_area / voxel_area * edge * edge, 1.0e-6));
+            mask.level = clamp(floor(lod + 0.5), 0.0, f32(textureNumLevels(color_textures) - 1u));
+        }
+        voxelize_triangle(p0, p1, p2, data, mask);
     }
 }

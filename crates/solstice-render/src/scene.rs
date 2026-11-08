@@ -46,8 +46,9 @@ pub(crate) const INSTANCE_MOVABLE: u32 = 1 << 30;
 pub(crate) const INSTANCE_HIDDEN: u32 = 1 << 29;
 /// Movable, but kept in the GI voxels where it stood when they were last drawn: for things
 /// that move only a little, such as a ship at anchor, whose light and shade would be missed.
-/// The bits below it hold the material's index.
 pub(crate) const INSTANCE_STAYS_IN_GI: u32 = 1 << 28;
+/// Cut out: goes through the masked lists and rasterizers (`docs/cutouts.md`).
+pub(crate) const INSTANCE_MASKED: u32 = 1 << 27;
 
 impl GpuInstance {
     /// Places the instance at `world`. Where it was drawn last stays as `prev_world`.
@@ -132,6 +133,8 @@ pub struct GpuScene {
     pub material_sampler: wgpu::Sampler,
     /// Instances on the GPU: those of the scene's instances that have geometry.
     pub gpu_instance_count: u32,
+    /// Whether any instance is cut out, so its lists and pipelines are needed.
+    pub has_masked: bool,
     /// The CPU's copy of `instances`, and what has changed in it.
     pub instance_table: InstanceTable,
     pub light_count: u32,
@@ -185,6 +188,7 @@ impl GpuScene {
             texture_summary,
             material_sampler,
             gpu_instance_count: instances.len() as u32,
+            has_masked: instances.iter().any(|i| i.has_flag(INSTANCE_MASKED)),
             instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
             light_count: scene.lights.len() as u32,
             max_hierarchy_depth: scene.hierarchy_depth,
@@ -247,10 +251,8 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
         };
         index.push(Some(out.len() as u32));
         // The bits above hold the INSTANCE_ flags.
-        debug_assert!(
-            instance.material < INSTANCE_STAYS_IN_GI,
-            "too many materials"
-        );
+        let source = scene.materials.get(instance.material as usize);
+        debug_assert!(instance.material < INSTANCE_MASKED, "too many materials");
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());
@@ -264,12 +266,13 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
             uv_step: Vec2::from_array(mesh.uv_step),
             root_node,
             material: instance.material
-                | if scene
-                    .materials
-                    .get(instance.material as usize)
-                    .is_some_and(|m| m.flags & Material::TWO_SIDED != 0)
-                {
+                | if source.is_some_and(|m| m.flags & Material::TWO_SIDED != 0) {
                     INSTANCE_TWO_SIDED
+                } else {
+                    0
+                }
+                | if source.is_some_and(|m| m.flags & Material::MASKED != 0) {
+                    INSTANCE_MASKED
                 } else {
                     0
                 },

@@ -276,8 +276,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             emissive = hash_color(packed_id) * max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);
         }
         case DEBUG_RASTER_MODE: {
-            // The hardware range grows down from the end of the list.
-            let hardware = visible_index >= arrayLength(&visible) / 2u;
+            // The hardware ranges grow down from the ends of their lists. The opaque list has four
+            // fifths of the entries if the scene has cut-outs too, and these are never so many
+            // as to tell that apart; the masked list has the last fifth.
+            let middle = select(arrayLength(&visible) / 2u, arrayLength(&visible) / 10u * 9u, instance_masked(instance));
+            let hardware = visible_index >= middle;
             emissive = select(vec3f(0.1, 0.9, 0.2), vec3f(1.0, 0.15, 0.1), hardware) * max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);
         }
         case DEBUG_INSTANCES: {

@@ -3,7 +3,8 @@
 use glam::{Mat4, Quat, Vec2, Vec3};
 use solstice_asset::{Instance, Light, LoadedScene, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
-    build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
+    build_virtual_mesh, compress_textures, masked_mip_chain, mip_chain, paginate, BuildOptions,
+    Mesh, Vertex,
 };
 use solstice_render::{
     Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
@@ -3574,4 +3575,510 @@ fn solid_box(half: Vec3) -> Mesh {
             .extend([0, 1, 2, 0, 2, 3].map(|i: u32| base + i));
     }
     mesh
+}
+
+/// Edge of the cut-out test textures.
+const CARD_EDGE: u32 = 64;
+
+/// A unit square in the XY plane around the origin, its UVs running over it, facing +Z or away,
+/// `cells` quads across.
+fn card_mesh(facing_camera: bool, cells: u32) -> Mesh {
+    let mut mesh = Mesh::default();
+    for j in 0..=cells {
+        for i in 0..=cells {
+            let (u, v) = (i as f32 / cells as f32, j as f32 / cells as f32);
+            mesh.vertices.push(Vertex {
+                position: Vec3::new(u - 0.5, v - 0.5, 0.0),
+                normal: if facing_camera { Vec3::Z } else { Vec3::NEG_Z },
+                uv: Vec2::new(u, v),
+            });
+        }
+    }
+    for j in 0..cells {
+        for i in 0..cells {
+            let a = j * (cells + 1) + i;
+            let (b, c, d) = (a + 1, a + cells + 1, a + cells + 2);
+            if facing_camera {
+                mesh.indices.extend_from_slice(&[a, b, c, b, d, c]);
+            } else {
+                mesh.indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+    }
+    mesh
+}
+
+/// The texture layer of a card: pale, with its alpha given per texel.
+fn card_layer(alpha: impl Fn(u32, u32) -> u8) -> TextureLayer {
+    let n = (CARD_EDGE * CARD_EDGE) as usize;
+    let mut color = Vec::with_capacity(n * 4);
+    for y in 0..CARD_EDGE {
+        for x in 0..CARD_EDGE {
+            color.extend_from_slice(&[220, 220, 220, alpha(x, y)]);
+        }
+    }
+    TextureLayer {
+        color_mips: masked_mip_chain(color, CARD_EDGE),
+        normal_mips: mip_chain([128, 128].repeat(n), CARD_EDGE, 2),
+        material_mips: mip_chain([128, 255].repeat(n), CARD_EDGE, 2),
+    }
+}
+
+/// The left half of the texture is a hole, the right half solid.
+fn half_cut(x: u32, _: u32) -> u8 {
+    if x < CARD_EDGE / 2 {
+        0
+    } else {
+        255
+    }
+}
+
+fn card_material(flags: u32) -> Material {
+    Material {
+        base_color: [1.0; 4],
+        texture_layer: 0,
+        flags: Material::MASKED | flags,
+        ..Default::default()
+    }
+}
+
+/// One card, as the only thing in the scene.
+fn card_scene(flags: u32, facing_camera: bool, alpha: impl Fn(u32, u32) -> u8) -> SceneAsset {
+    SceneAsset {
+        meshes: vec![build_virtual_mesh(
+            &card_mesh(facing_camera, 8),
+            &BuildOptions::default(),
+        )],
+        materials: vec![card_material(flags)],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        texture_size: CARD_EDGE,
+        textures: vec![card_layer(alpha)],
+        ..Default::default()
+    }
+}
+
+/// The albedo of a scene from `distance` along +Z, and whether software drew any of it.
+fn card_albedo(gpu: &Gpu, scene: &SceneAsset, distance: f32) -> (Vec<u8>, Camera, bool) {
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, distance),
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let run = render(gpu, scene, &camera, settings, 256);
+    (run.pixels, camera, run.software_clusters > 0)
+}
+
+/// A hole in a cut-out shows what is behind it and the solid part does not, on both rasterizers.
+#[test]
+fn cut_outs_have_holes_on_both_rasterizers() {
+    let Some(gpu) = request_gpu() else { return };
+    let scene = card_scene(0, true, half_cut);
+    for (distance, software) in [(1.0, false), (14.0, true)] {
+        let (pixels, camera, used_software) = card_albedo(&gpu, &scene, distance);
+        assert_eq!(used_software, software, "at {distance} m");
+        let at = |x: f32| {
+            let (px, py) = pixel_of(&camera, 256, Vec3::new(x, 0.0, 0.0));
+            brightness(patch(&pixels, 256, px, py, 0))
+        };
+        let (hole, solid) = (at(-0.25), at(0.25));
+        assert!(hole < 5.0, "at {distance} m the hole shows {hole}");
+        assert!(
+            solid > 100.0,
+            "at {distance} m the solid part shows {solid}"
+        );
+    }
+}
+
+/// Only a two-sided card shows from behind, and it keeps its holes there.
+#[test]
+fn cut_outs_are_two_sided_only_where_the_material_says() {
+    let Some(gpu) = request_gpu() else { return };
+    for (distance, software) in [(1.0, false), (14.0, true)] {
+        for two_sided in [false, true] {
+            let flags = if two_sided { Material::TWO_SIDED } else { 0 };
+            let mut scene = card_scene(flags, false, half_cut);
+            // One quad, so that a back face's texture has to be the right way round across all
+            // of it, and with points off its diagonal, which a swap would move.
+            scene.meshes[0] = build_virtual_mesh(&card_mesh(false, 1), &BuildOptions::default());
+            let (pixels, camera, used_software) = card_albedo(&gpu, &scene, distance);
+            assert!(!two_sided || used_software == software, "at {distance} m");
+            let at = |x: f32, y: f32| {
+                let (px, py) = pixel_of(&camera, 256, Vec3::new(x, y, 0.0));
+                brightness(patch(&pixels, 256, px, py, 0))
+            };
+            let (hole, solid) = (at(-0.25, 0.2), at(0.25, -0.2));
+            assert!(hole < 5.0, "the hole at {distance} m shows {hole}");
+            if two_sided {
+                assert!(solid > 100.0, "two-sided at {distance} m: {solid}");
+            } else {
+                assert!(solid < 5.0, "one-sided at {distance} m: {solid}");
+            }
+        }
+    }
+}
+
+/// Holes are not occluders: what stands behind one is still drawn, after occlusion culling has
+/// had frames to act.
+#[test]
+fn what_stands_behind_a_hole_is_not_occluded() {
+    let Some(gpu) = request_gpu() else { return };
+    let mut scene = card_scene(0, true, half_cut);
+    scene.instances[0].transform = Mat4::from_scale(Vec3::new(3.0, 3.0, 1.0));
+    scene
+        .meshes
+        .push(build_virtual_mesh(&sphere(4), &BuildOptions::default()));
+    scene.materials.push(white_material());
+    let ball = Vec3::new(-0.75, 0.0, -3.0);
+    scene.instances.push(Instance {
+        mesh: 1,
+        material: 1,
+        transform: Mat4::from_scale_rotation_translation(Vec3::splat(0.4), Quat::IDENTITY, ball),
+    });
+    let (pixels, camera, _) = card_albedo(&gpu, &scene, 5.0);
+    let (px, py) = pixel_of(&camera, 256, ball);
+    let seen = brightness(patch(&pixels, 256, px, py, 1));
+    assert!(seen > 100.0, "the ball behind the hole shows {seen}");
+}
+
+/// A two-sided cut-out card placed by `card` above a wide floor at y = 0.
+fn card_over_floor(mesh: &Mesh, card: Mat4) -> SceneAsset {
+    let mut floor = Mesh::default();
+    for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        floor.vertices.push(Vertex {
+            position: Vec3::new(x * 400.0, 0.0, z * 400.0),
+            normal: Vec3::Y,
+            uv: Vec2::new(x, z),
+        });
+    }
+    floor.indices = vec![0, 2, 1, 0, 3, 2];
+    let mut scene = card_scene(Material::TWO_SIDED, true, half_cut);
+    scene.meshes[0] = build_virtual_mesh(mesh, &BuildOptions::default());
+    scene.instances[0].transform = card;
+    scene
+        .meshes
+        .push(build_virtual_mesh(&floor, &BuildOptions::default()));
+    scene.materials.push(white_material());
+    scene.instances.push(Instance {
+        mesh: 1,
+        material: 1,
+        transform: Mat4::IDENTITY,
+    });
+    scene
+}
+
+/// A card placed by `card`, its hole on its -X side, casts the shadow of its solid half alone, on
+/// the rasterizer its size sends it to.
+#[allow(clippy::too_many_arguments)]
+fn check_card_shadow(
+    gpu: &Gpu,
+    mesh: &Mesh,
+    card: Mat4,
+    camera: Camera,
+    sun_slope: f32,
+    offset: f32,
+    software: bool,
+) {
+    let mut scene = card_over_floor(mesh, card);
+    let sun_direction = Vec3::new(sun_slope, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let run = render_in(gpu, &scene, &camera, settings, 512, &sun);
+    // The statistic is of the last cascade drawn, where even a large card is small, so it can
+    // only show that software was used, not that it was not.
+    assert!(!software || run.shadow_software_clusters > 0, "no software");
+    let with_card = run.pixels;
+    scene.instances.remove(0);
+    let bare = render_in(gpu, &scene, &camera, settings, 512, &sun).pixels;
+
+    // Where a point of the card's casts to on the floor.
+    let floor = |pixels: &[u8], local_x: f32| {
+        let point = card.transform_point3(Vec3::new(local_x, 0.0, 0.0));
+        let spot = point - sun_direction * (point.y / sun_direction.y);
+        let (px, py) = pixel_of(&camera, 512, spot);
+        brightness(patch(pixels, 512, px, py, 1))
+    };
+    let (solid, hole) = (floor(&with_card, offset), floor(&with_card, -offset));
+    let (bare_solid, bare_hole) = (floor(&bare, offset), floor(&bare, -offset));
+    // A small card's shadow is mostly penumbra, so these are modest margins.
+    assert!(
+        solid + 8.0 < bare_solid,
+        "behind the solid half the floor is {solid} against {bare_solid} bare"
+    );
+    assert!(
+        solid + 8.0 < hole,
+        "the floor is {solid} behind the solid half and {hole} through the hole"
+    );
+    assert!(
+        (hole - bare_hole).abs() < 10.0,
+        "through the hole the floor is {hole} against {bare_hole} bare"
+    );
+}
+
+/// A card that may move casts a shadow with holes too, drawn afresh over the cached cascades:
+/// with one cull for every cascade, and with one each, as a great many moving things get.
+#[test]
+fn moving_cut_outs_have_holes_in_their_shadows() {
+    let Some(gpu) = request_gpu() else { return };
+    check_moving_card_shadow(&gpu, 0);
+    check_moving_card_shadow(&gpu, 2100);
+}
+
+/// Checks a moving card's shadow, with `others` more tiny moving cards well away from it.
+fn check_moving_card_shadow(gpu: &Gpu, others: u32) {
+    let card = Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0))
+        * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+        * Mat4::from_scale(Vec3::new(2.0, 2.0, 1.0));
+    let mut scene = card_over_floor(&card_mesh(true, 8), card);
+    for i in 0..others {
+        let place = Vec3::new(
+            -12.0 - (i % 50) as f32 * 0.1,
+            0.5 + (i / 50) as f32 * 0.1,
+            -4.0,
+        );
+        scene.instances.push(Instance {
+            mesh: 0,
+            material: 0,
+            transform: Mat4::from_translation(place) * Mat4::from_scale(Vec3::splat(0.02)),
+        });
+    }
+    let sun_direction = Vec3::new(0.5, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(-0.5, 2.0, 2.5),
+        pitch: -0.7,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut stage = Stage::new(gpu, &scene, settings, 512);
+    assert!(stage.renderer.set_instance_movable(0, true));
+    for i in 0..others {
+        assert!(stage.renderer.set_instance_movable(2 + i, true));
+    }
+    stage.frames(gpu, &camera, &sun, 8);
+    let pixels = stage.pixels(gpu);
+    let floor = |local_x: f32| {
+        let point = card.transform_point3(Vec3::new(local_x, 0.0, 0.0));
+        let spot = point - sun_direction * (point.y / sun_direction.y);
+        let (px, py) = pixel_of(&camera, 512, spot);
+        brightness(patch(&pixels, 512, px, py, 1))
+    };
+    let (solid, hole) = (floor(0.25), floor(-0.25));
+    assert!(
+        solid + 30.0 < hole,
+        "with {others} others the floor is {solid} behind the solid half and {hole} through the hole"
+    );
+}
+
+#[test]
+fn sun_shadows_have_the_cut_outs_holes_on_both_rasterizers() {
+    let Some(gpu) = request_gpu() else { return };
+    let flat = |height: f32, size: f32| {
+        Mat4::from_translation(Vec3::new(0.0, height, 0.0))
+            * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+            * Mat4::from_scale(Vec3::new(size, size, 1.0))
+    };
+    // Close up, a cascade's texels are small and the card takes hardware.
+    let near = Camera {
+        position: Vec3::new(-0.5, 2.0, 2.5),
+        pitch: -0.7,
+        ..Default::default()
+    };
+    check_card_shadow(
+        &gpu,
+        &card_mesh(true, 8),
+        flat(1.0, 2.0),
+        near,
+        0.5,
+        0.25,
+        false,
+    );
+    // A flat card simplifies to clusters too large for software. A ball's surface keeps its
+    // small clusters, so with half of it cut away the shadow can only come out right through
+    // the software path, under a sun high enough that a ray meets just one half.
+    let mut ball = sphere(5);
+    for vertex in &mut ball.vertices {
+        vertex.uv = Vec2::new((vertex.position.x + 1.0) * 0.5, 0.5);
+    }
+    let placed = Mat4::from_scale_rotation_translation(
+        Vec3::splat(0.05),
+        Quat::IDENTITY,
+        Vec3::new(0.0, 0.3, 0.0),
+    );
+    check_card_shadow(&gpu, &ball, placed, near, 0.05, 0.5, true);
+}
+
+/// Local light goes through the voxels, which must have the wall's holes too: a lamp behind a
+/// wall reaches the floor beyond through the open half and not past the solid half.
+#[test]
+fn light_passes_through_a_cut_outs_holes_in_the_voxels() {
+    let Some(gpu) = request_gpu() else { return };
+    // Turned so the card's -X side, the hole, is towards +Z, and standing on the floor.
+    let wall = Mat4::from_translation(Vec3::new(0.0, 2.5, 0.0))
+        * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2)
+        * Mat4::from_scale(Vec3::new(10.0, 5.0, 1.0));
+    let mut scene = card_over_floor(&card_mesh(true, 8), wall);
+    scene.lights = vec![Light {
+        position: [-4.0, 1.5, 0.0],
+        range: 30.0,
+        intensity: [600.0; 3],
+        _pad: 0,
+    }];
+    let camera = Camera {
+        position: Vec3::new(3.0, 8.0, 0.0),
+        pitch: -1.5,
+        ..Default::default()
+    };
+    let night = Environment {
+        sun_illuminance: 0.0,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        daylight_illuminance: 10.0,
+        ..Default::default()
+    };
+    let settings = RendererSettings::default();
+    let pixels = render_in(&gpu, &scene, &camera, settings, 256, &night).pixels;
+    let at = |z: f32| {
+        let (px, py) = pixel_of(&camera, 256, Vec3::new(3.0, 0.0, z));
+        brightness(patch(&pixels, 256, px, py, 1))
+    };
+    let (open, shut) = (at(2.0), at(-2.0));
+    assert!(
+        open > shut + 20.0,
+        "beyond the wall the floor is {open} past the hole and {shut} past the solid half"
+    );
+}
+
+/// A cut-out's alpha is coverage: what passes is lit the same however far above the test it is.
+#[test]
+fn coverage_is_not_read_as_cavity() {
+    let Some(gpu) = request_gpu() else { return };
+    let lit = |alpha: u8| {
+        let scene = card_scene(0, true, |_, _| alpha);
+        let camera = Camera {
+            position: Vec3::new(0.0, 0.0, 1.0),
+            ..Default::default()
+        };
+        let settings = RendererSettings {
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        let environment = Environment::default();
+        let pixels = render_in(&gpu, &scene, &camera, settings, 64, &environment).pixels;
+        brightness(patch(&pixels, 64, 32, 32, 2))
+    };
+    let (barely, fully) = (lit(130), lit(255));
+    assert!(fully > 10.0, "the card shows: {fully}");
+    assert!((barely - fully).abs() < 2.0, "{barely} against {fully}");
+}
+
+/// Nothing for cut-outs exists in a scene without any.
+#[test]
+fn only_scenes_with_cut_outs_have_their_passes() {
+    let Some(gpu) = request_gpu() else { return };
+    let scene = card_scene(0, true, half_cut);
+    let masked = Stage::new(&gpu, &scene, Default::default(), 16);
+    assert!(masked.renderer.draws_masked());
+    let mut opaque = scene;
+    opaque.materials[0].flags = 0;
+    let plain = Stage::new(&gpu, &opaque, Default::default(), 16);
+    assert!(!plain.renderer.draws_masked());
+}
+
+/// A fine pattern far away covers about what it covers near, and holds still under TAA.
+#[test]
+fn distant_cut_outs_keep_their_coverage_and_hold_still() {
+    let Some(gpu) = request_gpu() else { return };
+    let scatter = |x: u32, y: u32| {
+        let h = ((y * CARD_EDGE + x) ^ 0x9e37_79b9).wrapping_mul(0x85eb_ca6b);
+        if (h ^ (h >> 13)).wrapping_mul(0xc2b2_ae35) >> 30 == 0 {
+            255
+        } else {
+            0
+        }
+    };
+    let scene = card_scene(0, true, scatter);
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: true,
+        ..Default::default()
+    };
+    let size = 512;
+    let camera_at = |distance: f32| Camera {
+        position: Vec3::new(0.0, 0.0, distance),
+        ..Default::default()
+    };
+    // Pixels over the middle of the card, in reading order.
+    let over_card = |pixels: &[u8], camera: &Camera| -> Vec<f32> {
+        let (x0, y1) = pixel_of(camera, size, Vec3::new(-0.45, -0.45, 0.0));
+        let (x1, y0) = pixel_of(camera, size, Vec3::new(0.45, 0.45, 0.0));
+        let mut values = Vec::new();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                values.push(brightness(patch(pixels, size, x, y, 0)));
+            }
+        }
+        values
+    };
+    let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+    // Without temporal blending each pixel is solid or not, so they can be counted.
+    let sharp = RendererSettings {
+        temporal_accumulation: false,
+        ..settings
+    };
+    let solid_share = |values: &[f32]| {
+        let middle = values.iter().cloned().fold(0.0, f32::max) / 2.0;
+        values.iter().filter(|&&v| v > middle).count() as f32 / values.len() as f32
+    };
+
+    let near_camera = camera_at(1.2);
+    let mut stage = Stage::new(&gpu, &scene, sharp, size);
+    stage.frames(&gpu, &near_camera, &darkness(), 4);
+    let near = solid_share(&over_card(&stage.pixels(&gpu), &near_camera));
+
+    let far_camera = camera_at(16.0);
+    let mut stage = Stage::new(&gpu, &scene, sharp, size);
+    stage.frames(&gpu, &far_camera, &darkness(), 4);
+    let far = solid_share(&over_card(&stage.pixels(&gpu), &far_camera));
+
+    let mut stage = Stage::new(&gpu, &scene, settings, size);
+    stage.frames(&gpu, &far_camera, &darkness(), 24);
+    let first = over_card(&stage.pixels(&gpu), &far_camera);
+    stage.frames(&gpu, &far_camera, &darkness(), 1);
+    let second = over_card(&stage.pixels(&gpu), &far_camera);
+
+    assert!(near > 0.1, "near the card shows: {near}");
+    assert!(
+        (far / near - 1.0).abs() < 0.45,
+        "{far} of the card is solid at a distance, {near} near"
+    );
+    let changes: Vec<f32> = first
+        .iter()
+        .zip(&second)
+        .map(|(a, b)| (a - b).abs())
+        .collect();
+    let shimmer = mean(&changes);
+    assert!(
+        shimmer < 8.0,
+        "pixels of the distant card change by {shimmer} a frame"
+    );
 }

@@ -83,7 +83,7 @@ fn push_retry(entry: QueueEntry) {
 // never meet, however many threads arrive at once. Returns false, and counts the loss, if
 // the list is full.
 fn emit_cluster(instance: u32, cluster: u32, software: bool) -> bool {
-    let capacity = arrayLength(&visible);
+    let capacity = state.opaque_end;
     if atomicAdd(&state.reserved, 1u) >= capacity {
         atomicAdd(&state.dropped, 1u);
         return false;
@@ -92,6 +92,21 @@ fn emit_cluster(instance: u32, cluster: u32, software: bool) -> bool {
         visible[atomicAdd(&state.sw_count, 1u)] = VisibleCluster(instance, cluster);
     } else {
         visible[capacity - 1u - atomicAdd(&state.hw_count, 1u)] = VisibleCluster(instance, cluster);
+    }
+    return true;
+}
+
+// The same for cut-out clusters, in the part of the list after the opaque clusters' part.
+fn emit_masked_cluster(instance: u32, cluster: u32, software: bool) -> bool {
+    let end = arrayLength(&visible);
+    if atomicAdd(&state.masked_reserved, 1u) >= end - state.opaque_end {
+        atomicAdd(&state.dropped, 1u);
+        return false;
+    }
+    if software {
+        visible[state.opaque_end + atomicAdd(&state.masked_sw_count, 1u)] = VisibleCluster(instance, cluster);
+    } else {
+        visible[end - 1u - atomicAdd(&state.masked_hw_count, 1u)] = VisibleCluster(instance, cluster);
     }
     return true;
 }
@@ -223,7 +238,13 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
             }
         }
     }
-    if !emit_cluster(entry.instance, cluster_index, software) {
+    var emitted: bool;
+    if view.masked_lists != 0u && instance_masked(instance) {
+        emitted = emit_masked_cluster(entry.instance, cluster_index, software);
+    } else {
+        emitted = emit_cluster(entry.instance, cluster_index, software);
+    }
+    if !emitted {
         return;
     }
     request_texture_detail(cluster, instance, length(center - view.camera_position) - radius);

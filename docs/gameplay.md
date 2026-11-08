@@ -792,9 +792,8 @@ Blender, before exporting.
   - The file is 11.8 MB: 38,462 triangles, 22,088 vertices, 12 materials, 53 bones.
   - The default export was 25.8 MB and 68,608 triangles. Most of the difference is the hidden
     geometry gone, and the textures baked down to 1024.
-- **Left for the renderer.** It draws cut-out materials as opaque, as it does the ship's
-  sails, so the keeper's hair, brows and lashes show as dark cards until alpha testing is
-  added.
+- **Cut-outs.** The keeper's hair, brows and lashes are drawn with their holes, as anything
+  authored `alphaMode: MASK` is: see `docs/cutouts.md`.
 
 ### Skinning in virtual geometry
 

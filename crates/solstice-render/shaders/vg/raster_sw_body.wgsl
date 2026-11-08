@@ -1,6 +1,7 @@
 // The software rasterizer's body, shared by the visibility and the depth-only entry points,
 // which each define, before including this: `write_visibility` and the bindings it writes to;
-// and `depth_bias`, the offset added to a triangle's depth from its slope on screen.
+// `depth_bias`, the offset added to a triangle's depth from its slope on screen; and which list
+// to draw and what counts as covered (vg/cover_none.wgsl and vg/cover_mask.wgsl).
 //
 // Hardware rasterizers shade 2x2 quads and waste most of their work on triangles near
 // pixel size. A compute shader has no such overhead, so small clusters come here. The
@@ -32,22 +33,23 @@ fn main(
     @builtin(local_invocation_index) lane: u32,
 ) {
     if lane == 0u {
-        cluster_count = state.sw_count - state.sw_base;
+        cluster_count = software_list_count();
     }
     let count = workgroupUniformLoad(&cluster_count);
 
     // A dispatch can hold at most 65535 workgroups, so each takes every so-many-th cluster.
     for (var item = group.x; item < count; item += groups.x) {
-        let visible_index = state.sw_base + item;
+        let visible_index = software_list_first() + item;
         let entry = visible[visible_index];
         let cluster = clusters[entry.cluster];
         let instance = instances[entry.instance];
 
         let vertex_count = cluster_vertex_count(cluster);
         for (var v = lane; v < vertex_count; v += GROUP_SIZE) {
-            let packed = vertices[cluster.vertex_offset + v];
+            let packed = load_vertex(cluster.vertex_offset + v);
             let world = transform_point(instance, decode_position(instance, packed));
             let clip = view.raster_view_proj * vec4f(world, 1.0);
+            cover_vertex(v, packed, entry.instance, clip.w);
             let ndc = clip.xyz / clip.w;
             screen[v] = vec3f(
                 (ndc.x * 0.5 + 0.5) * view.viewport.x,
@@ -58,13 +60,16 @@ fn main(
         workgroupBarrier();
 
         if lane < cluster_triangle_count(cluster) {
-            let packed = triangles[cluster.triangle_offset + lane];
+            let packed = pool[cluster.triangle_offset + lane];
+            let corners = vec3u(local_vertex(packed, 0u), local_vertex(packed, 1u), local_vertex(packed, 2u));
             rasterize_triangle(
-                screen[local_vertex(packed, 0u)],
-                screen[local_vertex(packed, 1u)],
-                screen[local_vertex(packed, 2u)],
+                screen[corners.x],
+                screen[corners.y],
+                screen[corners.z],
                 encode_id(visible_index, lane),
                 instance_two_sided(instance),
+                corners,
+                entry.instance,
             );
         }
         // The next cluster reuses the vertex memory.
@@ -89,13 +94,23 @@ fn fill_bias(a: vec2i, b: vec2i) -> i32 {
     return select(-1, 0, is_top || is_left);
 }
 
-fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_sided: bool) {
+fn rasterize_triangle(
+    a_in: vec3f,
+    b_given: vec3f,
+    c_given: vec3f,
+    id: u32,
+    two_sided: bool,
+    corners_given: vec3u,
+    instance: u32,
+) {
     var b_in = b_given;
     var c_in = c_given;
+    var corners = corners_given;
     // A back face of a two-sided material is drawn as the front face it is from behind.
     if two_sided && edge_f(a_in.xy, b_in.xy, c_in.xy) > 0.0 {
         b_in = c_given;
         c_in = b_given;
+        corners = corners_given.xzy;
     }
     let bounds_min = floor(min(min(a_in.xy, b_in.xy), c_in.xy));
     let bounds_max = ceil(max(max(a_in.xy, b_in.xy), c_in.xy));
@@ -131,6 +146,7 @@ fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_
         return;
     }
     let bias = depth_bias(a_in, b_in, c_in);
+    cover_triangle(corners.x, corners.y, corners.z, a_in, b_in, c_in, instance);
 
     let bias0 = fill_bias(p1, p2);
     let bias1 = fill_bias(p2, p0);
@@ -161,7 +177,7 @@ fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_
                 let w2 = f32(e2 - bias2) * inv_area;
                 let depth = w0 * z0 + w1 * z1 + w2 * z2;
                 // Tested before the bias, as the hardware clips before it biases.
-                if depth > 0.0 {
+                if depth > 0.0 && covered(w0, w2, w1) {
                     write_visibility(u32(y) * width + u32(x), depth + bias, id);
                 }
             }

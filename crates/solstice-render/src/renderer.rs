@@ -43,6 +43,8 @@ const MAIN_VISIBLE_CAPACITY: u64 = 1 << 21;
 /// The same for views that need no history: shadow cascades and voxelization.
 const AUX_QUEUE_CAPACITY: u64 = 1 << 22;
 const AUX_VISIBLE_CAPACITY: u64 = 1 << 21;
+/// Room for cut-out clusters, in a scene that has any, on top of the above.
+const MASKED_VISIBLE_CAPACITY: u64 = 1 << 19;
 
 /// Assignment of view slots.
 const SLOT_MAIN_FIRST: u32 = 0;
@@ -445,12 +447,18 @@ impl Renderer {
         let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
 
         let cull = CullPipelines::new(gpu);
+        let masked_capacity = if scene.has_masked {
+            MASKED_VISIBLE_CAPACITY
+        } else {
+            0
+        };
         let main_work = CullWork::new(
             gpu,
             &cull,
             "main cull",
             MAIN_QUEUE_CAPACITY,
             MAIN_VISIBLE_CAPACITY,
+            masked_capacity,
             streamer.requests_buffer(),
         );
         let aux_work = CullWork::new(
@@ -459,9 +467,10 @@ impl Renderer {
             "aux cull",
             AUX_QUEUE_CAPACITY,
             AUX_VISIBLE_CAPACITY,
+            masked_capacity,
             streamer.requests_buffer(),
         );
-        let rasterizer = Rasterizer::new(gpu);
+        let rasterizer = Rasterizer::new(gpu, scene.has_masked);
 
         // Views without occlusion culling never read the pyramid, but a binding is required.
         let no_hzb = Target::new(
@@ -666,6 +675,11 @@ impl Renderer {
     /// The weather now, part way to its target while it changes.
     pub fn weather(&self) -> Weather {
         self.clouds.weather()
+    }
+
+    /// Whether this scene has cut-out materials, and so the passes that draw them.
+    pub fn draws_masked(&self) -> bool {
+        self.rasterizer.draws_masked()
     }
 
     pub fn stats(&self) -> FrameStats {
@@ -1272,7 +1286,7 @@ impl Renderer {
             stamp: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
-            _pad2: 0.0,
+            masked_lists: 1,
         };
         self.view_slots.write(
             gpu,

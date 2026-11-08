@@ -1,8 +1,6 @@
 # Cut-out materials
 
-Status: the asset bit, import and mips are built. The renderer still draws masked materials solid
-until the rendering below lands. The costs are estimates until measured on the RTX 5080 and the
-integrated Radeon at Low.
+Status: built. Measured costs are at the end of this file.
 
 glTF `alphaMode: MASK` materials (hair cards, eyebrows, eyelashes, leaves, nets, the ship's sails)
 are drawn solid today. `solstice-import` warns and drops the alpha, so nothing later in the
@@ -99,8 +97,10 @@ geometry solid, which only matters for something like a net lying on the seabed.
 
 **Voxel GI.** Masked triangles sample coverage per voxel, at the mip that matches the voxel's
 footprint, and keep the voxel if the coverage beats a hash of its world coordinate. Over an area
-that gives the right density, it does not change between rebuilds, and it uses the base tier, which
-is all voxelization binds. Local light shadows follow from this.
+that gives roughly the right density, it does not change between rebuilds, and it uses the base
+tier, which is all voxelization binds. It is only roughly right because mip alpha is moved to keep
+coverage at the 0.5 test, not to equal coverage, so it leans towards half: sparse hair blocks a
+little too much light and dense leaves a little too little. Local light shadows follow from this.
 
 **Stability.** A hard 0.5 test on coverage-preserving mips, with no negative mip bias for the mask:
 resolve's `TEXTURE_DETAIL` sharpening stays on colour only. A stochastic threshold would resolve
@@ -109,11 +109,11 @@ is left out unless the shimmer test below shows a real problem.
 
 ## LOD
 
-No builder change is planned. Separate cards are already thinned with their area preserved
+No builder change was needed. Separate cards are already thinned with their area preserved
 (`thin.rs`), and connected hair is held back by the texture-movement error in `simplify.rs`, so
-holes stay in place until the error is too small to see. Both will be checked on a real MakeHuman
-head: triangles per level, and coverage at 5, 20 and 60 m against the finest level. If hair thins
-out, that gets fixed in the builder and reported as a change to this design.
+holes stay in place until the error is too small to see. On a real MakeHuman head, the keeper, the
+hair and brows keep their shape at 0.3 m and 2 m, and the hair is still a full head of hair at
+20 m, as the view falls from 24,000 triangles to 5,000.
 
 ## Costs
 
