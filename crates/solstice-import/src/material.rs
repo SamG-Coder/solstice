@@ -179,11 +179,10 @@ impl<'a> MaterialTable<'a> {
 
     fn convert(&mut self, source: &gltf::Material<'_>, warnings: &mut Vec<String>) -> Material {
         let name = source.name().unwrap_or("unnamed");
-        match source.alpha_mode() {
-            gltf::material::AlphaMode::Opaque => {}
-            mode => warnings.push(format!(
-                "material '{name}': alpha mode {mode:?} is drawn as opaque"
-            )),
+        if source.alpha_mode() == gltf::material::AlphaMode::Blend {
+            warnings.push(format!(
+                "material '{name}': alpha mode Blend is drawn as opaque"
+            ));
         }
         if source.emissive_texture().is_some() {
             warnings.push(format!(

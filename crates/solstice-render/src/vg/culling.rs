@@ -49,7 +49,9 @@ pub struct PassView {
     /// Towards the light, for a shadow view: a caster's error shows where its shadow lands,
     /// anywhere along the line from it away from the light.
     pub eye_light: Vec3,
-    pub _pad2: f32,
+    /// 1 if this view sends cut-out clusters through their own lists and rasterizers; 0 if it
+    /// draws them with everything else, solid or testing the mask itself.
+    pub masked_lists: u32,
 }
 
 /// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
@@ -120,8 +122,14 @@ impl PassView {
             stamp: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
-            _pad2: 0.0,
+            masked_lists: 0,
         }
+    }
+
+    /// The same view, cutting out masked clusters through their own lists.
+    pub fn cutting_out(mut self) -> Self {
+        self.masked_lists = 1;
+        self
     }
 
     /// Restricts a light's view to casters that can shadow the volume inside `planes`, given
@@ -203,9 +211,13 @@ const ARGS_QUEUE_OFFSET: u64 = 0;
 const ARGS_SOFTWARE_OFFSET: u64 = 12;
 const ARGS_DRAW_OFFSET: u64 = 24;
 const ARGS_MERGE_OFFSET: u64 = 40;
-const ARGS_SIZE: u64 = 56;
+const ARGS_MASKED_SOFTWARE_OFFSET: u64 = 56;
+const ARGS_MASKED_DRAW_OFFSET: u64 = 68;
+const ARGS_SIZE: u64 = 84;
 /// Size of `CullState` in bytes.
-const STATE_SIZE: u64 = 48;
+const STATE_SIZE: u64 = 72;
+/// Where in `CullState` the opaque lists' end is. A frame's clear stops short of it.
+const STATE_OPAQUE_END_OFFSET: u64 = 68;
 
 /// Which occlusion phase a cull runs. See the module docs of [`crate::vg`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +247,7 @@ impl CullWork {
         label: &str,
         queue_capacity: u64,
         visible_capacity: u64,
+        masked_capacity: u64,
         page_requests: &wgpu::Buffer,
     ) -> Self {
         let state = gpu.storage_buffer(
@@ -244,7 +257,16 @@ impl CullWork {
         );
         let queue_a = gpu.storage_buffer(label, queue_capacity * 8, wgpu::BufferUsages::empty());
         let queue_b = gpu.storage_buffer(label, queue_capacity * 8, wgpu::BufferUsages::empty());
-        let visible = gpu.storage_buffer(label, visible_capacity * 8, wgpu::BufferUsages::empty());
+        let visible = gpu.storage_buffer(
+            label,
+            (visible_capacity + masked_capacity) * 8,
+            wgpu::BufferUsages::empty(),
+        );
+        gpu.queue.write_buffer(
+            &state,
+            STATE_OPAQUE_END_OFFSET,
+            bytemuck::bytes_of(&(visible_capacity as u32)),
+        );
         let args = gpu.storage_buffer(label, ARGS_SIZE, wgpu::BufferUsages::INDIRECT);
 
         let bind = |queue: &wgpu::Buffer, retry: &wgpu::Buffer| {
@@ -294,6 +316,14 @@ impl CullWork {
 
     pub const fn draw_args_offset() -> u64 {
         ARGS_DRAW_OFFSET
+    }
+
+    pub const fn masked_software_args_offset() -> u64 {
+        ARGS_MASKED_SOFTWARE_OFFSET
+    }
+
+    pub const fn masked_draw_args_offset() -> u64 {
+        ARGS_MASKED_DRAW_OFFSET
     }
 
     /// Offset of the draw arguments for merging software-rasterized depth into a depth map:
@@ -382,7 +412,12 @@ impl CullStats {
                 .expect("the map has completed");
             let words: &[u32] = bytemuck::cast_slice(&data);
             // Word positions follow `CullState` in `vg/pass_view.wgsl`.
-            let (software, hardware, triangles, dropped) = (words[4], words[5], words[8], words[9]);
+            let (software, hardware, triangles, dropped) = (
+                words[4] + words[12],
+                words[5] + words[13],
+                words[8],
+                words[9],
+            );
             self.shared
                 .clusters
                 .store(software + hardware, Ordering::Release);
@@ -517,7 +552,7 @@ impl CullPipelines {
         phase: CullPhase,
     ) {
         if phase == CullPhase::First {
-            encoder.clear_buffer(&work.state, 0, None);
+            encoder.clear_buffer(&work.state, 0, Some(STATE_OPAQUE_END_OFFSET));
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cull"),
@@ -593,6 +628,7 @@ mod tests {
                 stamp,
                 receiver_planes,
                 eye_light,
+                masked_lists,
             ]
         );
     }

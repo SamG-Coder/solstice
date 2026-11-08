@@ -11,12 +11,11 @@ struct VertexOutput {
     @location(0) @interpolate(flat) id: u32,
 }
 
-fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
+fn cluster_vertex(vertex_index: u32, visible_index: u32) -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4f(0.0);
     out.id = 0u;
 
-    let visible_index = arrayLength(&visible) - 1u - (state.hw_base + instance_index);
     let entry = visible[visible_index];
     let cluster = clusters[entry.cluster];
     let triangle = vertex_index / 3u;
@@ -25,10 +24,10 @@ fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     }
 
     let instance = instances[entry.instance];
-    let packed_triangle = triangles[cluster.triangle_offset + triangle];
+    let packed_triangle = pool[cluster.triangle_offset + triangle];
     var clip: array<vec4f, 3>;
     for (var corner = 0u; corner < 3u; corner++) {
-        let vertex = vertices[cluster.vertex_offset + local_vertex(packed_triangle, corner)];
+        let vertex = load_vertex(cluster.vertex_offset + local_vertex(packed_triangle, corner));
         let world = transform_point(instance, decode_position(instance, vertex));
         clip[corner] = view.raster_view_proj * vec4f(world, 1.0);
     }
@@ -46,13 +45,18 @@ fn cluster_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     return out;
 }
 
+// The opaque hardware range grows down from where the opaque lists end.
+fn opaque_hardware_entry(instance_index: u32) -> u32 {
+    return state.opaque_end - 1u - (state.hw_base + instance_index);
+}
+
 @vertex
 fn vs_visibility(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> VertexOutput {
-    return cluster_vertex(v, i);
+    return cluster_vertex(v, opaque_hardware_entry(i));
 }
 
 // Depth-only entry point, used by shadow maps.
 @vertex
 fn vs_depth(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> @builtin(position) vec4f {
-    return cluster_vertex(v, i).position;
+    return cluster_vertex(v, opaque_hardware_entry(i)).position;
 }

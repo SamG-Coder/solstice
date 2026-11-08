@@ -96,7 +96,8 @@ const INSTANCE_TWO_SIDED: u32 = 0x80000000u;
 const INSTANCE_MOVABLE: u32 = 0x40000000u;
 const INSTANCE_HIDDEN: u32 = 0x20000000u;
 const INSTANCE_STAYS_IN_GI: u32 = 0x10000000u;
-const INSTANCE_MATERIAL_MASK: u32 = 0x0fffffffu;
+const INSTANCE_MASKED: u32 = 0x08000000u;
+const INSTANCE_MATERIAL_MASK: u32 = 0x07ffffffu;
 
 fn instance_material(i: Instance) -> u32 {
     return i.material & INSTANCE_MATERIAL_MASK;
@@ -112,6 +113,10 @@ fn instance_hidden(i: Instance) -> bool {
 
 fn instance_stays_in_gi(i: Instance) -> bool {
     return (i.material & INSTANCE_STAYS_IN_GI) != 0u;
+}
+
+fn instance_masked(i: Instance) -> bool {
+    return (i.material & INSTANCE_MASKED) != 0u;
 }
 
 fn instance_two_sided(i: Instance) -> bool {

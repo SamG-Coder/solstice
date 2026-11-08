@@ -29,6 +29,14 @@ struct Args {
     merge_instance_count: u32,
     merge_first_vertex: u32,
     merge_first_instance: u32,
+    // The same two rasterizations again, for the newly visible cut-out clusters.
+    masked_software_x: u32,
+    masked_software_y: u32,
+    masked_software_z: u32,
+    masked_draw_vertex_count: u32,
+    masked_draw_instance_count: u32,
+    masked_draw_first_vertex: u32,
+    masked_draw_first_instance: u32,
 }
 
 const MAX_CLUSTER_TRIANGLES: u32 = 128u;
@@ -60,8 +68,15 @@ fn finish() {
     args.draw_instance_count = atomicLoad(&state.hw_count) - state.hw_base;
     args.draw_first_vertex = 0u;
     args.draw_first_instance = 0u;
+    args.masked_software_x = min(atomicLoad(&state.masked_sw_count) - state.masked_sw_base, MAX_GROUPS);
+    args.masked_software_y = 1u;
+    args.masked_software_z = 1u;
+    args.masked_draw_vertex_count = MAX_CLUSTER_TRIANGLES * 3u;
+    args.masked_draw_instance_count = atomicLoad(&state.masked_hw_count) - state.masked_hw_base;
+    args.masked_draw_first_vertex = 0u;
+    args.masked_draw_first_instance = 0u;
     args.merge_vertex_count = 3u;
-    args.merge_instance_count = min(args.software_x, 1u);
+    args.merge_instance_count = min(args.software_x + args.masked_software_x, 1u);
     args.merge_first_vertex = 0u;
     args.merge_first_instance = 0u;
 }
@@ -77,4 +92,6 @@ fn begin_second_phase() {
     atomicStore(&state.retry_count, 0u);
     state.sw_base = atomicLoad(&state.sw_count);
     state.hw_base = atomicLoad(&state.hw_count);
+    state.masked_sw_base = atomicLoad(&state.masked_sw_count);
+    state.masked_hw_base = atomicLoad(&state.masked_hw_count);
 }

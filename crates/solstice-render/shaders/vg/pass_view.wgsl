@@ -37,6 +37,9 @@ struct PassView {
     receiver_planes: array<vec4f, 6>,
     // Towards the light, for a shadow view.
     eye_light: vec3f,
+    // 1 if this view sends cut-out clusters through their own lists and rasterizers; 0 if it
+    // draws them with the rest, as solid or testing the mask itself.
+    masked_lists: u32,
 }
 
 // Twins of `InstanceFilter` in vg/culling.rs.
@@ -64,6 +67,14 @@ struct CullState {
     // Entries of the visible list claimed so far, from both ends together.
     reserved: atomic<u32>,
     _pad2: u32,
+    // The cut-out clusters' lists, which fill the end of the visible list from `opaque_end` on.
+    masked_sw_count: atomic<u32>,
+    masked_hw_count: atomic<u32>,
+    masked_sw_base: u32,
+    masked_hw_base: u32,
+    masked_reserved: atomic<u32>,
+    // Where the opaque lists stop. Set when the list is made, and kept by each frame's clear.
+    opaque_end: u32,
 }
 
 // Read by the raster passes, after culling has finished.
@@ -80,4 +91,10 @@ struct CullStateRead {
     dropped: u32,
     reserved: u32,
     _pad2: u32,
+    masked_sw_count: u32,
+    masked_hw_count: u32,
+    masked_sw_base: u32,
+    masked_hw_base: u32,
+    masked_reserved: u32,
+    opaque_end: u32,
 }

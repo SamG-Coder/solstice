@@ -145,6 +145,8 @@ pub const MOVING_SLOTS: u32 = CASCADE_COUNT as u32 + 1;
 
 /// Shadow map resources and passes.
 pub struct ShadowMaps {
+    /// Draws cut-out clusters into a map, in a scene that has any.
+    masked_pipeline: Option<wgpu::RenderPipeline>,
     pub array_view: wgpu::TextureView,
     pub comparison_sampler: wgpu::Sampler,
     pub uniform: wgpu::Buffer,
@@ -246,7 +248,62 @@ impl ShadowMaps {
                 cache: None,
             });
 
+        let masked_pipeline = rasterizer
+            .masked_depth_parts()
+            .map(|(module, mask_layout)| {
+                let layout = gpu
+                    .device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("masked shadow"),
+                        bind_group_layouts: &[
+                            Some(&rasterizer.raster_layout),
+                            None,
+                            Some(mask_layout),
+                        ],
+                        immediate_size: 0,
+                    });
+                gpu.device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("masked shadow"),
+                        layout: Some(&layout),
+                        vertex: wgpu::VertexState {
+                            module,
+                            entry_point: Some("vs_masked"),
+                            compilation_options: Default::default(),
+                            buffers: &[],
+                        },
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            front_face: wgpu::FrontFace::Ccw,
+                            // Facing is decided per instance in `raster_hw.wgsl`.
+                            cull_mode: None,
+                            ..Default::default()
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: FORMAT,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(wgpu::CompareFunction::Less),
+                            stencil: Default::default(),
+                            bias: wgpu::DepthBiasState {
+                                constant: 0,
+                                slope_scale: 1.5,
+                                clamp: 0.0,
+                            },
+                        }),
+                        multisample: Default::default(),
+                        fragment: Some(wgpu::FragmentState {
+                            module,
+                            entry_point: Some("fs_masked_depth"),
+                            compilation_options: Default::default(),
+                            targets: &[],
+                        }),
+                        multiview_mask: None,
+                        cache: None,
+                    })
+            });
+
         Self {
+            masked_pipeline,
             array_view,
             comparison_sampler: gpu.device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("shadow comparison"),
@@ -385,6 +442,7 @@ impl ShadowMaps {
             .shadowing(&planes, sun_direction);
             // Small clusters go to the software rasterizer, as in the main view.
             view.allow_software = 1;
+            view = view.cutting_out();
             view.stamp = self.software_stamp;
             self.software_stamp += 1;
             self.drawn[cascade] = Some(Drawn {
@@ -428,7 +486,8 @@ impl ShadowMaps {
                 MOVING_RESOLUTION as f32 / (2.0 * radius),
                 lod_threshold,
             ))
-            .drawing(InstanceFilter::Movable);
+            .drawing(InstanceFilter::Movable)
+            .cutting_out();
             slots.write(gpu, first_moving_slot + cascade as u32, &view);
         }
         // One cull serves every touched cascade, since the traversal's fixed cost outweighs the
@@ -502,6 +561,7 @@ impl ShadowMaps {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
+            self.draw_masked(&mut pass, raster, work);
             rasterizer.merge_depth(&mut pass, raster, slot, work, &self.software_depth);
         }
 
@@ -541,6 +601,17 @@ impl ShadowMaps {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
+            self.draw_masked(&mut pass, raster, work);
+        }
+    }
+
+    /// Adds the cut-out clusters the most recent cull sent to hardware to `pass`, which has
+    /// the view's bind group set already.
+    fn draw_masked(&self, pass: &mut wgpu::RenderPass, raster: &RasterBindings, work: &CullWork) {
+        if let (Some(pipeline), Some(mask)) = (&self.masked_pipeline, &raster.mask) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(2, mask, &[]);
+            pass.draw_indirect(work.args(), CullWork::masked_draw_args_offset());
         }
     }
 
@@ -591,6 +662,7 @@ fn moving_cull_view(
         lod_threshold,
     )
     .drawing(InstanceFilter::Movable)
+    .cutting_out()
 }
 
 /// The up vector of a view along the light: anything but the light's own direction.
