@@ -23,6 +23,7 @@
 pub mod grid;
 pub mod sea;
 pub mod spectrum;
+pub mod surface;
 pub mod waves;
 
 pub use sea::Sea;

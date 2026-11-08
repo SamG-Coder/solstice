@@ -169,8 +169,8 @@ pub struct Viewpoint {
 pub struct Sea {
     /// Height of the calm surface, in metres.
     pub level: f32,
-    /// The ocean in its text form, as `solstice_render::Ocean::parse` reads it, so a scene can
-    /// carry an ocean of its own.
+    /// The name of a built-in ocean, such as `coastal`, or a whole ocean in its text form, as
+    /// `solstice_render::Ocean::parse` reads it, so a scene can carry an ocean of its own.
     pub ocean: String,
 }
 

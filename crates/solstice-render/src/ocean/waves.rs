@@ -11,6 +11,10 @@ use super::Ocean;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
 use crate::shaders;
 use bytemuck::{Pod, Zeroable};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Numbers each set of wave textures, so that what binds them knows when they are replaced.
+static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub const CASCADES: u32 = 3;
 
@@ -139,6 +143,7 @@ pub struct OceanWaves {
     seed: u32,
     frame: usize,
     uniform_data: OceanUniform,
+    generation: u64,
     /// The stretch below which the surface breaks into foam.
     pub(crate) foam_stretch: f32,
 }
@@ -340,6 +345,7 @@ impl OceanWaves {
             seed: 0x5eed,
             frame: 0,
             foam_stretch: FOAM_STRETCH,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             uniform_data: OceanUniform {
                 sizes: [CASCADE_SIZES[0], CASCADE_SIZES[1], CASCADE_SIZES[2], 0.0],
                 bands: [first, second, 0.0, 0.0],
@@ -357,6 +363,11 @@ impl OceanWaves {
     /// Texels across each cascade's tile.
     pub fn size(&self) -> u32 {
         self.size
+    }
+
+    /// Different for every set of wave textures ever made, so bind groups know when to remake.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// How far through the sea's repeat it is, 0..1.
@@ -765,10 +776,9 @@ mod tests {
                         for x in 0..width {
                             let at =
                                 |dx: usize, dz: usize| above[(2 * z + dz) * 2 * width + 2 * x + dx];
-                            for c in 0..4 {
+                            for (c, found) in here[z * width + x].iter().copied().enumerate() {
                                 let mean =
                                     (at(0, 0)[c] + at(1, 0)[c] + at(0, 1)[c] + at(1, 1)[c]) / 4.0;
-                                let found = here[z * width + x][c];
                                 assert!(
                                     (found - mean).abs() <= mean.abs() * 2.0e-3 + 1.0e-4,
                                     "level {level}, cascade {cascade}, ({x}, {z}), channel {c}: {found} against {mean}"

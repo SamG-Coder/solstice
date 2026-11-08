@@ -325,6 +325,13 @@ impl LayoutBuilder {
         )
     }
 
+    pub fn depth_texture(self) -> Self {
+        self.texture_of(
+            wgpu::TextureSampleType::Depth,
+            wgpu::TextureViewDimension::D2,
+        )
+    }
+
     pub fn depth_texture_array(self) -> Self {
         self.texture_of(
             wgpu::TextureSampleType::Depth,

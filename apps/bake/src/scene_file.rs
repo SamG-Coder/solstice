@@ -18,7 +18,7 @@
 use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
-use solstice_asset::{Instance, Light, Material, SceneAsset};
+use solstice_asset::{Instance, Light, Material, SceneAsset, Sea};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
 use solstice_procgen::noise::fbm;
@@ -40,6 +40,11 @@ enum Command {
     Water {
         height: f32,
         color: [f32; 3],
+    },
+    /// An open sea at `height`: a built-in ocean's name, or a `.ocean` file beside the scene.
+    Ocean {
+        height: f32,
+        ocean: String,
     },
     Camera(Viewpoint),
     Light(Light),
@@ -89,6 +94,13 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
         "texture_size" => {
             expect(1)?;
             Command::TextureSize(number(0)? as u32)
+        }
+        "ocean" => {
+            expect(2)?;
+            Command::Ocean {
+                height: number(0)?,
+                ocean: values[1].to_string(),
+            }
         }
         "water" => {
             expect(4)?;
@@ -368,6 +380,20 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 terrain = Some((size, cells, height, shore_x));
             }
             Some(Command::Water { height, color }) => water = Some((height, color)),
+            Some(Command::Ocean { height, ocean }) => {
+                // A file's text travels with the scene; a built-in ocean goes by its name.
+                let ocean = if ocean.ends_with(".ocean") {
+                    let file = base.join(&ocean);
+                    std::fs::read_to_string(&file)
+                        .map_err(|e| format!("{}: {e}", file.display()))?
+                } else {
+                    ocean
+                };
+                scene.sea = Some(Sea {
+                    level: height,
+                    ocean,
+                });
+            }
             Some(Command::Camera(viewpoint)) => scene.viewpoint = Some(viewpoint),
             Some(Command::Light(light)) => scene.lights.push(light),
             Some(Command::Model {
@@ -546,6 +572,14 @@ mod tests {
                 color: [0.1, 0.2, 0.3],
             })
         );
+        assert_eq!(
+            parse_line("ocean -0.6 coastal").unwrap(),
+            Some(Command::Ocean {
+                height: -0.6,
+                ocean: "coastal".to_string(),
+            })
+        );
+        assert!(parse_line("ocean -0.6").is_err());
     }
 
     #[test]

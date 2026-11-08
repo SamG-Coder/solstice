@@ -130,6 +130,8 @@ pub enum DebugView {
     DiffuseGi = 7,
     Reflections = 8,
     Voxels = 9,
+    /// The sea's normals, where it is drawn.
+    Ocean = 10,
 }
 
 impl DebugView {
@@ -146,6 +148,7 @@ impl DebugView {
             "gi" => Self::DiffuseGi,
             "reflections" => Self::Reflections,
             "voxels" => Self::Voxels,
+            "ocean" => Self::Ocean,
             _ => return None,
         })
     }

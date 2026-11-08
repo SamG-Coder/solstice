@@ -1,0 +1,125 @@
+// The water pass: where the sea's surface is nearer than the opaque scene, shades it and puts it
+// over the lit scene, and gives the water's own depth and motion to everything after. Elsewhere
+// the lit scene passes through unchanged.
+//
+// The shading is the first, simple form (docs/ocean.md, step 2): the sky reflected by Fresnel's
+// law, the sun's highlight, and the glow of the water's body from its own absorption and
+// scattering, all through the same haze as everything else. Refraction, shadows on the water and
+// foam come in later steps.
+
+#include "common/environment.wgsl"
+#include "common/brdf.wgsl"
+#include "ocean/surface_params.wgsl"
+
+// The opaque scene, lit, with its depth and motion.
+@group(0) @binding(0) var lit: texture_2d<f32>;
+@group(0) @binding(1) var opaque_depth: texture_2d<f32>;
+@group(0) @binding(2) var opaque_motion: texture_2d<f32>;
+// The water layer: its depth, and where its water lay on the calm sea.
+@group(0) @binding(3) var water_depth: texture_depth_2d;
+@group(0) @binding(4) var water_calm: texture_2d<f32>;
+// The waves' slopes and stretch, per cascade.
+@group(0) @binding(5) var derivatives: texture_2d_array<f32>;
+@group(0) @binding(6) var wave_sampler: sampler;
+@group(0) @binding(7) var<uniform> surface: SurfaceParams;
+@group(0) @binding(8) var out_color: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(9) var out_depth: texture_storage_2d<r32float, write>;
+@group(0) @binding(10) var out_motion: texture_storage_2d<rg32float, write>;
+
+const DEBUG_OCEAN: u32 = 10u;
+// Water's reflectance looking straight down: from its index of refraction, 1.33.
+const WATER_F0: f32 = 0.02;
+// Roughness of the water's surface between its drawn waves, for the sun's highlight. The
+// spectrum's finer ripples will set this properly (step 3).
+const WATER_ROUGHNESS: f32 = 0.08;
+
+// The surface's normal at `calm`, from every cascade's slopes at the level whose texels match
+// `footprint` metres.
+fn wave_normal(calm: vec2f, footprint: f32) -> vec3f {
+    var d = vec4f(0.0);
+    for (var cascade = 0u; cascade < 3u; cascade++) {
+        let tile = surface.sizes[cascade];
+        let level = max(log2(footprint / (tile / surface.grid.x)), 0.0);
+        d += textureSampleLevel(derivatives, wave_sampler, calm / tile, cascade, level);
+    }
+    // Slopes of the displaced surface: the horizontal displacement stretches or squeezes them.
+    let choppiness = surface.grid.y;
+    let slope = vec2f(d.x / (1.0 + choppiness * d.z), d.y / (1.0 + choppiness * d.w));
+    return normalize(vec3f(-slope.x, 1.0, -slope.y));
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    let size = vec2u(frame.viewport);
+    if any(id.xy >= size) {
+        return;
+    }
+    let pixel = vec2i(id.xy);
+    let behind = textureLoad(lit, pixel, 0);
+    let scene_depth = textureLoad(opaque_depth, pixel, 0).r;
+    let water = textureLoad(water_depth, pixel, 0);
+    // Reversed depth: nearer is larger. No water here, or something stands in front of it.
+    if water <= scene_depth {
+        textureStore(out_color, pixel, behind);
+        textureStore(out_depth, pixel, vec4f(scene_depth, 0.0, 0.0, 0.0));
+        textureStore(out_motion, pixel, textureLoad(opaque_motion, pixel, 0));
+        return;
+    }
+
+    let center = vec2f(id.xy) + vec2f(0.5);
+    let world = reconstruct_world(frame, center, water);
+    let to_camera = frame.camera_position - world;
+    let distance = length(to_camera);
+    let view = to_camera / distance;
+    // How much sea one pixel covers: wider at grazing angles.
+    let next = reconstruct_world(frame, center + vec2f(1.0, 0.0), water);
+    let footprint = length(next - world) / sqrt(max(abs(view.y), 0.02));
+    let calm = textureLoad(water_calm, pixel, 0).xy;
+    var normal = wave_normal(calm, footprint);
+    // Waves turned away from the camera show their backs only at grazing angles; lean them back
+    // into view, as the waves in front would hide them.
+    let facing = dot(normal, view);
+    if facing < 0.02 {
+        normal = normalize(normal + view * (0.02 - facing));
+    }
+
+    var color: vec3f;
+    if frame.debug_mode == DEBUG_OCEAN {
+        color = normal * 0.5 + vec3f(0.5);
+    } else {
+        let n_dot_v = max(dot(normal, view), 1.0e-3);
+        let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
+        let reflected = sky_radiance(toward_horizon(reflect(-view, normal)));
+
+        // The sun's highlight off the waves.
+        let sun = frame.sun_direction;
+        let n_dot_l = dot(normal, sun);
+        var highlight = vec3f(0.0);
+        if n_dot_l > 0.0 {
+            let a = WATER_ROUGHNESS * WATER_ROUGHNESS;
+            let h = normalize(view + sun);
+            let specular = d_ggx(max(dot(normal, h), 0.0), a) * v_smith(n_dot_v, n_dot_l, a)
+                * f_schlick(vec3f(WATER_F0), max(dot(view, h), 0.0));
+            highlight = specular * n_dot_l * sun_irradiance_at(world);
+        }
+
+        // Light scattered back out of the water's body: its share of what is not absorbed, of
+        // the light from the sky and sun that gets in.
+        let extinction = surface.absorption.rgb + surface.scattering.rgb;
+        let albedo = surface.scattering.rgb / max(extinction, vec3f(1.0e-4));
+        let skylight = clear_sky_radiance(vec3f(0.0, 1.0, 0.0)) * PI;
+        let sunlight = sun_irradiance_at(world) * max(sun.y, 0.0);
+        let body = albedo * (skylight + sunlight) / PI * 0.5;
+
+        color = mix(body, reflected, fresnel) + highlight;
+        color = aerial_perspective(color, world, view, distance);
+    }
+
+    let prev_clip = frame.prev_view_proj * vec4f(world, 1.0);
+    let current_clip = frame.unjittered_view_proj * vec4f(world, 1.0);
+    let motion = (prev_clip.xy / prev_clip.w - current_clip.xy / current_clip.w) * vec2f(0.5, -0.5);
+
+    textureStore(out_color, pixel, vec4f(color, 1.0));
+    textureStore(out_depth, pixel, vec4f(water, 0.0, 0.0, 0.0));
+    textureStore(out_motion, pixel, vec4f(motion, 0.0, 0.0));
+}

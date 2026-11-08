@@ -6,7 +6,7 @@
 
 texture_size 2048
 terrain 900 1024 0.3 52
-water -0.6 0.015 0.06 0.075
+ocean -0.6 coastal
 camera 66 1.5 -41 2.31 0.03
 
 # ---- Towers on the four corners. Each is wider than the walls, which hides the joints.

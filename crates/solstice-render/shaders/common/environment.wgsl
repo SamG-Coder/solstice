@@ -59,6 +59,34 @@ fn toward_horizon(direction: vec3f) -> vec3f {
     return normalize(vec3f(direction.x, max(direction.y, 0.003), direction.z));
 }
 
+// Distance over which distant objects dissolve into the air, as extinction per metre.
+const HAZE: f32 = 0.0011;
+
+// `color` of a surface at `world`, `distance` from the camera along `view` (towards the camera),
+// seen through the air between: distant things fade towards the sky colour behind them.
+fn aerial_perspective(color: vec3f, world: vec3f, view: vec3f, distance: f32) -> vec3f {
+    let transmittance = exp(-distance * HAZE);
+    // How far into the haze this is: nearby haze glows with light from all around, but over a
+    // long path the air takes the colour of the sky at the horizon behind the object.
+    let far = sq(1.0 - transmittance);
+    // Sampled above the horizon and partly desaturated: the air between here and a distant
+    // object scatters light from all around, not only the long path to the horizon line.
+    let haze_direction = normalize(vec3f(-view.x, max(-view.y, 0.2), -view.z));
+    // Haze is the air's own glow, so it comes from the clear sky, not the clouds in it. Where
+    // clouds shade the air between here and the surface, less sunlight scatters into it.
+    let shade = mix(0.35, 1.0, cloud_shadow((world + frame.camera_position) * 0.5));
+    let haze_sky = clear_sky_radiance(haze_direction) * shade;
+    var haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
+    // That direction can land on the glow around the sun even when looking down at nearby ground,
+    // whose radiance is so high that this small share of it shows as smoke across shadows. So the
+    // haze is limited relative to the open sky on the side away from the sun.
+    let away_from_sun = normalize(vec3f(-frame.sun_direction.x, 0.2, -frame.sun_direction.z));
+    let haze_limit = luminance(clear_sky_radiance(away_from_sun)) * shade * 2.0;
+    haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
+    haze_color = mix(haze_color, clear_sky_radiance(toward_horizon(-view)) * shade, far);
+    return mix(haze_color, color, transmittance);
+}
+
 // Radiance of the sky towards `direction`, clouds included, excluding the sun disc.
 fn sky_radiance(direction: vec3f) -> vec3f {
     let cloud = textureSampleLevel(cloud_sky, repeat_sampler, sky_view_uv(direction), 0.0);

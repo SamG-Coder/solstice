@@ -152,7 +152,12 @@ mod native {
                 ),
             };
             renderer.set_weather(options.weather, 0.0);
-            renderer.set_ocean(options.ocean, 0.0);
+            if options.ocean.is_some() {
+                renderer.set_ocean(options.ocean, 0.0);
+            }
+            if let Some(level) = options.sea_level {
+                renderer.set_sea_level(level);
+            }
             (renderer, reader)
         }
     }
@@ -184,8 +189,10 @@ mod native {
         weather: Weather,
         /// When set, the sun and moon follow the time of day instead of `environment`.
         clock: Option<DayClock>,
-        /// An open sea to run, by name or file. Until the sea is drawn, only its waves run.
+        /// An open sea, by name or file, and the level of its calm surface. Scenes with a sea of
+        /// their own bring both.
         ocean: Option<Ocean>,
+        sea_level: Option<f32>,
     }
 
     /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
@@ -216,6 +223,7 @@ mod native {
             stability: false,
             weather: Weather::default(),
             ocean: None,
+            sea_level: None,
             clock: None,
         };
         // The time of day, built up from its options and made at the end.
@@ -296,6 +304,10 @@ mod native {
                             Ocean::parse(&text).map_err(|e| format!("{name}: {e}"))?
                         }
                     });
+                }
+                "--sea-level" => {
+                    options.sea_level =
+                        Some(value()?.parse().map_err(|e| format!("--sea-level: {e}"))?);
                 }
                 "--weather" => {
                     let name = value()?;
@@ -617,7 +629,12 @@ mod native {
 
         let mut renderer = Renderer::new(&gpu, scene, CAPTURE_FORMAT, options.settings);
         renderer.set_weather(options.weather, 0.0);
-        renderer.set_ocean(options.ocean, 0.0);
+        if options.ocean.is_some() {
+            renderer.set_ocean(options.ocean, 0.0);
+        }
+        if let Some(level) = options.sea_level {
+            renderer.set_sea_level(level);
+        }
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),
             size: wgpu::Extent3d {

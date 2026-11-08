@@ -6,8 +6,8 @@ use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Environment, Gpu, Place, Quality, Renderer, RendererSettings, StreamRequest,
-    StreamingBudget, TimeOfDay, Weather,
+    Camera, DebugView, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
+    StreamRequest, StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
 
@@ -1274,5 +1274,155 @@ fn a_moonless_night_is_full_of_stars() {
     assert!(
         background < 60.0,
         "the night sky is too bright for stars to show: {background}"
+    );
+}
+
+/// The ball on its floor with an open sea at `sea_level`, seen through `debug` (the sea's
+/// normals for coverage, or the final image), after enough frames for its waves to run.
+fn render_sea(
+    gpu: &Gpu,
+    camera: &Camera,
+    ocean: &str,
+    sea_level: f32,
+    debug: DebugView,
+    quality: Quality,
+    size: u32,
+) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut settings = RendererSettings::default();
+    settings.apply_quality(quality);
+    settings.debug_view = debug;
+    let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
+    renderer.set_ocean(Some(Ocean::by_name(ocean).unwrap()), 0.0);
+    renderer.set_sea_level(sea_level);
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        ..Default::default()
+    };
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+    for _ in 0..30 {
+        renderer.render(gpu, camera, &environment, &view, (size, size), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, size);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    // SOLSTICE_TEST_IMAGES=DIR keeps each image, to see what a failing test saw.
+    if let Ok(dir) = std::env::var("SOLSTICE_TEST_IMAGES") {
+        let name = format!(
+            "{dir}/sea_{:.0}_{:.0}_{:.0}_{debug:?}.ppm",
+            camera.position.x, camera.position.y, camera.position.z
+        );
+        let mut ppm = format!(
+            "P6
+{size} {size}
+255
+"
+        )
+        .into_bytes();
+        ppm.extend(pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+        std::fs::write(name, ppm).unwrap();
+    }
+    pixels
+}
+
+/// Whether a pixel of the ocean debug view shows the sea: a normal leaning up, so green
+/// high, and red and blue within a tilt of 0.75 of the middle, as steep wave faces have. The
+/// sky and the white ball clip to white, which this is not.
+fn shows_sea(pixel: &[u8]) -> bool {
+    let near_middle = |c: u8| (32..=223).contains(&c);
+    pixel[1] > 180 && near_middle(pixel[0]) && near_middle(pixel[2])
+}
+
+#[test]
+fn the_sea_covers_everything_below_the_horizon() {
+    let Some(gpu) = request_gpu() else { return };
+    // The sea stands 5 m up. From just above the water, from a cliff, from far out at sea and from high above: every
+    // pixel below the horizon shows sea, so the surface has no cracks or holes, whatever the
+    // patches' sizes and however far they reach. The ball stands near the origin, so these
+    // look away from it.
+    let size = 128;
+    for (quality, position, pitch) in [
+        (Quality::High, Vec3::new(30.0, 6.5, 0.0), -0.15),
+        (Quality::High, Vec3::new(40.0, 30.0, 3.0), -0.5),
+        (Quality::Low, Vec3::new(5_000.0, 11.0, -3_000.0), -0.1),
+        (Quality::Medium, Vec3::new(60.0, 400.0, 0.0), -1.2),
+    ] {
+        let camera = Camera {
+            position,
+            yaw: -1.57,
+            pitch,
+            ..Default::default()
+        };
+        // The open ocean's swell, well above the floor, which its troughs must not reach.
+        let pixels = render_sea(&gpu, &camera, "ocean", 5.0, DebugView::Ocean, quality, size);
+        // Rows below the horizon, which sits at the screen row of the direction straight
+        // out, ignoring the few rows the waves themselves raise and lower.
+        let tan_half = (camera.fov_y * 0.5).tan();
+        // Pitched down, the horizon is above the middle of the view.
+        let horizon = ((0.5 - 0.5 * (-pitch).tan() / tan_half) * size as f32).max(0.0) as u32;
+        let first = (horizon + 6).min(size);
+        let mut missing = 0;
+        for y in first..size {
+            for x in 0..size {
+                let i = ((y * size + x) * 4) as usize;
+                if !shows_sea(&pixels[i..i + 4]) {
+                    missing += 1;
+                }
+            }
+        }
+        let checked = (size - first) * size;
+        assert!(
+            checked > 1000,
+            "{position}: only {checked} pixels below the horizon"
+        );
+        assert_eq!(
+            missing, 0,
+            "{position}, {quality:?}: {missing} of {checked} pixels show no sea"
+        );
+    }
+}
+
+#[test]
+fn what_stands_out_of_the_sea_is_not_covered_by_it() {
+    let Some(gpu) = request_gpu() else { return };
+    // The ball's top stands out of calm water half way up it, a harbour's, without swell: its
+    // upper half shows the ball, not water.
+    let camera = Camera {
+        position: Vec3::new(0.0, 1.6, 4.0),
+        ..Default::default()
+    };
+    let size = 128;
+    let pixels = render_sea(
+        &gpu,
+        &camera,
+        "murky",
+        1.0,
+        DebugView::Ocean,
+        Quality::High,
+        size,
+    );
+    let at = |x: u32, y: u32| {
+        let i = ((y * size + x) * 4) as usize;
+        pixels[i..i + 4].to_vec()
+    };
+    // The ball's upper half, above the water, and the sea in front of it, low in the view.
+    assert!(
+        !shows_sea(&at(64, 52)),
+        "the ball is drawn as water: {:?}",
+        at(64, 52)
+    );
+    assert!(
+        shows_sea(&at(64, 120)),
+        "the sea in front is missing: {:?}",
+        at(64, 120)
     );
 }

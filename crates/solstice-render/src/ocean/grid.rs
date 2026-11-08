@@ -66,7 +66,7 @@ impl Patch {
 /// with `cells` across each whole patch: an even number.
 pub fn select(camera: Vec3, sea_level: f32, cells: u32) -> Vec<Patch> {
     assert!(
-        cells >= 4 && cells % 4 == 0,
+        cells >= 4 && cells.is_multiple_of(4),
         "patches need a multiple of four cells, not {cells}"
     );
     let mut patches = Vec::new();
