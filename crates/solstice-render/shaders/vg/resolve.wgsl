@@ -8,6 +8,7 @@
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
 #include "common/frame.wgsl"
+#include "common/wetness.wgsl"
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> vis_depth: array<u32>;
@@ -203,6 +204,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if (material.flags & MATERIAL_TWO_SIDED) != 0u && dot(face, frame.camera_position - world0) < 0.0 {
         normal = -normal;
     }
+    // The geometry's own normal, before any normal map, for water to pool against.
+    let surface_normal = normal;
 
     var albedo = material.base_color.rgb;
     var roughness = material.roughness;
@@ -244,6 +247,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
     }
 
+    // Water on the surface, where it has been wetted (docs/wetness.md).
+    let wetness = wetness_at(world);
+    let wet = wet_surface(albedo, roughness, metallic, normal, surface_normal, cavity, wetness, submerged_at(world));
+    albedo = wet.albedo;
+    roughness = wet.roughness;
+    normal = wet.normal;
+
     // Motion, in UV units from this pixel to where it was last frame.
     let local = interp3(b, local0, local1, local2);
     let prev_world = transform_point_prev(instance, local);
@@ -275,6 +285,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         case DEBUG_NORMALS: {
             emissive = normal * 0.5 + vec3f(0.5);
+        }
+        case DEBUG_WETNESS: {
+            let shade = max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);
+            emissive = mix(vec3f(0.12), vec3f(0.1, 0.45, 1.0), wet.wetness) * shade;
         }
         default: {}
     }

@@ -18,6 +18,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "common/math.wgsl",
     "common/scene.wgsl",
     "common/frame.wgsl",
+    "common/wetness.wgsl",
     "common/brdf.wgsl",
     "common/atmosphere.wgsl",
     "clouds/params.wgsl",

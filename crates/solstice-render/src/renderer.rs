@@ -2,7 +2,7 @@
 
 use crate::clouds::{CloudBindings, Clouds, Weather};
 use crate::frame::{
-    jitter_offset, jitter_projection, Camera, DebugView, Environment, FrameUniform,
+    jitter_offset, jitter_projection, Camera, DebugView, Environment, FrameUniform, NO_SEA,
 };
 use crate::gi::{GiVolume, ScreenGi, ScreenGiBindings, LEVEL_COUNT};
 use crate::gpu::{Gpu, Target};
@@ -938,7 +938,11 @@ impl Renderer {
             star_equinox: environment.star_equinox,
             frame_seconds: self.frame_seconds,
             sun_disc: environment.sun_disc.unwrap_or(environment.sun_direction),
-            _pad1: 0.0,
+            sea_level: if self.sea.is_some() {
+                self.sea_level
+            } else {
+                NO_SEA
+            },
             moon_disc: environment.moon_disc.unwrap_or(Vec3::NEG_Y),
             _pad2: 0.0,
             daylight_illuminance: environment.daylight(),
