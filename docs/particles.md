@@ -487,6 +487,9 @@ picks the ones it needs, as `collide depth field water` then `bounce`, `stick` o
   - On the two finest levels its path, offset three voxels from the surface, is
     still marched for another surface ahead, so a wall stops it and anything lower than that
     doesn't, nor a ledge sticking out from a wall by less than that. On coarser levels it isn't.
+  - Where a wall meets a floor the field is blurred for about a voxel. A bouncing particle landing
+    there can take a diagonal normal and slide along it through the floor. Stick and kill end at
+    the contact, so only bounce is affected.
   - One within reach that remembers nothing was born there. It is trusted when the gradient points
     up, off a floor; otherwise it is left alone until it has come out of reach, and what it meets
     after that counts. So a particle born under the field's ridge, within half a voxel of a floor,
