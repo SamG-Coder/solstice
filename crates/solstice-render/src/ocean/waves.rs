@@ -6,7 +6,7 @@
 //! them back to the tile: displacement, slopes and the stretch of the surface, from which foam
 //! forms where crests fold. Three dispatches a frame, whatever the sea.
 
-use super::spectrum::{band_limits, SeaState, SpectrumParams, CASCADE_SIZES, REPEAT_SECONDS};
+use super::spectrum::{band_limits, SeaState, CASCADE_SIZES, REPEAT_SECONDS};
 use super::Ocean;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
 use crate::shaders;
@@ -28,7 +28,7 @@ const REBUILD_SECONDS: f32 = 0.25;
 const FOAM_STRETCH: f32 = 0.55;
 /// How quickly foam builds as the squeeze deepens.
 const FOAM_RATE: f32 = 4.0;
-/// Seconds for foam to fade to a third.
+/// Seconds for foam to fade to 1/e of itself.
 const FOAM_LIFE: f32 = 3.0;
 
 /// Twin of `OceanParams` in `ocean/common.wgsl`.
@@ -95,8 +95,8 @@ pub struct OceanWaves {
     evolve: (wgpu::ComputePipeline, wgpu::BindGroup),
     rows: (wgpu::ComputePipeline, wgpu::BindGroup),
     columns: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
-    /// What the amplitudes were last drawn from, and how long ago.
-    built: Option<SpectrumParams>,
+    /// The sea state the amplitudes were last drawn from, and how long ago.
+    built: Option<SeaState>,
     since_build: f32,
     /// The amplitudes must be redrawn before the next frame's waves.
     pending_build: bool,
@@ -105,15 +105,20 @@ pub struct OceanWaves {
     seed: u32,
     frame: usize,
     uniform_data: OceanUniform,
+    /// The stretch below which the surface breaks into foam.
+    pub(crate) foam_stretch: f32,
 }
 
 /// Compiles an ocean shader for tiles of `size` texels.
 fn module(gpu: &Gpu, path: &str, size: u32) -> wgpu::ShaderModule {
-    let source = shaders::expand(path).replacen(
-        "const SIZE: u32 = 256u;",
-        &format!("const SIZE: u32 = {size}u;"),
-        1,
+    const DECLARATION: &str = "const SIZE: u32 = 256u;";
+    let source = shaders::expand(path);
+    // A reformatted declaration would leave the shader at 256 texels on a smaller tile.
+    assert!(
+        source.contains(DECLARATION),
+        "{path} must declare `{DECLARATION}` for the tile size to be set"
     );
+    let source = source.replacen(DECLARATION, &format!("const SIZE: u32 = {size}u;"), 1);
     gpu.device
         .create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(path),
@@ -267,6 +272,7 @@ impl OceanWaves {
             time: 0.0,
             seed: 0x5eed,
             frame: 0,
+            foam_stretch: FOAM_STRETCH,
             uniform_data: OceanUniform {
                 sizes: [CASCADE_SIZES[0], CASCADE_SIZES[1], CASCADE_SIZES[2], 0.0],
                 bands: [first, second, 0.0, 0.0],
@@ -291,9 +297,10 @@ impl OceanWaves {
         self.tau_at(self.time)
     }
 
-    /// The foam the last [`Self::record`] wrote, per cascade.
+    /// The foam the last [`Self::record`] wrote, per cascade. Frame `n` reads foam `n % 2` and
+    /// writes the other, and `frame` has counted it by then.
     pub fn foam(&self) -> &CascadeTexture {
-        &self.foam[(self.frame + 1) % 2]
+        &self.foam[self.frame % 2]
     }
 
     /// Records this frame's waves: the amplitudes if the sea has changed, then the transform.
@@ -327,41 +334,43 @@ impl OceanWaves {
         let seconds = seconds.max(0.0);
         self.time += seconds as f64;
         self.since_build += seconds;
-        let params = sea.params();
-        let changed = self.built != Some(params);
+        let changed = self.built != Some(*sea);
         let rebuild = self.built.is_none() || (changed && self.since_build >= REBUILD_SECONDS);
         let tau = self.tau_at(self.time);
         let data = &mut self.uniform_data;
-        data.wind = [
-            params.peak_wavenumber,
-            params.inverse_age,
-            params.wind_angle,
-            params.short_level,
-        ];
-        data.shape = [
-            params.long_level,
-            params.peak_enhancement,
-            params.peak_width,
-            params.peak_speed,
-        ];
-        data.swell = [
-            params.swell_scale,
-            params.swell_peak,
-            params.swell_angle,
-            0.0,
-        ];
-        data.motion = [tau, seconds, ocean.choppiness, 0.0];
-        // Foam fades to a third over its life, whatever the frame rate.
-        let kept = (-seconds / FOAM_LIFE).exp();
-        data.foam = [FOAM_STRETCH, FOAM_RATE * ocean.foam, kept, 0.0];
-        data.seed = self.seed;
-        gpu.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.uniform_data));
+        // Only the amplitudes need the spectrum, so its parameters, which take an integral to
+        // work out, are only worked out when they are redrawn.
         if rebuild {
-            self.built = Some(params);
+            let params = sea.params();
+            data.wind = [
+                params.peak_wavenumber,
+                params.inverse_age,
+                params.wind_angle,
+                params.short_level,
+            ];
+            data.shape = [
+                params.long_level,
+                params.peak_enhancement,
+                params.peak_width,
+                params.peak_speed,
+            ];
+            data.swell = [
+                params.swell_scale,
+                params.swell_peak,
+                params.swell_angle,
+                0.0,
+            ];
+            self.built = Some(*sea);
             self.since_build = 0.0;
             self.pending_build = true;
         }
+        data.motion = [tau, seconds, ocean.choppiness, 0.0];
+        // Foam fades to 1/e over its life, whatever the frame rate.
+        let kept = (-seconds / FOAM_LIFE).exp();
+        data.foam = [self.foam_stretch, FOAM_RATE * ocean.foam, kept, 0.0];
+        data.seed = self.seed;
+        gpu.queue
+            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.uniform_data));
     }
 
     fn tau_at(&self, time: f64) -> f32 {
@@ -555,15 +564,21 @@ mod tests {
     #[test]
     fn the_transform_matches_a_direct_sum_over_every_wave() {
         let Some(gpu) = request_gpu() else { return };
-        let size = 256;
+        // At both sizes the quality presets use, so both builds of each shader are checked.
+        for size in [128, 256] {
+            check_against_direct_sum(&gpu, size);
+        }
+    }
+
+    fn check_against_direct_sum(gpu: &Gpu, size: u32) {
         // An arbitrary moment, so that every wave has turned.
-        let waves = run(&gpu, size, 37.3);
+        let waves = run(gpu, size, 37.3);
         let tau = waves.tau();
         for (cascade, tile) in CASCADE_SIZES.iter().enumerate() {
-            let texels = read_layer(&gpu, &waves.amplitudes, size, cascade as u32);
+            let texels = read_layer(gpu, &waves.amplitudes, size, cascade as u32);
             let amplitude = amplitudes_of(&texels, size);
-            let displacement = read_layer(&gpu, &waves.displacement, size, cascade as u32);
-            let derivatives = read_layer(&gpu, &waves.derivatives, size, cascade as u32);
+            let displacement = read_layer(gpu, &waves.displacement, size, cascade as u32);
+            let derivatives = read_layer(gpu, &waves.derivatives, size, cascade as u32);
             // Each field's own scale, for a tolerance in keeping with half floats.
             let mut scale = [0.0_f32; 8];
             for (a, b) in displacement.iter().zip(&derivatives) {
@@ -573,14 +588,16 @@ mod tests {
                 }
             }
             let texel_metres = tile / size as f32;
-            for (x, z) in [
-                (0, 0),
-                (17, 203),
-                (128, 64),
-                (255, 255),
-                (90, 1),
-                (201, 140),
+            // Texels spread over the tile, wherever its size puts them.
+            for (u, v) in [
+                (0.0, 0.0),
+                (0.07, 0.79),
+                (0.5, 0.25),
+                (0.999, 0.999),
+                (0.35, 0.004),
+                (0.79, 0.55),
             ] {
+                let (x, z) = ((u * size as f32) as usize, (v * size as f32) as usize);
                 let expected = direct_sum(
                     cascade,
                     size,
@@ -596,7 +613,7 @@ mod tests {
                     let tolerance = 4.0e-3 * scale[field] + 1.0e-5;
                     assert!(
                         (found[field] - expected[field]).abs() <= tolerance,
-                        "cascade {cascade}, texel ({x}, {z}), field {field}: {} against {} (scale {})",
+                        "{size}², cascade {cascade}, texel ({x}, {z}), field {field}: {} against {} (scale {})",
                         found[field],
                         expected[field],
                         scale[field]
@@ -611,12 +628,17 @@ mod tests {
         // Parseval: the height's variance across a tile is the sum of the squared amplitudes
         // of its waves at that moment. This pins the transform's scale.
         let Some(gpu) = request_gpu() else { return };
-        let size = 256;
-        let waves = run(&gpu, size, 12.0);
+        for size in [128, 256] {
+            let waves = run(&gpu, size, 12.0);
+            check_energy(&gpu, &waves, size);
+        }
+    }
+
+    fn check_energy(gpu: &Gpu, waves: &OceanWaves, size: u32) {
         let tau = waves.tau();
         let half = size as i32 / 2;
         for cascade in 0..CASCADES as usize {
-            let texels = read_layer(&gpu, &waves.amplitudes, size, cascade as u32);
+            let texels = read_layer(gpu, &waves.amplitudes, size, cascade as u32);
             let amplitude = amplitudes_of(&texels, size);
             let mut energy = 0.0_f64;
             for nz in -half..half {
@@ -632,14 +654,76 @@ mod tests {
                     energy += hr * hr + hi * hi;
                 }
             }
-            let heights = read_layer(&gpu, &waves.displacement, size, cascade as u32);
+            let heights = read_layer(gpu, &waves.displacement, size, cascade as u32);
             let variance =
                 heights.iter().map(|t| (t[1] as f64).powi(2)).sum::<f64>() / heights.len() as f64;
             assert!(
                 (variance / energy - 1.0).abs() < 0.01,
-                "cascade {cascade}: variance {variance} against energy {energy}"
+                "{size}², cascade {cascade}: variance {variance} against energy {energy}"
             );
         }
+    }
+
+    #[test]
+    fn foam_builds_where_crests_fold_and_fades_over_time() {
+        // Each frame's foam is the last frame's, faded, or the new breaking of this frame's own
+        // surface, whichever is more; and `foam` hands out this frame's.
+        let Some(gpu) = request_gpu() else { return };
+        let size = 128;
+        let gale = SeaState {
+            wind_speed: 16.0,
+            fetch: 300_000.0,
+            ..sea()
+        };
+        // Foam forms readily, so that many texels break.
+        let ocean = Ocean {
+            foam: 30.0,
+            ..Ocean::default()
+        };
+        let seconds = 0.5;
+        let mut waves = OceanWaves::new(&gpu, size);
+        // Single cascades rarely fold by themselves, so count anything squeezed at all.
+        waves.foam_stretch = 1.0;
+        let frame = |waves: &mut OceanWaves| {
+            waves.update(&gpu, &gale, &ocean, seconds);
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            waves.record(&mut encoder);
+            gpu.queue.submit([encoder.finish()]);
+        };
+        frame(&mut waves);
+        frame(&mut waves);
+        let previous: Vec<Vec<[f32; 4]>> = (0..CASCADES)
+            .map(|c| read_layer(&gpu, waves.foam(), size, c))
+            .collect();
+        frame(&mut waves);
+        let kept = (-seconds / FOAM_LIFE).exp();
+        let rate = FOAM_RATE * ocean.foam;
+        let lambda = ocean.choppiness;
+        let (mut breaking_texels, mut faded_texels) = (0, 0);
+        for cascade in 0..CASCADES {
+            let foam = read_layer(&gpu, waves.foam(), size, cascade);
+            let displacement = read_layer(&gpu, &waves.displacement, size, cascade);
+            let derivatives = read_layer(&gpu, &waves.derivatives, size, cascade);
+            for i in 0..foam.len() {
+                let (a, b) = (displacement[i], derivatives[i]);
+                let stretch =
+                    (1.0 + lambda * b[2]) * (1.0 + lambda * b[3]) - lambda * lambda * a[3] * a[3];
+                let breaking = ((waves.foam_stretch - stretch) * rate).clamp(0.0, 1.0);
+                let faded = previous[cascade as usize][i][0] * kept;
+                let expected = breaking.max(faded);
+                // The stretch is worked out here from half floats; the GPU had full ones.
+                let tolerance = rate * 2.0e-3 + 1.0e-4;
+                assert!(
+                    (foam[i][0] - expected).abs() <= tolerance,
+                    "cascade {cascade}, texel {i}: {} against {expected}",
+                    foam[i][0]
+                );
+                breaking_texels += (breaking > 0.0) as usize;
+                faded_texels += (faded > breaking && faded > 0.01) as usize;
+            }
+        }
+        assert!(breaking_texels > 0, "no crest broke");
+        assert!(faded_texels > 0, "no foam lingered");
     }
 
     /// Writes pictures of the sea for a person to judge: shaded relief of the three cascades

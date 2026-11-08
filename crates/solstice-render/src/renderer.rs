@@ -414,9 +414,12 @@ impl Renderer {
 
     /// The ocean as it is now, part way to any new one, or `None` without a sea.
     pub fn ocean(&self) -> Option<Ocean> {
-        match self.ocean_request {
-            Some((requested, _)) if self.sea.is_none() => requested,
-            _ => self.sea.as_ref().map(Sea::ocean),
+        match (self.ocean_request, &self.sea) {
+            // A change not yet begun: none, or one that is at once, or the first sea, is already
+            // as good as made; one that eases has not moved yet.
+            (Some((None, _)), _) => None,
+            (Some((Some(ocean), seconds)), sea) if sea.is_none() || seconds <= 0.0 => Some(ocean),
+            (_, sea) => sea.as_ref().map(Sea::ocean),
         }
     }
 

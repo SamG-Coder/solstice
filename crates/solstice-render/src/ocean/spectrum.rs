@@ -170,7 +170,12 @@ impl SeaState {
 }
 
 /// Elfouhaily's curvature spectrum of the wind sea at wavenumber `k`, `B = k³·S(k)`: the long
-/// waves around the peak, and the short waves the wind's friction raises (eqs. 31 and 40).
+/// waves around the peak (eq. 31), and the short waves the wind's friction raises (eq. 40).
+///
+/// The short waves are also cut off below the peak by Pierson and Moskowitz's factor, as in
+/// Bruneton, Neyret and Holzschuch's implementation (2010). As published (eq. 41) they carry no
+/// such factor, and would add ripples longer than the sea's own peak waves; the factor is
+/// negligible everywhere else.
 pub fn wind_curvature(k: f32, params: &SpectrumParams) -> f32 {
     if k <= 0.0 {
         return 0.0;
@@ -443,7 +448,8 @@ mod tests {
 
     #[test]
     fn a_fully_developed_sea_is_as_high_as_pierson_and_moskowitz_say() {
-        // Hs = 0.21 U19.5² / g, about 0.0246 U10².
+        // Komen, Hasselmann and Hasselmann (1984) restate Pierson and Moskowitz's fully developed
+        // sea at 10 m: dimensionless energy g²E/U10⁴ = 3.64e-3, so Hs = 4√E = 0.0246 U10².
         for wind in [5.0, 10.0, 15.0, 20.0] {
             let height = sea(wind, 50_000.0).wind_sea_height();
             let expected = 0.0246 * wind * wind;
@@ -578,7 +584,7 @@ mod tests {
             for size in [128, 256] {
                 let carried: f32 = (0..3).map(|c| expected_variance(c, size, &params)).sum();
                 assert!(
-                    (carried / expected - 1.0).abs() < 0.08,
+                    (carried / expected - 1.0).abs() < 0.03,
                     "{wind} m/s, {fetch} km, {size}²: {carried} of {expected}"
                 );
             }
@@ -601,14 +607,8 @@ mod tests {
     }
 
     #[test]
-    fn the_hash_matches_the_shader() {
-        // `pcg` in common/math.wgsl, worked by hand from its definition.
-        assert_eq!(pcg(0), {
-            let state = 2_891_336_453_u32;
-            let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277_803_737);
-            (word >> 22) ^ word
-        });
-        // Gaussian pairs have the right spread.
+    fn gaussian_pairs_are_standard_normal() {
+        // That the hash itself matches the shader's is checked on the GPU, wave by wave.
         let samples: Vec<f32> = (0..20_000)
             .flat_map(|i| gaussian_pair(0, i, -i, 7))
             .collect();

@@ -69,7 +69,8 @@ fn wrap_angle(angle: f32) -> f32 {
 }
 
 // Elfouhaily's curvature spectrum of the wind sea, B = k³·S(k): the long waves around the peak,
-// and the short waves the wind's friction raises.
+// and the short waves the wind's friction raises, cut off below the peak as in Bruneton et al.
+// (see wind_curvature in spectrum.rs).
 fn wind_curvature(params: OceanParams, k: f32) -> f32 {
     if k <= 0.0 {
         return 0.0;
