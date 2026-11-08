@@ -65,17 +65,17 @@ impl File {
             |kind: &str| self.texture(format!("../scan/{name}/textures/{name}_{kind}_2k.jpg"));
         let (color, normal) = (map("diff"), map("nor_gl"));
         let roughness = map(if material.arm { "arm" } else { "rough" });
-        let occlusion = if material.arm {
-            format!(r#","occlusionTexture":{{"index":{roughness}}}"#)
-        } else {
-            String::new()
-        };
         let scale = 1.0 / material.metres;
         let [red, green, blue] = material.tint;
         let transform =
             format!(r#""extensions":{{"KHR_texture_transform":{{"scale":[{scale},{scale}]}}}}"#);
+        let occlusion = if material.arm {
+            format!(r#","occlusionTexture":{{"index":{roughness},{transform}}}"#)
+        } else {
+            String::new()
+        };
         self.materials.push(format!(
-            r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{red},{green},{blue},1],"baseColorTexture":{{"index":{color},{transform}}},"metallicRoughnessTexture":{{"index":{roughness},{transform}}},"metallicFactor":0,"roughnessFactor":1}},"normalTexture":{{"index":{normal}}}{occlusion}}}"#
+            r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{red},{green},{blue},1],"baseColorTexture":{{"index":{color},{transform}}},"metallicRoughnessTexture":{{"index":{roughness},{transform}}},"metallicFactor":0,"roughnessFactor":1}},"normalTexture":{{"index":{normal},{transform}}}{occlusion}}}"#
         ));
         self.materials.len() - 1
     }

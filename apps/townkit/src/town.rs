@@ -149,9 +149,11 @@ pub fn mole() -> Geometry {
         .to_vec()
     };
     for step in 0..MOLE_STEPS {
-        let from = MOLE_START + STAIR_GOING * step as f32;
+        // The first step starts well back on the quay, since the mole leaves it at an angle.
+        let back = if step == 0 { 0.5 } else { 0.0 };
+        let from = MOLE_START + STAIR_GOING * step as f32 - back;
         let deck = QUAY_DECK + MOLE_RISE * (step + 1) as f32;
-        g.loft(&[ring(from, deck), ring(from + STAIR_GOING, deck)]);
+        g.loft(&[ring(from, deck), ring(from + STAIR_GOING + back, deck)]);
     }
     let end = path.length();
     let rings: Vec<Vec<Vec3>> = (0..=MOLE_STATIONS)

@@ -72,7 +72,7 @@ The origin is the middle of the quay's edge, at sea level. The sea stands at hei
 | Water stairs | z -10, cut into the quay | 2 m wide, 13 steps of 16 cm | |
 | North mole | from the quay at (0, -48), curving to (-92, -65) | 100 m long, 7 m wide, reached from the quay by 8 steps | deck 3.2 m, seaward parapet to 4.4 m |
 | Lighthouse | (-92, -64) | tower 18 m, base ⌀ 7 m, top ⌀ 4.8 m, lantern 4 m | lamp 22 m |
-| Timber pier | from (0, 40) west, T-head at x -44 | 44 × 3 m, head 20 × 5 m | deck 1.58 m, two steps down from the quay |
+| Timber pier | from (0, 40) west, T-head at x -45 to -50 | 44 × 3 m, head 20 × 5 m | deck 1.58 m, two steps down from the quay |
 | Quay-front row | x 11 to 23, z -46 to 50 | 12 houses, 4.5–8 m wide, 3 storeys, eaves 9.5 m, ridge 13 m | 1.9 m |
 | Market square | x 24 to 56, z -14 to 16 | 32 × 30 m | 3.0 m, falling 1:60 towards the sea |
 | Fountain | (39, 0) | basin ⌀ 5 m, column 2.4 m | |

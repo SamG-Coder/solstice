@@ -103,6 +103,33 @@ mod tests {
     use solstice_import::{import_gltf, ImportOptions};
 
     #[test]
+    fn the_importer_places_a_node_where_it_was_put() {
+        use glam::{Quat, Vec3};
+        let mut g = geometry::Geometry::default();
+        g.cuboid(Vec3::ZERO, Vec3::ONE);
+        let mut file = File::default();
+        let material = file.material(&plain("test", [0.5; 3], 0.5));
+        let mesh = file.mesh(&[(&g, material)]).unwrap();
+        let (at, turn) = (Vec3::new(3.0, 4.0, 5.0), Quat::from_rotation_y(0.7));
+        file.node(mesh, at, turn, 2.0);
+        file.node(mesh, -at, Quat::IDENTITY, 1.0);
+
+        let folder = std::env::temp_dir().join(format!("townkit-node-{}", std::process::id()));
+        file.write(&folder, "nodes").unwrap();
+        let imported = import_gltf(folder.join("nodes.gltf"), &ImportOptions::default());
+        std::fs::remove_dir_all(&folder).unwrap();
+        let scene = imported.unwrap().scene;
+
+        assert_eq!(scene.instances.len(), 2);
+        assert_eq!(scene.instances[0].mesh, scene.instances[1].mesh, "shared");
+        let moved = scene.instances[0].transform.transform_point3(Vec3::X);
+        assert!(
+            moved.abs_diff_eq(at + turn * Vec3::X * 2.0, 1.0e-4),
+            "{moved}"
+        );
+    }
+
+    #[test]
     fn the_importer_reads_the_town_and_finds_every_part_by_name() {
         let folder = std::env::temp_dir().join(format!("townkit-{}", std::process::id()));
         // In a plain material, since a test has no fetched textures to read.

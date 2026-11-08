@@ -60,7 +60,9 @@ const PAVING_GRID: f32 = 0.025;
 const HEAD_GRID: f32 = 0.04;
 
 /// The top of the walls, under the copings that cap them.
-const COPING_HEIGHT: f32 = 0.3;
+const COPING_HEIGHT: f32 = 0.28;
+/// How far copings stand proud of the solid under them, so that the two never share a surface.
+const COPING_RISE: f32 = 0.06;
 const COPING_LENGTH: f32 = 1.5;
 
 /// A texture's height map, repeating.
@@ -183,10 +185,10 @@ fn block(length: f32, width: f32, height: f32) -> Geometry {
         [
             (-w, -height),
             (w, -height),
-            (w, top - CHAMFER + inset),
-            (w - CHAMFER, top + inset),
-            (-w + CHAMFER, top + inset),
-            (-w, top - CHAMFER + inset),
+            (w, top - CHAMFER),
+            (w - CHAMFER, top),
+            (-w + CHAMFER, top),
+            (-w, top - CHAMFER),
         ]
         .map(|(z, y)| Vec3::new(x, y, z))
         .to_vec()
@@ -263,6 +265,7 @@ fn quay(file: &mut File, setts: usize, courses: usize, stones: &[usize]) {
     use town::{STAIRS_WIDTH, STAIRS_Z, STAIR_GOING, STAIR_STEPS};
     const NORTH: f32 = -52.0;
     const SOUTH: f32 = 50.0;
+    const PIER_LANDING: (f32, f32) = (38.5, 41.5);
     /// How far the deck's setts run inland: to the foot of the front row of houses.
     const INLAND: f32 = 11.0;
     const COPING_WIDTH: f32 = 0.66;
@@ -272,7 +275,8 @@ fn quay(file: &mut File, setts: usize, courses: usize, stones: &[usize]) {
 
     for (from, to) in [(NORTH, gap_north), (gap_south, SOUTH)] {
         let scale = fit(to - from, SETTS.metres).1;
-        let columns = ((INLAND - edge) / (SETTS.metres * scale)).round() as u32;
+        // Running on under the front row's walls, and into the mouths of the lanes.
+        let columns = ((INLAND - edge) / (SETTS.metres * scale)).ceil() as u32;
         paving(
             file,
             setts,
@@ -297,7 +301,7 @@ fn quay(file: &mut File, setts: usize, courses: usize, stones: &[usize]) {
 
     // The harbour face, leaning back as it rises, in two lengths either side of the stairs.
     let lean = Vec3::new(0.6, ground::QUAY_DECK - town::FOOTING, 0.0).normalize();
-    let top_y = deck - COPING_HEIGHT + 0.06;
+    let top_y = deck - COPING_HEIGHT + COPING_RISE;
     let face_x = -0.6 * (deck - top_y) / (deck - town::FOOTING);
     for (from, to) in [(NORTH, gap_north), (gap_south, SOUTH)] {
         wall(
@@ -307,7 +311,14 @@ fn quay(file: &mut File, setts: usize, courses: usize, stones: &[usize]) {
             to - from,
             3,
         );
-        let line = |z: f32| Vec3::new(COPING_WIDTH * 0.5 - 0.06, deck + 0.06, z);
+    }
+    // The copings stop either side of the stairs, and of the landing for the pier.
+    let line = |z: f32| Vec3::new(COPING_WIDTH * 0.5 - 0.06, deck + COPING_RISE, z);
+    for (from, to) in [
+        (NORTH, gap_north),
+        (gap_south, PIER_LANDING.0),
+        (PIER_LANDING.1, SOUTH),
+    ] {
         coping_run(file, stones, line(from), line(to));
     }
     // The south end, seen from the beach.
@@ -348,15 +359,19 @@ fn mole(file: &mut File, flags: usize, courses: usize, stones: &[usize], head: u
     }
 
     // Each face leans out as it falls, and runs along the curve.
-    let (count, scale) = fit(end - MOLE_START, COURSES.metres);
-    let size = COURSES.metres * scale;
-    let faces = [(SEA_FACE, 1.0, 4), (BASIN_FACE, -1.0, 3)];
-    for (face, side, rows) in faces {
+    // The basin side starts past the steps, where the solid behind it reaches the deck.
+    let faces = [
+        (SEA_FACE, 1.0, 4, MOLE_START),
+        (BASIN_FACE, -1.0, 3, MOLE_STEPS_END),
+    ];
+    for (face, side, rows, start) in faces {
+        let (count, scale) = fit(end - start, COURSES.metres);
+        let size = COURSES.metres * scale;
         let [(top_offset, top_y), (foot_offset, foot_y)] = face;
         let slope = (foot_offset - top_offset) / (top_y - foot_y);
-        let start_y = top_y - COPING_HEIGHT;
+        let start_y = top_y + COPING_RISE - COPING_HEIGHT;
         for i in 0..count {
-            let (p, heading, seaward) = path.at(MOLE_START + size * (i as f32 + 0.5));
+            let (p, heading, seaward) = path.at(start + size * (i as f32 + 0.5));
             let up = (Vec3::Y - flat(seaward) * slope).normalize();
             // A wall's outward side is `along × up`, and seaward lies to the right of the heading.
             let along = flat(heading) * side;
@@ -373,15 +388,20 @@ fn mole(file: &mut File, flags: usize, courses: usize, stones: &[usize], head: u
     let lines = [
         (
             (BASIN_FACE[0].0 + COPING_WIDTH * 0.5 - 0.05),
-            MOLE_DECK + 0.06,
+            MOLE_DECK + COPING_RISE,
+            MOLE_STEPS_END,
         ),
-        ((SEA_FACE[0].0 + PARAPET_INNER) * 0.5, PARAPET_TOP),
+        (
+            (SEA_FACE[0].0 + PARAPET_INNER) * 0.5,
+            PARAPET_TOP + COPING_RISE,
+            MOLE_START,
+        ),
     ];
-    let (count, scale) = fit(end - MOLE_START, COPING_LENGTH);
-    let stride = COPING_LENGTH * scale;
-    for (offset, top) in lines {
+    for (offset, top, start) in lines {
+        let (count, scale) = fit(end - start, COPING_LENGTH);
+        let stride = COPING_LENGTH * scale;
         for i in 0..count {
-            let (p, heading, seaward) = path.at(MOLE_START + stride * (i as f32 + 0.5));
+            let (p, heading, seaward) = path.at(start + stride * (i as f32 + 0.5));
             let rotation = Quat::from_rotation_arc(Vec3::X, flat(heading));
             let at = at_3d(p, seaward * offset, top);
             file.node(stones[i as usize % stones.len()], at, rotation, scale);
@@ -390,7 +410,7 @@ fn mole(file: &mut File, flags: usize, courses: usize, stones: &[usize], head: u
 
     // The round head's wall, and its ring of copings.
     file.node(head, Vec3::ZERO, Quat::IDENTITY, 1.0);
-    let centre = Vec3::new(HEAD_CENTRE.x, MOLE_DECK + 0.06, HEAD_CENTRE.z);
+    let centre = Vec3::new(HEAD_CENTRE.x, MOLE_DECK + COPING_RISE, HEAD_CENTRE.z);
     let radius = HEAD_TOP_RADIUS - 0.3;
     let circumference = std::f32::consts::TAU * radius;
     let (count, scale) = fit(circumference, COPING_LENGTH);
@@ -414,7 +434,7 @@ fn head_wall(map: &HeightMap) -> Geometry {
     let tiles = (std::f32::consts::TAU * radius_at(0.0) / COURSES.metres).round();
     let tile_width = std::f32::consts::TAU * radius_at(0.0) / tiles;
     let columns = (std::f32::consts::TAU * radius_at(0.0) / HEAD_GRID).round() as u32;
-    let top = MOLE_DECK - COPING_HEIGHT + 0.06;
+    let top = MOLE_DECK - COPING_HEIGHT + COPING_RISE;
     let rows = (6.5 / HEAD_GRID).round() as u32;
     sheet(columns, rows, map, COURSES.metres, COURSES_DEPTH, |i, j| {
         // Decreasing with the column, so that the wall faces outward.
@@ -434,14 +454,16 @@ fn head_wall(map: &HeightMap) -> Geometry {
 
 /// The market square's paving, laid on the ground's fall towards the sea.
 fn square(file: &mut File, mesh: usize) {
-    const COLUMNS: u32 = 17;
-    let origin = Vec2::new(23.5, -17.0);
+    // 16 by 17 tiles, stopping where the ground's fall ends at x = 56.
+    const ACROSS: u32 = 16;
+    const DOWN: u32 = 17;
+    let origin = Vec2::new(24.0, -17.0);
     let slope = 1.0 / 60.0;
     let along = Vec3::new(1.0, slope, 0.0).normalize();
     let rotation = facing(along, Vec3::new(-slope, 1.0, 0.0).normalize());
     let run = SQUARE.metres / along.x;
-    for j in 0..COLUMNS {
-        for i in 0..COLUMNS {
+    for j in 0..DOWN {
+        for i in 0..ACROSS {
             let x = origin.x + run * (i as f32 + 0.5);
             let z = origin.y + SQUARE.metres * (j as f32 + 0.5);
             let at = Vec3::new(x, ground::height(x, z) + LIFT, z);
