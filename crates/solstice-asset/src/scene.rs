@@ -44,7 +44,8 @@ pub struct Material {
     pub base_color: [f32; 4],
     /// RGB radiance.
     pub emissive: [f32; 3],
-    /// [`Material::TWO_SIDED`] and [`Material::FOLIAGE`]. Older files hold zero here.
+    /// [`Material::TWO_SIDED`], [`Material::FOLIAGE`] and [`Material::MASKED`]. Older files hold
+    /// zero here.
     pub flags: u32,
     pub roughness: f32,
     pub metallic: f32,
@@ -69,6 +70,9 @@ impl Material {
     /// Thin, translucent vegetation: light from behind shines through, tinted by its colour, as
     /// Unreal's two-sided foliage shading model does. Foliage should also be two-sided.
     pub const FOLIAGE: u32 = 2;
+    /// Cut out: alpha in its colour map is coverage instead of cavity, and a texel is solid when
+    /// that is at least 0.5. The cut-off is built into the map (`docs/cutouts.md`).
+    pub const MASKED: u32 = 4;
 }
 
 impl Default for Material {
@@ -104,7 +108,7 @@ pub struct Light {
 /// One texture set, with a full mip chain for each map. Their byte layout depends on the
 /// scene's [`TextureEncoding`].
 ///
-/// * `color`: RGB base colour (sRGB), A cavity.
+/// * `color`: RGB base colour (sRGB), A cavity, or coverage for a [`Material::MASKED`] material.
 /// * `normal`: RG tangent-space normal XY.
 /// * `material`: R roughness multiplier (0.5 is neutral), G metallic multiplier.
 #[derive(Clone, Debug, Default)]

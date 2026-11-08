@@ -448,6 +448,173 @@ fn unsupported_features_are_reported_not_hidden() {
     assert!(warnings.contains("Blend"), "{warnings}");
 }
 
+/// Writes a model with two images, each a flat 2x2 colour, and the given materials over them,
+/// with the cube using material 0.
+fn masked_model(dir: &TempDir, first: [u8; 4], second: [u8; 4], materials: &str) -> PathBuf {
+    write_png(dir, "a.png", [first; 4]);
+    write_png(dir, "b.png", [second; 4]);
+    let images = r#""images": [{"uri": "a.png"}, {"uri": "b.png"}],
+        "textures": [{"source": 0}, {"source": 1}]"#;
+    let extras = format!(r#", {images}, "materials": [{materials}]"#);
+    write_model(dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, &extras)
+}
+
+fn textured(texture: u32, extra: &str) -> String {
+    format!(r#"{{"pbrMetallicRoughness": {{"baseColorTexture": {{"index": {texture}}}}}{extra}}}"#)
+}
+
+/// The alpha of the largest level of a layer's colour map.
+fn first_alpha(scene: &SceneAsset, layer: usize) -> u8 {
+    scene.textures[layer].color_mips[0][3]
+}
+
+#[test]
+fn masked_materials_keep_coverage_at_the_cut_off() {
+    let dir = TempDir::new();
+    let material = textured(0, r#", "alphaMode": "MASK", "alphaCutoff": 0.25"#);
+    // Alpha 64 is just above a quarter, so it must pass the renderer's test at 0.5.
+    let path = masked_model(&dir, [10, 20, 30, 64], [0; 4], &material);
+    let scene = import(&path).scene;
+    assert_eq!(scene.materials[0].flags, Material::MASKED);
+    assert!(first_alpha(&scene, 0) >= 128, "{}", first_alpha(&scene, 0));
+
+    let dir = TempDir::new();
+    let material = textured(0, r#", "alphaMode": "MASK", "alphaCutoff": 0.75"#);
+    let path = masked_model(&dir, [10, 20, 30, 64], [0; 4], &material);
+    assert!(first_alpha(&import(&path).scene, 0) < 128);
+}
+
+#[test]
+fn a_tint_changes_colour_but_not_what_is_cut_out() {
+    let dir = TempDir::new();
+    let material = r#"{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0},
+        "baseColorFactor": [0.2, 0.9, 0.1, 1.0]}, "alphaMode": "MASK"}"#;
+    let path = masked_model(&dir, [200, 200, 200, 200], [0; 4], material);
+    assert!(first_alpha(&import(&path).scene, 0) >= 128);
+}
+
+/// Converts every material of a model, used or not, and returns what that made.
+fn convert_all(path: &Path, count: usize) -> (Vec<Material>, Vec<solstice_asset::TextureLayer>) {
+    let (document, _, images) = gltf::import(path).unwrap();
+    let mut table = material::MaterialTable::new(&document, &images, 4);
+    for index in 0..count {
+        table.slot(&document, Some(index), &mut Vec::new());
+    }
+    table.finish()
+}
+
+#[test]
+fn opaque_and_masked_materials_on_one_atlas_share_a_layer() {
+    let dir = TempDir::new();
+    let opaque = textured(0, "");
+    let masked = textured(0, r#", "alphaMode": "MASK", "alphaCutoff": 0.75"#);
+    // 64 of 255 is below the cut-off, so coverage in the layer must read below 0.5.
+    let materials = format!("{opaque}, {masked}");
+    let path = masked_model(&dir, [1, 2, 3, 64], [0; 4], &materials);
+    let (materials, layers) = convert_all(&path, 2);
+    assert_eq!(layers.len(), 1, "they must share");
+    assert_eq!(materials[0].flags & Material::MASKED, 0);
+    assert_eq!(materials[1].flags, Material::MASKED);
+    assert!(layers[0].color_mips[0][3] < 128, "the layer holds coverage");
+}
+
+#[test]
+fn an_opaque_material_with_a_cavity_of_its_own_keeps_it() {
+    let dir = TempDir::new();
+    let opaque = textured(0, r#", "occlusionTexture": {"index": 1}"#);
+    let masked = textured(0, r#", "alphaMode": "MASK""#);
+    let materials = format!("{opaque}, {masked}");
+    let path = masked_model(&dir, [1, 2, 3, 40], [99, 0, 0, 255], &materials);
+    let (materials, layers) = convert_all(&path, 2);
+    assert_eq!(layers.len(), 2, "a layer each");
+    let layer = materials[0].texture_layer as usize;
+    assert_eq!(layers[layer].color_mips[0][3], 99);
+}
+
+#[test]
+fn a_factor_alpha_raises_the_threshold_in_the_texture() {
+    let material = r#"{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0},
+        "baseColorFactor": [1, 1, 1, 0.5]}, "alphaMode": "MASK", "alphaCutoff": 0.25}"#;
+    // Multiplied by the factor, 127 of 255 falls just short of the cut-off and 128 reaches it.
+    let dir = TempDir::new();
+    let path = masked_model(&dir, [9, 9, 9, 127], [0; 4], material);
+    assert!(first_alpha(&import(&path).scene, 0) < 128);
+    let dir = TempDir::new();
+    let path = masked_model(&dir, [9, 9, 9, 128], [0; 4], material);
+    assert!(first_alpha(&import(&path).scene, 0) >= 128);
+}
+
+#[test]
+fn a_tiny_cut_off_still_leaves_holes_where_alpha_is_zero() {
+    let dir = TempDir::new();
+    let material = textured(0, r#", "alphaMode": "MASK", "alphaCutoff": 0.001"#);
+    let path = masked_model(&dir, [9, 9, 9, 0], [0; 4], &material);
+    assert!(first_alpha(&import(&path).scene, 0) < 128);
+}
+
+#[test]
+fn shrinking_a_mask_keeps_the_colour_of_its_strands() {
+    // Half a strand, half a black hole, shrunk to one texel.
+    let image = ImageData {
+        pixels: vec![200, 100, 50, 255, 0, 0, 0, 0],
+        format: Format::R8G8B8A8,
+        width: 2,
+        height: 2,
+    };
+    let image = ImageData {
+        pixels: [image.pixels.clone(), image.pixels].concat(),
+        ..image
+    };
+    assert!(material::sample_masked(&image, 0.5, 0.5, 1)[0] > 190);
+}
+
+#[test]
+fn enlarging_a_mask_keeps_the_colour_of_its_strands() {
+    // A column of strand and a column of black hole, read three quarters of the way to the hole's
+    // side of the strand: mostly solid, so it passes, and it must not be darkened.
+    let image = ImageData {
+        pixels: [[200, 100, 50, 255, 0, 0, 0, 0]; 2].concat(),
+        format: Format::R8G8B8A8,
+        width: 2,
+        height: 2,
+    };
+    let texel = material::sample_masked(&image, 0.375, 0.5, 4);
+    assert!(texel[3] > 128, "{texel:?}");
+    assert!(texel[0] > 190, "{texel:?}");
+}
+
+#[test]
+fn an_occlusion_map_on_a_masked_material_is_reported_and_left_out() {
+    let dir = TempDir::new();
+    let material = textured(
+        0,
+        r#", "alphaMode": "MASK", "occlusionTexture": {"index": 1}"#,
+    );
+    let path = masked_model(&dir, [9, 9, 9, 255], [7, 0, 0, 255], &material);
+    let imported = import(&path);
+    assert_eq!(first_alpha(&imported.scene, 0), 255);
+    assert!(imported.warnings.join("\n").contains("occlusion"));
+}
+
+#[test]
+fn a_mask_with_nothing_to_cut_out_of_is_solid() {
+    let dir = TempDir::new();
+    let materials = r#", "materials": [{"alphaMode": "MASK"}]"#;
+    let path = write_model(&dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, materials);
+    assert_eq!(import(&path).scene.materials[0].flags, 0);
+}
+
+#[test]
+fn a_mask_whose_factor_never_passes_is_left_out() {
+    let dir = TempDir::new();
+    let invisible =
+        r#"{"pbrMetallicRoughness": {"baseColorFactor": [1, 1, 1, 0.1]}, "alphaMode": "MASK"}"#;
+    let materials = format!(r#", "materials": [{invisible}]"#);
+    let path = write_model(&dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, &materials);
+    let result = import_gltf(&path, &ImportOptions::default());
+    assert!(matches!(result, Err(ImportError::NothingToDraw)));
+}
+
 #[test]
 fn double_sided_materials_are_drawn_from_both_sides() {
     let dir = TempDir::new();

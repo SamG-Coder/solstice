@@ -131,7 +131,7 @@ pub fn import_gltf(
     let root = root_transform(&bounds, options.fit_size);
     let world_bounds = bounds.transformed(root);
 
-    let mut materials = MaterialTable::new(&images, options.texture_size);
+    let mut materials = MaterialTable::new(&document, &images, options.texture_size);
     let mut mesh_slots: HashMap<MeshKey, u32> = HashMap::new();
     let mut keys: Vec<MeshKey> = Vec::new();
     let mut instances = Vec::with_capacity(placements.len());
@@ -329,6 +329,16 @@ fn walk(
                     mesh.index(),
                     primitive.mode()
                 ));
+                continue;
+            }
+            if material::is_invisible(&primitive.material()) {
+                let name = primitive.material().name().unwrap_or("unnamed").to_owned();
+                let warning = format!(
+                    "material '{name}': its alpha is below its cut-off everywhere, so what uses it is left out"
+                );
+                if !warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
                 continue;
             }
             let box_ = primitive.bounding_box();

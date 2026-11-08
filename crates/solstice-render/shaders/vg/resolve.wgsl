@@ -227,7 +227,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         } else {
             albedo *= color.rgb;
         }
-        cavity = color.a;
+        // A cut-out material's alpha is its coverage.
+        cavity = select(color.a, 1.0, (material.flags & MATERIAL_MASKED) != 0u);
         roughness = clamp(roughness * material_map.r * 2.0, 0.04, 1.0);
         metallic *= material_map.g;
 
