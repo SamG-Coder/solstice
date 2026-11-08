@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 glam.workspace = true
 solstice-procgen.workspace = true
+png = "0.17"
 
 [dev-dependencies]
 solstice-import.workspace = true

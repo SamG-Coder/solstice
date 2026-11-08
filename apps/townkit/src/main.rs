@@ -4,12 +4,14 @@
 //! townkit [--output FOLDER]     # target/town by default
 //! ```
 //!
-//! `ground.gltf` is the land and seabed, placed whole. `town.gltf` holds named parts, placed by
-//! `scenes/harbour.txt`. `docs/harbour.md` is the design.
+//! `ground.gltf` is the land and seabed, and `stone.gltf` the dressed stone, both placed whole.
+//! `town.gltf` holds named parts, placed by `scenes/harbour.txt`. `docs/harbour.md` is the design.
+//! The textures come first: `python scripts/fetch-scans.py scenes/harbour.surfaces 2k`.
 
 mod geometry;
 mod gltf;
 mod ground;
+mod stone;
 mod town;
 
 use gltf::{File, Plain};
@@ -47,10 +49,10 @@ fn ground_file() -> File {
     file
 }
 
-/// The stonework and the massing.
-fn town_file() -> File {
+/// The solid stonework and the massing. `stonework` adds the material they are drawn in.
+fn town_file(stonework: impl FnOnce(&mut File) -> usize) -> File {
     let mut file = File::default();
-    let granite = file.material(&plain("granite", [0.3, 0.29, 0.27], 0.85));
+    let granite = stonework(&mut file);
     let limewash = file.material(&plain("limewash", [0.72, 0.7, 0.64], 0.9));
     let terracotta = file.material(&plain("terracotta", [0.42, 0.18, 0.1], 0.8));
     let timber = file.material(&plain("timber", [0.14, 0.09, 0.06], 0.8));
@@ -84,7 +86,8 @@ fn output_folder() -> Result<PathBuf, String> {
 
 fn write_kit(folder: &Path) -> std::io::Result<()> {
     ground_file().write(folder, "ground")?;
-    town_file().write(folder, "town")
+    town_file(|file| file.textured(&stone::FLAGS)).write(folder, "town")?;
+    stone::file(&folder.join("../scan"))?.write(folder, "stone")
 }
 
 fn main() -> Result<(), String> {
@@ -100,9 +103,39 @@ mod tests {
     use solstice_import::{import_gltf, ImportOptions};
 
     #[test]
+    fn the_importer_places_a_node_where_it_was_put() {
+        use glam::{Quat, Vec3};
+        let mut g = geometry::Geometry::default();
+        g.cuboid(Vec3::ZERO, Vec3::ONE);
+        let mut file = File::default();
+        let material = file.material(&plain("test", [0.5; 3], 0.5));
+        let mesh = file.mesh(&[(&g, material)]).unwrap();
+        let (at, turn) = (Vec3::new(3.0, 4.0, 5.0), Quat::from_rotation_y(0.7));
+        file.node(mesh, at, turn, 2.0);
+        file.node(mesh, -at, Quat::IDENTITY, 1.0);
+
+        let folder = std::env::temp_dir().join(format!("townkit-node-{}", std::process::id()));
+        file.write(&folder, "nodes").unwrap();
+        let imported = import_gltf(folder.join("nodes.gltf"), &ImportOptions::default());
+        std::fs::remove_dir_all(&folder).unwrap();
+        let scene = imported.unwrap().scene;
+
+        assert_eq!(scene.instances.len(), 2);
+        assert_eq!(scene.instances[0].mesh, scene.instances[1].mesh, "shared");
+        let moved = scene.instances[0].transform.transform_point3(Vec3::X);
+        assert!(
+            moved.abs_diff_eq(at + turn * Vec3::X * 2.0, 1.0e-4),
+            "{moved}"
+        );
+    }
+
+    #[test]
     fn the_importer_reads_the_town_and_finds_every_part_by_name() {
         let folder = std::env::temp_dir().join(format!("townkit-{}", std::process::id()));
-        town_file().write(&folder, "town").unwrap();
+        // In a plain material, since a test has no fetched textures to read.
+        town_file(|file| file.material(&plain("granite", [0.3, 0.29, 0.27], 0.85)))
+            .write(&folder, "town")
+            .unwrap();
         let imported = import_gltf(folder.join("town.gltf"), &ImportOptions::default());
         std::fs::remove_dir_all(&folder).unwrap();
         let imported = imported.unwrap();

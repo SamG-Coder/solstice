@@ -5,16 +5,18 @@ use crate::ground::{self, QUAY_DECK};
 use glam::{Vec2, Vec3};
 
 /// How far down the stonework goes, into the seabed.
-const FOOTING: f32 = -13.0;
+pub const FOOTING: f32 = -13.0;
 
 /// One flight of water stairs: 16 cm risers on 30 cm treads, from the deck to below the sea.
 const STAIR_RISE: f32 = 0.16;
-const STAIR_GOING: f32 = 0.3;
-const STAIR_STEPS: usize = 13;
-const STAIRS_Z: f32 = -10.0;
-const STAIRS_WIDTH: f32 = 2.0;
-/// The pier's deck, two of the same steps below the quay.
-const PIER_DECK: f32 = QUAY_DECK - 2.0 * STAIR_RISE;
+pub const STAIR_GOING: f32 = 0.3;
+pub const STAIR_STEPS: usize = 13;
+pub const STAIRS_Z: f32 = -10.0;
+pub const STAIRS_WIDTH: f32 = 2.0;
+/// The length of one bay of the pier, as the scene scales the scan.
+const PIER_BAY: f32 = 3.48;
+/// Where the scan's own legs end, under the water.
+const PIER_PILE_TOP: f32 = -2.6;
 
 /// The quay: its wall leans back a little as it rises, as harbour walls do.
 fn quay_length(geometry: &mut Geometry, from: f32, to: f32) {
@@ -50,67 +52,121 @@ pub fn quay() -> Geometry {
     g
 }
 
-/// The mole's centre line, from the quay's north end out to the lighthouse.
-fn mole_point(t: f32) -> Vec2 {
-    let [a, b, c, d] = [
-        // Starting well inside the quay, so that their edges meet with no gap.
-        Vec2::new(6.0, -48.0),
-        Vec2::new(-35.0, -50.0),
-        Vec2::new(-65.0, -62.0),
-        Vec2::new(-92.0, -65.0),
-    ];
-    let s = 1.0 - t;
-    a * s * s * s + b * 3.0 * s * s * t + c * 3.0 * s * t * t + d * t * t * t
+/// The mole's centre line, from inside the quay's north end out to the lighthouse, by distance.
+pub struct MolePath {
+    points: Vec<Vec2>,
 }
 
-/// Deck height of the mole, which climbs from the quay by a ramp.
-const MOLE_DECK: f32 = 3.2;
-const RAMP: f32 = 16.0;
-/// How far the mole runs level with the quay, inside it, before its ramp begins.
-const RAMP_START: f32 = 6.0;
-const PARAPET: f32 = 1.2;
-const MOLE_STATIONS: usize = 48;
+impl MolePath {
+    const SAMPLES: usize = 800;
 
-/// A breakwater, with a parapet on its seaward (north) side.
+    pub fn new() -> Self {
+        let [a, b, c, d] = [
+            Vec2::new(6.0, -48.0),
+            Vec2::new(-35.0, -50.0),
+            Vec2::new(-65.0, -62.0),
+            Vec2::new(-92.0, -65.0),
+        ];
+        let point = |t: f32| {
+            let s = 1.0 - t;
+            a * s * s * s + b * 3.0 * s * s * t + c * 3.0 * s * t * t + d * t * t * t
+        };
+        Self {
+            points: (0..=Self::SAMPLES)
+                .map(|i| point(i as f32 / Self::SAMPLES as f32))
+                .collect(),
+        }
+    }
+
+    pub fn length(&self) -> f32 {
+        self.points.windows(2).map(|w| (w[1] - w[0]).length()).sum()
+    }
+
+    /// The point `distance` along the line, the way it is heading, and the side facing the sea.
+    pub fn at(&self, distance: f32) -> (Vec2, Vec2, Vec2) {
+        let mut left = distance;
+        for w in self.points.windows(2) {
+            let step = (w[1] - w[0]).length();
+            if left <= step {
+                let heading = (w[1] - w[0]) / step;
+                return (
+                    w[0] + heading * left,
+                    heading,
+                    Vec2::new(-heading.y, heading.x),
+                );
+            }
+            left -= step;
+        }
+        let n = self.points.len();
+        let heading = (self.points[n - 1] - self.points[n - 2]).normalize();
+        (
+            self.points[n - 1],
+            heading,
+            Vec2::new(-heading.y, heading.x),
+        )
+    }
+}
+
+/// Deck height of the mole, above the quay's.
+pub const MOLE_DECK: f32 = 3.2;
+/// The top of the mole's seaward parapet.
+pub const PARAPET_TOP: f32 = 4.4;
+/// How far along its centre line the mole leaves the quay.
+pub const MOLE_START: f32 = 6.0;
+/// The flight of steps from the quay's deck up to the mole's: level stone courses cannot follow a
+/// ramp.
+const MOLE_STEPS: usize = 8;
+const MOLE_RISE: f32 = (MOLE_DECK - QUAY_DECK) / MOLE_STEPS as f32;
+pub const MOLE_STEPS_END: f32 = MOLE_START + STAIR_GOING * MOLE_STEPS as f32;
+const MOLE_STATIONS: usize = 48;
+/// The cross-section's offsets towards the sea, and heights, at the top and foot of each face.
+pub const SEA_FACE: [(f32, f32); 2] = [(3.5, PARAPET_TOP), (4.8, FOOTING)];
+pub const BASIN_FACE: [(f32, f32); 2] = [(-3.5, MOLE_DECK), (-4.6, FOOTING)];
+pub const PARAPET_INNER: f32 = 2.9;
+/// The round platform at the mole's end, which carries the lighthouse.
+pub const HEAD_CENTRE: Vec3 = Vec3::new(-92.0, FOOTING, -65.0);
+pub const HEAD_TOP_RADIUS: f32 = 7.5;
+pub const HEAD_FOOT_RADIUS: f32 = 10.0;
+
+/// A breakwater with a parapet on its seaward (north) side, reached from the quay by steps.
 pub fn mole() -> Geometry {
     let mut g = Geometry::default();
-    let points: Vec<Vec2> = (0..=MOLE_STATIONS)
-        .map(|i| mole_point(i as f32 / MOLE_STATIONS as f32))
-        .collect();
-    let mut along = 0.0;
-    let rings: Vec<Vec<Vec3>> = points
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| {
-            if i > 0 {
-                along += (p - points[i - 1]).length();
-            }
-            let before = points[i.saturating_sub(1)];
-            let after = points[(i + 1).min(MOLE_STATIONS)];
-            let tangent = (after - before).normalize();
-            let seaward = Vec2::new(-tangent.y, tangent.x);
-            let deck =
-                QUAY_DECK + (MOLE_DECK - QUAY_DECK) * ((along - RAMP_START) / RAMP).clamp(0.0, 1.0);
-            [
-                (4.8, FOOTING),
-                (3.5, deck + PARAPET),
-                (2.9, deck + PARAPET),
-                (2.9, deck),
-                (-3.5, deck),
-                (-4.6, FOOTING),
-            ]
-            .map(|(offset, y)| {
-                let q = p + seaward * offset;
-                Vec3::new(q.x, y, q.y)
-            })
-            .to_vec()
+    let path = MolePath::new();
+    let ring = |distance: f32, deck: f32| {
+        let (p, _, seaward) = path.at(distance);
+        [
+            SEA_FACE[1],
+            SEA_FACE[0],
+            (PARAPET_INNER, PARAPET_TOP),
+            (PARAPET_INNER, deck),
+            (BASIN_FACE[0].0, deck),
+            BASIN_FACE[1],
+        ]
+        .map(|(offset, y)| {
+            let q = p + seaward * offset;
+            Vec3::new(q.x, y, q.y)
+        })
+        .to_vec()
+    };
+    for step in 0..MOLE_STEPS {
+        // The first step starts well back on the quay, since the mole leaves it at an angle.
+        let back = if step == 0 { 0.5 } else { 0.0 };
+        let from = MOLE_START + STAIR_GOING * step as f32 - back;
+        let deck = QUAY_DECK + MOLE_RISE * (step + 1) as f32;
+        g.loft(&[ring(from, deck), ring(from + STAIR_GOING + back, deck)]);
+    }
+    let end = path.length();
+    let rings: Vec<Vec<Vec3>> = (0..=MOLE_STATIONS)
+        .map(|i| {
+            let t = i as f32 / MOLE_STATIONS as f32;
+            ring(MOLE_STEPS_END + (end - MOLE_STEPS_END) * t, MOLE_DECK)
         })
         .collect();
     g.loft(&rings);
     g.frustum(
-        Vec3::new(-92.0, FOOTING, -65.0),
-        10.0,
-        7.5,
+        HEAD_CENTRE,
+        HEAD_FOOT_RADIUS,
+        HEAD_TOP_RADIUS,
         MOLE_DECK - FOOTING,
         48,
     );
@@ -344,17 +400,26 @@ pub fn massing() -> Massing {
     m.stone.frustum(base, 3.5, 2.4, 18.0, 32);
     m.timber.frustum(base + Vec3::Y * 18.0, 1.4, 1.4, 4.0, 16);
 
-    // The timber pier and its T-head, two steps down from the quay.
-    m.timber
-        .cuboid(Vec3::new(-44.0, 0.9, 38.5), Vec3::new(0.0, PIER_DECK, 41.5));
-    m.timber.cuboid(
+    // The step from the quay down to the timber pier, whose scan the scene places, and the piles
+    // that carry it on down to the seabed, below where the scan's own legs end.
+    m.stone.cuboid(
         Vec3::new(-0.3, 0.9, 38.5),
         Vec3::new(0.0, QUAY_DECK - STAIR_RISE, 41.5),
     );
-    m.timber.cuboid(
-        Vec3::new(-49.0, 0.9, 30.0),
-        Vec3::new(-44.0, PIER_DECK, 50.0),
-    );
+    let mut pile = |x: f32, z: f32| {
+        m.timber
+            .frustum(Vec3::new(x, -9.0, z), 0.14, 0.14, PIER_PILE_TOP + 9.0, 8);
+    };
+    for i in 0..14 {
+        let x = -PIER_BAY * i as f32;
+        pile(x, 38.8);
+        pile(x, 41.2);
+    }
+    for i in 0..7 {
+        let z = 29.55 + PIER_BAY * i as f32;
+        pile(-50.0, z);
+        pile(-45.3, z);
+    }
 
     // A merchant ship alongside the quay, and small boats on their moorings.
     m.timber
@@ -413,14 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn the_mole_is_about_a_hundred_metres_and_climbs_gently() {
-        let length: f32 = (0..MOLE_STATIONS)
-            .map(|i| {
-                let t = |k: usize| k as f32 / MOLE_STATIONS as f32;
-                (mole_point(t(i + 1)) - mole_point(t(i))).length()
-            })
-            .sum();
+    fn the_mole_is_about_a_hundred_metres_and_its_steps_are_within_the_collision_limit() {
+        let length = MolePath::new().length();
         assert!((90.0..110.0).contains(&length), "{length}");
-        const { assert!((MOLE_DECK - QUAY_DECK) / RAMP < 1.0 / 10.0) };
+        const { assert!(MOLE_RISE <= 0.17) };
     }
 }

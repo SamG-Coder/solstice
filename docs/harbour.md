@@ -70,9 +70,9 @@ The origin is the middle of the quay's edge, at sea level. The sea stands at hei
 | Harbour basin | x -75 to 0, z -45 to 50 | 75 × 95 m | seabed -3.5 m at the quay, -7 m at the mouth |
 | Quay | x 0 to 10, z -52 to 50 | 102 × 10 m | deck 1.9 m |
 | Water stairs | z -10, cut into the quay | 2 m wide, 13 steps of 16 cm | |
-| North mole | from the quay at (0, -48), curving to (-92, -65) | 100 m long, 7 m wide | deck 3.2 m, seaward parapet to 4.4 m |
+| North mole | from the quay at (0, -48), curving to (-92, -65) | 100 m long, 7 m wide, reached from the quay by 8 steps | deck 3.2 m, seaward parapet to 4.4 m |
 | Lighthouse | (-92, -64) | tower 18 m, base ⌀ 7 m, top ⌀ 4.8 m, lantern 4 m | lamp 22 m |
-| Timber pier | from (0, 40) west, T-head at x -44 | 44 × 3 m, head 20 × 5 m | deck 1.58 m, two steps down from the quay |
+| Timber pier | from (0, 40) west, T-head at x -45 to -50 | 44 × 3 m, head 20 × 5 m | deck 1.58 m, two steps down from the quay |
 | Quay-front row | x 11 to 23, z -46 to 50 | 12 houses, 4.5–8 m wide, 3 storeys, eaves 9.5 m, ridge 13 m | 1.9 m |
 | Market square | x 24 to 56, z -14 to 16 | 32 × 30 m | 3.0 m, falling 1:60 towards the sea |
 | Fountain | (39, 0) | basin ⌀ 5 m, column 2.4 m | |
@@ -122,14 +122,15 @@ Everything is CC0 and fetched by script. None of it is committed.
   `sand_rocks_small_01`, `boulder_01`, `rock_moss_set_01`.
 - *Town:* `modular_fort_01` (the town wall, its gate arch and towers), `large_iron_gate`,
   `large_castle_door`, `street_lamp_01`, `street_lamp_02`, `wooden_lantern_01`.
-- *Quayside and market:* `wooden_barrels_01`, `Barrel_01`, `wooden_crate_01` and `02`,
+- *Quayside and market:* `wooden_barrels_01`, `wooden_crate_01` and `02`,
   `wooden_bucket_01`, `wicker_basket_01`, `painted_wooden_bench`, `WoodenTable_03`, `cannon_01`,
   `treasure_chest` (in the warehouse), `tree_small_02`, `fern_02`.
 
 **From Poly Haven, as textures.** The same site publishes each texture as a tiled glTF, so the
-importer already reads them, and `fetch-scans.py` gains `surface` lines (from step 2, the first to use them) to fetch them: cobblestones,
-cut granite blocks, plaster and limewash, clay roof tiles, weathered planks and sand, with their
-height maps.
+importer already reads them. `scenes/harbour.surfaces` lists them in `surface` lines, which
+`fetch-scans.py` reads to fetch them with their height maps. So far: `stone_wall_02` (ashlar for the
+walls), `cobblestone_floor_07` (setts on the quay), `granite_tile_04` (flags and copings) and
+`square_cobblestone` (the square). Plaster, roof tiles, planks and ground follow.
 
 **Made by a new tool, because no CC0 scan exists.** Poly Haven has no period houses, no small
 boats, no lighthouse and no fountain. `apps/townkit` is a small Rust program that generates them
@@ -137,7 +138,8 @@ as glTF into `target/town/`, from the fetched textures:
 - houses, from eight plans with variation: window reveals, shutters, doors, chimneys, eaves, and
   roofs with real tile geometry;
 - the quay, mole, steps and paving, displaced from the textures' height maps, as virtual geometry
-  is meant to be used;
+  is meant to be used. Each surface is one tile of real relief, instanced along the stonework, on
+  plain solids that stay simple for collision;
 - the lighthouse, fountain, chapel and warehouse;
 - small boats, with planked hulls;
 - the terrain, in patches by material.
@@ -234,8 +236,8 @@ viewpoints and times of day judged as a whole picture, and costs measured.
 1. **The kit and the blockout.** `apps/townkit`; terrain, quay, mole and the basin, and plain
    shapes for everything else, in plain materials, with the sea. Judge scale and composition from
    every viewpoint.
-2. **Stone.** `fetch-scans.py` for textures; real stone courses and paving on the quay, mole, steps and square; the pier; props
-   along the quay.
+2. **Stone.** `fetch-scans.py` for textures; ashlar walls and paving on the quay, mole and square,
+   copings and iron bollards; the pier; props along the quay.
 3. **The houses.** The eight plans and their variations; the quay-front row and the back rows.
 4. **The town.** Lanes and steps; the warehouse; the chapel; the wall and gate; the fountain, with
    its particles.
