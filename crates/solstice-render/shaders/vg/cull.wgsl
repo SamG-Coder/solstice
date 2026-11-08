@@ -74,11 +74,13 @@ fn push_retry(entry: QueueEntry) {
 }
 
 // Software clusters fill the list from the front and hardware from the back, so
-// both can append concurrently and each still forms one contiguous range.
-// Returns false, and counts the loss, if the list is full.
+// both can append concurrently and each still forms one contiguous range. An entry is
+// claimed from a single count of both before either end is written, so the two ranges can
+// never meet, however many threads arrive at once. Returns false, and counts the loss, if
+// the list is full.
 fn emit_cluster(instance: u32, cluster: u32, software: bool) -> bool {
     let capacity = arrayLength(&visible);
-    if atomicLoad(&state.sw_count) + atomicLoad(&state.hw_count) + 256u >= capacity {
+    if atomicAdd(&state.reserved, 1u) >= capacity {
         atomicAdd(&state.dropped, 1u);
         return false;
     }
