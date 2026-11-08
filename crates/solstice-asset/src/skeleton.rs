@@ -9,6 +9,39 @@ pub const NO_POSE: u32 = u32::MAX;
 /// The most bones a skeleton may have: [`crate::gpu::PackedSkin`] names them in eight bits.
 pub const MAX_BONES: usize = 256;
 
+/// Clips are sampled this many times a second.
+pub const CLIP_HZ: f32 = 30.0;
+
+/// Where one bone's samples are in a [`Clip`]. A bone that doesn't move keeps one sample.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BoneTrack {
+    pub rotations_first: u32,
+    pub rotations_frames: u32,
+    pub translations_first: u32,
+    pub translations_frames: u32,
+    /// The range translations are quantised over.
+    pub translation_min: [f32; 3],
+    pub translation_max: [f32; 3],
+}
+
+/// An animation, retargeted onto one skeleton and quantised (solstice-anim samples it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Clip {
+    pub name: String,
+    /// The index of its skeleton in the scene.
+    pub skeleton: u32,
+    /// Samples, at [`CLIP_HZ`].
+    pub frames: u32,
+    /// A looping clip's last sample wraps round to its first.
+    pub loops: bool,
+    pub tracks: Vec<BoneTrack>,
+    /// Three smallest components, the index of the dropped one in the first's top two bits.
+    pub rotations: Vec<[u16; 3]>,
+    /// Quantised over each track's range.
+    pub translations: Vec<[u16; 3]>,
+}
+
 /// One bone of a [`Skeleton`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bone {

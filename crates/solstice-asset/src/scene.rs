@@ -225,6 +225,8 @@ pub struct SceneAsset {
     /// Which pose each instance follows, or [`crate::skeleton::NO_POSE`]. Instances past its end
     /// follow none.
     pub instance_poses: Vec<u32>,
+    /// Every animation in the scene.
+    pub clips: Vec<crate::skeleton::Clip>,
 }
 
 impl SceneAsset {

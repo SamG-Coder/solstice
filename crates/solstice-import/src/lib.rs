@@ -7,6 +7,7 @@
 //! Features the renderer cannot show yet are reported in [`Imported::warnings`], never
 //! silently dropped.
 
+pub mod animation;
 pub mod character;
 mod material;
 
@@ -267,6 +268,7 @@ pub fn import_gltf(
             skeletons: skeleton.into_iter().collect(),
             poses: vec![0; poses],
             instance_poses,
+            ..Default::default()
         },
         parts,
         warnings,

@@ -22,7 +22,7 @@ use crate::paged::{
 use crate::scene::{
     GameFile, Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint,
 };
-use crate::skeleton::{Bone, Skeleton, MAX_BONES, NO_POSE};
+use crate::skeleton::{Bone, BoneTrack, Clip, Skeleton, MAX_BONES, NO_POSE};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Quat, Vec3};
 use std::fmt;
@@ -40,6 +40,8 @@ const GAME_TAG: [u8; 4] = *b"GAME";
 const COLLISION_TAG: [u8; 4] = *b"COLL";
 /// The optional section holding a scene's skins and skeletons, written only if it has any.
 const SKIN_TAG: [u8; 4] = *b"SKIN";
+/// The optional section holding a scene's animation clips, written only if it has any.
+const CLIP_TAG: [u8; 4] = *b"CLIP";
 /// In a skin section's mesh list: a mesh that isn't skinned.
 const NO_BONE_LISTS: i32 = i32::MIN;
 
@@ -249,7 +251,77 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     if !scene.skeletons.is_empty() {
         w.section(SKIN_TAG, &encode_skin(scene));
     }
+    if !scene.clips.is_empty() {
+        w.section(CLIP_TAG, &encode_clips(&scene.clips));
+    }
     w.finish()
+}
+
+fn encode_clips(clips: &[Clip]) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.pod(&(clips.len() as u32));
+    for clip in clips {
+        w.slice(clip.name.as_bytes());
+        w.pod(&clip.skeleton);
+        w.pod(&clip.frames);
+        w.pod(&u32::from(clip.loops));
+        w.slice(&clip.tracks);
+        w.slice(&clip.rotations);
+        w.slice(&clip.translations);
+    }
+    w.finish()
+}
+
+fn decode_clips(bytes: &[u8]) -> Result<Vec<Clip>, DecodeError> {
+    let bad = |_| DecodeError::BadSkin;
+    let mut r = Reader { bytes };
+    let count: u32 = r.pod().map_err(bad)?;
+    if count as usize > bytes.len() {
+        return Err(DecodeError::BadSkin);
+    }
+    let mut clips = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let name: Vec<u8> = r.slice().map_err(bad)?;
+        let skeleton: u32 = r.pod().map_err(bad)?;
+        let frames: u32 = r.pod().map_err(bad)?;
+        let loops: u32 = r.pod().map_err(bad)?;
+        let tracks: Vec<BoneTrack> = r.slice().map_err(bad)?;
+        let rotations: Vec<[u16; 3]> = r.slice().map_err(bad)?;
+        let translations: Vec<[u16; 3]> = r.slice().map_err(bad)?;
+        clips.push(Clip {
+            name: String::from_utf8(name).map_err(|_| DecodeError::BadSkin)?,
+            skeleton,
+            frames,
+            loops: loops != 0,
+            tracks,
+            rotations,
+            translations,
+        });
+    }
+    if !r.bytes.is_empty() {
+        return Err(DecodeError::BadSkin);
+    }
+    Ok(clips)
+}
+
+/// Checks that every sample a clip's tracks name is there, and every clip's skeleton exists and
+/// has as many bones as it has tracks.
+fn clips_are_consistent(scene: &PagedScene) -> bool {
+    scene.clips.iter().all(|clip| {
+        let Some(skeleton) = scene.skeletons.get(clip.skeleton as usize) else {
+            return false;
+        };
+        clip.frames > 0
+            && clip.tracks.len() == skeleton.bones.len()
+            && clip.tracks.iter().all(|track| {
+                (track.rotations_frames == 1 || track.rotations_frames == clip.frames)
+                    && (track.translations_frames == 1 || track.translations_frames == clip.frames)
+                    && u64::from(track.rotations_first) + u64::from(track.rotations_frames)
+                        <= clip.rotations.len() as u64
+                    && u64::from(track.translations_first) + u64::from(track.translations_frames)
+                        <= clip.translations.len() as u64
+            })
+    })
 }
 
 /// A scene's skins: the bone lists, each mesh's way into them, the skeletons, and who follows what.
@@ -553,6 +625,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let mut gameplay = Vec::new();
     let mut collision = None;
     let mut skin = None;
+    let mut clips = Vec::new();
     while !r.bytes.is_empty() {
         let tag: [u8; 4] = r.pod()?;
         let contents: Vec<u8> = r.slice()?;
@@ -570,6 +643,8 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             collision = Some(decode_collision_index(&contents)?);
         } else if tag == SKIN_TAG {
             skin = Some(decode_skin(&contents)?);
+        } else if tag == CLIP_TAG {
+            clips = decode_clips(&contents)?;
         }
     }
     let mut meshes = meshes;
@@ -623,11 +698,12 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         skeletons,
         poses,
         instance_poses,
+        clips,
     };
     if !tables_are_consistent(&scene) {
         return Err(DecodeError::BadPages);
     }
-    if !skin_is_consistent(&scene) {
+    if !skin_is_consistent(&scene) || !clips_are_consistent(&scene) {
         return Err(DecodeError::BadSkin);
     }
     Ok(scene)
@@ -1438,6 +1514,33 @@ mod tests {
         assert_eq!(read.poses, [0]);
         assert_eq!(read.instance_poses, [0]);
         assert_eq!(read.meshes[0].bone_lists, Some(0));
+    }
+
+    #[test]
+    fn clips_travel_with_their_scene_and_bad_ones_are_refused() {
+        let mut scene = skinned_scene();
+        scene.scene.clips = vec![Clip {
+            name: "walk".to_owned(),
+            skeleton: 0,
+            frames: 2,
+            loops: true,
+            tracks: vec![BoneTrack {
+                rotations_frames: 2,
+                translations_frames: 1,
+                ..Default::default()
+            }],
+            rotations: vec![[1, 2, 3], [4, 5, 6]],
+            translations: vec![[7, 8, 9]],
+        }];
+        let read = decode(&encode(&scene)).unwrap().scene;
+        assert_eq!(read.clips, scene.scene.clips);
+        scene.scene.clips[0].rotations.pop();
+        assert_eq!(decode(&encode(&scene)).err(), Some(DecodeError::BadSkin));
+        scene.scene.clips[0] = Clip {
+            tracks: vec![BoneTrack::default()],
+            ..Default::default()
+        };
+        assert_eq!(decode(&encode(&scene)).err(), Some(DecodeError::BadSkin));
     }
 
     #[test]

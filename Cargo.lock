@@ -3163,6 +3163,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "solstice-anim"
+version = "0.2.0"
+dependencies = [
+ "glam 0.33.12",
+ "solstice-asset",
+]
+
+[[package]]
 name = "solstice-asset"
 version = "0.2.0"
 dependencies = [
@@ -3203,6 +3211,7 @@ dependencies = [
  "gltf",
  "png 0.17.16",
  "rayon",
+ "solstice-anim",
  "solstice-asset",
  "solstice-builder",
 ]
