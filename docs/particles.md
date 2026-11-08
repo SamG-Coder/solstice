@@ -2,8 +2,9 @@
 
 Rain that streaks past and splashes on the flagstones, spray thrown off the rocks, smoke from a
 chimney leaning with the wind, sparks off a forge. This document is the plan for a particle
-system in the spirit of Unreal's Niagara, agreed before any of it is built and kept up to date as
-each step lands.
+system in the spirit of Unreal's Niagara, agreed before any of it was built, and kept up to date
+as each step lands. Modules and syntax that later steps add are shown as planned; the module
+table says which exist.
 
 ## Goals
 
@@ -93,7 +94,7 @@ Not in the first version, though the design leaves room for each:
   Divergence-free turbulence from the curl of a noise field, so smoke swirls without bunching up
   or thinning out.
 - **McGuire and Bavoil, *Weighted Blended Order-Independent Transparency* (JCGT 2013).** The
-  alternative to sorting; see [Decisions](#decisions-for-you).
+  alternative to sorting; see [Decisions](#decisions).
 - **Garg and Nayar, *Photorealistic Rendering of Rain Streaks* (SIGGRAPH 2006),** and
   **Tatarchuk, *Artist-Directable Real-Time Rain Rendering in City Environments* (ATI, 2006).**
   How a drop looks as a streak over one exposure, a top-down map so that rain doesn't fall
@@ -125,7 +126,8 @@ emitter drops
   budget 40000                     # most particles alive at once
   follow camera                    # spawns in a box that moves with the camera
   spawn rate=14000*rain            # per second, scaled by the parameter
-  shape box 50 24 50 offset=0 12 0
+  shape box 50 24 50
+  offset 0 12 0
   lifetime 2.5
   size 0.0015*size 0.003*size      # drop radius in metres, uniform between the two
   velocity terminal                # starts at its terminal speed (Gunn and Kinzer)
@@ -140,39 +142,45 @@ emitter splash
   budget 6000
   spawn event=splash count=4
   lifetime 0.25 0.4
-  velocity cone up=30 speed=1.2 2.0
+  velocity 0 1.6 0 cone=30 spread=0.25
   size 0.001 0.002
   gravity
   render sprite opacity=0.5 lit
 ```
 
 - **Lines are a keyword, then values,** as in weather files. `#` begins a comment. Every module
-  has defaults, so a file names only what differs.
+  has defaults, so a file names only what differs. Two values where one would do are a range:
+  each particle takes its own value, uniformly between them.
+- **Options** are `key=value`, and take the plain values that follow them too, as in
+  `color life 0=1 1 1 0 1=1 1 1 1`. Plain words come before options.
 - **Parameters.** `param NAME DEFAULT` declares one. A value anywhere may be a number, a
   parameter, or a number times a parameter (`14000*rain`). That is all the expression language
   there is. A module that needs more takes a curve.
 - **Curves** for anything over a particle's life, such as `color life 0=1 .6 .2 1 .5=.3 .3 .3 .6
-  1=.2 .2 .2 0`, as keys from 0 to 1. Each is baked to 32 entries in a small curve atlas on the
-  GPU.
+  1=.2 .2 .2 0`, as keys from 0 to 1, linear between them. Each is baked to 32 entries per
+  emitter on the GPU. The colour curve's fourth value scales opacity.
 - **Errors name the line,** as with weather and oceans, and a bad file falls back to no effect
   with a warning, never a crash.
 
-**The modules**, by stage:
+**The modules**, by stage. Step 1 built those in **bold**; the rest come with the steps that
+need them.
 
 | Stage | Modules |
 |---|---|
-| Spawn | `spawn rate=` per second, `burst=` once, `event=` from another emitter, `distance=` per metre moved (trails); `follow camera` or `follow effect` |
-| Shape | `point`, `sphere`, `box`, `disc`, `cone`, and two that join the scene: `sea crests` (where waves break) and `surf` (where the sea rises against a face) |
-| Initial attributes | `lifetime`, `velocity` (cone, radial, `terminal`, inherited from the effect's motion), `size`, `rotation`, `color`, `flipbook` frame, `temperature` |
-| Forces | `gravity`, `drag` (linear, quadratic or `terminal`), `wind`, `curl` noise, `buoyancy` (hot gas rising and cooling), `attract` to a point, `vortex` |
-| Over life | `color`, `opacity`, `size` and `spin` by curve; `temperature` cooling for fire and sparks |
+| Spawn | **`spawn rate=`** per second, **`burst=`** at the start and **`every=`** seconds after, `event=` from another emitter, `distance=` per metre moved (trails); **`follow camera`** or **`follow effect`**; **`budget`** |
+| Shape | **`point`**, **`sphere R [surface]`**, **`box X Y Z`**, **`offset`**, `disc`, `cone`, and two that join the scene: `sea crests` (where waves break) and `surf` (where the sea rises against a face) |
+| Initial attributes | **`lifetime`**, **`velocity X Y Z cone= spread=`**, `terminal` and inherited velocity, **`size`**, **`color`**, **`brightness`**, rotation (random for now), `flipbook` frame, `temperature` |
+| Forces | **`gravity`**, **`drag`** (linear; quadratic and `terminal` later), `wind`, `curl` noise, `buoyancy` (hot gas rising and cooling), `attract` to a point, `vortex` |
+| Over life | **`color life`** (with opacity), **`size life`**, `spin`; `temperature` cooling for fire and sparks |
 | Collision | `collide` against `depth`, `field` (the GI volume's distance field), `cover` (the top-down cover map) and `water`; then `bounce`, `stick`, or `kill`, with an optional `event=` |
-| Kill | by age; by leaving the follow box; below the water |
-| Render | `sprite` (facing the camera, the velocity, or up), `streak`, `flipbook`, later `mesh`; shading `lit`, `emissive` or `unlit`; `soft=` fade distance; `shadow` to cast one |
+| Kill | **by age**; by leaving the follow box; below the water |
+| Render | **`sprite`** facing the camera (velocity and up later), **`blend=alpha`** or **`add`**, **`soft=`** fade distance, **`opacity=`**; `streak`, `flipbook`, later `mesh`; shading `lit` or `emissive` (unlit until step 2); `shadow` to cast one |
 
 **How modules run.** Modules are not compiled into a shader per emitter, as Niagara does. Each
-emitter becomes a fixed record on the GPU: a bit for each module it uses, its values, and its
-curves' rows in the atlas. One simulation shader reads that record and branches on the bits.
+emitter becomes a fixed record on the GPU (`EmitterRecord`, 192 bytes): its values, worked out
+on the CPU each frame from the effect's parameters, flags for the modules it uses, and its slice
+of the pool. Its curves sit in their own buffer. One simulation shader reads that record and
+branches on it.
 Every particle in a workgroup belongs to the same emitter, so the branches are uniform and cost
 almost nothing.
 - **Why:** browsers compile pipelines slowly, and on the first use. One set of pipelines,
@@ -187,11 +195,15 @@ almost nothing.
 - **The library** gets general calls only:
 
   ```rust
-  let fire = renderer.particles().spawn(&Effect::by_name("campfire")?, transform);
-  renderer.particles().set(fire, "heat", 0.8);       // eased, like the weather
+  let fire = renderer.particles().spawn(&Effect::by_name("campfire")?, transform)?;
+  renderer.particles().set(fire, "heat", 0.8);       // from the next frame
   renderer.particles().set_transform(fire, transform);
   renderer.particles().stop(fire);                   // stops spawning; what is alive dies out
+  renderer.particles().kill(fire);                   // ends it at once
   ```
+
+  `set` takes effect at once. Easing, as the weather eases, can be added where an effect needs
+  it; a script can ease a value itself.
 
   Gameplay's `effect` component calls these. A footstep or a sword's hit is a `burst`.
 - **The weather's own effects,** rain and snow, are owned by the renderer, which sets their
@@ -204,8 +216,9 @@ slice of it, its `budget`, and keeps its own free list and alive list there.
 - **A particle is 64 bytes:**
   - position and age;
   - velocity and lifetime;
-  - the position last frame, for motion vectors, and packed size and rotation;
-  - packed colour, packed temperature and flipbook frame, and its seed.
+  - the position at the start of its last step, for motion vectors, and its size;
+  - its spawn index, which seeds its random values, and its rotation, with 8 bytes spare for
+    later steps' temperature and flipbook frame.
 - **Its light is 16 bytes more,** in a separate buffer written by the lighting pass (below).
 - **The pool's size** is set by quality:
 
@@ -215,9 +228,14 @@ slice of it, its `budget`, and keeps its own free list and alive list there.
   | Medium | 131,072 | 10 MB |
   | Low | 65,536 | 5 MB |
 
-  Effects that ask for more than the pool holds have their budgets scaled down to fit.
+  An effect started while the pool is nearly full gets smaller budgets than it asks for, down
+  to the largest free run of slots; with none, it does not start. Changing quality makes a new
+  pool, and running effects start again in it.
+- **At most 64 emitters** run at once, across every effect, and 8 in one effect.
 
-**Each frame** is five dispatches and the draws, however many emitters there are:
+**Each frame** is a handful of dispatches and the draws, however many emitters there are. Step 1
+has four: plan, spawn, update, and a small `finish` that writes the draw counts. Light, sort and
+cull come with steps 2 and 3:
 
 1. **Plan**, one workgroup. For each live emitter, it works out:
    - how many particles to spawn: rate times time, plus bursts and queued events, limited by its
@@ -227,9 +245,11 @@ slice of it, its `budget`, and keeps its own free list and alive list there.
 
    It writes the indirect arguments for everything after it. One small pass replaces a dispatch
    per emitter, which matters on the web, where each dispatch costs CPU time in the browser.
-2. **Spawn.** Each new particle pops a slot from its emitter's free list with an atomic. It is
-   seeded from the emitter's running spawn count, not its slot, so a particle's random values
-   are the same however the GPU orders the atomics.
+2. **Spawn.** The plan takes the frame's spawns off the top of each free list at once, so each
+   new particle reads its slot without an atomic. It is seeded from the emitter's running spawn
+   count, not its slot, so a particle's random values are the same however the GPU orders the
+   atomics. Spawns are spread evenly through the frame: each is born part way through it and
+   moved on to its end, so a fast emitter makes a smooth stream, not clumps a frame apart.
 3. **Update.** Ages each live particle and applies its emitter's forces and collisions. Then it
    kills the particle, returning its slot to the free list, or appends it to next frame's alive
    list. The two alive lists take turns, one read while the other is written. Collisions append
@@ -244,9 +264,10 @@ emitter's draw list by `instance_index`, so no instance buffer is built. The emi
 into the list comes from a uniform array indexed by the draw, since a non-zero `first_instance`
 needs an optional feature.
 
-**Integration** is semi-implicit Euler at the frame's time step. Steps longer than 1/30 s are
-split, so a slow frame doesn't throw sparks through walls. Drag is integrated exactly for the
-linear case, and stably for the quadratic case.
+**Integration.** Gravity and linear drag are integrated exactly, in closed form, so a particle
+lands in the same place however time is split into frames: a slow frame gives what two fast ones
+would. Forces without a closed form (wind, curl noise, quadratic drag) and collisions will take
+substeps of at most 1/30 s, so a slow frame doesn't throw sparks through walls.
 
 **The CPU never reads a particle.** Statistics come back asynchronously, as culling statistics
 do: alive, spawned and dropped for lack of budget, per emitter.
@@ -415,7 +436,7 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
 - clippy clean with `-D warnings`, natively and for `wasm32-unknown-unknown`;
 - a review by a separate AI agent, and your go-ahead before it is merged.
 
-1. **The core.**
+1. **The core.** *Built; in review.*
    - The `.particles` format and its parser, and the CPU reference.
    - The pool, free lists, alive lists, and the plan, spawn and update passes.
    - Indirect drawing of unlit, soft sprites; the depth copy.
@@ -430,6 +451,29 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
      - Spawns beyond the budget are dropped and counted, and never write outside the slice.
      - A sprite fades to nothing where it meets a surface.
      - Uneven frame times give the same result as even ones.
+
+   Every test was mutation-checked: each of 14 bugs was put back in turn, and each made a
+   test fail. They included a leaked or doubly freed slot, drag ignored, seeding by slot,
+   unclamped spawns, plain Euler steps, no soft fade, no depth test, and drawing into the
+   target that post does not read over the sea.
+
+   **Cost** at 1280×720, the median of repeated runs with the first discarded. On the
+   integrated GPU (AMD Radeon, Low quality) the render scale is 0.6 and spawn rates are 0.35.
+
+   | Case | RTX 5080, High: simulate, draw | Integrated, Low: simulate, draw |
+   |---|---|---|
+   | No effects | 0, 0 | 0, 0 |
+   | One particle: the fixed cost, mostly the depth copy | 0.02, 0.02 ms | 0.03, 0.11 ms |
+   | The fountain, close: 3,200 particles (1,100 on Low) | 0.02, 0.04 ms | 0.05, 0.19 ms |
+   | 100,000 small drops (35,000 on Low) | 0.07, 0.07 ms | 0.29, 0.41 ms |
+
+   The profiler reads to a hundredth of a millisecond. The pool takes 20 MB on High and 5 MB
+   on Low.
+
+   Running on the integrated GPU also showed that the profiler's readback cast its mapped
+   bytes in place to 64-bit numbers. A mapped range is only promised 4-byte alignment, and with
+   this step's extra buffers the AMD driver gave no more, so the viewer panicked. The bytes are
+   now copied out instead.
 2. **Lighting and haze.**
    - Per-particle light: sun, cascaded shadow and cloud shadow; the sky's harmonics with
      enclosure; GI bounce; local lights.
@@ -514,7 +558,10 @@ Each step reports, separately:
 plus memory. Timings come from the profiler natively. In browsers, only the frame time can be
 measured.
 
-## Decisions for you
+## Decisions
+
+Taken on 8 November 2026, when you approved the plan with the recommendations below as they
+stand.
 
 1. **Which first use to build first, after the core.** I recommend rain. The weather already has
    `rain`, and it proves cover collision, water collision, events, streaks and the reactive mask

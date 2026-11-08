@@ -21,7 +21,7 @@ mod native {
     use solstice_asset::scene::Viewpoint;
     use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
+        Camera, DebugView, Effect, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
         StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
     use solstice_viewer::{
@@ -158,6 +158,7 @@ mod native {
             if let Some(level) = options.sea_level {
                 renderer.set_sea_level(level);
             }
+            spawn_effects(&mut renderer, options);
             (renderer, reader)
         }
     }
@@ -193,6 +194,17 @@ mod native {
         /// their own bring both.
         ocean: Option<Ocean>,
         sea_level: Option<f32>,
+        /// Particle effects to run, by name or file, and where.
+        effects: Vec<(Effect, Vec3)>,
+    }
+
+    /// Starts the effects the options name.
+    fn spawn_effects(renderer: &mut Renderer, options: &Options) {
+        for (effect, at) in &options.effects {
+            renderer
+                .particles()
+                .spawn(effect, glam::Mat4::from_translation(*at));
+        }
     }
 
     /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
@@ -225,6 +237,7 @@ mod native {
             ocean: None,
             sea_level: None,
             clock: None,
+            effects: Vec::new(),
         };
         // The time of day, built up from its options and made at the end.
         let (mut time, mut day_seconds, mut latitude) = (None, 0.0, None);
@@ -304,6 +317,34 @@ mod native {
                             Ocean::parse(&text).map_err(|e| format!("{name}: {e}"))?
                         }
                     });
+                }
+                "--effect" => {
+                    // NAME or FILE, then optionally @x,y,z for where it stands.
+                    let text = value()?;
+                    let (name, at) = match text.split_once('@') {
+                        Some((name, at)) => {
+                            let at = floats(at)?;
+                            let [x, y, z] = at[..] else {
+                                return Err("--effect expects NAME@x,y,z".into());
+                            };
+                            (name.to_owned(), Vec3::new(x, y, z))
+                        }
+                        None => (text, Vec3::ZERO),
+                    };
+                    let effect = match Effect::by_name(&name) {
+                        Some(effect) => effect,
+                        None => {
+                            let text = std::fs::read_to_string(&name).map_err(|e| {
+                                let names: Vec<_> = Effect::names().collect();
+                                format!(
+                                    "--effect: {name} is neither {} nor a file: {e}",
+                                    names.join(", ")
+                                )
+                            })?;
+                            Effect::parse(&text).map_err(|e| format!("{name}: {e}"))?
+                        }
+                    };
+                    options.effects.push((effect, at));
                 }
                 "--sea-level" => {
                     options.sea_level =
@@ -526,6 +567,18 @@ mod native {
             stats.unique_triangles,
             stats.instances,
         );
+        if stats.particles.emitters > 0 {
+            let particles = stats.particles;
+            println!(
+                "particles: {} alive in {} emitters, {} of {} slots reserved, {} spawned, {} dropped",
+                particles.alive,
+                particles.emitters,
+                particles.reserved,
+                particles.capacity,
+                particles.spawned,
+                particles.dropped,
+            );
+        }
 
         if let Some(times) = renderer.section_times() {
             let parts: Vec<String> = solstice_render::profiler::SECTIONS
@@ -635,6 +688,7 @@ mod native {
         if let Some(level) = options.sea_level {
             renderer.set_sea_level(level);
         }
+        spawn_effects(&mut renderer, options);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),
             size: wgpu::Extent3d {

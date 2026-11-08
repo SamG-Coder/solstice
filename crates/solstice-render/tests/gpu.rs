@@ -6,7 +6,7 @@ use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
+    Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
     StreamRequest, StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
@@ -1808,4 +1808,226 @@ fn waves_wet_the_faces_they_break_against() {
         washed < dry * 0.85,
         "the side the waves break against is dry: {washed}, against {dry} with no sea near"
     );
+}
+
+/// A black wall facing the camera, 10 m in front of it along -Z.
+fn black_wall() -> SceneAsset {
+    let mut wall = Mesh::default();
+    for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        wall.vertices.push(Vertex {
+            position: Vec3::new(x * 60.0, y * 60.0, -10.0),
+            normal: Vec3::Z,
+            uv: Vec2::new(x, y),
+        });
+    }
+    wall.indices = vec![0, 1, 2, 0, 2, 3];
+    SceneAsset {
+        meshes: vec![build_virtual_mesh(&wall, &BuildOptions::default())],
+        materials: vec![Material {
+            base_color: [0.0, 0.0, 0.0, 1.0],
+            flags: Material::TWO_SIDED,
+            ..Default::default()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    }
+}
+
+/// `count` still white particles of radius 3 m in one place, fading over `soft` metres: large
+/// enough on screen that the resolve filter does not soften their middles.
+fn still_particles(count: u32, soft: f32) -> Effect {
+    Effect::parse(&format!(
+        "emitter e\n budget {count}\n spawn burst={count}\n lifetime 1000\n size 3\n color 1 1 1 1\n render sprite soft={soft}"
+    ))
+    .unwrap()
+}
+
+/// Renders the black wall with the particles of `effect` at `at`, in a debug view that shows the
+/// scene's colour as it is, with no exposure or history, and reads back the image.
+fn render_particles(
+    gpu: &Gpu,
+    effect: &Effect,
+    at: Vec3,
+    debug: DebugView,
+    sea_level: Option<f32>,
+    size: u32,
+) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let settings = RendererSettings {
+        debug_view: debug,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(gpu, &paginate(&black_wall()), FORMAT, settings);
+    if let Some(level) = sea_level {
+        renderer.set_ocean(Some(Ocean::by_name("coastal").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+    }
+    renderer
+        .particles()
+        .spawn(effect, Mat4::from_translation(at))
+        .expect("room for the effect");
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+    for _ in 0..4 {
+        renderer.render(gpu, &camera, &darkness(), &view, (size, size), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, size);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    pixels
+}
+
+fn srgb_to_linear(byte: f32) -> f32 {
+    let c = byte / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// A particle fades by how far it stands in front of the surface behind it, over its soft
+/// distance: nearly gone just in front of the wall, a quarter at a quarter of the distance, whole
+/// beyond it, and hidden behind it.
+#[test]
+fn particles_fade_softly_into_the_surface_behind_them() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let centre = |z: f32, soft: f32| {
+        let pixels = render_particles(
+            &gpu,
+            &still_particles(1, soft),
+            Vec3::new(0.0, 0.0, z),
+            DebugView::Albedo,
+            None,
+            size,
+        );
+        srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0])
+    };
+    let (touching, quarter, clear) = (centre(-9.97, 1.0), centre(-9.75, 1.0), centre(-8.0, 1.0));
+    assert!(touching < 0.06, "touching the wall: {touching}");
+    assert!(
+        (quarter - 0.25).abs() < 0.05,
+        "a quarter of the way out: {quarter}"
+    );
+    assert!(clear > 0.95, "well clear of it: {clear}");
+    // Without a fade, just in front of the wall it shows whole, and behind it the depth test
+    // alone hides it.
+    assert!(centre(-9.97, 0.0) > 0.95);
+    assert_eq!(centre(-10.5, 0.0), 0.0, "behind the wall");
+}
+
+/// The overdraw view counts layers of particles: more layers, hotter.
+#[test]
+fn the_overdraw_view_counts_layers() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let red = |count| {
+        let pixels = render_particles(
+            &gpu,
+            &still_particles(count, 0.0),
+            Vec3::new(0.0, 0.0, -9.0),
+            DebugView::Particles,
+            None,
+            size,
+        );
+        // Away from the sprite there is nothing at all.
+        assert_eq!(brightness(patch(&pixels, size, 2, 2, 1)), 0.0);
+        srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0])
+    };
+    let (one, two) = (red(1), red(2));
+    assert!((one - 0.25).abs() < 0.02, "{one}");
+    assert!((two - 0.5).abs() < 0.03, "{two}");
+}
+
+/// Over the sea, particles are drawn into the colour post reads, the water's, so they show.
+#[test]
+fn particles_show_over_the_sea() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let pixels = render_particles(
+        &gpu,
+        &still_particles(1, 0.0),
+        Vec3::new(0.0, 0.0, -5.0),
+        DebugView::Particles,
+        Some(-1.0),
+        size,
+    );
+    let one = srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0]);
+    assert!((one - 0.25).abs() < 0.02, "{one}");
+}
+
+/// The fountain runs at every quality, in the lit view, with no GPU errors, and its particles
+/// are counted, fewer on lower qualities.
+#[test]
+fn the_fountain_runs_at_every_quality() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let mut alive = Vec::new();
+    for quality in [Quality::Low, Quality::Medium, Quality::High] {
+        let errors: Arc<Mutex<Vec<String>>> = Default::default();
+        let sink = errors.clone();
+        gpu.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                sink.lock().unwrap().push(error.to_string());
+            }));
+        let mut settings = RendererSettings::default();
+        settings.apply_quality(quality);
+        let mut renderer = Renderer::new(&gpu, &paginate(&ball_on_floor()), FORMAT, settings);
+        let fountain = renderer
+            .particles()
+            .spawn(
+                &Effect::by_name("fountain").unwrap(),
+                Mat4::from_translation(Vec3::new(0.0, 0.0, -4.0)),
+            )
+            .unwrap();
+        assert!(renderer.particles().set(fountain, "strength", 0.5));
+        let target = test_target(&gpu, 64);
+        let view = target.create_view(&Default::default());
+        let camera = Camera {
+            position: Vec3::new(0.0, 1.5, 4.0),
+            ..Default::default()
+        };
+        for _ in 0..40 {
+            renderer.render(
+                &gpu,
+                &camera,
+                &Environment::default(),
+                &view,
+                (64, 64),
+                1.0 / 60.0,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        let stats = renderer.stats().particles;
+        assert_eq!(stats.emitters, 2);
+        assert!(stats.alive > 50, "{quality:?}: {stats:?}");
+        assert_eq!(stats.dropped, 0);
+        alive.push(stats.alive);
+        let errors = errors.lock().unwrap();
+        assert!(errors.is_empty(), "{quality:?}: {}", errors.join("\n"));
+    }
+    assert!(alive[0] < alive[1] && alive[1] < alive[2], "{alive:?}");
 }

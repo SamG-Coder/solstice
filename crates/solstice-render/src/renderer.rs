@@ -11,6 +11,9 @@ use crate::ocean::grid::PATCH_CELLS;
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::waterline::{SeaViews, Waterline};
 use crate::ocean::{Ocean, Sea, SeaState};
+use crate::particles::{
+    ParticleStats, ParticleTargets, Particles, POOL_HIGH, POOL_LOW, POOL_MEDIUM,
+};
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
@@ -92,6 +95,10 @@ pub struct RendererSettings {
     pub probe_rays: u32,
     /// Cells across each of the sea surface's patches: a multiple of four.
     pub ocean_patch_cells: u32,
+    /// Particles the pool holds, across every effect.
+    pub particle_pool: u32,
+    /// Scales every effect's spawn rate: fewer particles for smaller GPUs.
+    pub particle_detail: f32,
 }
 
 impl Default for RendererSettings {
@@ -106,6 +113,8 @@ impl Default for RendererSettings {
             ocean_resolution: 256,
             probe_rays: 8,
             ocean_patch_cells: PATCH_CELLS,
+            particle_pool: POOL_HIGH,
+            particle_detail: 1.0,
         }
     }
 }
@@ -128,6 +137,11 @@ impl RendererSettings {
             PATCH_CELLS / 2
         } else {
             PATCH_CELLS
+        };
+        (self.particle_pool, self.particle_detail) = match quality {
+            Quality::Low => (POOL_LOW, 0.35),
+            Quality::Medium => (POOL_MEDIUM, 0.6),
+            Quality::High => (POOL_HIGH, 1.0),
         };
     }
 }
@@ -175,6 +189,7 @@ pub struct FrameStats {
     pub source_triangles: u64,
     pub unique_triangles: u64,
     pub streaming: StreamingStats,
+    pub particles: ParticleStats,
 }
 
 /// Everything whose size depends on the resolution.
@@ -194,6 +209,8 @@ struct SizedResources {
     hdr: Target,
     /// Where the water pass draws, when there is a sea.
     water: Option<WaterTargets>,
+    /// The depth particles test against.
+    particles: ParticleTargets,
 }
 
 /// Previous-frame camera state, for reprojection and occlusion culling.
@@ -239,6 +256,8 @@ pub struct Renderer {
     sea_level: f32,
     /// Draws and shades the sea's surface, when there is a sea.
     water: Option<WaterSurface>,
+    /// Effects, and the pool their particles live in.
+    particles: Particles,
     /// The layout of the lighting bind group, for passes made after the renderer.
     environment_layout: wgpu::BindGroupLayout,
     sized: Option<SizedResources>,
@@ -390,6 +409,7 @@ impl Renderer {
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
             post: PostProcess::new(gpu, output_format),
+            particles: Particles::new(gpu, &frame_uniform, settings.particle_pool),
             profiler: Profiler::new(gpu),
             scene,
             streamer,
@@ -461,6 +481,11 @@ impl Renderer {
         &mut self.settings
     }
 
+    /// The effects running, to start, steer and stop them.
+    pub fn particles(&mut self) -> &mut Particles {
+        &mut self.particles
+    }
+
     /// Gives the scene an open sea, easing from the current one over `seconds`, or at once for
     /// 0; `None` takes the sea away. Its waves follow the weather's wind.
     pub fn set_ocean(&mut self, ocean: Option<Ocean>, seconds: f32) {
@@ -517,6 +542,7 @@ impl Renderer {
             source_triangles: self.scene.source_triangles,
             unique_triangles: self.scene.unique_triangles,
             streaming: self.streamer.stats(),
+            particles: self.particles.stats(),
         }
     }
 
@@ -564,6 +590,13 @@ impl Renderer {
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
         self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
+        self.particles.resize(gpu, self.settings.particle_pool);
+        self.particles.prepare(
+            gpu,
+            camera.position,
+            self.frame_seconds,
+            self.settings.particle_detail,
+        );
 
         // Everything below draws what's installed from here on.
         self.streamer.update(gpu, &self.scene);
@@ -782,9 +815,24 @@ impl Renderer {
             );
         }
 
+        // Particles, over the lit scene and the water.
+        mark(&self.profiler, &mut encoder, section::PARTICLES);
+        self.particles.record_simulation(&mut encoder);
+        mark(&self.profiler, &mut encoder, section::PARTICLE_DRAW);
+        let debug = self.settings.debug_view;
+        let scene_color = sized
+            .water
+            .as_ref()
+            .map_or(&sized.hdr.view, |water| &water.color.view);
+        self.particles.record_draw(
+            &mut encoder,
+            scene_color,
+            &sized.particles,
+            debug == DebugView::Particles,
+        );
+
         // From the lit scene to the display.
         mark(&self.profiler, &mut encoder, section::POST);
-        let debug = self.settings.debug_view;
         let passthrough = !matches!(
             debug,
             DebugView::Lit | DebugView::DiffuseGi | DebugView::Reflections | DebugView::Voxels
@@ -806,9 +854,11 @@ impl Renderer {
             profiler.resolve(&mut encoder);
         }
         self.main_work.capture_stats(&mut encoder);
+        self.particles.capture_stats(&mut encoder);
         self.streamer.capture_requests(&mut encoder);
         gpu.queue.submit([encoder.finish()]);
         self.main_work.map_stats();
+        self.particles.map_stats();
         self.streamer.map_requests();
         if let Some(profiler) = &mut self.profiler {
             profiler.request_map();
@@ -830,12 +880,13 @@ impl Renderer {
         let visibility = VisibilityBuffer::new(gpu, &self.rasterizer, render_size);
         let hzb = Hzb::new(gpu, &visibility);
         let gbuffer = GBuffer::new(gpu, render_size);
+        // Particles are drawn into whichever of this and the water's colour post reads.
         let hdr = Target::new(
             gpu,
             "hdr",
             render_size,
             HDR_FORMAT,
-            wgpu::TextureUsages::empty(),
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
         );
         let cull_scene = self
             .cull
@@ -884,6 +935,7 @@ impl Renderer {
             ),
             None => (&hdr.view, &gbuffer.depth.view, &gbuffer.motion.view),
         };
+        let particles = self.particles.targets(gpu, render_size, scene_depth);
         let post = self.post.bindings(
             gpu,
             &self.frame_uniform,
@@ -912,6 +964,7 @@ impl Renderer {
             post,
             hdr,
             water,
+            particles,
         });
     }
 
