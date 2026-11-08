@@ -59,9 +59,12 @@ def main():
     basemesh = HumanService.create_human(macro_detail_dict=BODY)
     basemesh.name = "keeper"
     HumanService.add_builtin_rig(basemesh, RIG)
-    HumanService.set_character_skin(asset(SKIN), basemesh)
+    # MPFB's own choices, given rather than left to its defaults, which may change.
+    HumanService.set_character_skin(asset(SKIN), basemesh, skin_type="ENHANCED_SSS",
+                                    material_instances=True)
     for kind, pattern in ASSETS:
-        HumanService.add_mhclo_asset(asset(pattern), basemesh, asset_type=kind, subdiv_levels=0)
+        HumanService.add_mhclo_asset(asset(pattern), basemesh, asset_type=kind, subdiv_levels=0,
+                                     material_type="MAKESKIN")
     bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(output))
 
 

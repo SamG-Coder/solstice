@@ -3,14 +3,21 @@
 //! The export tool (`tools/blender/solstice_export.py`) prepares a character in Blender and has
 //! Blender write it. This reads the file back, as the importer will, and lists every way it falls
 //! short of what skinning needs:
-//! - one skin, which every mesh uses;
-//! - at most four weights a vertex, summing to one, each naming a bone of the skin;
+//! - one skin, which every mesh uses, of at most [`MAX_JOINTS`] bones in one tree, each with an
+//!   inverse bind matrix that undoes where the bone stands, so the file is in its rest pose;
+//! - triangles, with texture coordinates;
+//! - at most four weights a vertex, none negative, summing to one, each naming a bone of the
+//!   skin;
 //! - no morph targets, which the engine doesn't draw;
-//! - every material with its base colour, normal, and metallic-roughness textures, opaque or
-//!   cut out, never blended;
-//! - every bone the rig's role file names, and no bone that deforms nothing unless the role file
-//!   names it.
+//! - every material with its base colour, normal, and metallic-roughness textures, all on the
+//!   first texture coordinates, opaque or cut out, never blended;
+//! - every bone the rig's role file names, and no leaf bone that deforms nothing unless the role
+//!   file names it.
+//!
+//! What can't be seen in the file, such as geometry a mask hid in Blender, the export tool
+//! checks before it writes it.
 
+use glam::Mat4;
 use gltf::mesh::Semantic;
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -19,6 +26,14 @@ use std::path::Path;
 /// How far a vertex's weights may sum from one: glTF's own tolerance for normalised weights is
 /// of this order, and Blender writes them as floats.
 pub const WEIGHT_SUM_TOLERANCE: f32 = 2.0e-3;
+
+/// The most bones a skeleton may have: the engine's bone indices are 8 bits (docs/gameplay.md,
+/// Skinning in virtual geometry).
+pub const MAX_JOINTS: usize = 256;
+
+/// How far an inverse bind matrix times its bone's place may be from the identity, in each of
+/// its entries: a tenth of a millimetre at a metre.
+pub const BIND_TOLERANCE: f32 = 1.0e-4;
 
 /// A rig's role file: which bones play each part, for retargeting animation onto it.
 ///
@@ -133,6 +148,9 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
         .unwrap_or_default();
     let mut used = vec![false; report.joints.len()];
     let mut used_materials = BTreeSet::new();
+    if let Some(skin) = skin {
+        check_skin(&document, &buffers, skin, &mut problems);
+    }
 
     for node in document.nodes() {
         let Some(mesh) = node.mesh() else {
@@ -144,6 +162,17 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
             problems.push(format!("mesh `{name}` isn't bound to the character's skin"));
         }
         for primitive in mesh.primitives() {
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                problems.push(format!(
+                    "mesh `{name}` has a part drawn as {:?}, not triangles: remove loose edges and points",
+                    primitive.mode()
+                ));
+            }
+            if primitive.get(&Semantic::TexCoords(0)).is_none() {
+                problems.push(format!(
+                    "mesh `{name}` has a part with no texture coordinates"
+                ));
+            }
             if let Some(material) = primitive.material().index() {
                 used_materials.insert(material);
             } else {
@@ -171,12 +200,16 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
                 problems.push(format!("mesh `{name}` has no bone weights"));
                 continue;
             };
-            let (mut off, mut stray, mut empty) = (0, 0, 0);
+            let (mut off, mut stray, mut empty, mut bad) = (0, 0, 0, 0);
             for (joints, weights) in joints.into_u16().zip(weights.into_f32()) {
+                if weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+                    bad += 1;
+                    continue;
+                }
                 let sum: f32 = weights.iter().sum();
                 if sum < 1.0e-6 {
                     empty += 1;
-                } else if (sum - 1.0).abs() > WEIGHT_SUM_TOLERANCE {
+                } else if !((sum - 1.0).abs() <= WEIGHT_SUM_TOLERANCE) {
                     off += 1;
                 }
                 for (joint, weight) in joints.iter().zip(weights) {
@@ -187,6 +220,11 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
                         }
                     }
                 }
+            }
+            if bad > 0 {
+                problems.push(format!(
+                    "mesh `{name}`: {bad} vertices have a negative weight, or one that isn't a number"
+                ));
             }
             if empty > 0 {
                 problems.push(format!("mesh `{name}`: {empty} vertices follow no bone"));
@@ -230,6 +268,16 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
                 missing.join(" or ")
             ));
         }
+        let sets = [
+            pbr.base_color_texture().map(|t| t.tex_coord()),
+            material.normal_texture().map(|t| t.tex_coord()),
+            pbr.metallic_roughness_texture().map(|t| t.tex_coord()),
+        ];
+        if sets.iter().flatten().any(|&set| set != 0) {
+            problems.push(format!(
+                "material `{name}` reads a texture through other texture coordinates than the first"
+            ));
+        }
         if material.alpha_mode() == gltf::material::AlphaMode::Blend {
             problems.push(format!(
                 "material `{name}` is blended: make it opaque, or cut out with a mask"
@@ -262,6 +310,81 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
     problems.retain(|p| seen.insert(p.clone()));
     report.problems = problems;
     Ok(report)
+}
+
+/// Checks the skeleton: its size, that it is one tree, and that each inverse bind matrix undoes
+/// where its bone stands, so the file is in the pose the skin was bound in.
+fn check_skin(
+    document: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    skin: &gltf::Skin,
+    problems: &mut Vec<String>,
+) {
+    let joints: Vec<gltf::Node> = skin.joints().collect();
+    if joints.len() > MAX_JOINTS {
+        problems.push(format!(
+            "the skin has {} bones, more than the {MAX_JOINTS} the engine takes",
+            joints.len()
+        ));
+    }
+    // Each node's parent, and its place in the world.
+    let mut parent = vec![None; document.nodes().len()];
+    for node in document.nodes() {
+        for child in node.children() {
+            parent[child.index()] = Some(node.index());
+        }
+    }
+    let local: Vec<Mat4> = document
+        .nodes()
+        .map(|n| Mat4::from_cols_array_2d(&n.transform().matrix()))
+        .collect();
+    let world = |mut index: usize| {
+        let mut matrix = local[index];
+        while let Some(up) = parent[index] {
+            matrix = local[up] * matrix;
+            index = up;
+        }
+        matrix
+    };
+    let in_skin: BTreeSet<usize> = joints.iter().map(|j| j.index()).collect();
+    let roots = joints
+        .iter()
+        .filter(|j| !parent[j.index()].is_some_and(|p| in_skin.contains(&p)))
+        .count();
+    if roots != 1 {
+        problems.push(format!("the skin's bones form {roots} trees, not one"));
+    }
+    let reader = skin.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+    let Some(inverse_binds) = reader.read_inverse_bind_matrices() else {
+        problems.push("the skin has no inverse bind matrices".to_owned());
+        return;
+    };
+    let inverse_binds: Vec<Mat4> = inverse_binds
+        .map(|m| Mat4::from_cols_array_2d(&m))
+        .collect();
+    if inverse_binds.len() != joints.len() {
+        problems.push(format!(
+            "the skin has {} inverse bind matrices for {} bones",
+            inverse_binds.len(),
+            joints.len()
+        ));
+        return;
+    }
+    let posed: Vec<&str> = joints
+        .iter()
+        .zip(&inverse_binds)
+        .filter(|(joint, inverse)| {
+            !(**inverse * world(joint.index())).abs_diff_eq(Mat4::IDENTITY, BIND_TOLERANCE)
+        })
+        .map(|(joint, _)| joint.name().unwrap_or("(unnamed)"))
+        .collect();
+    if !posed.is_empty() {
+        problems.push(format!(
+            "{} bones aren't where the skin was bound, so the file isn't in its rest pose: {}",
+            posed.len(),
+            posed.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+        ));
+    }
 }
 
 #[cfg(test)]

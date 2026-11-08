@@ -50,6 +50,24 @@ struct Character {
     /// Base colour, normal, and metallic-roughness textures.
     textures: [bool; 3],
     alpha: &'static str,
+    uvs: bool,
+    /// The primitive's mode: 4 is triangles.
+    mode: u32,
+    /// Whether the skin has inverse bind matrices, and how many it has short.
+    inverse_binds: bool,
+    binds_short: usize,
+    /// Moves the second bone a metre up, away from where the skin was bound.
+    posed: bool,
+    /// Leaves the third bone out of the chain, as a tree of its own.
+    two_trees: bool,
+    /// The texture coordinates the normal map reads through.
+    normal_tex_coord: u32,
+    material: bool,
+    weighted: bool,
+    /// Adds a material no mesh uses, without a single texture.
+    unused_material: bool,
+    /// Leaves out the index buffer, so each three vertices are a triangle.
+    unindexed: bool,
 }
 
 impl Default for Character {
@@ -68,6 +86,17 @@ impl Default for Character {
             skins: 1,
             textures: [true; 3],
             alpha: "OPAQUE",
+            uvs: true,
+            mode: 4,
+            inverse_binds: true,
+            binds_short: 0,
+            posed: false,
+            two_trees: false,
+            normal_tex_coord: 0,
+            material: true,
+            weighted: true,
+            unused_material: false,
+            unindexed: false,
         }
     }
 }
@@ -109,9 +138,11 @@ impl Character {
                 .collect::<Vec<_>>(),
         ));
         let bones = self.bones.len();
+        let binds = bones - self.binds_short;
         let ibm = add(floats(
-            &(0..bones).flat_map(|_| IDENTITY).collect::<Vec<_>>(),
+            &(0..binds).flat_map(|_| IDENTITY).collect::<Vec<_>>(),
         ));
+        let uv = add(floats(&[0., 0., 1., 0., 1., 1., 0., 1.]));
         let mut accessors = vec![
             format!(
                 r#"{{"bufferView": {p}, "componentType": 5126, "count": 4, "type": "VEC3", "min": [0,0,0], "max": [1,1,0]}}"#
@@ -122,71 +153,99 @@ impl Character {
             format!(r#"{{"bufferView": {j}, "componentType": 5123, "count": 4, "type": "VEC4"}}"#),
             format!(r#"{{"bufferView": {w}, "componentType": 5126, "count": 4, "type": "VEC4"}}"#),
             format!(
-                r#"{{"bufferView": {ibm}, "componentType": 5126, "count": {bones}, "type": "MAT4"}}"#
+                r#"{{"bufferView": {ibm}, "componentType": 5126, "count": {binds}, "type": "MAT4"}}"#
             ),
+            format!(r#"{{"bufferView": {uv}, "componentType": 5126, "count": 4, "type": "VEC2"}}"#),
         ];
-        let mut attributes = r#""POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3"#.to_owned();
+        let mut attributes = r#""POSITION": 0"#.to_owned();
+        if self.weighted {
+            attributes += r#", "JOINTS_0": 2, "WEIGHTS_0": 3"#;
+        }
+        if self.uvs {
+            attributes += r#", "TEXCOORD_0": 5"#;
+        }
         if self.second_weights {
             attributes += r#", "JOINTS_1": 2, "WEIGHTS_1": 3"#;
         }
         let targets = if self.morph {
             accessors.push(accessors[0].clone());
-            r#", "targets": [{"POSITION": 5}]"#
+            r#", "targets": [{"POSITION": 6}]"#
         } else {
             ""
         };
         let [base, normal, mr] = self.textures;
-        let texture = |on: bool, key: &str| {
+        let texture = |on: bool, key: &str, set: u32| {
             if on {
-                format!(r#""{key}": {{"index": 0}},"#)
+                format!(r#""{key}": {{"index": 0, "texCoord": {set}}},"#)
             } else {
                 String::new()
             }
         };
-        let material = format!(
+        let mut materials = vec![format!(
             r#"{{"name": "skin", {} "pbrMetallicRoughness": {{ {} {} "roughnessFactor": 1}}, "alphaMode": "{}"}}"#,
-            texture(normal, "normalTexture"),
-            texture(base, "baseColorTexture"),
-            texture(mr, "metallicRoughnessTexture"),
+            texture(normal, "normalTexture", self.normal_tex_coord),
+            texture(base, "baseColorTexture", 0),
+            texture(mr, "metallicRoughnessTexture", 0),
             self.alpha
-        );
+        )];
+        if self.unused_material {
+            materials.push(r#"{"name": "spare", "alphaMode": "BLEND"}"#.to_owned());
+        }
+        let mut primitive = format!(r#""attributes": {{ {attributes} }}, "mode": {}"#, self.mode);
+        if !self.unindexed {
+            primitive += r#", "indices": 1"#;
+        }
+        if self.material {
+            primitive += r#", "material": 0"#;
+        }
         // Node 0 is the mesh; the bones follow, each the parent of the next.
         let mut nodes = vec![format!(
             r#"{{"name": "body", "mesh": 0 {}}}"#,
             if self.skinned { r#", "skin": 0"# } else { "" }
         )];
+        let mut scene_roots = vec!["0".to_owned(), "1".to_owned()];
         for (index, bone) in self.bones.iter().enumerate() {
-            let children = if index + 1 < bones {
+            let separate = self.two_trees && index == 1;
+            let children = if index + 1 < bones && !separate {
                 format!(r#", "children": [{}]"#, index + 2)
             } else {
                 String::new()
             };
-            nodes.push(format!(r#"{{"name": "{bone}" {children}}}"#));
+            if self.two_trees && index == 2 {
+                scene_roots.push((index + 1).to_string());
+            }
+            let place = if self.posed && index == 1 {
+                r#", "translation": [0, 1, 0]"#
+            } else {
+                ""
+            };
+            nodes.push(format!(r#"{{"name": "{bone}" {children} {place}}}"#));
         }
         let joints: Vec<String> = (1..=bones).map(|n| n.to_string()).collect();
+        let binds = if self.inverse_binds {
+            r#", "inverseBindMatrices": 4"#
+        } else {
+            ""
+        };
+        let skin = format!(r#"{{"joints": [{}] {binds}}}"#, joints.join(","));
         let json = format!(
             r#"{{
             "asset": {{"version": "2.0"}},
-            "scene": 0, "scenes": [{{"nodes": [0, 1]}}],
+            "scene": 0, "scenes": [{{"nodes": [{}]}}],
             "nodes": [{}],
             "skins": [{}],
-            "meshes": [{{"primitives": [{{"attributes": {{ {attributes} }}, "indices": 1, "material": 0 {targets}}}]}}],
-            "materials": [{material}],
+            "meshes": [{{"primitives": [{{ {primitive} {targets} }}]}}],
+            "materials": [{}],
             "images": [{{"uri": "t.png"}}],
             "textures": [{{"source": 0}}],
             "buffers": [{{"uri": "c.bin", "byteLength": {}}}],
             "bufferViews": [{}],
             "accessors": [{}]
         }}"#,
+            scene_roots.join(","),
             nodes.join(","),
-            vec![
-                format!(
-                    r#"{{"joints": [{}], "inverseBindMatrices": 4}}"#,
-                    joints.join(",")
-                );
-                self.skins
-            ]
-            .join(","),
+            vec![skin; self.skins].join(","),
+            materials.join(","),
             bin.len(),
             views.join(","),
             accessors.join(",")
@@ -283,6 +342,176 @@ fn every_kind_of_mistake_is_found() {
         &stray.check(None),
         "1 weights name a bone the skin doesn't have"
     ));
+}
+
+#[test]
+fn what_skinning_needs_of_the_skeleton_is_checked() {
+    let cases: Vec<(Character, &str)> = vec![
+        (
+            Character {
+                inverse_binds: false,
+                ..Default::default()
+            },
+            "the skin has no inverse bind matrices",
+        ),
+        (
+            Character {
+                binds_short: 1,
+                ..Default::default()
+            },
+            "the skin has 2 inverse bind matrices for 3 bones",
+        ),
+        (
+            Character {
+                posed: true,
+                ..Default::default()
+            },
+            "2 bones aren't where the skin was bound, so the file isn't in its rest pose: pelvis, spine",
+        ),
+        (
+            Character {
+                two_trees: true,
+                ..Default::default()
+            },
+            "the skin's bones form 2 trees, not one",
+        ),
+    ];
+    for (character, part) in cases {
+        let report = character.check(Some(ROLES));
+        assert!(has(&report, part), "{part}: {}", report.summary());
+    }
+    let many: Vec<&'static str> = (0..=MAX_JOINTS)
+        .map(|i| &*Box::leak(format!("b{i}").into_boxed_str()))
+        .collect();
+    let report = Character {
+        bones: many,
+        ..Default::default()
+    }
+    .check(None);
+    assert!(
+        has(&report, "the skin has 257 bones, more than the 256"),
+        "{}",
+        report.summary()
+    );
+}
+
+#[test]
+fn what_skinning_needs_of_each_mesh_is_checked() {
+    let cases: Vec<(Character, &str)> = vec![
+        (
+            Character {
+                uvs: false,
+                ..Default::default()
+            },
+            "has a part with no texture coordinates",
+        ),
+        (
+            Character {
+                mode: 1,
+                ..Default::default()
+            },
+            "has a part drawn as Lines, not triangles",
+        ),
+        (
+            Character {
+                material: false,
+                ..Default::default()
+            },
+            "has a part with no material",
+        ),
+        (
+            Character {
+                weighted: false,
+                ..Default::default()
+            },
+            "has no bone weights",
+        ),
+        (
+            Character {
+                normal_tex_coord: 1,
+                ..Default::default()
+            },
+            "reads a texture through other texture coordinates than the first",
+        ),
+    ];
+    for (character, part) in cases {
+        let report = character.check(Some(ROLES));
+        assert!(has(&report, part), "{part}: {}", report.summary());
+    }
+    let mut nan = Character::default();
+    nan.weights[0].1 = [f32::NAN, 0.0, 0.0, 0.0];
+    let mut negative = Character::default();
+    negative.weights[1].1 = [1.5, -0.5, 0.0, 0.0];
+    for character in [nan, negative] {
+        let report = character.check(None);
+        assert!(
+            has(
+                &report,
+                "1 vertices have a negative weight, or one that isn't a number"
+            ),
+            "{}",
+            report.summary()
+        );
+    }
+}
+
+#[test]
+fn materials_no_mesh_uses_are_not_checked() {
+    let report = Character {
+        unused_material: true,
+        ..Default::default()
+    }
+    .check(Some(ROLES));
+    assert!(report.problems.is_empty(), "{}", report.summary());
+    assert_eq!(report.materials, 1);
+}
+
+#[test]
+fn a_bone_named_with_no_weight_is_not_used() {
+    // Every vertex names Root first, with no weight: Root still deforms nothing.
+    let mut character = Character {
+        bones: vec!["Root", "pelvis", "spine", "tip"],
+        ..Default::default()
+    };
+    for (joints, _) in &mut character.weights {
+        joints[3] = 3;
+    }
+    let report = character.check(Some(ROLES));
+    assert!(
+        has(&report, "bone `tip` deforms nothing"),
+        "{}",
+        report.summary()
+    );
+}
+
+#[test]
+fn a_file_without_indices_counts_its_triangles_by_vertex() {
+    let report = Character {
+        unindexed: true,
+        ..Default::default()
+    }
+    .check(Some(ROLES));
+    assert_eq!(report.triangles, 1, "{}", report.summary());
+}
+
+#[test]
+fn the_summary_lists_each_problem() {
+    let report = Character {
+        morph: true,
+        alpha: "BLEND",
+        ..Default::default()
+    }
+    .check(Some(ROLES));
+    let summary = report.summary();
+    assert!(summary.contains("; 2 problems:"), "{summary}");
+    assert!(
+        summary.contains("\n  - mesh `body` has morph targets"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("\n  - material `skin` is blended"),
+        "{summary}"
+    );
 }
 
 #[test]
