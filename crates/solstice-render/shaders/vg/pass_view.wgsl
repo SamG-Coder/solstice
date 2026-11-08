@@ -46,7 +46,9 @@ struct CullState {
     sw_base: u32,
     hw_base: u32,
     triangle_count: atomic<u32>,
-    _pad0: u32,
+    // Queue entries and clusters that found no room in their lists, and so were lost. Nonzero
+    // means the lists are too small for this view, and the image or shadow has holes.
+    dropped: atomic<u32>,
     _pad1: u32,
     _pad2: u32,
 }
@@ -62,7 +64,7 @@ struct CullStateRead {
     sw_base: u32,
     hw_base: u32,
     triangle_count: u32,
-    _pad0: u32,
+    dropped: u32,
     _pad1: u32,
     _pad2: u32,
 }

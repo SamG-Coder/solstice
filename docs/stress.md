@@ -160,3 +160,28 @@ What this round found:
   foliage whose clusters stay fine. The software rasterizer carries it (raster 1 1.2 ms), but
   it is the ceiling for small GPUs.
 
+#### Fix 2: cloud shadows beyond their map (PR #26)
+
+A one-workgroup pass averages the cloud shadow map each frame, reading every fourth texel, and
+`cloud_shadow()` blends from the map to that mean across the map's outer band (4.5 to 6 km) and
+uses the mean beyond. The streaks and the line on the far sea are gone from 80 m and 300 m up;
+a faint lens remains within the map where a cloud's shadow really falls 5 km out. Reviewed and
+approved by a separate agent; its nits (a 4× subsample, wording) are in.
+
+#### Fix 3: the cull lists report what they drop, and hold twice as much
+
+`CullState` gains a `dropped` counter: every queue entry, retry entry and cluster that found no
+room is counted, and a dropped cluster no longer adds its triangles to the count either.
+`FrameStats` reports it for the main view and the last shadow cascade, and the viewer prints a
+warning after a capture or a flyover when either is nonzero. Both visible lists grow from
+1,048,576 to 2,097,152 entries (8 bytes each, so 16 MB more on the GPU in all): the far cascade
+in the round-2 courtyard selects 988,000 clusters with the receiver planes and would have
+overflowed within a camera turn. Checked by shrinking the lists to 65,536 for one build: the
+courtyard then reports 887,927 clusters dropped in the main view and 920,079 in the cascade.
+
+What this does not fix: a 2048² cascade over a dense wood legitimately asks for a million
+clusters, four texels each, and 100 million triangles. That is the content's density, the same
+as the main view's per pixel, over four and a half times the pixels. Fewer, larger triangles for
+far shadow casters would need a coarser LOD than the texel for foliage, which is a design
+question for the cluster builder's thinning, not a cull bug.
+
