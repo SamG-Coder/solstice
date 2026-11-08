@@ -80,7 +80,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let cos_light = dot(normal, direction);
             if cos_light > 0.0 {
                 let falloff = sq(clamp(1.0 - sq(sq(distance / light.range)), 0.0, 1.0)) / max(distance * distance, 0.25);
-                let open = light_shadow(i, -to_light, distance, voxel);
+                let open = light_shadow(i, -to_light, distance, voxel, normal);
                 irradiance += light.intensity * falloff * cos_light * open;
             }
         }

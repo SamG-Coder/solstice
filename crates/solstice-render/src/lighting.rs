@@ -85,17 +85,27 @@ pub const LIGHT_SHADOW_SIZE: u32 = 64;
 /// through the GI volume once a frame by `lighting/light_shadows.wgsl`, so that the passes
 /// lighting a point look each light's shadow up instead of tracing it per pixel per light,
 /// whose cost grew with pixels times the lights overlapping them. One layer per light, of
-/// distances; a scene with no lights keeps one unused layer, so that the bindings exist.
+/// distances; a scene with no lights keeps one unused layer, so that the bindings exist, and
+/// a scene with more lights than the device allows layers leaves the rest unshadowed.
 pub struct LightShadows {
     pipeline: wgpu::ComputePipeline,
     group: wgpu::BindGroup,
     pub view: wgpu::TextureView,
-    light_count: u32,
+    /// Lights with a map: the scene's, up to the device's layers.
+    mapped: u32,
 }
 
 impl LightShadows {
     pub fn new(gpu: &Gpu, environment: &wgpu::BindGroupLayout, scene: &GpuScene) -> Self {
         let format = wgpu::TextureFormat::R32Float;
+        let layers = gpu.device.limits().max_texture_array_layers;
+        if scene.light_count > layers {
+            log::warn!(
+                "{} lights, but the device allows {layers} shadow maps: the rest cast none",
+                scene.light_count
+            );
+        }
+        let mapped = scene.light_count.min(layers);
         let layout = LayoutBuilder::new()
             .storage_read()
             .storage_texture_array(format)
@@ -105,7 +115,7 @@ impl LightShadows {
             size: wgpu::Extent3d {
                 width: LIGHT_SHADOW_SIZE,
                 height: LIGHT_SHADOW_SIZE,
-                depth_or_array_layers: scene.light_count.max(1),
+                depth_or_array_layers: mapped.max(1),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -135,14 +145,14 @@ impl LightShadows {
                 ],
             ),
             view,
-            light_count: scene.light_count,
+            mapped,
         }
     }
 
     /// Traces every light's map afresh, after the volume's passes and before the passes that
     /// read the maps.
     pub fn record(&self, encoder: &mut wgpu::CommandEncoder, environment: &wgpu::BindGroup) {
-        if self.light_count == 0 {
+        if self.mapped == 0 {
             return;
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -153,7 +163,7 @@ impl LightShadows {
         pass.set_bind_group(0, &self.group, &[]);
         pass.set_bind_group(1, environment, &[]);
         let groups = groups_for(LIGHT_SHADOW_SIZE, 8);
-        pass.dispatch_workgroups(groups, groups, self.light_count);
+        pass.dispatch_workgroups(groups, groups, self.mapped);
     }
 }
 

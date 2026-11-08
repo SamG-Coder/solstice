@@ -90,7 +90,7 @@ fn local_light(index: u32, s: Surface, view: vec3f, world: vec3f) -> vec3f {
     let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
     let voxel = volume_params.levels[level].w;
     let from_light = world + s.normal * voxel * 1.5 - light.position;
-    let open = light_shadow(index, from_light, length(from_light), voxel);
+    let open = light_shadow(index, from_light, length(from_light), voxel, s.normal);
     return shade_light(s, view, direction) * light.intensity * falloff * open;
 }
 

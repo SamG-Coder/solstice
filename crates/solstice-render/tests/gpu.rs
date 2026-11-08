@@ -3327,7 +3327,10 @@ fn solid_particles_hide_what_is_behind_them() {
 /// Local lights are shadowed through their own maps: a lamp over the floor with a ball hung
 /// between them leaves the floor under the ball dark and the floor beside it lit, and taking
 /// the ball away lights the floor under it. A map never traced would shadow the floor beside
-/// the ball too; a map never consulted would shadow nothing.
+/// the ball too; a map never consulted would shadow nothing; a second lamp, out of the ball's
+/// way and first in the list, would light the floor under the ball if the lamps' maps were
+/// mixed up; and the floor far to the side, lit at a slant, stays lit, where a map read with
+/// too little margin would shadow it with itself.
 #[test]
 fn a_lamp_is_shadowed_through_its_map() {
     let Some(gpu) = request_gpu() else {
@@ -3348,25 +3351,29 @@ fn a_lamp_is_shadowed_through_its_map() {
         daylight_illuminance: 10.0,
         ..Default::default()
     };
-    let lamp = Light {
-        position: [0.0, 5.0, 0.0],
+    let lamp = |x: f32| Light {
+        position: [x, 5.0, 0.0],
         range: 9.0,
         intensity: [60.0; 3],
         _pad: 0,
     };
     let size = 128;
     // The volume resolves the ball at 0.2 m voxels and stops its traces most of a voxel short
-    // of a surface, so the shadow is some 2.5 m across on the floor; the lit spot stands well
-    // outside it, 42° from the lamp's vertical against the shadow's 26°.
+    // of a surface, so the shadow is some 2.5 m in radius on the floor; the lit spot stands
+    // well outside it, 42° from the lamp's vertical against the shadow's 26°, and the slanted
+    // one at 46°, nearer the camera, where the lamp's light arrives at half its strength.
     let under = Vec3::ZERO;
     let beside = Vec3::new(4.5, 0.0, 0.0);
+    let slanted = Vec3::new(-2.5, 0.0, 4.5);
     let floor_at = |pixels: &[u8], world: Vec3| {
         let (x, y) = pixel_of(&camera, size, world);
         brightness(patch(pixels, size, x, y, 2))
     };
     let mut scene = ball_on_floor();
-    scene.lights = vec![lamp];
-    // The ball hangs between the lamp and the floor, a metre clear of both.
+    // The other lamp is far enough along +X that nothing it lights is measured.
+    scene.lights = vec![lamp(16.0), lamp(0.0)];
+    // The ball hangs between the lamp and the floor, a metre above the floor and two below
+    // the lamp.
     scene.instances[0].transform = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
     let with_ball = render_in(
         &gpu,
@@ -3390,6 +3397,7 @@ fn a_lamp_is_shadowed_through_its_map() {
 
     let (shadowed, lit) = (floor_at(&with_ball, under), floor_at(&with_ball, beside));
     let (open, lit_alone) = (floor_at(&without, under), floor_at(&without, beside));
+    let slant = floor_at(&without, slanted);
     assert!(
         shadowed + 20.0 < lit,
         "under the ball the floor is {shadowed}, beside it {lit}: no shadow"
@@ -3401,5 +3409,9 @@ fn a_lamp_is_shadowed_through_its_map() {
     assert!(
         (lit - lit_alone).abs() < 8.0,
         "beside the ball the floor is {lit} with it and {lit_alone} without: the ball shadows what it should not"
+    );
+    assert!(
+        slant > lit_alone * 0.3,
+        "the floor lit at a slant is {slant} against {lit_alone} nearer the lamp: it shadows itself"
     );
 }
