@@ -416,6 +416,60 @@ def on_hour(self, hour):
   Monty's interface becomes fit for a game, or Solstice ever grows its own language, only the
   generated layer changes; the API and the game's scripts stay put.
 
+**As built (step 3, `crates/solstice-script`):**
+- **Handlers.** `on_begin(self)` runs once, the first step an actor has the script.
+  `on_tick(self, dt)` runs every step, but only for scripts that have one. `on_<name>(self, ...)`
+  runs for each `ScriptEvent` named `<name>`, sent to the actor or to every actor, by a script
+  or by Rust.
+  - Each step they run in `PrePhysics`: beginnings, then events in the order they were sent,
+    then ticks, each in the world's order of entities.
+  - An event a script sends, even to itself, is handled the next step: one step, 1/60 s, of
+    latency between one actor and the next.
+- **`self`** is a copy of the actor on the call's heap:
+  - its properties, which can be set but not added;
+  - `self.vars`, where plain data can be kept: numbers, strings, `vec3`s, entities, and lists
+    and dicts of those, at most 64 deep and 100,000 values, and never containing themselves;
+  - `self.position` and `self.yaw`, written back to its `Transform`, local to its `Parent` if it
+    has one; an actor without a `Transform` gets one when it first moves, and both must stay
+    finite;
+  - `self.entity`, which can be a dict key.
+
+  Lists in `self.vars` are changed in place within a call, and kept.
+- **A failing handler changes nothing but the log.** Its copy is thrown away, and what it asked
+  of the world (events to send, timers to set or cancel) is held back until it succeeds, so an
+  actor is never left half-changed. Its log lines are kept, to show why it failed; what failed,
+  with file and line, goes to the host's errors.
+- **Timers** set by `after` and `every` belong to the actor: their handles are its own, and
+  `cancel` refuses, returning `False`, another actor's. `begin` and `tick` are the engine's own
+  events, and can't be sent.
+- **Loading.** Each script is parsed, run once and frozen, and its handlers are shared. A script
+  that fails to load, or whose `on_*` names aren't functions, leaves the old one running. Each
+  call gets a temporary heap of its own, dropped when the call ends; sharing one heap across a
+  step was tried, and was slower. Type checking is left to editors for now.
+  - Reloads aren't part of a `Recording`: a replay runs the scripts loaded when it starts.
+- **Limits.** Each call, and each load, may do 100,000 of Starlark's steps of work, and hold
+  16 MiB.
+  - Counting work, not time, stops a runaway script at the same point natively and on the web:
+    tested, at the same 100 lines of its log, plus one counting those dropped, on both.
+  - It stops in about 4 ms on the web: one hitch, not a hang.
+  - The memory limit is best effort. Starlark checks it now and then, and the host once more as
+    the call ends, from Starlark's own count of what it allocated. That count is of values,
+    which are larger on 64-bit than on wasm32, so a script near the limit may pass on the web
+    and fail natively.
+  - A call keeps 100 lines of log, of up to 1,000 characters each.
+- **The API** is the one `#[starlark_module]` in `api.rs`: `vec3`, `send`, `after`, `every`,
+  `cancel`, `find`, `input`, `held`, `pressed`, `now` and `log`. Starlark's own documentation,
+  `api_reference()`, renders it for people and editors, in place of a hand-written stub.
+- **Cost** (`tools/gameplay-bench/b_script`, 9800X3D):
+  - about 1.1 to 1.3 µs a ticking actor on the web, and 1.9 to 2.4 µs natively, most of it
+    setting up each call;
+  - so the 1 ms scripts line of the budget holds about 400 actors ticking every step on an
+    integrated-GPU laptop. Most actors don't tick: they wait for events.
+  - Starlark adds 1.4 MB, gzipped, to the gameplay web build.
+- **No `unsafe` code.** A frozen handler is called from a temporary heap by allocating it on the
+  call's frozen heap, which keeps its own heap alive for the call.
+- **`Name`** moved into `solstice-world`, since the world's own tools will find entities by it.
+
 ## Physics
 
 **Rapier**, version 0.36, in `solstice-physics`.
@@ -734,7 +788,7 @@ your go-ahead, and nothing is published without asking.
    - Tests: a moved instance's motion vectors and shadow follow it; cached shadows of static
      geometry stay as they were; nothing static is redrawn; nothing moving is left behind in a
      cache.
-2. **The world.** *In review.* `solstice-world`: entities and components on `hecs`, the
+2. **The world.** *Done.* `solstice-world`: entities and components on `hecs`, the
    transform tree, tick groups, events, timers, and the fixed clock with input per step.
    Headless.
    - Tests: tick order; event order; a recorded run replays to the same state; the clock under
@@ -745,9 +799,9 @@ your go-ahead, and nothing is published without asking.
      0.15 ms a step on the web; perhaps 0.3 ms on an integrated-GPU laptop, within the world's
      line of the budget. Every entity with a transform is worked out every step. If scenes grow
      past that, skipping what hasn't moved comes next.
-3. **Scripting.** `solstice-script` with Starlark: actor scripts, properties and `self.vars`,
-   events, timers, the engine API table and its generated bindings, hot reload, step and memory
-   caps, and errors with file and line. The benchmarks are run again in place.
+3. **Scripting.** *In review.* `solstice-script` with Starlark: actor scripts, properties and
+   `self.vars`, events, timers, the engine API table and its generated bindings, hot reload,
+   step and memory caps, and errors with file and line. The benchmarks are run again in place.
    - Tests: hot reload keeps state; a runaway script is stopped and reported, at the same point
      natively and on the web; a broken reload keeps the old script running.
 4. **Scenes, actors and play mode.** `.actor` files, `actor` lines in scene files and their
