@@ -51,7 +51,12 @@ impl Rig {
 
     /// Simulates one frame of `seconds`.
     fn frame(&mut self, seconds: f32) {
-        self.particles.prepare(&self.gpu, Vec3::ZERO, seconds, 1.0);
+        self.frame_at(seconds, Vec3::ZERO);
+    }
+
+    /// Simulates one frame of `seconds` with the camera at `camera`.
+    fn frame_at(&mut self, seconds: f32, camera: Vec3) {
+        self.particles.prepare(&self.gpu, camera, seconds, 1.0);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.particles.record_simulation(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
@@ -410,6 +415,212 @@ fn stopped_effects_end_and_their_slices_are_reused() {
     rig.frame(1.0 / 30.0);
     assert!(!rig.particles.is_active());
     assert!(rig.particles.spawn(&effect, Mat4::IDENTITY).is_some());
+}
+
+/// Changing the pool's size, as changing quality does, starts running effects again in the new
+/// pool, with budgets that fit it, and nothing is lost or listed twice.
+#[test]
+fn a_running_effect_moves_to_a_resized_pool() {
+    let Some(mut rig) = Rig::new(8192) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter a
+          budget 3000
+          spawn rate=3000
+          lifetime 0.2 1.5
+        emitter b
+          budget 3000
+          spawn rate=900
+          lifetime 2
+        ",
+    )
+    .unwrap();
+    let id = rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    for frame in 0..40 {
+        rig.frame(UNEVEN[frame % UNEVEN.len()]);
+    }
+    rig.particles.resize(&rig.gpu, 4000);
+    assert_eq!(rig.particles.capacity(), 4000);
+    assert!(rig.particles.is_running(id));
+    for frame in 0..200 {
+        rig.frame(UNEVEN[frame % UNEVEN.len()]);
+    }
+    let emitters = rig.emitters();
+    assert_eq!(emitters.len(), 2);
+    // The first takes all it asked for; the second only what was left.
+    assert_eq!((emitters[0].budget, emitters[1].budget), (3000, 1000));
+    for e in &emitters {
+        assert_eq!(
+            e.state.free_count + e.state.alive[rig.particles.parity as usize],
+            e.budget
+        );
+        let mut seen = HashSet::new();
+        for &slot in e.free.iter().chain(&e.alive) {
+            assert!((e.base..e.base + e.budget).contains(&slot));
+            assert!(seen.insert(slot));
+        }
+        assert!(!e.alive.is_empty());
+    }
+}
+
+/// An emitter that follows the camera spawns around it, wherever it goes.
+#[test]
+fn camera_following_emitters_spawn_around_the_camera() {
+    let Some(mut rig) = Rig::new(4096) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter rain\n budget 2000\n follow camera\n spawn rate=6000\n shape box 20 4 20\n offset 0 10 0\n lifetime 5",
+    )
+    .unwrap();
+    rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    let camera = Vec3::new(140.0, 3.0, -60.0);
+    rig.frame_at(1.0 / 60.0, camera);
+    let [e] = rig.emitters().try_into().ok().unwrap();
+    assert_eq!(e.particles.len(), 100);
+    for p in &e.particles {
+        let local = Vec3::from(p.position) - camera - Vec3::new(0.0, 10.0, 0.0);
+        assert!(
+            local.abs().cmple(Vec3::new(10.0, 2.0, 10.0)).all(),
+            "{local}"
+        );
+    }
+}
+
+/// A paused frame, of no time, moves nothing and spawns nothing.
+#[test]
+fn a_paused_frame_moves_nothing() {
+    let Some(mut rig) = Rig::new(4096) else {
+        return;
+    };
+    let effect = Effect::parse(
+        BALLISTIC
+            .replace("burst=1500", "burst=500 rate=300")
+            .as_str(),
+    )
+    .unwrap();
+    rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    for seconds in &UNEVEN[..4] {
+        rig.frame(*seconds);
+    }
+    let before = rig.emitters().remove(0);
+    for _ in 0..5 {
+        rig.frame(0.0);
+    }
+    let after = rig.emitters().remove(0);
+    assert_eq!(after.state.spawned, before.state.spawned);
+    let positions = |e: &Snapshot| -> HashMap<u32, [f32; 3]> {
+        e.particles.iter().map(|p| (p.index, p.position)).collect()
+    };
+    assert_eq!(positions(&after), positions(&before));
+}
+
+/// A burst at low detail still gives at least one particle.
+#[test]
+fn bursts_survive_low_detail() {
+    let effect = Effect::parse("emitter e\n spawn burst=1 every=0.5").unwrap();
+    let mut emitter = LiveEmitter {
+        slot: 0,
+        base: 0,
+        budget: 10,
+        carry: 0.0,
+        burst_started: false,
+        until_burst: 0.0,
+        longest_life: 0.0,
+    };
+    let desc = &effect.emitters[0];
+    assert_eq!(spawns_due(&mut emitter, desc, &[], 0.1, 0.35), 1);
+    assert_eq!(spawns_due(&mut emitter, desc, &[], 0.3, 0.35), 0);
+    assert_eq!(spawns_due(&mut emitter, desc, &[], 0.2, 0.35), 1);
+    // And a burst of nothing stays nothing.
+    let none = Effect::parse("emitter e\n spawn rate=0").unwrap();
+    emitter.burst_started = false;
+    assert_eq!(
+        spawns_due(&mut emitter, &none.emitters[0], &[], 0.1, 0.35),
+        0
+    );
+}
+
+/// Every record the shaders share with the CPU has the same size and field offsets in both, as
+/// naga lays out the WGSL.
+#[test]
+fn shader_records_match_their_rust_twins() {
+    let source = crate::shaders::expand("particles/simulate.wgsl");
+    let module = naga::front::wgsl::parse_str(&source).unwrap();
+    let layout = |name: &str| -> (u32, HashMap<String, u32>) {
+        let ty = module
+            .types
+            .iter()
+            .find(|(_, t)| t.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no struct {name}"))
+            .1;
+        let naga::TypeInner::Struct { members, span } = &ty.inner else {
+            panic!("{name} is not a struct");
+        };
+        let offsets = members
+            .iter()
+            .map(|m| (m.name.clone().unwrap(), m.offset))
+            .collect();
+        (*span, offsets)
+    };
+    macro_rules! twin {
+        ($wgsl:literal, $rust:ty, [$($field:ident),* $(,)?]) => {{
+            let (span, offsets) = layout($wgsl);
+            assert_eq!(span as usize, std::mem::size_of::<$rust>(), "size of {}", $wgsl);
+            $(
+                assert_eq!(
+                    offsets[stringify!($field)] as usize,
+                    std::mem::offset_of!($rust, $field),
+                    "{}.{}", $wgsl, stringify!($field)
+                );
+            )*
+        }};
+    }
+    twin!(
+        "Emitter",
+        EmitterRecord,
+        [
+            transform,
+            shape_size,
+            offset_cone,
+            velocity_spread,
+            acceleration_drag,
+            lifetime_size,
+            color,
+            base,
+            budget,
+            spawn_request,
+            seed,
+            shape_kind,
+            flags,
+            soft,
+            scale,
+        ]
+    );
+    twin!(
+        "Particle",
+        Particle,
+        [position, age, velocity, lifetime, previous, size, index, rotation,]
+    );
+    twin!(
+        "EmitterState",
+        EmitterState,
+        [
+            free_count,
+            alive,
+            spawned,
+            dropped,
+            spawn_count,
+            spawn_first,
+            spawn_index,
+            update_count,
+            spawn_start,
+            update_start,
+        ]
+    );
+    twin!("SimParams", SimUniform, [seconds, parity, capacity]);
 }
 
 #[test]

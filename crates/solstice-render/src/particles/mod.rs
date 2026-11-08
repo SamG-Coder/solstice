@@ -168,8 +168,8 @@ pub struct Particles {
 }
 
 impl Particles {
-    /// Creates the passes and a pool of `capacity` particles. `frame` is the renderer's frame
-    /// uniform, which the draw reads.
+    /// Creates the passes and a pool of `capacity` particles, or as many as the device can
+    /// bind. `frame` is the renderer's frame uniform, which the draw reads.
     pub fn new(gpu: &Gpu, frame: &wgpu::Buffer, capacity: u32) -> Self {
         let plan_layout = LayoutBuilder::new()
             .uniform()
@@ -334,7 +334,7 @@ impl Particles {
             &frame_layout,
             &[frame.as_entire_binding()],
         );
-        let capacity = capacity.max(GROUP_SIZE_U32);
+        let capacity = fitted_capacity(gpu, capacity);
         let pool = Pool::new(
             gpu,
             capacity,
@@ -376,7 +376,7 @@ impl Particles {
     /// Makes the pool hold `capacity` particles. Running effects start again in the new pool,
     /// with budgets that fit it.
     pub fn resize(&mut self, gpu: &Gpu, capacity: u32) {
-        let capacity = capacity.max(GROUP_SIZE_U32);
+        let capacity = fitted_capacity(gpu, capacity);
         if capacity == self.pool.capacity {
             return;
         }
@@ -744,7 +744,8 @@ impl Particles {
     }
 
     /// Draws every emitter's particles over `color`. With `overdraw`, `color` is cleared first
-    /// and each layer of particle adds a step of the overdraw view's heat.
+    /// and each layer of particle adds a step of the overdraw view's heat, so with nothing
+    /// running the view is black.
     pub fn record_draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -752,7 +753,7 @@ impl Particles {
         targets: &ParticleTargets,
         overdraw: bool,
     ) {
-        if !self.active {
+        if !self.active && !overdraw {
             return;
         }
         let load = if overdraw {
@@ -783,6 +784,9 @@ impl Particles {
             occlusion_query_set: None,
             multiview_mask: None,
         });
+        if !self.active {
+            return;
+        }
         pass.set_pipeline(&self.depth_copy);
         pass.set_bind_group(0, &targets.copy_group, &[]);
         pass.draw(0..3, 0..1);
@@ -817,6 +821,18 @@ impl Particles {
 
 /// Twin of `GROUP_SIZE` in `particles/common.wgsl`.
 const GROUP_SIZE_U32: u32 = 64;
+
+/// `wanted` particles, or as many as the device can bind in one storage buffer, and at least a
+/// workgroup's worth.
+fn fitted_capacity(gpu: &Gpu, wanted: u32) -> u32 {
+    let particle = std::mem::size_of::<Particle>() as u64;
+    let largest = gpu
+        .limits
+        .max_storage_buffer_binding_size
+        .min(gpu.limits.max_buffer_size)
+        / particle;
+    (u64::from(wanted).min(largest) as u32).max(GROUP_SIZE_U32)
+}
 
 impl Pool {
     fn new(
@@ -970,7 +986,14 @@ fn spawns_due(
     emitter.carry += rate * seconds;
     let mut count = emitter.carry.floor();
     emitter.carry -= count;
-    let burst = (desc.burst.eval(params).max(0.0) * detail).round();
+    // A burst asked for always gives at least one particle, however low the detail: a flash
+    // or a hit marker must not vanish on small GPUs.
+    let asked = desc.burst.eval(params).max(0.0);
+    let burst = if asked > 0.0 {
+        (asked * detail).round().max(1.0)
+    } else {
+        0.0
+    };
     let every = desc.every.eval(params);
     if !emitter.burst_started {
         emitter.burst_started = true;

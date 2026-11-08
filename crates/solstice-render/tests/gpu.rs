@@ -1810,8 +1810,8 @@ fn waves_wet_the_faces_they_break_against() {
     );
 }
 
-/// A black wall facing the camera, 10 m in front of it along -Z.
-fn black_wall() -> SceneAsset {
+/// A wall of grey `albedo`, glowing as brightly, facing the camera 10 m in front of it along -Z.
+fn wall(albedo: f32) -> SceneAsset {
     let mut wall = Mesh::default();
     for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
         wall.vertices.push(Vertex {
@@ -1824,7 +1824,9 @@ fn black_wall() -> SceneAsset {
     SceneAsset {
         meshes: vec![build_virtual_mesh(&wall, &BuildOptions::default())],
         materials: vec![Material {
-            base_color: [0.0, 0.0, 0.0, 1.0],
+            base_color: [albedo, albedo, albedo, 1.0],
+            // It glows as bright as it is pale, so views that light it show it in the dark.
+            emissive: [albedo; 3],
             flags: Material::TWO_SIDED,
             ..Default::default()
         }],
@@ -1842,11 +1844,13 @@ fn still_particles(count: u32, soft: f32) -> Effect {
     .unwrap()
 }
 
-/// Renders the black wall with the particles of `effect` at `at`, in a debug view that shows the
-/// scene's colour as it is, with no exposure or history, and reads back the image.
+/// Renders a wall of `albedo` with the particles of `effect`, if any, at `at`, in a debug view
+/// that shows the scene's colour as it is, with no exposure or history, and reads back the image.
+#[allow(clippy::too_many_arguments)]
 fn render_particles(
     gpu: &Gpu,
-    effect: &Effect,
+    albedo: f32,
+    effect: Option<&Effect>,
     at: Vec3,
     debug: DebugView,
     sea_level: Option<f32>,
@@ -1863,15 +1867,17 @@ fn render_particles(
         temporal_accumulation: false,
         ..Default::default()
     };
-    let mut renderer = Renderer::new(gpu, &paginate(&black_wall()), FORMAT, settings);
+    let mut renderer = Renderer::new(gpu, &paginate(&wall(albedo)), FORMAT, settings);
     if let Some(level) = sea_level {
         renderer.set_ocean(Some(Ocean::by_name("coastal").unwrap()), 0.0);
         renderer.set_sea_level(level);
     }
-    renderer
-        .particles()
-        .spawn(effect, Mat4::from_translation(at))
-        .expect("room for the effect");
+    if let Some(effect) = effect {
+        renderer
+            .particles()
+            .spawn(effect, Mat4::from_translation(at))
+            .expect("room for the effect");
+    }
     let camera = Camera {
         position: Vec3::ZERO,
         ..Default::default()
@@ -1911,7 +1917,8 @@ fn particles_fade_softly_into_the_surface_behind_them() {
     let centre = |z: f32, soft: f32| {
         let pixels = render_particles(
             &gpu,
-            &still_particles(1, soft),
+            0.0,
+            Some(&still_particles(1, soft)),
             Vec3::new(0.0, 0.0, z),
             DebugView::Albedo,
             None,
@@ -1942,7 +1949,8 @@ fn the_overdraw_view_counts_layers() {
     let red = |count| {
         let pixels = render_particles(
             &gpu,
-            &still_particles(count, 0.0),
+            0.0,
+            Some(&still_particles(count, 0.0)),
             Vec3::new(0.0, 0.0, -9.0),
             DebugView::Particles,
             None,
@@ -1966,7 +1974,8 @@ fn particles_show_over_the_sea() {
     let size = 64;
     let pixels = render_particles(
         &gpu,
-        &still_particles(1, 0.0),
+        0.0,
+        Some(&still_particles(1, 0.0)),
         Vec3::new(0.0, 0.0, -5.0),
         DebugView::Particles,
         Some(-1.0),
@@ -2030,4 +2039,64 @@ fn the_fountain_runs_at_every_quality() {
         assert!(errors.is_empty(), "{quality:?}: {}", errors.join("\n"));
     }
     assert!(alive[0] < alive[1] && alive[1] < alive[2], "{alive:?}");
+}
+
+/// Additive particles add their light and hide nothing; alpha ones cover what is behind.
+#[test]
+fn additive_particles_add_light_and_alpha_particles_cover() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let centre = |blend: &str, z: f32| {
+        let effect = Effect::parse(&format!(
+            "emitter e
+ budget 1
+ spawn burst=1
+ lifetime 1000
+ size 3
+ color 0.25 0.25 0.25 1
+ render sprite soft=0 blend={blend}"
+        ))
+        .unwrap();
+        let pixels = render_particles(
+            &gpu,
+            0.5,
+            Some(&effect),
+            Vec3::new(0.0, 0.0, z),
+            DebugView::Albedo,
+            None,
+            size,
+        );
+        srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0])
+    };
+    // Behind the wall, the wall alone.
+    let wall = centre("alpha", -11.0);
+    let covered = centre("alpha", -8.0);
+    let added = centre("add", -8.0);
+    assert!(wall > 0.3, "{wall}");
+    assert!((covered - 0.25).abs() < 0.03, "covered: {covered}");
+    assert!(
+        (added - (wall + 0.25)).abs() < 0.04,
+        "added: {added} over {wall}"
+    );
+}
+
+/// With nothing running, the overdraw view is black rather than the scene.
+#[test]
+fn the_overdraw_view_is_black_with_no_particles() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let pixels = render_particles(
+        &gpu,
+        0.8,
+        None,
+        Vec3::ZERO,
+        DebugView::Particles,
+        None,
+        size,
+    );
+    assert_eq!(brightness(patch(&pixels, size, size / 2, size / 2, 4)), 0.0);
 }

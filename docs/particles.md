@@ -452,10 +452,32 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
      - A sprite fades to nothing where it meets a surface.
      - Uneven frame times give the same result as even ones.
 
-   Every test was mutation-checked: each of 14 bugs was put back in turn, and each made a
-   test fail. They included a leaked or doubly freed slot, drag ignored, seeding by slot,
-   unclamped spawns, plain Euler steps, no soft fade, no depth test, and drawing into the
-   target that post does not read over the sea.
+   Further tests, from the review:
+   - the WGSL records match their Rust twins field by field, as naga lays them out;
+   - a running effect moves to a resized pool;
+   - camera-following emitters spawn around the camera;
+   - additive particles add light while alpha ones cover;
+   - a paused frame moves nothing;
+   - bursts survive low detail;
+   - the overdraw view is black with nothing running.
+
+   Every test was mutation-checked: each of 21 bugs was put back in turn, and each made a test
+   fail. They included:
+   - a leaked or doubly freed slot;
+   - drag ignored, and plain Euler steps;
+   - seeding by slot;
+   - unclamped spawns;
+   - no soft fade, and no depth test;
+   - drawing into the target that post does not read over the sea;
+   - additive particles covering;
+   - WGSL fields out of order.
+
+   In a browser (Chromium's WebGPU, through the web viewer's new `?effect=NAME@x,y,z`), the
+   fountain draws in the overdraw view with no GPU errors. Unlit, it is faint against the sunlit
+   scene; step 2 lights it.
+
+   Known until step 3: particles have no motion vectors or reactive mask, so in the final image,
+   with TAA on, moving particles leave short trails. The tests run with TAA off.
 
    **Cost** at 1280×720, the median of repeated runs with the first discarded. On the
    integrated GPU (AMD Radeon, Low quality) the render scale is 0.6 and spawn rates are 0.35.

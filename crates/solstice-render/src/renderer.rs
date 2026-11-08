@@ -591,10 +591,12 @@ impl Renderer {
         self.time += delta_seconds;
         self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
         self.particles.resize(gpu, self.settings.particle_pool);
+        // Particles take the frame's own time, so a host that pauses by passing 0 holds them
+        // still, where the passes that filter over time need a step above zero.
         self.particles.prepare(
             gpu,
             camera.position,
-            self.frame_seconds,
+            delta_seconds.clamp(0.0, 0.25),
             self.settings.particle_detail,
         );
 
