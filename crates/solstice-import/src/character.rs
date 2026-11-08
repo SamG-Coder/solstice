@@ -209,7 +209,7 @@ pub fn check_character(path: &Path, roles: Option<&Roles>) -> Result<CharacterRe
                 let sum: f32 = weights.iter().sum();
                 if sum < 1.0e-6 {
                     empty += 1;
-                } else if !((sum - 1.0).abs() <= WEIGHT_SUM_TOLERANCE) {
+                } else if (sum - 1.0).abs() > WEIGHT_SUM_TOLERANCE {
                     off += 1;
                 }
                 for (joint, weight) in joints.iter().zip(weights) {
