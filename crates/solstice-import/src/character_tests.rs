@@ -68,6 +68,8 @@ struct Character {
     unused_material: bool,
     /// Leaves out the index buffer, so each three vertices are a triangle.
     unindexed: bool,
+    /// Lists the skin's joints last bone first, so children come before their parents.
+    reversed_joints: bool,
 }
 
 impl Default for Character {
@@ -97,6 +99,7 @@ impl Default for Character {
             weighted: true,
             unused_material: false,
             unindexed: false,
+            reversed_joints: false,
         }
     }
 }
@@ -228,7 +231,10 @@ impl Character {
             };
             nodes.push(format!(r#"{{"name": "{bone}" {children} {place}}}"#));
         }
-        let joints: Vec<String> = (1..=bones).map(|n| n.to_string()).collect();
+        let mut joints: Vec<String> = (1..=bones).map(|n| n.to_string()).collect();
+        if self.reversed_joints {
+            joints.reverse();
+        }
         let binds = if self.inverse_binds {
             r#", "inverseBindMatrices": 4"#
         } else {
@@ -310,6 +316,37 @@ fn importing_a_skin_keeps_its_bones_and_weights() {
     // No weight reaches the root, so it moves nothing.
     assert_eq!(bones[0].radius, 0.0);
     assert!(bones[2].radius > 0.5, "{}", bones[2].radius);
+}
+
+/// The file's joints run children first, but bones are numbered parents first, so weights given
+/// by the file's numbers must follow their bones to the new numbers.
+#[test]
+fn weights_follow_their_bones_when_bones_are_renumbered() {
+    let imported = import_skinned(&Character {
+        reversed_joints: true,
+        ..Default::default()
+    })
+    .unwrap();
+    let scene = &imported.scene;
+    let bones = &scene.skeletons[0].bones;
+    assert_eq!(
+        bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+        ["Root", "pelvis", "spine"]
+    );
+    assert_eq!(bones[1].parent, Some(0));
+    let mesh = &scene.meshes[0];
+    let cluster = mesh.clusters[0];
+    let skins: Vec<solstice_asset::PackedSkin> = mesh.vertices
+        [cluster.vertex_offset as usize + 4..cluster.vertex_offset as usize + 6]
+        .iter()
+        .flat_map(|record| bytemuck::cast::<_, [solstice_asset::PackedSkin; 2]>(*record))
+        .collect();
+    // In this file joint 0 is the spine (bone 2), 1 the pelvis (bone 1) and 2 the root (bone 0).
+    for (joints, weights) in Character::default().weights {
+        let numbered = joints.map(|j| 2 - j as u8);
+        let wanted = solstice_asset::PackedSkin::new(numbered, weights);
+        assert!(skins.contains(&wanted), "{wanted:?} missing from {skins:?}");
+    }
 }
 
 #[test]

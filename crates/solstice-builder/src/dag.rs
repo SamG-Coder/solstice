@@ -1,7 +1,7 @@
 //! Builds the cluster LOD DAG and packs it for the GPU.
 
 use crate::bounds::Sphere;
-use crate::group::{group_clusters, GroupInput};
+use crate::group::{group_clusters, GroupInput, MAX_GROUP_SIZE, MAX_SKINNED_GROUP_SIZE};
 use crate::hierarchy::{build_hierarchy, Leaf};
 use crate::mesh::Mesh;
 use crate::partition::{partition_triangles, ClusterLimits};
@@ -178,6 +178,11 @@ fn build_level(
     let partition = group_clusters(&GroupInput {
         triangles: &cluster_triangles,
         bounds: &cluster_bounds,
+        max_group_size: if welded.skins.is_some() {
+            MAX_SKINNED_GROUP_SIZE
+        } else {
+            MAX_GROUP_SIZE
+        },
     });
 
     // A vertex used by two different groups is on a boundary and must not move.
@@ -1314,7 +1319,9 @@ pub(crate) mod tests {
     #[test]
     fn a_change_of_weights_counts_in_the_error() {
         let source = bumpy_sphere(5);
-        let rigid = build_virtual_mesh(&source, &BuildOptions::default());
+        // One bone everywhere, for a skinned mesh whose weights never change.
+        let same = vec![PackedSkin::new([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]); source.vertices.len()];
+        let rigid = build_skinned_mesh(&source, &same, &BuildOptions::default());
         // Bones change sharply and often, so that simplifying must cross many boundaries.
         let hard: Vec<PackedSkin> = source
             .vertices
@@ -1337,6 +1344,39 @@ pub(crate) mod tests {
             worst(&bent),
             worst(&rigid)
         );
+    }
+
+    /// Cards like hair: lots of separate quads, each with its own seams, so clusters are as full
+    /// of vertices as they can be, and a set of them is as large as a set can be.
+    #[test]
+    fn a_full_set_of_skinned_cards_fits_in_a_page() {
+        let mut source = Mesh::default();
+        for i in 0..6000u32 {
+            let (x, z) = ((i % 80) as f32 * 0.03, (i / 80) as f32 * 0.03);
+            let base = source.vertices.len() as u32;
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                source.vertices.push(Vertex {
+                    position: Vec3::new(x + u * 0.02, v * 0.02, z),
+                    normal: Vec3::Z,
+                    uv: Vec2::new(i as f32 + u, v),
+                });
+            }
+            source
+                .indices
+                .extend([0, 1, 2, 0, 2, 3].map(|corner| base + corner));
+        }
+        let skins =
+            vec![PackedSkin::new([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]); source.vertices.len()];
+        let mesh = build_skinned_mesh(&source, &skins, &BuildOptions::default());
+        let page = solstice_asset::paged::PAGE_BYTES;
+        for set in &mesh.sets {
+            let bytes: usize = mesh.clusters[set.first_cluster as usize..]
+                [..set.cluster_count as usize]
+                .iter()
+                .map(|c| c.vertex_records(true) as usize * 16 + c.triangle_count() as usize * 4)
+                .sum();
+            assert!(bytes <= page, "a set takes {bytes} bytes, more than a page");
+        }
     }
 
     #[test]

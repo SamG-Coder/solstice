@@ -10,8 +10,11 @@ use rustc_hash::FxHashMap;
 
 /// Number of clusters a group aims for.
 const TARGET_GROUP_SIZE: usize = 16;
-/// Groups never grow beyond this, even when merging leftovers.
-const MAX_GROUP_SIZE: usize = 24;
+/// Groups never grow beyond this, even when merging leftovers, so that a sibling set always fits
+/// in a page: full clusters of 255 vertices and 128 triangles take 4,592 bytes.
+pub const MAX_GROUP_SIZE: usize = 24;
+/// The same for a skinned mesh, whose full clusters take 6,640 bytes.
+pub const MAX_SKINNED_GROUP_SIZE: usize = 18;
 /// Groups smaller than this pull in spatial neighbours or merge into another group.
 const MIN_GROUP_SIZE: usize = 6;
 
@@ -20,6 +23,8 @@ pub struct GroupInput<'a> {
     /// `triangles[c]` holds the welded position indices of cluster `c`.
     pub triangles: &'a [Vec<[u32; 3]>],
     pub bounds: &'a [Sphere],
+    /// The most clusters a group may hold.
+    pub max_group_size: usize,
 }
 
 /// Returns cluster indices per group. Every cluster appears in exactly one group.
@@ -77,7 +82,7 @@ pub fn group_clusters(input: &GroupInput<'_>) -> Vec<Vec<u32>> {
         groups.push(group);
     }
 
-    merge_small_groups(groups, &adjacency, &mut group_of)
+    merge_small_groups(groups, &adjacency, &mut group_of, input.max_group_size)
 }
 
 /// A sphere around the group, inflated to define "close enough to join".
@@ -141,6 +146,7 @@ fn merge_small_groups(
     mut groups: Vec<Vec<u32>>,
     adjacency: &[Vec<(u32, u32)>],
     group_of: &mut [u32],
+    max_group_size: usize,
 ) -> Vec<Vec<u32>> {
     for index in 0..groups.len() {
         if groups[index].is_empty() || groups[index].len() >= MIN_GROUP_SIZE {
@@ -157,7 +163,7 @@ fn merge_small_groups(
         }
         let target = weights
             .into_iter()
-            .filter(|&(g, _)| groups[g as usize].len() + groups[index].len() <= MAX_GROUP_SIZE)
+            .filter(|&(g, _)| groups[g as usize].len() + groups[index].len() <= max_group_size)
             .max_by_key(|&(g, weight)| (weight, std::cmp::Reverse(g)))
             .map(|(g, _)| g);
         if let Some(target) = target {
@@ -200,6 +206,7 @@ mod tests {
         let groups = group_clusters(&GroupInput {
             triangles: &triangles,
             bounds: &bounds,
+            max_group_size: MAX_GROUP_SIZE,
         });
         let mut seen = vec![0; 100];
         for group in &groups {
@@ -216,6 +223,7 @@ mod tests {
         let groups = group_clusters(&GroupInput {
             triangles: &triangles,
             bounds: &bounds,
+            max_group_size: MAX_GROUP_SIZE,
         });
         assert!(
             groups.len() < 50,

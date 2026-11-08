@@ -133,6 +133,7 @@ pub fn import_gltf(
             walk(
                 &node,
                 Mat4::IDENTITY,
+                options.skinned,
                 &mut placements,
                 &mut bounds,
                 &mut warnings,
@@ -404,6 +405,7 @@ fn document_warnings(document: &Document, skinned: bool) -> Vec<String> {
 fn walk(
     node: &Node<'_>,
     parent: Mat4,
+    skinned: bool,
     placements: &mut Vec<Placement>,
     bounds: &mut Bounds,
     warnings: &mut Vec<String>,
@@ -431,7 +433,13 @@ fn walk(
                 continue;
             }
             let box_ = primitive.bounding_box();
-            bounds.add_box(Vec3::from(box_.min), Vec3::from(box_.max), transform);
+            // A skinned mesh is drawn where its skeleton puts it, whatever its node says.
+            let drawn = if skinned && node.skin().is_some() {
+                Mat4::IDENTITY
+            } else {
+                transform
+            };
+            bounds.add_box(Vec3::from(box_.min), Vec3::from(box_.max), drawn);
             placements.push(Placement {
                 node_name: node.name().map(str::to_string),
                 bound: node.skin().is_some(),
@@ -446,7 +454,7 @@ fn walk(
         }
     }
     for child in node.children() {
-        walk(&child, transform, placements, bounds, warnings);
+        walk(&child, transform, skinned, placements, bounds, warnings);
     }
 }
 
