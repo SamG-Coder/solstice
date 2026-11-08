@@ -3350,6 +3350,7 @@ name = "townkit"
 version = "0.2.0"
 dependencies = [
  "glam",
+ "png 0.17.16",
  "solstice-import",
  "solstice-procgen",
 ]

@@ -1,6 +1,7 @@
 //! Writes meshes as a glTF 2.0 file and its binary buffer.
 
 use crate::geometry::Geometry;
+use glam::{Quat, Vec3};
 use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
@@ -13,8 +14,20 @@ pub struct Plain {
     pub roughness: f32,
 }
 
-/// One glTF file being put together. Each named part is a node at the origin, its vertices in
-/// world space, so that the scene places it at 0 0 0.
+/// A material whose maps come from a Poly Haven texture fetched by `scripts/fetch-scans.py`.
+pub struct Textured {
+    /// The texture's name, which is also its folder under `target/scan`.
+    pub surface: &'static str,
+    /// How many metres one repeat of the texture covers.
+    pub metres: f32,
+    /// Whether it has an occlusion-roughness-metallic map, rather than only a roughness map.
+    pub arm: bool,
+    /// Multiplies the texture's colour.
+    pub tint: [f32; 3],
+}
+
+/// One glTF file being put together. A part is a node at the origin with its vertices in world
+/// space, so that the scene places it at 0 0 0; a node instances a shared mesh.
 #[derive(Default)]
 pub struct File {
     bin: Vec<u8>,
@@ -23,6 +36,8 @@ pub struct File {
     views: Vec<String>,
     meshes: Vec<String>,
     nodes: Vec<String>,
+    images: Vec<String>,
+    textures: Vec<String>,
 }
 
 impl File {
@@ -31,6 +46,36 @@ impl File {
         self.materials.push(format!(
             r#"{{"name":"{}","pbrMetallicRoughness":{{"baseColorFactor":[{r},{g},{b},1],"metallicFactor":0,"roughnessFactor":{}}}}}"#,
             material.name, material.roughness
+        ));
+        self.materials.len() - 1
+    }
+
+    fn texture(&mut self, uri: String) -> usize {
+        self.images.push(format!(r#"{{"uri":"{uri}"}}"#));
+        self.textures
+            .push(format!(r#"{{"source":{}}}"#, self.images.len() - 1));
+        self.textures.len() - 1
+    }
+
+    /// Adds a material for a fetched texture. UVs are in metres, as [`Geometry`] makes them, and
+    /// the texture's own transform scales them to its repeat.
+    pub fn textured(&mut self, material: &Textured) -> usize {
+        let name = material.surface;
+        let mut map =
+            |kind: &str| self.texture(format!("../scan/{name}/textures/{name}_{kind}_2k.jpg"));
+        let (color, normal) = (map("diff"), map("nor_gl"));
+        let roughness = map(if material.arm { "arm" } else { "rough" });
+        let occlusion = if material.arm {
+            format!(r#","occlusionTexture":{{"index":{roughness}}}"#)
+        } else {
+            String::new()
+        };
+        let scale = 1.0 / material.metres;
+        let [red, green, blue] = material.tint;
+        let transform =
+            format!(r#""extensions":{{"KHR_texture_transform":{{"scale":[{scale},{scale}]}}}}"#);
+        self.materials.push(format!(
+            r#"{{"name":"{name}","pbrMetallicRoughness":{{"baseColorFactor":[{red},{green},{blue},1],"baseColorTexture":{{"index":{color},{transform}}},"metallicRoughnessTexture":{{"index":{roughness},{transform}}},"metallicFactor":0,"roughnessFactor":1}},"normalTexture":{{"index":{normal}}}{occlusion}}}"#
         ));
         self.materials.len() - 1
     }
@@ -73,8 +118,26 @@ impl File {
         self.accessor(&bytes, 5126, count, kind, bounds)
     }
 
-    /// Adds a part made of pieces, each in its own material. Pieces with no triangles are left out.
+    /// Adds a named part at the origin, made of pieces, each in its own material.
     pub fn part(&mut self, name: &str, pieces: &[(&Geometry, usize)]) {
+        if let Some(mesh) = self.mesh(pieces) {
+            self.nodes
+                .push(format!(r#"{{"name":"{name}","mesh":{mesh}}}"#));
+        }
+    }
+
+    /// Places a shared mesh, with its own origin at `at`.
+    pub fn node(&mut self, mesh: usize, at: Vec3, rotation: Quat, scale: f32) {
+        let (r, t) = (rotation.to_array(), at.to_array());
+        self.nodes.push(format!(
+            r#"{{"mesh":{mesh},"translation":[{},{},{}],"rotation":[{},{},{},{}],"scale":[{scale},{scale},{scale}]}}"#,
+            t[0], t[1], t[2], r[0], r[1], r[2], r[3]
+        ));
+    }
+
+    /// Adds a mesh made of pieces, each in its own material, returning its number. Pieces with no
+    /// triangles are left out; if none are left, there is no mesh.
+    pub fn mesh(&mut self, pieces: &[(&Geometry, usize)]) -> Option<usize> {
         let mut primitives = String::new();
         for (geometry, material) in pieces.iter().filter(|(g, _)| !g.indices.is_empty()) {
             let (mut min, mut max) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
@@ -112,21 +175,27 @@ impl File {
             );
         }
         if primitives.is_empty() {
-            return;
+            return None;
         }
         self.meshes
             .push(format!(r#"{{"primitives":[{primitives}]}}"#));
-        self.nodes.push(format!(
-            r#"{{"name":"{name}","mesh":{}}}"#,
-            self.meshes.len() - 1
-        ));
+        Some(self.meshes.len() - 1)
     }
 
     /// Writes `NAME.gltf` and `NAME.bin` into `folder`.
     pub fn write(&self, folder: &Path, name: &str) -> io::Result<()> {
         let nodes: Vec<String> = (0..self.nodes.len()).map(|i| i.to_string()).collect();
+        let textures = if self.textures.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#""extensionsUsed":["KHR_texture_transform"],"images":[{}],"textures":[{}],"#,
+                self.images.join(","),
+                self.textures.join(",")
+            )
+        };
         let json = format!(
-            r#"{{"asset":{{"version":"2.0","generator":"townkit"}},"scene":0,"scenes":[{{"nodes":[{}]}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"uri":"{name}.bin","byteLength":{}}}]}}"#,
+            r#"{{"asset":{{"version":"2.0","generator":"townkit"}},{textures}"scene":0,"scenes":[{{"nodes":[{}]}}],"nodes":[{}],"meshes":[{}],"materials":[{}],"accessors":[{}],"bufferViews":[{}],"buffers":[{{"uri":"{name}.bin","byteLength":{}}}]}}"#,
             nodes.join(","),
             self.nodes.join(","),
             self.meshes.join(","),
