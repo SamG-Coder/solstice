@@ -285,6 +285,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "b_world"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "glam 0.30.10",
+ "solstice-world",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "beef"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1309,6 +1320,9 @@ name = "glam"
 version = "0.30.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
+dependencies = [
+ "bytemuck",
+]
 
 [[package]]
 name = "glam"
@@ -3160,6 +3174,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "solstice-world"
+version = "0.2.0"
+dependencies = [
+ "glam 0.30.10",
+ "hecs",
 ]
 
 [[package]]
