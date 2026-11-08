@@ -90,8 +90,10 @@ pub struct AnimGraph {
 }
 
 fn number(word: &str) -> Result<f32, String> {
-    word.parse()
-        .map_err(|_| format!("`{word}` is not a number"))
+    word.parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| format!("`{word}` is not a number"))
 }
 
 impl AnimGraph {
@@ -196,15 +198,28 @@ impl AnimGraph {
         }
         let has_state = |name: &str| self.states.iter().any(|(n, _)| n == name);
         let has_clip = |name: &str| self.clips.iter().any(|c| c.name == name);
+        let has_param = |name: &str| self.params.iter().any(|(n, _)| n == name);
         if !has_state(&self.start) {
             return Err(format!("`start` names no state: `{}`", self.start));
         }
         let mut clip_names = Vec::new();
         for (name, motion) in &self.states {
+            let mut uses = Vec::new();
             match motion {
                 Motion::Clip(c) => clip_names.push(c),
-                Motion::Blend1d(_, points) => clip_names.extend(points.iter().map(|p| &p.1)),
-                Motion::Blend2d(_, _, points) => clip_names.extend(points.iter().map(|p| &p.1)),
+                Motion::Blend1d(param, points) => {
+                    uses.push(param);
+                    clip_names.extend(points.iter().map(|p| &p.1));
+                }
+                Motion::Blend2d(x, y, points) => {
+                    uses.extend([x, y]);
+                    clip_names.extend(points.iter().map(|p| &p.1));
+                }
+            }
+            if let Some(param) = uses.iter().find(|p| !has_param(p)) {
+                return Err(format!(
+                    "state `{name}` blends by `{param}`: no `param` line names it"
+                ));
             }
             if clip_names.iter().any(|c| !has_clip(c)) {
                 return Err(format!("state `{name}` uses a clip no `clip` line names"));
@@ -214,6 +229,12 @@ impl AnimGraph {
             if !has_state(&transition.to) || transition.from.as_ref().is_some_and(|f| !has_state(f))
             {
                 return Err("a transition names a state that doesn't exist".to_owned());
+            }
+            if !has_param(&transition.param) {
+                return Err(format!(
+                    "a transition reads `{}`: no `param` line names it",
+                    transition.param
+                ));
             }
         }
         for (clip, _, name) in &self.notifies {
@@ -266,7 +287,7 @@ fn shares_of(motion: &Motion, value: &dyn Fn(&str) -> f32) -> Vec<(String, f32)>
             let v = value(param);
             let first = points[0].0;
             let last = points[points.len() - 1].0;
-            if v <= first {
+            if v.is_nan() || v <= first {
                 return vec![(points[0].1.clone(), 1.0)];
             }
             if v >= last {
@@ -298,14 +319,24 @@ fn shares_of(motion: &Motion, value: &dyn Fn(&str) -> f32) -> Vec<(String, f32)>
     }
 }
 
+/// What a fade comes from.
+#[derive(Clone, Copy, Debug)]
+enum FadeFrom {
+    /// A state still running as it fades out.
+    Running(Run),
+    /// The pose as it stood: a state changing in the middle of a fade carries on from there.
+    Frozen,
+}
+
 /// A graph, running: parameters, the state playing, and any fade under way.
 pub struct Animator {
     pub graph: AnimGraph,
     params: Vec<f32>,
     current: Run,
-    fade: Option<(Run, f32, f32)>,
+    fade: Option<(FadeFrom, f32, f32)>,
     scratch: Pose,
     blended: Pose,
+    last: Pose,
 }
 
 impl Animator {
@@ -326,6 +357,7 @@ impl Animator {
             fade: None,
             scratch: Pose::with_bones(bones),
             blended: Pose::with_bones(bones),
+            last: Pose::with_bones(bones),
         }
     }
 
@@ -333,8 +365,12 @@ impl Animator {
         &self.graph.states[self.current.state].0
     }
 
-    /// Sets a parameter by name. Returns false if the graph has no such parameter.
+    /// Sets a parameter by name. Returns false if the graph has no such parameter, or the value
+    /// isn't a number.
     pub fn set(&mut self, param: &str, value: f32) -> bool {
+        if !value.is_finite() {
+            return false;
+        }
         match self.graph.params.iter().position(|(n, _)| n == param) {
             Some(index) => {
                 self.params[index] = value;
@@ -359,12 +395,34 @@ impl Animator {
         if state == self.current.state {
             return;
         }
-        self.fade = (fade > 0.0).then_some((self.current, 0.0, fade));
-        // A locomotion cycle stays in step across a fade.
-        self.current = Run {
-            state,
-            phase: self.current.phase,
+        let from = if self.fade.is_some() {
+            FadeFrom::Frozen
+        } else {
+            FadeFrom::Running(self.current)
         };
+        self.fade = (fade > 0.0).then_some((from, 0.0, fade));
+        // A locomotion cycle stays in step across a fade; anything else starts from its start.
+        let phase = if self.state_loops(self.current.state) && self.state_loops(state) {
+            self.current.phase
+        } else {
+            0.0
+        };
+        self.current = Run { state, phase };
+    }
+
+    /// Whether every clip of a state loops, which is what makes it a cycle.
+    fn state_loops(&self, state: usize) -> bool {
+        let loops = |name: &str| {
+            self.graph
+                .clips
+                .iter()
+                .any(|clip| clip.name == name && clip.looping)
+        };
+        match &self.graph.states[state].1 {
+            Motion::Clip(c) => loops(c),
+            Motion::Blend1d(_, points) => points.iter().all(|p| loops(&p.1)),
+            Motion::Blend2d(_, _, points) => points.iter().all(|p| loops(&p.1)),
+        }
     }
 
     fn value(&self, name: &str) -> f32 {
@@ -406,14 +464,19 @@ impl Animator {
             }
         }
 
-        if let Some((run, elapsed, length)) = self.fade {
-            let cycle = self.cycle_seconds(clips, run.state);
-            let run = Run {
-                state: run.state,
-                phase: run.phase + seconds / cycle,
+        if let Some((from, elapsed, length)) = self.fade {
+            let from = match from {
+                FadeFrom::Running(run) => {
+                    let cycle = self.cycle_seconds(clips, run.state);
+                    FadeFrom::Running(Run {
+                        state: run.state,
+                        phase: run.phase + seconds / cycle,
+                    })
+                }
+                FadeFrom::Frozen => FadeFrom::Frozen,
             };
             let elapsed = elapsed + seconds;
-            self.fade = (elapsed < length).then_some((run, elapsed, length));
+            self.fade = (elapsed < length).then_some((from, elapsed, length));
         }
 
         let cycle = self.cycle_seconds(clips, self.current.state);
@@ -421,6 +484,9 @@ impl Animator {
         let mut after = before + seconds / cycle;
         let dominant = self.dominant_clip();
         let clip = clips.get(&dominant);
+        if !clip.loops {
+            after = after.min(1.0);
+        }
         let notifies = self.crossed(clip, &dominant, before, after);
         if clip.loops {
             after %= 1.0;
@@ -448,8 +514,13 @@ impl Animator {
                 continue;
             }
             let at = time / length;
-            let hit = (at >= before && at < after)
-                || (clip.loops && after >= 1.0 && at + 1.0 >= before && at + 1.0 < after);
+            let hit = if clip.loops {
+                (at >= before && at < after) || (at + 1.0 >= before && at + 1.0 < after)
+            } else {
+                // A clip that holds its end reaches it once.
+                let at = at.min(1.0);
+                (at >= before && at < after) || (at >= 1.0 && before < 1.0 && after >= 1.0)
+            };
             if hit {
                 out.push(notify.clone());
             }
@@ -478,17 +549,22 @@ impl Animator {
             out,
             &mut self.scratch,
         );
-        if let Some((run, elapsed, length)) = fade {
-            let older = shares_of(&graph.states[run.state].1, &value);
+        if let Some((from, elapsed, length)) = fade {
             let t = (elapsed / length).clamp(0.0, 1.0);
-            Self::pose_of(
-                &older,
-                run.phase,
-                clips,
-                rest,
-                &mut self.blended,
-                &mut self.scratch,
-            );
+            match from {
+                FadeFrom::Running(run) => {
+                    let older = shares_of(&graph.states[run.state].1, &value);
+                    Self::pose_of(
+                        &older,
+                        run.phase,
+                        clips,
+                        rest,
+                        &mut self.blended,
+                        &mut self.scratch,
+                    );
+                }
+                FadeFrom::Frozen => self.blended.copy_from(&self.last),
+            }
             // From the old state towards the new one.
             let finished = out.clone();
             out.copy_from(&self.blended);
@@ -496,6 +572,7 @@ impl Animator {
         }
         self.params = params;
         self.graph = graph;
+        self.last.copy_from(out);
     }
 
     fn pose_of(
@@ -577,9 +654,15 @@ mod tests {
             ("state a blend1d x 1\nstart a", "pairs"),
             ("state", "understand"),
             (
-                "clip a A\nstate a clip a\nstart a\ntransition a b x > 1 fade 0",
+                "clip a A\nparam x 0\nstate a clip a\nstart a\ntransition a b x > 1 fade 0",
                 "doesn't exist",
             ),
+            ("clip a A\nstate s blend1d x NaN a\nstart s", "not a number"),
+            (
+                "clip a A\nstate a clip a\nstart a\ntransition a a typo > 1 fade 0",
+                "typo",
+            ),
+            ("clip a A\nstate s blend1d x 0 a\nstart s", "`x`"),
         ] {
             let error = AnimGraph::parse(bad).unwrap_err();
             assert!(error.contains(says), "{error}");
@@ -624,11 +707,128 @@ mod tests {
         assert!(animator.fade.is_some());
         let rest = Pose::with_bones(1);
         let mut pose = Pose::with_bones(1);
+        // Just begun, it is still the state it left. The idle clip stands at 0, and the walk
+        // rises to 2 over its cycle.
         animator.evaluate(&clips, &rest, &mut pose);
+        assert!(
+            pose.translations[0].y.abs() < 1.0e-3,
+            "{}",
+            pose.translations[0].y
+        );
+        // Half way through the fade, it is half way between them.
+        animator.advance(0.1, &clips);
+        animator.evaluate(&clips, &rest, &mut pose);
+        let walk_height = 2.0 * animator.current.phase;
+        let middle = pose.translations[0].y;
+        assert!(
+            (middle - walk_height * 0.5).abs() < 0.05,
+            "{middle} isn't half way to {walk_height}"
+        );
         animator.advance(0.5, &clips);
         assert!(animator.fade.is_none(), "the fade should be finished");
         animator.evaluate(&clips, &rest, &mut pose);
         assert!((pose.translations[0].y - 2.0 * animator.current.phase).abs() < 0.01);
+    }
+
+    #[test]
+    fn cycles_stay_in_step_across_a_fade_and_one_shots_start_at_their_start() {
+        let graph = "
+            clip a A
+            clip b B
+            clip die D once
+            state a clip a
+            state b clip b
+            state dead clip die
+            start a
+        ";
+        let names = |name: &str, frames: usize| {
+            (
+                name.to_owned(),
+                compress(
+                    name,
+                    0,
+                    &Frames {
+                        rotations: vec![vec![Quat::IDENTITY]; frames],
+                        translations: vec![vec![Vec3::ZERO]; frames],
+                    },
+                    name != "die",
+                ),
+            )
+        };
+        let clips = ClipSet::new(vec![names("a", 60), names("b", 60), names("die", 60)]);
+        let mut animator = Animator::new(AnimGraph::parse(graph).unwrap(), 1);
+        animator.advance(0.5, &clips);
+        let phase = animator.current.phase;
+        assert!(phase > 0.2);
+        assert!(animator.go_to("b", 0.2));
+        assert_eq!(animator.current.phase, phase, "a cycle fell out of step");
+        assert!(animator.go_to("dead", 0.2));
+        assert_eq!(
+            animator.current.phase, 0.0,
+            "a one-shot started part way in"
+        );
+    }
+
+    #[test]
+    fn a_change_of_state_during_a_fade_starts_from_where_it_had_got_to() {
+        let clips = set();
+        let graph = GRAPH.replace("fade 0.2", "fade 0");
+        let mut animator = Animator::new(AnimGraph::parse(&graph).unwrap(), 1);
+        animator.set("speed", 4.0);
+        animator.advance(0.1, &clips);
+        let rest = Pose::with_bones(1);
+        let mut pose = Pose::with_bones(1);
+        assert!(animator.go_to("idle", 0.5));
+        animator.advance(0.25, &clips);
+        animator.evaluate(&clips, &rest, &mut pose);
+        let before = pose.translations[0].y;
+        assert!(animator.go_to("moving", 0.5), "changing back in the middle");
+        animator.evaluate(&clips, &rest, &mut pose);
+        assert!(
+            (pose.translations[0].y - before).abs() < 1.0e-3,
+            "it jumped from {before} to {}",
+            pose.translations[0].y
+        );
+    }
+
+    #[test]
+    fn an_end_of_clip_notify_fires_once_and_one_at_the_wrap_each_cycle() {
+        let graph = "
+            clip a A once
+            notify a 1.0 end
+            state a clip a
+            start a
+        ";
+        let once = compress(
+            "a",
+            0,
+            &Frames {
+                rotations: vec![vec![Quat::IDENTITY]; 31],
+                translations: vec![vec![Vec3::ZERO]; 31],
+            },
+            false,
+        );
+        let clips = ClipSet::new(vec![("a".to_owned(), once)]);
+        let mut animator = Animator::new(AnimGraph::parse(graph).unwrap(), 1);
+        let count: usize = (0..120)
+            .map(|_| animator.advance(1.0 / 30.0, &clips).len())
+            .sum();
+        assert_eq!(count, 1);
+
+        let clips = set();
+        let graph = "
+            clip idle I
+            clip walk W
+            clip run R
+            notify walk 0.0 step
+            state walking clip walk
+            start walking
+        ";
+        let mut animator = Animator::new(AnimGraph::parse(graph).unwrap(), 1);
+        let count: usize = (0..110)
+            .map(|_| animator.advance(1.0 / 30.0, &clips).len())
+            .sum();
+        assert_eq!(count, 4, "at 0 s, and each wrap at 1, 2 and 3 s");
     }
 
     #[test]

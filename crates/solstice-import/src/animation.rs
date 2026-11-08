@@ -214,6 +214,18 @@ fn role_map(
     map
 }
 
+/// A bone and its parents, from the root down to it.
+fn chain_to_root(skeleton: &Skeleton, bone: usize) -> Vec<usize> {
+    let mut chain = vec![bone];
+    let mut at = bone;
+    while let Some(parent) = skeleton.bones[at].parent {
+        at = parent as usize;
+        chain.push(at);
+    }
+    chain.reverse();
+    chain
+}
+
 /// How far from the pelvis the feet stand at rest, for the ratio of leg lengths.
 fn leg_length(skeleton: &Skeleton, roles: &Roles) -> Option<f32> {
     let rest = skeleton.rest();
@@ -320,23 +332,26 @@ pub fn retarget(
             target_rotations.push((parent.inverse() * world_rotation).normalize());
             target_world.push(world_rotation);
         }
-        // The pelvis travels by the ratio of leg lengths, so feet keep their place.
-        if let (Some(source_p), Some(target_p)) = (source_pelvis, target_pelvis) {
-            let moved = (positions[source_p] - source_rest_positions[source_p]) * scale;
-            let wanted = target_rest_positions[target_p] + moved;
-            let parent = target.bones[target_p].parent.map(|p| p as usize);
-            let (parent_rotation, parent_position) = parent
-                .map_or((Quat::IDENTITY, Vec3::ZERO), |p| {
-                    (target_world[p], target_rest_positions[p])
-                });
-            target_translations[target_p] = parent_rotation.inverse() * (wanted - parent_position);
-        }
         if let Some(root) = target_root {
             // The root follows the mapped root's own travel, if any.
             if let Some(s) = map[root] {
                 target_translations[root] = target_rest.translations[root]
                     + (positions[s] - source_rest_positions[s]) * scale;
             }
+        }
+        // The pelvis travels by the ratio of leg lengths, so feet keep their place, whatever
+        // its parents did on the way.
+        if let (Some(source_p), Some(target_p)) = (source_pelvis, target_pelvis) {
+            let moved = (positions[source_p] - source_rest_positions[source_p]) * scale;
+            let wanted = target_rest_positions[target_p] + moved;
+            let mut parent_position = Vec3::ZERO;
+            let mut parent_rotation = Quat::IDENTITY;
+            let chain = chain_to_root(target, target_p);
+            for &bone in chain.iter().rev().skip(1).rev() {
+                parent_position += parent_rotation * target_translations[bone];
+                parent_rotation = target_world[bone];
+            }
+            target_translations[target_p] = parent_rotation.inverse() * (wanted - parent_position);
         }
         out.rotations.push(target_rotations);
         out.translations.push(target_translations);
@@ -407,9 +422,12 @@ mod tests {
             let swing = (f as f32 / 8.0 * std::f32::consts::TAU).sin() * 0.4;
             let rest = Pose::rest(rig);
             let mut rotations = rest.rotations.clone();
-            let translations = rest.translations.clone();
-            rotations[2] = rotations[2] * Quat::from_rotation_x(swing);
-            rotations[3] = rotations[3] * Quat::from_rotation_x(swing * 0.5);
+            let mut translations = rest.translations.clone();
+            // The root and the pelvis both travel, as a walk's root motion would.
+            translations[0] += Vec3::Z * f as f32 * 0.1;
+            translations[1] += Vec3::X * swing * 0.05;
+            rotations[2] *= Quat::from_rotation_x(swing);
+            rotations[3] *= Quat::from_rotation_x(swing * 0.5);
             frames.rotations.push(rotations);
             frames.translations.push(translations);
         }

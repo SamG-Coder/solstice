@@ -779,6 +779,7 @@ mod tests {
                 yaw_degrees: 90.0,
                 scale: 0.5,
                 collide: Collide::Auto,
+                skinned: false,
             })
         );
     }

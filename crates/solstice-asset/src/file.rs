@@ -311,7 +311,8 @@ fn clips_are_consistent(scene: &PagedScene) -> bool {
         let Some(skeleton) = scene.skeletons.get(clip.skeleton as usize) else {
             return false;
         };
-        clip.tracks.len() == skeleton.bones.len()
+        clip.frames > 0
+            && clip.tracks.len() == skeleton.bones.len()
             && clip.tracks.iter().all(|track| {
                 (track.rotations_frames == 1 || track.rotations_frames == clip.frames)
                     && (track.translations_frames == 1 || track.translations_frames == clip.frames)
@@ -1534,6 +1535,11 @@ mod tests {
         let read = decode(&encode(&scene)).unwrap().scene;
         assert_eq!(read.clips, scene.scene.clips);
         scene.scene.clips[0].rotations.pop();
+        assert_eq!(decode(&encode(&scene)).err(), Some(DecodeError::BadSkin));
+        scene.scene.clips[0] = Clip {
+            tracks: vec![BoneTrack::default()],
+            ..Default::default()
+        };
         assert_eq!(decode(&encode(&scene)).err(), Some(DecodeError::BadSkin));
     }
 

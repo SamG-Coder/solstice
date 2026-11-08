@@ -17,8 +17,9 @@ pub struct Frames {
     pub translations: Vec<Vec<Vec3>>,
 }
 
-/// Rotations closer than this to the same one are one sample: about a hundredth of a degree.
-const STILL_ROTATION: f32 = 2.0e-4;
+/// Rotations differing by less than this, in the quaternion's own units (half the angle), are one
+/// sample: about a hundredth of a degree.
+const STILL_ROTATION: f32 = 1.0e-4;
 /// Translations closer than this are one sample: a tenth of a millimetre.
 const STILL_TRANSLATION: f32 = 1.0e-4;
 
@@ -110,9 +111,10 @@ pub fn compress(name: &str, skeleton: u32, frames: &Frames, loops: bool) -> Clip
     for bone in 0..bones {
         let rotations: Vec<Quat> = frames.rotations.iter().map(|f| f[bone]).collect();
         let translations: Vec<Vec3> = frames.translations.iter().map(|f| f[bone]).collect();
-        let still_rotation = rotations
-            .iter()
-            .all(|q| q.dot(rotations[0]).abs() > 1.0 - STILL_ROTATION);
+        let still_rotation = rotations.iter().all(|q| {
+            let q = if q.dot(rotations[0]) < 0.0 { -*q } else { *q };
+            (q - rotations[0]).length() < STILL_ROTATION
+        });
         let (min, max) = translations
             .iter()
             .fold((Vec3::MAX, Vec3::MIN), |(lo, hi), v| {
@@ -302,5 +304,26 @@ mod tests {
             a.rotations[1].dot(b.rotations[1]) > 0.99999,
             "doesn't hold its end"
         );
+
+        // Between the last frame of a loop and its first again.
+        sample(&looping, 11.5 / CLIP_HZ, &mut a);
+        let half = Quat::from_rotation_x(11.5 / 12.0 * std::f32::consts::TAU);
+        assert!(
+            a.rotations[1].dot(half).abs() > 0.999,
+            "{:?}",
+            a.rotations[1]
+        );
+    }
+
+    #[test]
+    fn a_slow_bone_is_kept_as_moving() {
+        let frames = Frames {
+            rotations: (0..30)
+                .map(|f| vec![Quat::from_rotation_x((f as f32 * 0.2).sin() * 0.02)])
+                .collect(),
+            translations: vec![vec![Vec3::ZERO]; 30],
+        };
+        let clip = compress("breath", 0, &frames, true);
+        assert_eq!(clip.tracks[0].rotations_frames, 30);
     }
 }
