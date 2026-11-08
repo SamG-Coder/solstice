@@ -801,6 +801,7 @@ impl Renderer {
         self.shadows.record(
             &mut encoder,
             &self.cull,
+            &self.rasterizer,
             &self.scene,
             &self.aux_cull_scene,
             &self.aux_work,

@@ -17,8 +17,8 @@ use crate::frame::Camera;
 use crate::gpu::{Gpu, LayoutBuilder};
 use crate::scene::GpuScene;
 use crate::vg::{
-    CullPhase, CullPipelines, CullWork, InstanceFilter, PassView, RasterBindings, Rasterizer,
-    ViewSlots,
+    CullPhase, CullPipelines, CullWork, DepthBuffer, InstanceFilter, PassView, RasterBindings,
+    Rasterizer, ViewSlots,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -28,7 +28,7 @@ const RESOLUTION: u32 = 2048;
 /// Each cascade's quarter of the layer for movable instances, the last layer of the array.
 const MOVING_RESOLUTION: u32 = RESOLUTION / 2;
 const MOVING_LAYER: u32 = CASCADE_COUNT as u32;
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const FORMAT: wgpu::TextureFormat = crate::vg::DEPTH_FORMAT;
 /// Far end of each cascade, in metres from the camera.
 const SPLITS: [f32; CASCADE_COUNT] = [12.0, 38.0, 120.0, 420.0];
 /// How far casters may lie towards the sun beyond a cascade's bounds.
@@ -136,6 +136,10 @@ pub struct ShadowMaps {
     /// The layer movable instances are drawn into.
     moving_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
+    /// Where the software rasterizer draws a cascade's small clusters before they are laid
+    /// over its map. Most of a wood's clusters are pixel-sized, and the hardware rasterizer
+    /// draws those slowly, as the main view found long ago.
+    software_depth: DepthBuffer,
     data: ShadowUniform,
     /// What each cascade last drew, to tell when it has gone stale.
     drawn: [Option<Drawn>; CASCADE_COUNT],
@@ -234,6 +238,7 @@ impl ShadowMaps {
             layer_views,
             moving_view,
             pipeline,
+            software_depth: rasterizer.depth_buffer(gpu, (RESOLUTION, RESOLUTION)),
             data: ShadowUniform {
                 view_proj: [Mat4::IDENTITY; CASCADE_COUNT],
                 splits: Vec4::from_array(SPLITS),
@@ -334,7 +339,7 @@ impl ShadowMaps {
                 SPLITS[cascade],
                 texel * SNAP_TEXELS + slack,
             );
-            let view = PassView::orthographic(
+            let mut view = PassView::orthographic(
                 view_proj,
                 center,
                 Vec2::splat(RESOLUTION as f32),
@@ -349,6 +354,8 @@ impl ShadowMaps {
                 nearest[cascade],
             )
             .shadowing(&planes, sun_direction);
+            // Small clusters go to the software rasterizer, as in the main view.
+            view.allow_software = 1;
             self.drawn[cascade] = Some(Drawn {
                 view_proj,
                 lod_threshold,
@@ -428,6 +435,7 @@ impl ShadowMaps {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         cull: &CullPipelines,
+        rasterizer: &Rasterizer,
         scene: &GpuScene,
         cull_scene: &wgpu::BindGroup,
         work: &CullWork,
@@ -439,6 +447,7 @@ impl ShadowMaps {
         for cascade in (0..CASCADE_COUNT).filter(|&c| shadow_work.due[c]) {
             let slot = first_slot + cascade as u32;
             cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
+            rasterizer.record_software_depth(encoder, raster, slot, work, &self.software_depth);
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow cascade"),
@@ -456,6 +465,7 @@ impl ShadowMaps {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
+            rasterizer.merge_depth(&mut pass, raster, slot, &self.software_depth);
         }
 
         if shadow_work.shared_cull && shadow_work.moving.iter().any(|&moving| moving) {

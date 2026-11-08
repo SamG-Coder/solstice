@@ -1,0 +1,38 @@
+// Software rasterization of small clusters into a depth map: for the shadow cascades, whose
+// pixel-sized foliage clusters the hardware rasterizer draws slowly. Depth alone is kept, as
+// an atomic on each pixel, and vg/shadow_merge.wgsl then lays it over the cascade's own depth.
+
+#include "vg/raster_common.wgsl"
+
+// Reversed depth per pixel, 0 where nothing has been drawn, so that a cleared buffer is empty
+// and the nearest sample has the largest bits: positive floats order as their bits do.
+@group(1) @binding(0) var<storage, read_write> shadow_depth: array<atomic<u32>>;
+
+// Keeps the nearest depth. The view is orthographic with depth running 0 at the light's side
+// to 1 at the far side, so it is reversed here, and anything past either side is left out.
+fn write_visibility(index: u32, depth: f32, id: u32) {
+    let reversed = 1.0 - depth;
+    if depth < 0.0 || reversed <= 0.0 {
+        return;
+    }
+    atomicMax(&shadow_depth[index], bitcast<u32>(reversed));
+}
+
+// The same slope-scaled bias as the hardware shadow pipeline's, in depth per pixel of the
+// steepest direction, so that a surface does not shadow itself where a texel spans a long
+// stretch of it. Twin of the `slope_scale` in shadow.rs.
+const SLOPE_BIAS: f32 = 1.5;
+
+fn depth_bias(a: vec3f, b: vec3f, c: vec3f) -> f32 {
+    let ab = b - a;
+    let ac = c - a;
+    let det = ab.x * ac.y - ac.x * ab.y;
+    if abs(det) < 1.0e-12 {
+        return 0.0;
+    }
+    let dzdx = (ab.z * ac.y - ac.z * ab.y) / det;
+    let dzdy = (ac.z * ab.x - ab.z * ac.x) / det;
+    return SLOPE_BIAS * max(abs(dzdx), abs(dzdy));
+}
+
+#include "vg/raster_sw_body.wgsl"
