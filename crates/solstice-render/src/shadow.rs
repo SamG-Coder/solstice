@@ -25,6 +25,19 @@ use glam::{Mat4, Vec2, Vec3, Vec4};
 
 pub const CASCADE_COUNT: usize = 4;
 const RESOLUTION: u32 = 2048;
+/// The stamps for `count` cascades drawn this frame through the software depth buffer, after
+/// `last` was the last one used: whether the buffer must be cleared before them, and the first
+/// of them, which the rest follow one by one. A frame's cascades never straddle a round, since
+/// the clear is recorded once before the frame's first cascade: a cascade stamped 1 after one
+/// stamped `DEPTH_STAMPS` in the same frame would lose every pixel the other had written.
+fn next_stamps(last: u32, count: u32) -> (bool, u32) {
+    if last + count > DEPTH_STAMPS {
+        (true, 1)
+    } else {
+        (false, last + 1)
+    }
+}
+
 /// Each cascade's quarter of the layer for movable instances, the last layer of the array.
 const MOVING_RESOLUTION: u32 = RESOLUTION / 2;
 const MOVING_LAYER: u32 = CASCADE_COUNT as u32;
@@ -144,8 +157,9 @@ pub struct ShadowMaps {
     /// draws those slowly, as the main view found long ago.
     software_depth: DepthBuffer,
     /// The stamp of the last cascade drawn through it, 1 to `DEPTH_STAMPS`; 0 before any.
-    /// Once the stamps have gone round, the buffer is cleared before they start again, so
-    /// that a word left from exactly a round ago cannot pass for this drawing's.
+    /// Before the stamps start a new round the buffer is cleared, or the words the last round
+    /// left, with their higher stamps, would win the atomic max against the new round's. See
+    /// [`next_stamps`].
     software_stamp: u32,
     data: ShadowUniform,
     /// What each cascade last drew, to tell when it has gone stale.
@@ -326,7 +340,13 @@ impl ShadowMaps {
         if std::mem::take(&mut self.redraw_all) {
             due = stale;
         }
-        let mut clear_software_depth = false;
+        // Every cascade drawn this frame takes a stamp of its own, and all of them come from
+        // one round: the clear is recorded once, before the frame's first cascade.
+        let (clear_software_depth, first_stamp) = next_stamps(
+            self.software_stamp,
+            due.iter().filter(|&&due| due).count() as u32,
+        );
+        self.software_stamp = first_stamp;
 
         for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
             self.outdated[cascade] = false;
@@ -363,15 +383,10 @@ impl ShadowMaps {
                 nearest[cascade],
             )
             .shadowing(&planes, sun_direction);
-            // Small clusters go to the software rasterizer, as in the main view, each cascade
-            // under a stamp of its own.
+            // Small clusters go to the software rasterizer, as in the main view.
             view.allow_software = 1;
-            if self.software_stamp == DEPTH_STAMPS {
-                clear_software_depth = true;
-                self.software_stamp = 0;
-            }
-            self.software_stamp += 1;
             view.stamp = self.software_stamp;
+            self.software_stamp += 1;
             self.drawn[cascade] = Some(Drawn {
                 view_proj,
                 lod_threshold,
@@ -434,6 +449,8 @@ impl ShadowMaps {
             ));
             slots.write(gpu, first_moving_slot + CASCADE_COUNT as u32, &view);
         }
+        // Back to the last stamp used.
+        self.software_stamp -= 1;
         self.data.moving = Vec4::from_array(moving_due.map(|m| f32::from(u8::from(m))));
 
         gpu.queue
@@ -1229,5 +1246,19 @@ mod tests {
                 "shift of {value} texels"
             );
         }
+    }
+
+    #[test]
+    fn a_frame_of_cascades_never_straddles_a_round_of_stamps() {
+        // Stamps continue from the last one used while the round has room for the frame.
+        assert_eq!(next_stamps(0, 1), (false, 1));
+        assert_eq!(next_stamps(7, 4), (false, 8));
+        assert_eq!(next_stamps(DEPTH_STAMPS - 4, 4), (false, DEPTH_STAMPS - 3));
+        // A frame that would run past the last stamp starts a new round, cleared first, even
+        // when its first cascade alone would still have fitted.
+        assert_eq!(next_stamps(DEPTH_STAMPS - 3, 4), (true, 1));
+        assert_eq!(next_stamps(DEPTH_STAMPS, 1), (true, 1));
+        // A frame with no cascade due changes nothing.
+        assert_eq!(next_stamps(DEPTH_STAMPS, 0), (false, DEPTH_STAMPS + 1));
     }
 }
