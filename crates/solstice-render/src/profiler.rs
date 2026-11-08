@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 22] = [
+pub const SECTIONS: [&str; 23] = [
     "sky",
     "clouds",
     "ocean",
@@ -20,6 +20,7 @@ pub const SECTIONS: [&str; 22] = [
     "gi voxelize",
     "gi flood",
     "gi write",
+    "light shadows",
     "gi light",
     "cull 1",
     "raster 1",
@@ -47,25 +48,27 @@ pub mod section {
     pub const GI_VOXELIZE: usize = 6;
     pub const GI_FLOOD: usize = 7;
     pub const GI_WRITE: usize = 8;
-    pub const GI_LIGHT: usize = 9;
+    /// The local lights' shadow maps, traced through the volume.
+    pub const LIGHT_SHADOWS: usize = 9;
+    pub const GI_LIGHT: usize = 10;
     /// Culling and rasterizing what was visible last frame, then the occlusion pyramid.
-    pub const CULL_FIRST: usize = 10;
-    pub const RASTER_FIRST: usize = 11;
+    pub const CULL_FIRST: usize = 11;
+    pub const RASTER_FIRST: usize = 12;
     /// Culling and rasterizing what that revealed.
-    pub const CULL_SECOND: usize = 12;
-    pub const RASTER_SECOND: usize = 13;
-    pub const RESOLVE: usize = 14;
-    pub const CLOUDS_ON_SCREEN: usize = 15;
-    pub const SCREEN_GI: usize = 16;
-    pub const LIGHTING: usize = 17;
+    pub const CULL_SECOND: usize = 13;
+    pub const RASTER_SECOND: usize = 14;
+    pub const RESOLVE: usize = 15;
+    pub const CLOUDS_ON_SCREEN: usize = 16;
+    pub const SCREEN_GI: usize = 17;
+    pub const LIGHTING: usize = 18;
     /// The sea's surface, drawn and shaded.
-    pub const WATER: usize = 18;
+    pub const WATER: usize = 19;
     /// Spawning and moving particles.
-    pub const PARTICLES: usize = 19;
+    pub const PARTICLES: usize = 20;
     /// Drawing them over the scene.
-    pub const PARTICLE_DRAW: usize = 20;
-    pub const POST: usize = 21;
-    pub const END: usize = 22;
+    pub const PARTICLE_DRAW: usize = 21;
+    pub const POST: usize = 22;
+    pub const END: usize = 23;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;

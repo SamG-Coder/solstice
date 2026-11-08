@@ -77,6 +77,96 @@ pub fn environment_group(
 pub const TILE_SIZE: u32 = 16;
 pub const TILE_WORDS: u32 = 128;
 
+/// Texels along each side of a local light's shadow map, an octahedral map of its directions.
+/// Twin of `lighting/light_shadows_common.wgsl`.
+pub const LIGHT_SHADOW_SIZE: u32 = 64;
+
+/// Each local light's shadow map: how far its light reaches in every direction, traced
+/// through the GI volume once a frame by `lighting/light_shadows.wgsl`, so that the passes
+/// lighting a point look each light's shadow up instead of tracing it per pixel per light,
+/// whose cost grew with pixels times the lights overlapping them. One layer per light, of
+/// distances; a scene with no lights keeps one unused layer, so that the bindings exist, and
+/// a scene with more lights than the device allows layers leaves the rest unshadowed.
+pub struct LightShadows {
+    pipeline: wgpu::ComputePipeline,
+    group: wgpu::BindGroup,
+    pub view: wgpu::TextureView,
+    /// Lights with a map: the scene's, up to the device's layers.
+    mapped: u32,
+}
+
+impl LightShadows {
+    pub fn new(gpu: &Gpu, environment: &wgpu::BindGroupLayout, scene: &GpuScene) -> Self {
+        let format = wgpu::TextureFormat::R32Float;
+        let layers = gpu.device.limits().max_texture_array_layers;
+        if scene.light_count > layers {
+            log::warn!(
+                "{} lights, but the device allows {layers} shadow maps: the rest cast none",
+                scene.light_count
+            );
+        }
+        let mapped = scene.light_count.min(layers);
+        let layout = LayoutBuilder::new()
+            .storage_read()
+            .storage_texture_array(format)
+            .build(gpu, "light shadows");
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("light shadows"),
+            size: wgpu::Extent3d {
+                width: LIGHT_SHADOW_SIZE,
+                height: LIGHT_SHADOW_SIZE,
+                depth_or_array_layers: mapped.max(1),
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let module = shaders::module(&gpu.device, "lighting/light_shadows.wgsl");
+        Self {
+            pipeline: gpu.compute_pipeline(
+                "light shadows",
+                &module,
+                "main",
+                &[&layout, environment],
+            ),
+            group: gpu.bind_group(
+                "light shadows",
+                &layout,
+                &[
+                    scene.lights.as_entire_binding(),
+                    wgpu::BindingResource::TextureView(&view),
+                ],
+            ),
+            view,
+            mapped,
+        }
+    }
+
+    /// Traces every light's map afresh, after the volume's passes and before the passes that
+    /// read the maps.
+    pub fn record(&self, encoder: &mut wgpu::CommandEncoder, environment: &wgpu::BindGroup) {
+        if self.mapped == 0 {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("light shadows"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.group, &[]);
+        pass.set_bind_group(1, environment, &[]);
+        let groups = groups_for(LIGHT_SHADOW_SIZE, 8);
+        pass.dispatch_workgroups(groups, groups, self.mapped);
+    }
+}
+
 /// The pass that finds which local lights reach each tile of the screen, so that lighting
 /// loops over those alone. With no lights in the scene it is skipped, and the tiles, zero
 /// from creation, say so.
@@ -174,6 +264,7 @@ impl DeferredLighting {
             .texture()
             .texture()
             .storage_read()
+            .texture_array_unfilterable()
             .build(gpu, "deferred");
         let module = shaders::module(&gpu.device, "lighting/deferred.wgsl");
         Self {
@@ -195,6 +286,7 @@ impl DeferredLighting {
         scene: &GpuScene,
         clouds: &CloudBindings,
         light_tiles: &wgpu::Buffer,
+        light_shadows: &wgpu::TextureView,
     ) -> [wgpu::BindGroup; 2] {
         let tex = |view| wgpu::BindingResource::TextureView(view);
         let group = |parity: usize| {
@@ -216,6 +308,7 @@ impl DeferredLighting {
                     tex(&clouds.screen[parity].view),
                     tex(&self.milky_way.view),
                     light_tiles.as_entire_binding(),
+                    tex(light_shadows),
                 ],
             )
         };

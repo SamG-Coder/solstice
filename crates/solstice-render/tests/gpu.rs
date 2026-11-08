@@ -3323,3 +3323,112 @@ fn solid_particles_hide_what_is_behind_them() {
     let [r, _, b] = patch(&stage.pixels(&gpu), size, size / 2, size / 2, 0).map(srgb_to_linear);
     assert!(r > 0.9 && b < 0.02, "red {r}, blue {b}");
 }
+
+/// Local lights are shadowed through their own maps: a lamp over the floor with a ball hung
+/// between them leaves the floor under the ball dark and the floor beside it lit, and taking
+/// the ball away lights the floor under it. A map never traced would shadow the floor beside
+/// the ball too; a map never consulted would shadow nothing; a second lamp, out of the ball's
+/// way and first in the list, would light the floor under the ball if the lamps' maps were
+/// mixed up; and a low lamp lights the floor at a steep slant, where a map read with too
+/// little margin, or compared at the wrong depth, would shadow the floor with itself.
+#[test]
+fn a_lamp_is_shadowed_through_its_map() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 6.0, 9.0),
+        yaw: 0.0,
+        pitch: -0.6,
+        ..Default::default()
+    };
+    // No sun, no sky and no indirect light, with the exposure held to daylight, so only the
+    // lamp's direct light shows.
+    let night = Environment {
+        sun_illuminance: 0.0,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        daylight_illuminance: 10.0,
+        ..Default::default()
+    };
+    let lamp = |position: [f32; 3]| Light {
+        position,
+        range: 9.0,
+        intensity: [60.0; 3],
+        _pad: 0,
+    };
+    let size = 128;
+    // The volume resolves the ball at 0.2 m voxels and stops its traces most of a voxel short
+    // of a surface, so the shadow is some 2.5 m in radius on the floor; the lit spot stands
+    // well outside it, 42° from the lamp's vertical against the shadow's 26°. The slanted spot,
+    // nearer the camera, is lit by the low lamp at 69° from its vertical, four times as much
+    // as by the lamp over the ball.
+    let under = Vec3::ZERO;
+    let beside = Vec3::new(4.5, 0.0, 0.0);
+    let slanted = Vec3::new(-2.5, 0.0, 4.5);
+    let low_lamp = lamp([-6.5, 1.5, 4.5]);
+    let floor_at = |pixels: &[u8], world: Vec3| {
+        let (x, y) = pixel_of(&camera, size, world);
+        brightness(patch(pixels, size, x, y, 2))
+    };
+    let mut scene = ball_on_floor();
+    // The first lamp is far enough along +X that nothing it lights is measured; the low lamp
+    // reaches the spot under the ball only faintly, at the edge of its range.
+    scene.lights = vec![lamp([16.0, 5.0, 0.0]), lamp([0.0, 5.0, 0.0]), low_lamp];
+    // The ball hangs between the lamp and the floor, a metre above the floor and two below
+    // the lamp.
+    scene.instances[0].transform = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
+    let with_ball = render_in(
+        &gpu,
+        &scene,
+        &camera,
+        RendererSettings::default(),
+        size,
+        &night,
+    )
+    .pixels;
+    scene.instances.remove(0);
+    let without = render_in(
+        &gpu,
+        &scene,
+        &camera,
+        RendererSettings::default(),
+        size,
+        &night,
+    )
+    .pixels;
+
+    let slant = floor_at(&without, slanted);
+    scene.lights.pop();
+    let no_low_lamp = render_in(
+        &gpu,
+        &scene,
+        &camera,
+        RendererSettings::default(),
+        size,
+        &night,
+    )
+    .pixels;
+    let slant_unlit = floor_at(&no_low_lamp, slanted);
+
+    let (shadowed, lit) = (floor_at(&with_ball, under), floor_at(&with_ball, beside));
+    let (open, lit_alone) = (floor_at(&without, under), floor_at(&without, beside));
+    assert!(
+        shadowed + 20.0 < lit,
+        "under the ball the floor is {shadowed}, beside it {lit}: no shadow"
+    );
+    assert!(
+        shadowed + 20.0 < open,
+        "under the ball the floor is {shadowed}, and {open} with the ball gone: no shadow"
+    );
+    // The probes' indirect specular is not scaled by `gi_intensity`, so the lit ball's glow
+    // reaches the floor beside it a little; a map never traced would leave it near black.
+    assert!(
+        (lit - lit_alone).abs() < 30.0,
+        "beside the ball the floor is {lit} with it and {lit_alone} without: the ball shadows what it should not"
+    );
+    assert!(
+        slant > slant_unlit + 20.0,
+        "the floor at a steep slant to the low lamp is {slant} with it and {slant_unlit} without: it shadows itself"
+    );
+}

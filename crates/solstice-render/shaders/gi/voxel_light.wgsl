@@ -8,6 +8,7 @@
 #include "common/environment.wgsl"
 #include "common/scene.wgsl"
 #include "gi/radiance_codec.wgsl"
+#include "lighting/light_shadows_common.wgsl"
 
 struct Params {
     level: u32,
@@ -23,6 +24,8 @@ struct Params {
 @group(0) @binding(1) var<storage, read> voxels: array<u32>;
 @group(0) @binding(2) var<storage, read_write> radiance: array<vec2u>;
 @group(0) @binding(3) var<storage, read> lights: array<Light>;
+// Each light's shadow map, from lighting/light_shadows.wgsl.
+@group(0) @binding(4) var light_shadows: texture_2d_array<f32>;
 
 const EMISSIVE_RANGE: f32 = 128.0;
 const INDIRECT_RAYS: u32 = 3u;
@@ -67,7 +70,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         irradiance += sun_irradiance_at(center) * sun_cos * visible;
     }
 
-    // Local lights, with visibility so that walls contain them.
+    // Local lights, through their shadow maps so that walls contain them.
     for (var i = 0u; i < params.light_count; i++) {
         let light = lights[i];
         let to_light = light.position - origin;
@@ -77,7 +80,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let cos_light = dot(normal, direction);
             if cos_light > 0.0 {
                 let falloff = sq(clamp(1.0 - sq(sq(distance / light.range)), 0.0, 1.0)) / max(distance * distance, 0.25);
-                let open = volume_visibility(origin, direction, voxel, max(distance - voxel * 3.0, 0.0), 24u);
+                let open = light_shadow(i, -to_light, distance, voxel, normal);
                 irradiance += light.intensity * falloff * cos_light * open;
             }
         }
