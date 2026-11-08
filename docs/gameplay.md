@@ -440,8 +440,10 @@ Animation Library.
     can be remade or changed by editing it, the way scenes are made from `scenes/*.txt`.
   - It is exported as glTF with MPFB 2's game-engine rig, with modifiers applied and PBR
     materials, as its users advise.
-  - Blender is not installed on this machine yet. Installing it, and the plugin, waits for your
-    go-ahead when step 6 begins.
+  - Blender 5.2.1 LTS is installed at `D:\Blender`, and the script runs it headless
+    (`blender --background --python`). MPFB 2 is not installed yet. Installing it from Blender's
+    extensions site waits for your go-ahead when step 6 begins, and that step first checks that
+    it supports Blender 5.2.
 - **The animations** come from the Universal Animation Library, volumes 1 and 2: over 250 CC0
   clips in glTF on one humanoid rig, with walking in eight directions, jogging, sprinting,
   sitting, climbing, swimming and more. The free tier is enough. The *Source* tier, with its
