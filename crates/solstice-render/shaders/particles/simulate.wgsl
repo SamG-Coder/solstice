@@ -13,6 +13,13 @@
 @group(0) @binding(4) var<storage, read_write> free_list: array<u32>;
 // Both alive lists, the second `sim.capacity` entries after the first.
 @group(0) @binding(5) var<storage, read_write> alive: array<u32>;
+// Each emitter's events from last frame's hits, EVENT_CAPACITY apiece.
+@group(0) @binding(6) var<storage, read_write> events: array<Event>;
+
+// The air this frame's steps end in.
+fn sim_air() -> Air {
+    return Air(sim.time, sim.wind, sim.camera_position.w);
+}
 
 // Keeps a particle for the next frame, in the alive list being written.
 fn keep(e: u32, base: u32, slot: u32) {
@@ -41,9 +48,17 @@ fn spawn(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) l
     }
     let emitter = emitters[e];
     let slot = free_list[emitter.base + state[e].spawn_first + i];
-    // Born part way through the frame, and moved on to its end.
-    var p = spawn_particle(emitter, state[e].spawn_index + i);
-    step_particle(&p, emitter, spawn_elapsed(i, count, sim.seconds));
+    // Born part way through the frame, and moved on to its end; from last frame's events first,
+    // each spawning its share.
+    let index = state[e].spawn_index + i;
+    var p: Particle;
+    let from_events = state[e].events_in * emitter.event_spawn;
+    if i < from_events {
+        p = event_particle(emitter, index, events[e * EVENT_CAPACITY + i / max(emitter.event_spawn, 1u)]);
+    } else {
+        p = spawn_particle(emitter, index);
+    }
+    step_particle(&p, emitter, spawn_elapsed(i, count, sim.seconds), sim_air());
     particles[slot] = p;
     keep(e, emitter.base, slot);
 }
@@ -68,7 +83,7 @@ fn update(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) 
     let emitter = emitters[e];
     let slot = alive[sim.parity * sim.capacity + emitter.base + i];
     var p = particles[slot];
-    step_particle(&p, emitter, sim.seconds);
+    step_particle(&p, emitter, sim.seconds, sim_air());
     if is_dead(p) {
         // Its slot goes back on the free list, above the slots this frame's spawns took.
         let at = atomicAdd(&state[e].free_count, 1u);
