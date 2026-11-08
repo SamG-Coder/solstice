@@ -288,17 +288,49 @@ thing's shadow can land, by the same planes the receiver cull uses.
 Images unchanged within noise except the cove ship alone (41 dB): the camera-bounded detail
 thins the rigging's shadow on the hull slightly, as fix 1 does for static casters.
 
+#### Fix 6: shadow cascades through the software rasterizer
+
+The cascades drew every cluster through the hardware rasterizer, which shades 2×2 quads and
+wastes most of its work on the pixel-sized triangles a wood's leaves become in a shadow map;
+the main view has sent such clusters to a compute rasterizer from the start. The cull now
+marks small clusters software for the cascades too (by their size in texels, since an
+orthographic view has no distance), a depth-only variant of the software rasterizer draws
+them into a buffer of reversed depth with atomics, with the same slope-scaled bias as the
+hardware pipeline so that surfaces do not shadow themselves, and a pass of one triangle lays
+that buffer over the cascade's map under the usual depth test. Movable instances' quarters
+stay on the hardware path for now.
+
+| Flyover, shadows pass: redraw mean / p95 / max | Hardware only | With software |
+|---|---|---|
+| Stress, fair 10:00 | 2.71 / 5.40 / 11.3 ms | 1.27 / 2.59 / 5.1 ms |
+| Stress, storm 18:40 (low sun) | 8.47 / 17.4 / 33.1 ms | 4.94 / 9.60 / 23.2 ms |
+| Cove, fair 10:00 | 0.36 / 0.31 / 0.59 ms | 0.40 / 0.38 / 0.66 ms |
+
+The cove pays the clear and the merge, about 0.04 ms a redraw, for little gain: its clusters
+are large. Images are unchanged within noise (hill 56.4 dB against a 58 dB floor, dusk 58.9,
+beach 44.6 against 45.4, cove 45.2 against 46.5); without the slope bias the first attempt
+darkened the barrels and leaves with self-shadowing, which the difference image showed. A GPU
+test renders a ball over a floor with and without the ball, under a sun alone, and requires the
+floor to darken under it; the ball's clusters all take the software path in the nearest
+cascade, so a software rasterizer that wrote nothing, or a merge that wrote the far plane,
+fails it, while turning the software path off (everything through the hardware) still passes.
+
+The low sun's far cascade still asks for over two million clusters; drawing them twice as fast
+does not change that count. The remaining lever is a coarser level of detail for leaves at
+shadow-map distances, a cluster builder question.
+
 ### Where things stand
 
 Fixed and in pull requests: shadow caster culling (#25, merged), cloud shadows beyond their map
-(#26, merged), the cull lists' overflow counter and capacity (#27 and #31), light tiles (#30), and
-movable casters culled once (fix 5).
+(#26, merged), the cull lists' overflow counter and capacity (#27 and #31), light tiles (#30,
+merged), movable casters culled once (#32), and the cascades through the software rasterizer
+(fix 6).
 
 Found and not yet fixed, in order of how much they would give:
 
-1. Shadow cascades redrawn through the hardware rasterizer for pixel-sized clusters, and at full
-   texel LOD for leaves the camera cannot resolve: 2 to 60 ms a redraw in dense woods, worst
-   with a low sun.
+1. Shadow cascades at full texel LOD for leaves the camera cannot resolve: with the software
+   rasterizer (fix 6) a redraw is 1 to 23 ms in dense woods, worst with a low sun, and the far
+   cascade still selects over two million clusters there.
 2. Local-light visibility traced per pixel per light: 7 ms at 1440p where thirty torches overlap.
 3. Haze fixed at 0.0011 per metre: a clear day has the air of a hazy one, which long views show.
 4. The voxel light pass loops over every light per voxel; per-block lists would cut its loop

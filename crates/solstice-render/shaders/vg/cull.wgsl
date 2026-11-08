@@ -209,9 +209,14 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     // 2 means the list is consumed by a compute pass, not a rasterizer: voxelization.
     var software = view.allow_software == 2u;
     if view.allow_software == 1u {
-        let distance = length(center - view.camera_position) - radius;
-        if distance > view.near {
-            software = 2.0 * radius * view.lod_scale / distance < SOFTWARE_MAX_DIAMETER_PX;
+        if view.is_ortho != 0u {
+            // Orthographic: the same size everywhere.
+            software = 2.0 * radius * view.lod_scale < SOFTWARE_MAX_DIAMETER_PX;
+        } else {
+            let distance = length(center - view.camera_position) - radius;
+            if distance > view.near {
+                software = 2.0 * radius * view.lod_scale / distance < SOFTWARE_MAX_DIAMETER_PX;
+            }
         }
     }
     if !emit_cluster(entry.instance, cluster_index, software) {

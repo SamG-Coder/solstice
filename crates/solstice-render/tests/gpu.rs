@@ -1,6 +1,6 @@
 //! End-to-end tests on a real GPU. They pass trivially, with a note, if none is available.
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 use solstice_asset::{Instance, Light, LoadedScene, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
@@ -1039,6 +1039,59 @@ fn tiled_lights_reach_what_is_in_their_range_and_nothing_else() {
     assert!(
         difference < 1.0,
         "far lamps changed the picture by {difference} per channel on average"
+    );
+}
+
+/// Small casters are drawn into the shadow maps by the software rasterizer: a ball 20 cm
+/// across is a few clusters, each about twenty texels wide in the nearest cascade, so they all
+/// take that path,
+/// and if it drew nothing the ball would cast no shadow. Under a low sun the shadow falls on
+/// the floor a metre from the ball, where it must be darker than the same floor with no ball.
+#[test]
+fn small_casters_shadow_through_the_software_rasterizer() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 2.5),
+        yaw: 0.0,
+        pitch: -0.7,
+        ..Default::default()
+    };
+    // Low enough that the shadow lands well clear of the ball, beyond the reach of the
+    // screen-space contact shadows, which would darken the floor next to it on their own.
+    let sun_direction = Vec3::new(5.0, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let size = 256;
+    let settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let (radius, centre) = (0.1, Vec3::new(0.0, 0.1, 0.0));
+    let mut scene = ball_on_floor();
+    scene.instances[0].transform =
+        Mat4::from_scale_rotation_translation(Vec3::splat(radius), Quat::IDENTITY, centre);
+    let with_ball = render_in(&gpu, &scene, &camera, settings, size, &sun).pixels;
+    scene.instances.remove(0);
+    let floor = render_in(&gpu, &scene, &camera, settings, size, &sun).pixels;
+    // Where the ball's centre casts to on the floor, on screen.
+    let on_floor = centre - sun_direction * (centre.y / sun_direction.y);
+    let clip = camera.projection(1.0) * camera.view() * on_floor.extend(1.0);
+    let ndc = clip.truncate() / clip.w;
+    let (px, py) = (
+        ((ndc.x * 0.5 + 0.5) * size as f32) as u32,
+        ((0.5 - ndc.y * 0.5) * size as f32) as u32,
+    );
+    let shadowed = brightness(patch(&with_ball, size, px, py, 2));
+    let lit = brightness(patch(&floor, size, px, py, 2));
+    assert!(
+        shadowed + 30.0 < lit,
+        "the floor at ({px}, {py}) is {shadowed} with the ball and {lit} without: no shadow"
     );
 }
 
