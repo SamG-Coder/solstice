@@ -34,10 +34,10 @@ const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// Capacity of the main view's traversal queue and selected-cluster list.
 const MAIN_QUEUE_CAPACITY: u64 = 1 << 22;
-const MAIN_VISIBLE_CAPACITY: u64 = 1 << 20;
+const MAIN_VISIBLE_CAPACITY: u64 = 1 << 21;
 /// The same for views that need no history: shadow cascades and voxelization.
 const AUX_QUEUE_CAPACITY: u64 = 1 << 22;
-const AUX_VISIBLE_CAPACITY: u64 = 1 << 20;
+const AUX_VISIBLE_CAPACITY: u64 = 1 << 21;
 
 /// Assignment of view slots.
 const SLOT_MAIN_FIRST: u32 = 0;
@@ -180,6 +180,11 @@ pub struct FrameStats {
     /// frames to arrive, and a redraw is skipped over while the last is still in flight.
     pub shadow_clusters: u32,
     pub shadow_triangles: u32,
+    /// Queue entries and clusters the main view, and that cascade, lost for want of room in
+    /// their lists. Zero unless the scene has outgrown them, in which case the image, or the
+    /// shadow, has holes.
+    pub dropped: u32,
+    pub shadow_dropped: u32,
 }
 
 /// Everything whose size depends on the resolution.
@@ -590,6 +595,8 @@ impl Renderer {
             streaming: self.streamer.stats(),
             shadow_clusters: self.aux_work.stats().clusters(),
             shadow_triangles: self.aux_work.stats().triangles(),
+            dropped: self.main_work.stats().dropped(),
+            shadow_dropped: self.aux_work.stats().dropped(),
         }
     }
 
