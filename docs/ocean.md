@@ -243,6 +243,30 @@ lighting flicker investigation finishes.
    - no cracks;
    - no popping or swimming as the camera moves;
    - the water meets the land correctly.
+
+   How, decided from the code:
+   - **Scene files.** The manifest gains optional tagged sections after its fixed part: a
+     four-byte tag, a length, then the contents. The first is the sea: its level, and the
+     ocean's own text, so a scene can carry an ocean of its own.
+     - Readers skip tags they don't know, and older readers never look past the fixed part, so
+       files stay readable both ways with no change of version.
+     - The temple and forest keep working unbaked; only the cove is rebaked.
+   - **Wave mips.** Each frame, the displacement and slope textures get their mip chains, so
+     geometry and pixels far away sample waves as large as they can show, not alias smaller ones.
+   - **The grid.** Rings of 64 × 64 cells, eleven levels from 25 cm to 256 m. Each level is
+     snapped to twice its own cell size as the camera moves, so vertices never slide over the
+     waves. Each level's outer band morphs onto the next level's grid, so neighbouring levels
+     meet exactly and nothing cracks or pops. The last ring is stretched out to the horizon.
+     That is about 70,000 triangles.
+   - **The water layer.** The grid is drawn by the hardware rasterizer into its own depth target,
+     with the undisplaced position of each pixel's water in a colour target.
+   - **The water pass.** A compute pass after deferred lighting. Where the water is nearer than
+     the opaque scene, it shades it: Fresnel reflection of the sky, sun specular, deep-water
+     colour, and the same haze as everything else. It writes the result into a new HDR target,
+     which post then reads, and the water's depth and motion into the G-buffer. Opaque light
+     stays untouched in the old HDR target, ready for refraction in step 3.
+   - **Debug view.** "Ocean": the water's normals, so the waves, cracks and coverage can be
+     checked on screen and by tests.
 3. **Water shading.** Reflection, refraction, absorption and scattering, sun and moon specular with
    shadows, filtering to roughness, and the horizon. Compared against photographs, one condition at
    a time: calm, choppy, storm, shallows, sunset, night.

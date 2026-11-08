@@ -2,9 +2,13 @@
 //!
 //! ```text
 //! header    magic, version, where the manifest and data area are
-//! manifest  deflated: everything in a [`PagedScene`]
+//! manifest  deflated: everything in a [`PagedScene`], then optional tagged sections
 //! data      each page deflated on its own, then texture levels as they are
 //! ```
+//!
+//! Each optional section is a four-byte tag, its length in bytes, and its contents. Readers skip
+//! tags they don't know, and older readers stop at the manifest's fixed part, so a section can be
+//! added without changing the version: files stay readable both ways.
 //!
 //! Block-compressed textures barely shrink further, so they aren't deflated. Pages are deflated
 //! separately so a client can fetch any one with an HTTP Range request. All values are
@@ -14,7 +18,7 @@ use crate::gpu::{PackedCluster, PackedNode};
 use crate::paged::{
     upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
 };
-use crate::scene::{Instance, Light, Material, TextureEncoding, TextureLayer, Viewpoint};
+use crate::scene::{Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::fmt;
@@ -23,6 +27,8 @@ const MAGIC: [u8; 8] = *b"SOLSTICE";
 const VERSION: u32 = 4;
 /// How hard to compress when baking. Unpacking takes the same time at any level.
 const DEFLATE_LEVEL: u8 = 9;
+/// The optional section holding the scene's [`Sea`]: its level, then its ocean's text.
+const SEA_TAG: [u8; 4] = *b"SEA ";
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +39,7 @@ pub enum DecodeError {
     BadInstanceReference,
     BadTextures,
     BadPages,
+    BadSea,
 }
 
 impl fmt::Display for DecodeError {
@@ -51,6 +58,7 @@ impl fmt::Display for DecodeError {
             }
             Self::BadTextures => write!(f, "the texture data does not match its stated format"),
             Self::BadPages => write!(f, "the page tables are inconsistent"),
+            Self::BadSea => write!(f, "the sea's description is not text"),
         }
     }
 }
@@ -203,6 +211,12 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
         }
     }
     w.slice(&scene.upper_mip_offsets);
+
+    if let Some(sea) = &scene.sea {
+        let mut contents = sea.level.to_le_bytes().to_vec();
+        contents.extend_from_slice(sea.ocean.as_bytes());
+        w.section(SEA_TAG, &contents);
+    }
     w.finish()
 }
 
@@ -279,6 +293,21 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     }
     let upper_mip_offsets: Vec<u64> = r.slice()?;
 
+    let mut sea = None;
+    while !r.bytes.is_empty() {
+        let tag: [u8; 4] = r.pod()?;
+        let contents: Vec<u8> = r.slice()?;
+        if tag == SEA_TAG {
+            let (level, text) = contents
+                .split_first_chunk::<4>()
+                .ok_or(DecodeError::Truncated)?;
+            sea = Some(Sea {
+                level: f32::from_le_bytes(*level),
+                ocean: String::from_utf8(text.to_vec()).map_err(|_| DecodeError::BadSea)?,
+            });
+        }
+    }
+
     let scene = PagedScene {
         clusters,
         nodes,
@@ -292,6 +321,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         materials,
         lights,
         viewpoint: (has_viewpoint != 0).then_some(viewpoint),
+        sea,
         hierarchy_depth,
         source_triangles,
         unique_triangles,
@@ -469,6 +499,12 @@ impl Writer {
         self.bytes(bytemuck::cast_slice(values));
     }
 
+    /// An optional section: its tag, then its contents with their length.
+    fn section(&mut self, tag: [u8; 4], contents: &[u8]) {
+        self.bytes(&tag);
+        self.slice(contents);
+    }
+
     fn finish(self) -> Vec<u8> {
         self.out
     }
@@ -639,6 +675,7 @@ mod tests {
         assert_eq!(a.materials, b.materials);
         assert_eq!(a.lights, b.lights);
         assert_eq!(a.viewpoint, b.viewpoint);
+        assert_eq!(a.sea, b.sea);
         assert_eq!(a.meshes, b.meshes);
         assert_eq!(a.instances[0].transform, b.instances[0].transform);
         assert_eq!(a.hierarchy_depth, 3);
@@ -662,6 +699,56 @@ mod tests {
         );
         assert_eq!(decoded.page(0), loaded.page(0));
         assert_eq!(decoded.page(1), loaded.page(1));
+    }
+
+    #[test]
+    fn a_sea_travels_with_its_scene() {
+        let mut loaded = sample_scene();
+        let sea = Sea {
+            level: -0.6,
+            ocean: "# Clear water\nabsorption 0.35 0.06 0.015\n".to_string(),
+        };
+        loaded.scene.sea = Some(sea.clone());
+        assert_eq!(decode(&encode(&loaded)).unwrap().scene.sea, Some(sea));
+        // And a scene without one has none.
+        assert_eq!(decode(&encode(&sample_scene())).unwrap().scene.sea, None);
+    }
+
+    #[test]
+    fn manifests_from_before_sections_still_read() {
+        // A manifest of the fixed part alone, as files were before optional sections, reads
+        // as a scene with no sea.
+        let mut loaded = sample_scene();
+        loaded.scene.sea = None;
+        let manifest = encode_manifest(&loaded.scene);
+        let scene = decode_manifest(&manifest, 0).unwrap();
+        assert_eq!(scene.sea, None);
+        assert_eq!(scene.clusters, loaded.scene.clusters);
+    }
+
+    #[test]
+    fn unknown_sections_are_skipped() {
+        // A section from a newer writer, before and after the sea, is passed over.
+        let mut loaded = sample_scene();
+        let sea = Sea {
+            level: 2.0,
+            ocean: String::new(),
+        };
+        loaded.scene.sea = Some(sea.clone());
+        let mut w = Writer { out: Vec::new() };
+        w.section(*b"NEW1", &[1, 2, 3]);
+        let mut manifest = encode_manifest(&loaded.scene);
+        // Fixed part, then the unknown section, then the sea.
+        let mut fixed = sample_scene().scene;
+        fixed.sea = None;
+        let fixed_len = encode_manifest(&fixed).len();
+        let sea_section = manifest.split_off(fixed_len);
+        manifest.extend(w.finish());
+        manifest.extend(sea_section);
+        assert_eq!(decode_manifest(&manifest, 0).unwrap().sea, Some(sea));
+        // A section cut short is an error, not a silent loss.
+        manifest.truncate(manifest.len() - 2);
+        assert!(decode_manifest(&manifest, 0).is_err());
     }
 
     #[test]

@@ -643,5 +643,6 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
             yaw: 0.6,
             pitch: -0.04,
         }),
+        sea: None,
     }
 }
