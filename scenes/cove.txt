@@ -37,8 +37,12 @@ part ../target/scan/modular_fort_01/modular_fort_01.gltf wall_walkway_straight_0
 part ../target/scan/modular_fort_01/modular_fort_01.gltf wall_walkway_straight_01 -19.45 0 0 0 1
 part ../target/scan/modular_fort_01/modular_fort_01.gltf wall_stairs_straight_01 -1.26 0 15.91 270 1
 
-# ---- The iron gate, filling the 3.4 m opening of the arch.
-model ../target/scan/large_iron_gate/large_iron_gate.gltf 20.7 0 0 90 1.15
+# ---- The iron gate, filling the 3.4 m opening of the arch. An actor: walk up to it and press
+# ---- E, and it rises (viewer --play, or Play on the web).
+actor cove/gate.actor 20.7 0 0 90
+
+# ---- Whoever plays, starting where the camera does, outside the gate.
+actor cove/player.actor 66 0 -41 132.4
 
 # ---- The courtyard: a statue facing the gate, flanked by smaller monuments on their own bases.
 model ../target/scan/gothic_statue/gothic_statue.gltf -7 0 0 90 2.4

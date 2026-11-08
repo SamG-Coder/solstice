@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["b_base", "b_rhai", "b_starlark", "b_monty", "b_rapier", "b_bevy", "b_hecs", "b_world", "b_script"]
+members = ["b_base", "b_rhai", "b_starlark", "b_monty", "b_rapier", "b_bevy", "b_hecs", "b_world", "b_script", "b_play"]
 
 [profile.release]
 opt-level = 3

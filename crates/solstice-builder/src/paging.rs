@@ -32,6 +32,7 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
         lights: scene.lights.clone(),
         viewpoint: scene.viewpoint,
         sea: scene.sea.clone(),
+        gameplay: scene.gameplay.clone(),
         hierarchy_depth: 1,
         source_triangles: scene.total_source_triangles(),
         unique_triangles: scene.unique_source_triangles(),

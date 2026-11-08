@@ -509,7 +509,7 @@ fn the_api_reference_lists_every_engine_function() {
     let reference = api_reference();
     for name in [
         "vec3", "send", "after", "every", "cancel", "find", "input", "held", "pressed", "now",
-        "log",
+        "log", "sin", "cos", "atan2", "sqrt",
     ] {
         let heading = format!("def {name}(");
         assert!(
@@ -792,4 +792,28 @@ fn rust_builds_events_for_scripts_in_one_line() {
     );
     let actor = Entity::DANGLING;
     assert_eq!(ScriptEvent::to(actor, "poke").to, Some(actor));
+}
+
+#[test]
+fn scripts_have_the_maths_games_need() {
+    let source = r#"
+def on_tick(self, dt):
+    self.vars.results = [sin(0), cos(0), atan2(1, 0), sqrt(9), sin(1.5707963267948966)]
+    sqrt(-1)
+"#;
+    let (mut game, host) = game_with(&[("maths", source)]);
+    let actor = game.world.spawn((Script::new("maths"),));
+    steps(&mut game, 1);
+    let errors = host.borrow_mut().take_errors();
+    assert!(errors[0].message.contains("isn't negative"), "{errors:?}");
+    // The failing call kept nothing, so run the good part alone.
+    host.borrow_mut()
+        .load("maths", &source.replace("    sqrt(-1)\n", ""))
+        .unwrap();
+    steps(&mut game, 1);
+    let expected = [0.0, 1.0, std::f64::consts::FRAC_PI_2, 3.0, 1.0].map(ScriptValue::Float);
+    assert_eq!(
+        var(&game, actor, "results"),
+        Some(ScriptValue::List(expected.to_vec()))
+    );
 }
