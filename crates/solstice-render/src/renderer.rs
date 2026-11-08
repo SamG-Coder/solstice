@@ -495,6 +495,19 @@ impl Renderer {
             clouds.placeholders(),
         );
 
+        let particles = Particles::new(
+            gpu,
+            &frame_uniform,
+            settings.particle_pool,
+            &environment_layout,
+            waterline.resolve_layout(),
+            LightInputs {
+                lights: scene.lights.clone(),
+                shadow_uniform: shadows.uniform.clone(),
+                shadow_maps: shadows.array_view.clone(),
+                shadow_sampler: shadows.comparison_sampler.clone(),
+            },
+        );
         Self {
             settings,
             resolve: Resolve::new(gpu, waterline.resolve_layout()),
@@ -503,18 +516,7 @@ impl Renderer {
             deferred: DeferredLighting::new(gpu, &environment_layout),
             light_tiles: LightTiles::new(gpu, &environment_layout),
             post: PostProcess::new(gpu, output_format),
-            particles: Particles::new(
-                gpu,
-                &frame_uniform,
-                settings.particle_pool,
-                &environment_layout,
-                LightInputs {
-                    lights: scene.lights.clone(),
-                    shadow_uniform: shadows.uniform.clone(),
-                    shadow_maps: shadows.array_view.clone(),
-                    shadow_sampler: shadows.comparison_sampler.clone(),
-                },
-            ),
+            particles,
             profiler: Profiler::new(gpu),
             scene,
             streamer,
@@ -723,6 +725,15 @@ impl Renderer {
             .set_light_interval(self.settings.particle_light_interval);
         self.particles
             .set_ray_steps(self.settings.particle_ray_steps);
+        // The weather's wind is at cloud height; near the ground it is about half that, as the
+        // sea takes it, measured from the sea's level where there is a sea.
+        let [east, south] = self.clouds.weather().wind_velocity();
+        let floor = if self.sea.is_some() {
+            self.sea_level
+        } else {
+            0.0
+        };
+        self.particles.set_air([east * 0.5, south * 0.5], floor);
         // Particles take the frame's own time, so a host that pauses by passing 0 holds them
         // still, where the passes that filter over time need a step above zero.
         self.particles.prepare(
@@ -980,6 +991,12 @@ impl Renderer {
         // Particles, over the lit scene and the water.
         mark(&self.profiler, &mut encoder, section::PARTICLES);
         self.particles.record_simulation(&mut encoder);
+        self.particles.record_collide(
+            &mut encoder,
+            &self.environment,
+            &sized.particles,
+            self.waterline.resolve_group(),
+        );
         self.particles.record_light(&mut encoder, &self.environment);
         self.particles.record_sort(&mut encoder);
         mark(&self.profiler, &mut encoder, section::PARTICLE_DRAW);
@@ -1105,9 +1122,14 @@ impl Renderer {
             ),
             None => (&hdr.view, &gbuffer.depth.view, &gbuffer.motion.view),
         };
-        let particles = self
-            .particles
-            .targets(gpu, render_size, scene_depth, scene_motion);
+        let particles = self.particles.targets(
+            gpu,
+            render_size,
+            scene_depth,
+            scene_motion,
+            &gbuffer.depth.view,
+            &gbuffer.normal.view,
+        );
         let post = self.post.bindings(
             gpu,
             &self.frame_uniform,

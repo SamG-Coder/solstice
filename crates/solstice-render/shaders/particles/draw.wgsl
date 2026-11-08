@@ -92,6 +92,12 @@ fn curve_size(e: u32, t: f32) -> f32 {
 fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> Varyings {
     let slot = alive[draw.list_offset + instance];
     let p = particles[slot];
+    var out: Varyings;
+    // Killed by a collision this frame: drawn as nothing, and freed next frame.
+    if is_dead(p) {
+        out.clip = vec4f(0.0, 0.0, -1.0, 1.0);
+        return out;
+    }
     let e = draw.emitter;
     let emitter = emitters[e];
     let t = p.age / max(p.lifetime, 1.0e-6);
@@ -112,7 +118,6 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     let offset = (right * turned.x + up * turned.y) * size;
     let world = p.position + offset;
 
-    var out: Varyings;
     out.clip = frame.view_proj * vec4f(world, 1.0);
     out.corner = corner;
     // Last frame the particle stood at the start of its last step; the sprite turns with the

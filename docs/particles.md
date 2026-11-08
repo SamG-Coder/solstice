@@ -167,12 +167,12 @@ need them.
 
 | Stage | Modules |
 |---|---|
-| Spawn | **`spawn rate=`** per second, **`burst=`** at the start and **`every=`** seconds after, `event=` from another emitter, `distance=` per metre moved (trails); **`follow camera`** or **`follow effect`**; **`budget`** |
+| Spawn | **`spawn rate=`** per second, **`burst=`** at the start and **`every=`** seconds after, **`event=`** with **`count=`** from another emitter's hits, `distance=` per metre moved (trails); **`follow camera`** or **`follow effect`**; **`budget`** |
 | Shape | **`point`**, **`sphere R [surface]`**, **`box X Y Z`**, **`offset`**, `disc`, `cone`, and two that join the scene: `sea crests` (where waves break) and `surf` (where the sea rises against a face) |
 | Initial attributes | **`lifetime`**, **`velocity X Y Z cone= spread=`**, `terminal` and inherited velocity, **`size`**, **`color`**, **`brightness`**, rotation (random for now), `flipbook` frame, **`temperature`** in kelvin |
-| Forces | **`gravity`**, **`drag`** (linear; quadratic and `terminal` later), `wind`, `curl` noise, `buoyancy` (hot gas rising and cooling), `attract` to a point, `vortex` |
+| Forces | **`gravity`**, **`drag`** (linear; quadratic and `terminal` later), **`wind`**, **`curl`** noise, **`buoyancy`** (hot gas rising), **`attract`** to the origin, **`vortex`** |
 | Over life | **`color life`** (with opacity), **`size life`**, `spin`; **`cooling`** towards the air, and **`glow`** (emissivity), for fire and sparks |
-| Collision | `collide` against `depth`, `field` (the GI volume's distance field), `cover` (the top-down cover map) and `water`; then `bounce`, `stick`, or `kill`, with an optional `event=` |
+| Collision | **`collide`** against **`depth`**, **`field`** (the GI volume's distance field), `cover` (the top-down cover map, step 4b) and **`water`**; then **`bounce`**, **`stick`**, or **`kill`**, with **`restitution=`**, **`friction=`** and an optional **`event=`** |
 | Kill | **by age**; by leaving the follow box; below the water |
 | Render | **`sprite`** facing the camera (velocity and up later), **`blend=alpha`** or **`add`**, **`soft=`** fade distance, **`opacity=`**, **`shading=lit`** (the default) or **`unlit`**, **`phase=`** asymmetry; `streak`, `flipbook`, later `mesh`; `shadow` to cast one |
 
@@ -440,14 +440,80 @@ The lighting pass, the water pass and particle lighting all multiply the sun by 
 shades the ground below it and shades itself. Only emitters marked `shadow` cast one, and it is
 off on Low.
 
+### Forces
+
+The forces that vary through space and time (step 4a) take substeps of at most 1/30 s; with
+gravity and linear drag alone, the step is still exact.
+- **Moving air** is the wind, curl noise and vortices, summed. It pulls a particle through its
+  drag, as an extra acceleration of drag times the air's velocity: a particle with no drag isn't
+  carried at all, and one with plenty soon moves with the air.
+- **`wind S`** is S times the weather's wind near the ground.
+  - The weather's wind is at cloud height; 10 m up it is half that, as the sea takes it.
+  - It is brought to the particle's height by the log profile over open ground (a roughness
+    length of 3 cm), from the sea's level, or 0 with no sea, and no lower than half a metre.
+  - It gusts by up to 30% either way, with slow noise in space and time.
+- **`curl SPEED scale=L change=R`** is the curl of three gradient noises (Bridson et al.).
+  - Its divergence is zero, so it swirls particles without gathering them or thinning them out.
+  - The noise has an analytic gradient, so its curl is exact.
+  - It moves through time at R noise cells a second.
+- **`vortex W`** is air turning about the effect's up axis at W radians a second.
+- **`attract A`** is an acceleration towards the effect's origin.
+- **`buoyancy B`** lifts a hot particle by B times gravity, times how much hotter than the air it
+  is, as a share of its temperature.
+
 ### Collision
 
-Each test is cheap, and an emitter picks the ones it needs:
-- **`depth`.** This frame's depth and normals, so a particle bounces off exactly what is drawn.
-  It is detailed, but blind off screen and behind things.
+Collisions run as a pass of their own (`particles/collide.wgsl`), after the simulation and
+before the light, over the same workgroups as the light pass. Each test is cheap, and an emitter
+picks the ones it needs, as `collide depth field water` then `bounce`, `stick` or `kill`, with
+`restitution=`, `friction=` and `event=`:
+- **`depth`.** This frame's opaque depth and normals, so a particle bounces off exactly what is
+  drawn.
+  - It touches the plane of the surface drawn at its pixel once its centre is within its radius
+    of it. A particle that began the frame behind that plane passed behind what is drawn, and is
+    left alone.
+  - It is detailed, but blind off screen and behind things.
 - **`field`.** The GI volume's distance field: everywhere within the volume, on screen or not,
   at 0.2 m near the camera and coarser further off. This is Niagara's distance-field collision.
-  It is the default for sparks and debris.
+  - The field holds the distance to the nearest surface without saying which side a point is
+    on. So a particle's path this frame is marched from where it started, in steps no longer
+    than that distance, which can't pass through a surface. It touches where the distance first
+    falls within its reach: its radius, or half a voxel.
+  - The normal is the field's gradient. A particle in touch with a surface remembers that normal
+    in its flags, because under the ridge of a coarser level the gradient points the wrong way.
+  - One that began the frame within reach, and knows its side, keeps its movement along the
+    surface and loses any into it. If what is within reach is beside it instead, such as a wall
+    by a ledge it has slid off, nothing holds it up.
+  - On the two finest levels its path, offset three voxels from the surface, is
+    still marched for another surface ahead, so a wall stops it and anything lower than that
+    doesn't, nor a ledge sticking out from a wall by less than that. On coarser levels it isn't.
+  - Where a wall meets a floor the field is blurred for about a voxel. A bouncing particle landing
+    there can take a diagonal normal and slide along it through the floor. Stick and kill end at
+    the contact, so only bounce is affected.
+  - One within reach that remembers nothing was born there. It is trusted when the gradient points
+    up, off a floor; otherwise it is left alone until it has come out of reach, and what it meets
+    after that counts. So a particle born under the field's ridge, within half a voxel of a floor,
+    and moving down passes through it, and one born between a ceiling and its ridge is taken to be
+    on a floor there. Particles spawned by an event remember their surface.
+- **`water`.** The water's height now, from the water-line map within 64 m and the calm level
+  beyond it. A particle more than 25 cm under it when the frame began stays under.
+- **What a hit does.** Only a particle moving into the surface bounces, sticks, dies or sends an
+  event.
+  - **Bounce** keeps the restitution's share of speed into the surface, and loses the
+    friction's share along it.
+  - **Resting.** A bouncing particle moving into the surface slower than two frames' worth of
+    what pushes it there is resting rather than landing. It is held at the surface and sends no event, and slides on it,
+    losing the friction times the speed the surface took from it (Coulomb's law).
+  - **Stick** marks the particle, which then only ages.
+  - **Kill** ages it out at once: it is drawn as nothing and freed the next frame.
+- **Events.** A hit's `event=NAME` reaches the emitter of the effect that spawns on it
+  (`spawn event=NAME count=N`).
+  - An event has one listener; the parser refuses two.
+  - Each emitter takes up to 256 events a frame, into its own slice of an event buffer. What
+    those past it would have spawned counts as dropped.
+  - The next frame it spawns N particles at each, before any by rate. They leave the surface
+    with the emitter's velocity turned so that its up is the surface's normal.
+  - The parser refuses an event that no emitter of the effect spawns on.
 - **`cover`.** A new top-down map of the scene's highest surfaces: 512² over 256 m, half a metre
   a texel. It is drawn by the shadow maps' depth-only pass, like the seabed map but with nothing
   clipped away, and only when the camera has moved far or geometry has streamed in. Rain and
@@ -662,17 +728,54 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
      - So would sorting every other frame, since the order changes slowly.
    - **The smoke's draw is overdraw:** large puffs covering the same pixels many times. That is
      what step 7's half-resolution drawing is for.
-4. **Forces and collision.**
-   - Wind from the weather, brought down to the particle's height with the log profile the sea
-     uses, plus gusts; curl noise, buoyancy, attract and vortex.
-   - Collision against depth, the distance field, the cover map and the water, with bounce,
-     stick and kill.
-   - Events between emitters.
-   - Tests:
-     - Nothing falls through the floor, the cliff, or the sea.
-     - Bounces keep the right energy for their restitution.
-     - Curl noise is divergence-free.
-     - Particles under the gate's arch stay dry of rain.
+4. **Forces and collision,** in two parts. The cover map draws the scene from above through the
+   shared culling and rasterising, which another session was changing, so it lands on its own.
+   - **4a, forces, collisions and events.** *Built; in review.*
+     - Wind from the weather, brought down to the particle's height with a log profile, plus
+       gusts; curl noise, buoyancy, attract and vortex.
+     - Collision against depth, the distance field and the water, with bounce, stick and kill.
+     - Events between emitters.
+     - Tests, each mutation-checked: 33 bugs were put back in turn, and each made a test fail. No test reaches two other paths:
+       a wall merely beside a particle not holding it up, and a corner's blur not being taken for
+       the surface.
+       - Under every force at once, the GPU's particles are where the CPU reference puts them,
+         to within 0.1 mm (2 µm measured).
+       - Curl noise has no divergence, and the noise's gradient matches finite differences.
+       - Wind carries a particle with drag up to its speed.
+       - Particles thrown at a floor in view never fall through it, by depth or by the field.
+       - A dropped particle rebounds to its restitution squared of its fall.
+       - Drops landing on the sea die there, and each sends three splash particles.
+       - Sticking particles stay where they landed.
+       - A landing particle slides on, by depth or by the field, until friction stops it.
+       - A resting particle sends no more events, at a shallow view or pressed by other forces.
+       - What is born on a surface can leave it, and an event's child knows the open side.
+       - A sliding particle still stops at a wall, and a slow one doesn't jump to it.
+       - A particle born near a surface still hits the next, one falling from just above a floor
+         lands, and a wall beside a particle holds nothing up.
+       - Events past the limit count as dropped.
+       - What is already behind a surface, or under the water, stays there.
+       - An effect with events lasts until its last child could have died.
+
+     The built-in fountain's drops now die where they land, and its mist drifts on the
+     weather's wind and swirls.
+
+     **Cost** at 1280×720 in the cove, with the same method as before, simulate (now with
+     collisions), light and sort, then draw:
+
+     | Case | RTX 5080, High | Integrated, Low |
+     |---|---|---|
+     | The fountain | 0.08, 0.08 ms | 0.52, 0.28 ms |
+     | 100,000 drops in wind and curl noise, dying where they land (58,000 alive; 20,000 on Low) | 0.12, 0.05 ms | 1.7, 0.4 ms |
+
+     The same drops on the integrated GPU, at Low, three runs each:
+     - with neither forces nor collisions, 35,000 alive: 2.2 ms;
+     - with the forces alone, 35,000 alive: 2.4 ms;
+     - with the collisions alone, 20,000 alive: 1.6 ms.
+
+     So forces add about a tenth to a particle's cost there, and collisions about a third.
+     Lighting is still most of it.
+   - **4b, the cover map.** Rain and snow stopped by the first surface above them.
+     - Test: particles under the gate's arch stay dry of rain.
 5. **Rain and snow.**
    - The renderer's own rain and snow, driven by the weather.
    - A new weather setting, `snow`, in the weather files and in `Observation`.
