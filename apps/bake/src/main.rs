@@ -14,6 +14,7 @@
 //!
 //! Textures are block compressed unless `--raw-textures` is given.
 
+mod flora;
 mod forest;
 mod gallery;
 mod meshes;

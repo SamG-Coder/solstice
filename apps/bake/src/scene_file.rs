@@ -11,16 +11,27 @@
 //! model rocks/rock.gltf 9 ground 0 45 2     # standing on the terrain at this spot
 //! model rocks/rock.gltf 9 ground:0.2 0 45 2 # with its lowest 20% buried, as rocks are
 //! part kit/kit.gltf wall_01 0 0 0 90 1  # one named piece of a model, by its own origin
+//!
+//! # Many at once, laid out at random over a rectangle of ground, from x0 z0 to x1 z1:
+//! hills 40 300 120                      # relief: height, wavelength, and the level radius
+//! scatter rocks/rock.gltf 500 -300 -300 300 300 ground:0.2 0.5 2 1  # count, rect, height, scales, seed
+//! trees oak 2000 -400 -400 400 400 6 1  # species, count, rect, spacing, seed
+//! grass meadow -100 -100 100 100        # breed, rect
+//! lights 64 -40 -40 40 40 3 12 40 14 3 1  # count, rect, height, range, r g b, seed
 //! ```
 //!
 //! A model placed several times is imported once and shared, so repeats cost almost nothing.
 
+use crate::flora::{self, Ground, Layers, Rect, Stand};
 use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Light, Material, SceneAsset, Sea};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
+use solstice_procgen::foliage::grass::Meadow;
+use solstice_procgen::foliage::tree::Species;
+use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
 use solstice_procgen::surfaces;
@@ -64,6 +75,47 @@ enum Command {
         yaw_degrees: f32,
         scale: f32,
     },
+    Hills(Hills),
+    /// Copies of a model thrown at random over a rectangle of ground.
+    Scatter {
+        path: String,
+        count: u32,
+        area: Rect,
+        /// A fixed height, or `Some(buried)` to stand each on the terrain.
+        height: f32,
+        seat: Option<f32>,
+        scale: (f32, f32),
+        seed: u32,
+    },
+    Trees {
+        species: String,
+        count: u32,
+        area: Rect,
+        spacing: f32,
+        seed: u32,
+    },
+    Grass {
+        breed: String,
+        area: Rect,
+    },
+    Lights {
+        count: u32,
+        area: Rect,
+        height: f32,
+        range: f32,
+        intensity: [f32; 3],
+        seed: u32,
+    },
+}
+
+/// Broad relief added to the terrain: hills of `amplitude` over about `wavelength` metres,
+/// level within `flat_radius` of the origin so that whatever stands there keeps its footing, and
+/// fading out towards the coast so that the shore still meets the sea.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hills {
+    amplitude: f32,
+    wavelength: f32,
+    flat_radius: f32,
 }
 
 fn parse_line(line: &str) -> Result<Option<Command>, String> {
@@ -156,6 +208,55 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 scale: number(5)?,
             }
         }
+        "hills" => {
+            expect(3)?;
+            Command::Hills(Hills {
+                amplitude: number(0)?,
+                wavelength: number(1)?,
+                flat_radius: number(2)?,
+            })
+        }
+        "scatter" => {
+            expect(10)?;
+            let (height, seat) = parse_height(values[6])?;
+            Command::Scatter {
+                path: values[0].to_string(),
+                count: number(1)? as u32,
+                area: Rect::new(number(2)?, number(3)?, number(4)?, number(5)?),
+                height,
+                seat,
+                scale: (number(7)?, number(8)?),
+                seed: number(9)? as u32,
+            }
+        }
+        "trees" => {
+            expect(8)?;
+            Command::Trees {
+                species: values[0].to_string(),
+                count: number(1)? as u32,
+                area: Rect::new(number(2)?, number(3)?, number(4)?, number(5)?),
+                spacing: number(6)?,
+                seed: number(7)? as u32,
+            }
+        }
+        "grass" => {
+            expect(5)?;
+            Command::Grass {
+                breed: values[0].to_string(),
+                area: Rect::new(number(1)?, number(2)?, number(3)?, number(4)?),
+            }
+        }
+        "lights" => {
+            expect(11)?;
+            Command::Lights {
+                count: number(0)? as u32,
+                area: Rect::new(number(1)?, number(2)?, number(3)?, number(4)?),
+                height: number(5)?,
+                range: number(6)?,
+                intensity: [number(7)?, number(8)?, number(9)?],
+                seed: number(10)? as u32,
+            }
+        }
         other => return Err(format!("unknown command '{other}'")),
     }))
 }
@@ -230,39 +331,70 @@ fn seat_height(
 }
 
 /// How far inland the coast around the rest of the island lies from the origin, before its bays
-/// and points. With the slope down to the seabed, this keeps the land well inside the terrain
-/// square, so that its edges lie under the sea rather than showing as straight lines.
-const ISLAND_RADIUS: f32 = 270.0;
+/// and points, as a fraction of the terrain's width. With the slope down to the seabed, this
+/// keeps the land well inside the terrain square, so that its edges lie under the sea rather
+/// than showing as straight lines.
+const ISLAND_FRACTION: f32 = 0.3;
 /// How far the seabed lies beyond the waterline.
 const SHELF_WIDTH: f32 = 90.0;
 const SEABED_DEPTH: f32 = 9.0;
 
-/// Gently rolling ground that falls away into the sea beyond `shore_x`, and beyond a wandering
-/// coast all the way round, so that the land is an island whose edges never show.
-fn terrain_height(x: f32, z: f32, amplitude: f32, shore_x: f32) -> f32 {
-    let p = Vec3::new(x, 0.0, z);
-    let broad = fbm(p * 0.015, 4, 301) * amplitude;
-    let ripples = fbm(p * 0.25, 4, 303) * 0.04;
-    let shelf = |offshore: f32| {
+/// The ground of a scene: a square of gently rolling land that falls away into the sea beyond
+/// `shore_x`, and beyond a wandering coast all the way round, so that the land is an island
+/// whose edges never show.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Terrain {
+    size: f32,
+    cells: u32,
+    /// Height of the rolling ground's bumps.
+    amplitude: f32,
+    shore_x: f32,
+    hills: Option<Hills>,
+}
+
+impl Terrain {
+    /// How far the shelf has fallen towards the seabed, 0 on land to 1 at full depth.
+    fn shelf(offshore: f32) -> f32 {
         let t = (offshore / SHELF_WIDTH).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
-    };
-    // Bays and points, so that the waterline wanders rather than running ruler-straight.
-    let wander = fbm(Vec3::new(0.0, 7.0, z) * 0.011, 4, 305) * 28.0;
-    let cove = shelf(x - shore_x - wander);
-    // The coast round the rest of the island, sampled around a circle so that it wanders
-    // seamlessly: broad headlands and bays, with smaller points along them.
-    let radius = x.hypot(z);
-    let around = Vec3::new(x, 0.0, z) / radius.max(1.0);
-    let headlands = fbm(around * 1.6 + Vec3::new(0.0, 3.0, 0.0), 3, 307) * 45.0;
-    let points = fbm(around * 7.0 + Vec3::new(0.0, 11.0, 0.0), 3, 309) * 14.0;
-    let island = shelf(radius - ISLAND_RADIUS - headlands - points);
-    broad + ripples - cove.max(island) * SEABED_DEPTH
+    }
+
+    /// How far out to sea a point is, 0 on land to 1 over the seabed.
+    fn offshore(&self, x: f32, z: f32) -> f32 {
+        // Bays and points, so that the waterline wanders rather than running ruler-straight.
+        let wander = fbm(Vec3::new(0.0, 7.0, z) * 0.011, 4, 305) * 28.0;
+        let cove = Self::shelf(x - self.shore_x - wander);
+        // The coast round the rest of the island, sampled around a circle so that it wanders
+        // seamlessly: broad headlands and bays, with smaller points along them.
+        let radius = x.hypot(z);
+        let around = Vec3::new(x, 0.0, z) / radius.max(1.0);
+        let headlands = fbm(around * 1.6 + Vec3::new(0.0, 3.0, 0.0), 3, 307) * 45.0;
+        let points = fbm(around * 7.0 + Vec3::new(0.0, 11.0, 0.0), 3, 309) * 14.0;
+        let island = Self::shelf(radius - self.size * ISLAND_FRACTION - headlands - points);
+        cove.max(island)
+    }
+
+    fn height(&self, x: f32, z: f32) -> f32 {
+        let p = Vec3::new(x, 0.0, z);
+        let broad = fbm(p * 0.015, 4, 301) * self.amplitude;
+        let ripples = fbm(p * 0.25, 4, 303) * 0.04;
+        let offshore = self.offshore(x, z);
+        let hills = self.hills.map_or(0.0, |hills| {
+            // Always above the level ground, so no valley sinks below the sea inland, and
+            // rising smoothly from the level circle over a distance of half its radius.
+            let relief = (fbm(p / hills.wavelength, 5, 311) * 0.5 + 0.5) * hills.amplitude;
+            let from_centre =
+                ((x.hypot(z) - hills.flat_radius) / (hills.flat_radius * 0.5)).clamp(0.0, 1.0);
+            let rise = from_centre * from_centre * (3.0 - 2.0 * from_centre);
+            relief * rise * (1.0 - offshore)
+        });
+        broad + ripples + hills - offshore * SEABED_DEPTH
+    }
 }
 
 /// Adds the terrain as one mesh, with its own ground material and texture.
-fn add_terrain(scene: &mut SceneAsset, size: f32, cells: u32, height: f32, shore_x: f32) -> i32 {
-    let mesh = meshes::terrain(size, cells, |x, z| terrain_height(x, z, height, shore_x));
+fn add_terrain(scene: &mut SceneAsset, terrain: &Terrain) -> i32 {
+    let mesh = meshes::terrain(terrain.size, terrain.cells, |x, z| terrain.height(x, z));
     let layer = scene.textures.len() as i32;
     scene
         .textures
@@ -358,13 +490,16 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
         texture_size: 1024,
         ..Default::default()
     };
-    let mut terrain = None;
+    let mut terrain: Option<Terrain> = None;
+    let mut hills = None;
     let mut water = None;
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
     let mut order: Vec<PathBuf> = Vec::new();
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
     // Placed once the model has been imported, since its shape decides the height.
     let mut seated: HashMap<PathBuf, Vec<(Vec3, f32, f32, f32)>> = HashMap::new();
+    // Grown once the terrain is known, whichever line it is on.
+    let mut flora = Vec::new();
     for (number, line) in text.lines().enumerate() {
         let command =
             parse_line(line).map_err(|e| format!("{}:{}: {e}", path.display(), number + 1))?;
@@ -377,8 +512,15 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 height,
                 shore_x,
             }) => {
-                terrain = Some((size, cells, height, shore_x));
+                terrain = Some(Terrain {
+                    size,
+                    cells,
+                    amplitude: height,
+                    shore_x,
+                    hills: None,
+                });
             }
+            Some(Command::Hills(relief)) => hills = Some(relief),
             Some(Command::Water { height, color }) => water = Some((height, color)),
             Some(Command::Ocean { height, ocean }) => {
                 // A file's text travels with the scene; a built-in ocean goes by its name.
@@ -431,7 +573,62 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                     .parts
                     .push((name, transform));
             }
+            Some(Command::Scatter {
+                path: model,
+                count,
+                area,
+                height,
+                seat,
+                scale,
+                seed,
+            }) => {
+                let full = base.join(&model);
+                let placements = placements_of(&mut order, &mut models, base, model);
+                let mut rng = Rng::new(seed, 17);
+                for _ in 0..count {
+                    let (x, z) = area.sample(&mut rng);
+                    let yaw = rng.range(0.0, 360.0);
+                    let size = rng.range(scale.0, scale.1);
+                    let position = Vec3::new(x, height, z);
+                    match seat {
+                        Some(buried) => seated
+                            .entry(full.clone())
+                            .or_default()
+                            .push((position, yaw, size, buried)),
+                        None => placements
+                            .whole
+                            .push(placement_transform(position, yaw, size)),
+                    }
+                }
+            }
+            Some(command @ (Command::Trees { .. } | Command::Grass { .. })) => {
+                flora.push(command);
+            }
+            Some(Command::Lights {
+                count,
+                area,
+                height,
+                range,
+                intensity,
+                seed,
+            }) => {
+                // Lit once the terrain is known, so each hangs at `height` above the ground.
+                flora.push(Command::Lights {
+                    count,
+                    area,
+                    height,
+                    range,
+                    intensity,
+                    seed,
+                });
+            }
         }
+    }
+    if let Some(hills) = hills {
+        let Some(terrain) = &mut terrain else {
+            return Err("'hills' needs a terrain line".to_string());
+        };
+        terrain.hills = Some(hills);
     }
 
     if let Some(size) = texture_size {
@@ -451,12 +648,12 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             .map_or(String::new(), |s| s.to_string_lossy().to_string());
         warnings.extend(imported.warnings.iter().map(|w| format!("{name}: {w}")));
         if let Some(list) = seated.get(model) {
-            let Some((_, _, amplitude, shore_x)) = terrain else {
+            let Some(terrain) = terrain else {
                 return Err(format!("{name}: 'ground' needs a terrain line"));
             };
             // Water hides whatever is below it, so the sea floor does not count.
             let water_level = water.map_or(f32::MIN, |(level, _)| level);
-            let ground = |x: f32, z: f32| terrain_height(x, z, amplitude, shore_x).max(water_level);
+            let ground = |x: f32, z: f32| terrain.height(x, z).max(water_level);
             let points = model_points(&imported.scene);
             let placements = models.get_mut(model).expect("registered while parsing");
             for &(position, yaw_degrees, scale, buried) in list {
@@ -473,10 +670,81 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             .map_err(|e| format!("{}: {e}", model.display()))?;
     }
 
-    if let Some((size, cells, height, shore_x)) = terrain {
-        let ground_layer = add_terrain(&mut scene, size, cells, height, shore_x);
+    if let Some(terrain) = terrain {
+        let ground_layer = add_terrain(&mut scene, &terrain);
         if let Some((level, color)) = water {
             add_water(&mut scene, level, color, ground_layer);
+        }
+    }
+    if !flora.is_empty() {
+        let Some(terrain) = terrain else {
+            return Err("'trees', 'grass' and 'lights' need a terrain line".to_string());
+        };
+        let sea_level = water
+            .map(|(level, _)| level)
+            .or(scene.sea.as_ref().map(|sea| sea.level))
+            .unwrap_or(f32::MIN);
+        let height = |x: f32, z: f32| terrain.height(x, z);
+        let ground = Ground {
+            height: &height,
+            sea_level,
+        };
+        let mut layers = Layers::default();
+        for command in flora {
+            match command {
+                Command::Trees {
+                    species,
+                    count,
+                    area,
+                    spacing,
+                    seed,
+                } => {
+                    let grown = Species::by_name(&species).ok_or_else(|| {
+                        let names: Vec<_> = Species::names().collect();
+                        format!("no species '{species}': there are {}", names.join(", "))
+                    })?;
+                    println!("growing {species}...");
+                    let stand = Stand {
+                        count,
+                        area,
+                        spacing,
+                        seed,
+                    };
+                    let placed =
+                        flora::add_trees(&mut scene, &mut layers, &grown, &species, stand, ground);
+                    println!("  {placed} of {count} {species} placed");
+                }
+                Command::Grass { breed, area } => {
+                    let meadow = Meadow::by_name(&breed).ok_or_else(|| {
+                        let names: Vec<_> = Meadow::names().collect();
+                        format!("no grass '{breed}': there are {}", names.join(", "))
+                    })?;
+                    println!("growing {breed} grass...");
+                    let placed =
+                        flora::add_grass(&mut scene, &mut layers, &meadow, &breed, area, ground);
+                    println!("  {placed} patches");
+                }
+                Command::Lights {
+                    count,
+                    area,
+                    height,
+                    range,
+                    intensity,
+                    seed,
+                } => {
+                    let mut rng = Rng::new(seed, 19);
+                    for _ in 0..count {
+                        let (x, z) = area.sample(&mut rng);
+                        scene.lights.push(Light {
+                            position: [x, terrain.height(x, z).max(sea_level) + height, z],
+                            range,
+                            intensity,
+                            _pad: 0,
+                        });
+                    }
+                }
+                _ => unreachable!("only flora and lights wait for the terrain"),
+            }
         }
     }
     Ok((scene, warnings))
@@ -582,26 +850,35 @@ mod tests {
         assert!(parse_line("ocean -0.6").is_err());
     }
 
+    /// The cove's terrain: 900 m square, with rolling ground of amplitude 0.3.
+    fn cove(amplitude: f32) -> Terrain {
+        Terrain {
+            size: 900.0,
+            cells: 16,
+            amplitude,
+            shore_x: 52.0,
+            hills: None,
+        }
+    }
+
     #[test]
     fn the_seabed_falls_below_the_shore_only_on_the_sea_side() {
+        let terrain = Terrain {
+            shore_x: 40.0,
+            ..cove(0.0)
+        };
+        assert!(terrain.height(-50.0, 0.0).abs() < 0.1, "inland stays level");
         assert!(
-            terrain_height(-50.0, 0.0, 0.0, 40.0).abs() < 0.1,
-            "inland stays level"
-        );
-        assert!(
-            terrain_height(10.0, 0.0, 0.0, 40.0).abs() < 0.1,
+            terrain.height(10.0, 0.0).abs() < 0.1,
             "level behind the shoreline, wherever it wanders"
         );
-        assert!(
-            terrain_height(130.0, 0.0, 0.0, 40.0) < -8.0,
-            "deep offshore"
-        );
+        assert!(terrain.height(130.0, 0.0) < -8.0, "deep offshore");
     }
 
     #[test]
     fn the_terrain_edges_lie_under_the_sea_on_every_side() {
-        // The cove's terrain is 900 m square, with rolling ground of amplitude 0.3.
         let water = -0.6;
+        let terrain = cove(0.3);
         for i in 0..=200 {
             let along = -450.0 + 4.5 * i as f32;
             for (x, z) in [
@@ -610,7 +887,7 @@ mod tests {
                 (along, -445.0),
                 (445.0, along),
             ] {
-                let height = terrain_height(x, z, 0.3, 52.0);
+                let height = terrain.height(x, z);
                 assert!(
                     height < water - 4.0,
                     "({x}, {z}) is {height}, above the seabed"
@@ -618,6 +895,7 @@ mod tests {
             }
         }
         // The fort and the ground around it are untouched.
+        let terrain = cove(0.0);
         for (x, z) in [
             (0.0, 0.0),
             (-68.0, 0.0),
@@ -625,11 +903,116 @@ mod tests {
             (-30.0, -92.0),
             (-150.0, 0.0),
         ] {
+            assert!(terrain.height(x, z).abs() < 0.1, "({x}, {z}) moved");
+        }
+    }
+
+    #[test]
+    fn a_wider_terrain_has_a_wider_island() {
+        // Twice the cove's width: land at the cove's island radius, on the side away from the
+        // shore, where the cove is already under the sea.
+        let wide = Terrain {
+            size: 1800.0,
+            ..cove(0.0)
+        };
+        assert!(wide.height(-300.0, 0.0).abs() < 0.1);
+        assert!(cove(0.0).height(-300.0, 0.0) < -1.0);
+        // And its edges are under the sea all the same.
+        for i in 0..=100 {
+            let along = -890.0 + 17.8 * i as f32;
+            assert!(wide.height(-890.0, along) < -5.0);
+            assert!(wide.height(along, 890.0) < -5.0);
+        }
+    }
+
+    #[test]
+    fn hills_rise_inland_but_leave_the_centre_and_the_coast_level() {
+        let terrain = Terrain {
+            size: 1800.0,
+            hills: Some(Hills {
+                amplitude: 60.0,
+                wavelength: 200.0,
+                flat_radius: 120.0,
+            }),
+            ..cove(0.0)
+        };
+        let flat = cove(0.0);
+        for (x, z) in [(0.0, 0.0), (80.0, 60.0), (-110.0, 0.0)] {
             assert!(
-                terrain_height(x, z, 0.0, 52.0).abs() < 0.1,
-                "({x}, {z}) moved"
+                (terrain.height(x, z) - flat.height(x, z)).abs() < 1.0e-4,
+                "({x}, {z}) is not level"
             );
         }
+        // Somewhere inland is high ground, and nowhere is lower than the level ground.
+        let mut highest: f32 = 0.0;
+        for i in 0..40 {
+            for j in 0..40 {
+                let (x, z) = (-500.0 + i as f32 * 25.0, -500.0 + j as f32 * 25.0);
+                let rise = terrain.height(x, z) - flat.height(x, z);
+                assert!(rise >= -1.0e-4, "({x}, {z}) sank by {rise}");
+                highest = highest.max(rise);
+            }
+        }
+        assert!(highest > 20.0, "the highest hill rises only {highest}");
+        // The hills have gone by the shore, so the sea still meets the land.
+        assert!(terrain.height(60.0, 0.0) - flat.height(60.0, 0.0) < 0.5);
+    }
+
+    #[test]
+    fn the_new_commands_parse() {
+        assert_eq!(
+            parse_line("hills 40 300 120").unwrap(),
+            Some(Command::Hills(Hills {
+                amplitude: 40.0,
+                wavelength: 300.0,
+                flat_radius: 120.0,
+            }))
+        );
+        assert_eq!(
+            parse_line("scatter r.gltf 50 -10 -20 10 20 ground:0.2 0.5 2 7").unwrap(),
+            Some(Command::Scatter {
+                path: "r.gltf".to_string(),
+                count: 50,
+                area: Rect::new(-10.0, -20.0, 10.0, 20.0),
+                height: 0.0,
+                seat: Some(0.2),
+                scale: (0.5, 2.0),
+                seed: 7,
+            })
+        );
+        assert_eq!(
+            parse_line("trees oak 2000 -400 -400 400 400 6 1").unwrap(),
+            Some(Command::Trees {
+                species: "oak".to_string(),
+                count: 2000,
+                area: Rect::new(-400.0, -400.0, 400.0, 400.0),
+                spacing: 6.0,
+                seed: 1,
+            })
+        );
+        assert_eq!(
+            parse_line("grass meadow -100 -100 100 100").unwrap(),
+            Some(Command::Grass {
+                breed: "meadow".to_string(),
+                area: Rect::new(-100.0, -100.0, 100.0, 100.0),
+            })
+        );
+        assert_eq!(
+            parse_line("lights 64 -40 -40 40 40 3 12 40 14 3 1").unwrap(),
+            Some(Command::Lights {
+                count: 64,
+                area: Rect::new(-40.0, -40.0, 40.0, 40.0),
+                height: 3.0,
+                range: 12.0,
+                intensity: [40.0, 14.0, 3.0],
+                seed: 1,
+            })
+        );
+        assert!(
+            parse_line("scatter r.gltf 50 -10 -20 10 20 ground:0.2 0.5 2")
+                .unwrap_err()
+                .contains("takes 10 values")
+        );
     }
 
     #[test]
