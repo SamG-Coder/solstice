@@ -7,6 +7,7 @@ use crate::frame::{
 use crate::gi::{GiVolume, ScreenGi, ScreenGiBindings, LEVEL_COUNT};
 use crate::gpu::{Gpu, Target};
 use crate::lighting::{environment_group, environment_layout, DeferredLighting};
+use crate::ocean::{Ocean, Sea, SeaState};
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
@@ -80,6 +81,8 @@ pub struct RendererSettings {
     pub temporal_accumulation: bool,
     /// Draw volumetric clouds, their shadows and their light in the sky.
     pub clouds: bool,
+    /// Texels across each of the ocean's wave tiles: a power of two, at most 256.
+    pub ocean_resolution: u32,
 }
 
 impl Default for RendererSettings {
@@ -91,6 +94,7 @@ impl Default for RendererSettings {
             debug_view: DebugView::Lit,
             temporal_accumulation: true,
             clouds: true,
+            ocean_resolution: 256,
         }
     }
 }
@@ -107,6 +111,7 @@ impl RendererSettings {
             Quality::Medium => (0.8, 1.5, 2.0),
             Quality::High => (1.0, 1.0, 1.0),
         };
+        self.ocean_resolution = if quality == Quality::Low { 128 } else { 256 };
     }
 }
 
@@ -205,6 +210,10 @@ pub struct Renderer {
     deferred: DeferredLighting,
     post: PostProcess,
     profiler: Option<Profiler>,
+    /// The open sea, if the scene has one, and an ocean waiting to be eased into, with the
+    /// seconds to take. The sea is made on the next frame, which has the GPU to hand.
+    sea: Option<Sea>,
+    ocean_request: Option<(Option<Ocean>, f32)>,
     sized: Option<SizedResources>,
     history: Option<History>,
     frame_index: u32,
@@ -349,6 +358,8 @@ impl Renderer {
             shadows,
             volume,
             environment,
+            sea: None,
+            ocean_request: None,
             sized: None,
             history: None,
             frame_index: 0,
@@ -396,6 +407,28 @@ impl Renderer {
 
     pub fn settings_mut(&mut self) -> &mut RendererSettings {
         &mut self.settings
+    }
+
+    /// Gives the scene an open sea, easing from the current one over `seconds`, or at once for
+    /// 0; `None` takes the sea away. Its waves follow the weather's wind.
+    pub fn set_ocean(&mut self, ocean: Option<Ocean>, seconds: f32) {
+        self.ocean_request = Some((ocean, seconds));
+    }
+
+    /// The ocean as it is now, part way to any new one, or `None` without a sea.
+    pub fn ocean(&self) -> Option<Ocean> {
+        match (self.ocean_request, &self.sea) {
+            // A change not yet begun: none, or one that is at once, or the first sea, is already
+            // as good as made; one that eases has not moved yet.
+            (Some((None, _)), _) => None,
+            (Some((Some(ocean), seconds)), sea) if sea.is_none() || seconds <= 0.0 => Some(ocean),
+            (_, sea) => sea.as_ref().map(Sea::ocean),
+        }
+    }
+
+    /// The wind and swell the waves are drawn from now, which lag the weather's wind.
+    pub fn sea_state(&self) -> Option<SeaState> {
+        self.sea.as_ref().and_then(Sea::state)
     }
 
     /// Current counters. They lag a few frames, since readback is asynchronous.
@@ -504,6 +537,23 @@ impl Renderer {
         self.clouds.update(gpu, delta_seconds, camera.position);
         self.clouds
             .record_lighting(&mut encoder, &self.cloud_environment);
+
+        // The sea's waves, raised by the weather's wind.
+        if let Some((ocean, seconds)) = self.ocean_request.take() {
+            match (ocean, &mut self.sea) {
+                (None, _) => self.sea = None,
+                (Some(ocean), Some(sea)) => sea.set_ocean(ocean, seconds),
+                (Some(ocean), None) => {
+                    self.sea = Some(Sea::new(gpu, ocean, self.settings.ocean_resolution))
+                }
+            }
+        }
+        mark(&self.profiler, &mut encoder, section::OCEAN);
+        if let Some(sea) = &mut self.sea {
+            let weather = self.clouds.weather();
+            sea.update(gpu, &weather, delta_seconds, self.settings.ocean_resolution);
+            sea.record(&mut encoder);
+        }
 
         mark(&self.profiler, &mut encoder, section::SHADOWS);
         self.shadows.record(

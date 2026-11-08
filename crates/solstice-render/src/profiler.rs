@@ -10,9 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 17] = [
+pub const SECTIONS: [&str; 18] = [
     "sky",
     "clouds",
+    "ocean",
     "shadows",
     "gi cull",
     "gi voxelize",
@@ -33,24 +34,26 @@ pub const SECTIONS: [&str; 17] = [
 pub mod section {
     pub const SKY: usize = 0;
     pub const CLOUDS: usize = 1;
-    pub const SHADOWS: usize = 2;
-    pub const GI_CULL: usize = 3;
-    pub const GI_VOXELIZE: usize = 4;
-    pub const GI_FLOOD: usize = 5;
-    pub const GI_WRITE: usize = 6;
-    pub const GI_LIGHT: usize = 7;
+    /// The sea's waves.
+    pub const OCEAN: usize = 2;
+    pub const SHADOWS: usize = 3;
+    pub const GI_CULL: usize = 4;
+    pub const GI_VOXELIZE: usize = 5;
+    pub const GI_FLOOD: usize = 6;
+    pub const GI_WRITE: usize = 7;
+    pub const GI_LIGHT: usize = 8;
     /// Culling and rasterizing what was visible last frame, then the occlusion pyramid.
-    pub const CULL_FIRST: usize = 8;
-    pub const RASTER_FIRST: usize = 9;
+    pub const CULL_FIRST: usize = 9;
+    pub const RASTER_FIRST: usize = 10;
     /// Culling and rasterizing what that revealed.
-    pub const CULL_SECOND: usize = 10;
-    pub const RASTER_SECOND: usize = 11;
-    pub const RESOLVE: usize = 12;
-    pub const CLOUDS_ON_SCREEN: usize = 13;
-    pub const SCREEN_GI: usize = 14;
-    pub const LIGHTING: usize = 15;
-    pub const POST: usize = 16;
-    pub const END: usize = 17;
+    pub const CULL_SECOND: usize = 11;
+    pub const RASTER_SECOND: usize = 12;
+    pub const RESOLVE: usize = 13;
+    pub const CLOUDS_ON_SCREEN: usize = 14;
+    pub const SCREEN_GI: usize = 15;
+    pub const LIGHTING: usize = 16;
+    pub const POST: usize = 17;
+    pub const END: usize = 18;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;
