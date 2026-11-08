@@ -62,7 +62,7 @@ struct Instance {
 struct Material {
     base_color: vec4f,
     emissive: vec3f,
-    flags: u32, // MATERIAL_TWO_SIDED | MATERIAL_FOLIAGE
+    flags: u32, // MATERIAL_TWO_SIDED | MATERIAL_FOLIAGE | MATERIAL_MASKED
     roughness: f32,
     metallic: f32,
     uv_scale: f32,
@@ -87,9 +87,10 @@ struct VisibleCluster {
     cluster: u32,
 }
 
-// Twins of Material::TWO_SIDED and Material::FOLIAGE.
+// Twins of Material::TWO_SIDED, Material::FOLIAGE and Material::MASKED.
 const MATERIAL_TWO_SIDED: u32 = 1u;
 const MATERIAL_FOLIAGE: u32 = 2u;
+const MATERIAL_MASKED: u32 = 4u;
 // Twins of the INSTANCE_ flags in scene.rs.
 const INSTANCE_TWO_SIDED: u32 = 0x80000000u;
 const INSTANCE_MOVABLE: u32 = 0x40000000u;
