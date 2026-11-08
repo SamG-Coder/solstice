@@ -14,7 +14,7 @@ use crate::ocean::{Ocean, Sea, SeaState};
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
-use crate::shadow::{ShadowMaps, CASCADE_COUNT};
+use crate::shadow::{ShadowMaps, CASCADE_COUNT, MOVING_SLOTS};
 use crate::sky::Sky;
 use crate::streaming::{choose_tiers, StreamRequest, Streamer, StreamingStats};
 use crate::vg::{
@@ -46,7 +46,7 @@ const SLOT_SHADOW: u32 = 2;
 const SLOT_VOXEL: u32 = SLOT_SHADOW + CASCADE_COUNT as u32;
 const SLOT_SEABED: u32 = SLOT_VOXEL + LEVEL_COUNT as u32;
 const SLOT_MOVING_SHADOW: u32 = SLOT_SEABED + 1;
-const SLOT_COUNT: u32 = SLOT_MOVING_SHADOW + CASCADE_COUNT as u32;
+const SLOT_COUNT: u32 = SLOT_MOVING_SHADOW + MOVING_SLOTS;
 
 /// A named balance between image quality and GPU cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

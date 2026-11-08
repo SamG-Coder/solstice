@@ -83,6 +83,14 @@ impl Drawn {
                 .all(|&corner| plane.truncate().dot(corner) + plane.w - self.slack >= 0.0)
         })
     }
+
+    /// Whether a sphere could shadow this cascade's receivers: whether it lies in the volume
+    /// the cascade's casters were culled to, the slice swept towards the light.
+    fn can_be_shadowed_by(&self, (center, radius): (Vec3, f32)) -> bool {
+        self.receivers[..self.receiver_count]
+            .iter()
+            .all(|plane| plane.truncate().dot(center) + plane.w >= -radius)
+    }
 }
 
 /// Twin of `Shadows` in `lighting/deferred.wgsl`.
@@ -102,7 +110,20 @@ pub struct ShadowWork {
     pub due: [bool; CASCADE_COUNT],
     /// Cascades with movable instances to draw.
     pub moving: [bool; CASCADE_COUNT],
+    /// Whether the movable instances are culled once, through the slot after the cascades'
+    /// own, and that one list drawn into each touched cascade's quarter; otherwise each
+    /// cascade culls them through its own view.
+    pub shared_cull: bool,
 }
+
+/// Up to this many movable instances, one cull serves every touched cascade: a traversal's
+/// fixed cost outweighs drawing a few things into quarters they fall outside of. Beyond it,
+/// drawing the whole list into every quarter would cost more than the traversals saved.
+const SHARED_CULL_LIMIT: usize = 1024;
+
+/// Slots a [`ShadowMaps`] writes from `first_moving_slot`: one per cascade for drawing movable
+/// instances into its quarter, then one for culling them all at once.
+pub const MOVING_SLOTS: u32 = CASCADE_COUNT as u32 + 1;
 
 /// Shadow map resources and passes.
 pub struct ShadowMaps {
@@ -338,27 +359,49 @@ impl ShadowMaps {
         }
 
         // Movable instances go through each cascade's view as it stands, drawn this frame or
-        // before, so that the two maps line up.
+        // before, so that the two maps line up. A cascade is touched when one of them lies in
+        // its view and could shadow its slice.
         let moving_due: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
-            let (center, radius) = self.extents[cascade];
+            let (_, radius) = self.extents[cascade];
             let view_proj = self.data.view_proj[cascade];
-            let touched = self.drawn[cascade].is_some()
-                && moving
-                    .iter()
-                    .any(|&sphere| cascade_touches(view_proj, radius, sphere));
-            if touched {
-                let view = PassView::orthographic(
-                    view_proj,
-                    center,
-                    Vec2::splat(MOVING_RESOLUTION as f32),
-                    MOVING_RESOLUTION as f32 / (2.0 * radius),
-                    lod_threshold,
-                )
-                .drawing(InstanceFilter::Movable);
-                slots.write(gpu, first_moving_slot + cascade as u32, &view);
-            }
-            touched
+            self.drawn[cascade].is_some_and(|drawn| {
+                moving.iter().any(|&sphere| {
+                    cascade_touches(view_proj, radius, sphere) && drawn.can_be_shadowed_by(sphere)
+                })
+            })
         });
+        for cascade in (0..CASCADE_COUNT).filter(|&c| moving_due[c]) {
+            let (center, radius) = self.extents[cascade];
+            let view = PassView::orthographic(
+                self.data.view_proj[cascade],
+                center,
+                Vec2::splat(MOVING_RESOLUTION as f32),
+                MOVING_RESOLUTION as f32 / (2.0 * radius),
+                lod_threshold,
+            )
+            .drawing(InstanceFilter::Movable);
+            slots.write(gpu, first_moving_slot + cascade as u32, &view);
+        }
+        // One cull serves every touched cascade, since the traversal's fixed cost outweighs the
+        // few movable instances: through the widest cascade's view, whose square holds the
+        // nearer ones' and whose far side lies at least as deep, with its near side opened
+        // towards the light, where a nearer cascade may reach further; at the finest touched
+        // cascade's level of detail, which satisfies the rest.
+        let shared_cull = moving.len() <= SHARED_CULL_LIMIT;
+        let touched: Vec<usize> = (0..CASCADE_COUNT).filter(|&c| moving_due[c]).collect();
+        if let (true, Some(&finest), Some(&widest)) = (shared_cull, touched.first(), touched.last())
+        {
+            let view = moving_cull_view(
+                self.data.view_proj[widest],
+                self.extents[widest].0,
+                self.extents[finest].1,
+                lod_threshold,
+            )
+            // Movable things may be anywhere, so the camera's own distance to each bounds the
+            // detail that is worth drawing of it, as for the cascades' static casters.
+            .seen_from(camera.position, sun_direction, eye_lod_scale, camera.near);
+            slots.write(gpu, first_moving_slot + CASCADE_COUNT as u32, &view);
+        }
         self.data.moving = Vec4::from_array(moving_due.map(|m| f32::from(u8::from(m))));
 
         gpu.queue
@@ -366,6 +409,7 @@ impl ShadowMaps {
         ShadowWork {
             due,
             moving: moving_due,
+            shared_cull,
         }
     }
 
@@ -405,10 +449,16 @@ impl ShadowMaps {
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
         }
 
+        if shadow_work.shared_cull && shadow_work.moving.iter().any(|&moving| moving) {
+            let slot = first_moving_slot + CASCADE_COUNT as u32;
+            cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
+        }
         let mut cleared = false;
         for cascade in (0..CASCADE_COUNT).filter(|&c| shadow_work.moving[c]) {
             let slot = first_moving_slot + cascade as u32;
-            cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
+            if !shadow_work.shared_cull {
+                cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
+            }
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("moving shadows"),
@@ -448,6 +498,28 @@ impl ShadowMaps {
 /// `moving_quarter` in `lighting/sun_shadow.wgsl`.
 fn moving_quarter(cascade: usize) -> [u32; 2] {
     [cascade as u32 % 2, cascade as u32 / 2]
+}
+
+/// The view that culls movable instances for every touched cascade at once: the widest touched
+/// cascade's, centred on `center`, with its near plane, towards the light, dropped, and
+/// with the level of detail of the finest touched cascade, `finest_radius` across.
+fn moving_cull_view(
+    view_proj: Mat4,
+    center: Vec3,
+    finest_radius: f32,
+    lod_threshold: f32,
+) -> PassView {
+    let mut view = PassView::orthographic(
+        view_proj,
+        center,
+        Vec2::splat(MOVING_RESOLUTION as f32),
+        MOVING_RESOLUTION as f32 / (2.0 * finest_radius),
+        lod_threshold,
+    )
+    .drawing(InstanceFilter::Movable);
+    // `frustum_planes` puts the near plane fifth. A plane with no normal passes everything.
+    view.planes[4] = Vec4::W;
+    view
 }
 
 /// Whether a sphere could cast a shadow into a cascade drawn through `view_proj`, an
@@ -945,6 +1017,37 @@ mod tests {
     fn each_cascade_has_its_own_quarter() {
         let quarters: Vec<_> = (0..CASCADE_COUNT).map(moving_quarter).collect();
         assert_eq!(quarters, vec![[0, 0], [1, 0], [0, 1], [1, 1]]);
+    }
+
+    #[test]
+    fn a_movable_sphere_touches_a_cascade_only_where_its_shadow_can_land() {
+        let aspect = 16.0 / 9.0;
+        let camera = test_camera();
+        let drawn = drawn_for(&camera, aspect, sun());
+        let receiver = points_at(&camera, aspect, 200.0)[0];
+        // On the way to the sun from a receiver in the slice: can shadow it.
+        assert!(drawn.can_be_shadowed_by((receiver + sun() * 300.0, 2.0)));
+        assert!(drawn.can_be_shadowed_by((receiver, 2.0)));
+        // Well beyond the slice on the side away from the sun: cannot.
+        assert!(!drawn.can_be_shadowed_by((receiver - sun() * 600.0, 2.0)));
+    }
+
+    #[test]
+    fn the_shared_moving_cull_is_open_towards_the_light_and_closed_beyond_the_slice() {
+        let camera = test_camera();
+        let (view_proj, center, radius) = fit_cascade(&camera, 1.5, sun(), SPLITS[2], SPLITS[3]);
+        let view = moving_cull_view(view_proj, center, radius * 0.25, 1.0);
+        // Within the view's square, far towards the sun, past the depth the cascade reaches.
+        let towards_sun = center + sun() * (DEPTH_REACH + radius * 3.0);
+        assert!(
+            inside(&view.planes, towards_sun),
+            "closed towards the light"
+        );
+        // Beyond the far side, away from the sun, where no caster can shadow the slice.
+        let beyond = center - sun() * (radius * 3.0);
+        assert!(!inside(&view.planes, beyond), "open beyond the slice");
+        // The finest cascade's level of detail, not the widest's.
+        assert!((view.lod_scale - MOVING_RESOLUTION as f32 / (2.0 * radius * 0.25)).abs() < 1.0e-3);
     }
 
     #[test]

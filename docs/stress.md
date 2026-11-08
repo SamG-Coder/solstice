@@ -265,10 +265,34 @@ What this round found:
   cascade that frame drew 83,000 clusters from what had arrived.
 - Textures at 2048 (31 layers, BC7 and BC5) cost nothing measurable over 1024 in these passes.
 
+#### Fix 5: movable casters culled once (after #29)
+
+Gameplay step 1 (#29) draws movable instances every frame into a quarter of a shadow layer per
+cascade they fall in, each through its own cull, and the cull's fixed cost (a seed over every
+instance and one dispatch per hierarchy level) came four times over: 0.47 ms a frame for the
+cove's bobbing ship. Now the movable instances are culled once, through the widest touched
+cascade's view with its near plane opened towards the light and the finest cascade's texel
+scale, bounded by what the camera can see of each caster, and that one list is drawn into every
+touched quarter. Up to 1,024 movable instances; beyond that each cascade culls its own, since
+drawing the whole list into every quarter costs more than the traversals saved (19,500 bobbing
+instances: 12.5 ms shared against 5 to 8 per cascade). A cascade is touched only where a movable
+thing's shadow can land, by the same planes the receiver cull uses.
+
+| Shadows pass, movable instances bobbing | Before | After |
+|---|---|---|
+| Cove, the ship (7 instances) | 0.47 ms | 0.19 ms |
+| Cove, 102 instances within 400 m | 0.62 ms | 0.45 ms |
+| Stress, 40 ships and the reefs | 0.68 ms | 0.45 ms |
+| Stress, 19,500 instances (per-cascade path) | 5.9 ms | 4.7 to 8.0 ms, run to run |
+
+Images unchanged within noise except the cove ship alone (41 dB): the camera-bounded detail
+thins the rigging's shadow on the hull slightly, as fix 1 does for static casters.
+
 ### Where things stand
 
 Fixed and in pull requests: shadow caster culling (#25, merged), cloud shadows beyond their map
-(#26, merged), the cull lists' overflow counter and capacity (#27, merged), light tiles (#30).
+(#26, merged), the cull lists' overflow counter and capacity (#27 and #31), light tiles (#30), and
+movable casters culled once (fix 5).
 
 Found and not yet fixed, in order of how much they would give:
 
