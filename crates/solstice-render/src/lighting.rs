@@ -27,6 +27,7 @@ pub fn environment_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
         .texture()
         .texture()
         .uniform()
+        .texture()
         .build(gpu, "environment")
 }
 
@@ -66,6 +67,7 @@ pub fn environment_group(
             wgpu::BindingResource::TextureView(clouds.sky),
             wgpu::BindingResource::TextureView(clouds.shadow),
             clouds.params.as_entire_binding(),
+            wgpu::BindingResource::TextureView(clouds.shadow_mean),
         ],
     )
 }

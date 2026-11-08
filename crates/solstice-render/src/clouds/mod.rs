@@ -63,6 +63,8 @@ struct CloudUniform {
 pub struct CloudSky<'a> {
     pub sky: &'a wgpu::TextureView,
     pub shadow: &'a wgpu::TextureView,
+    /// A single texel: the shadow map's mean, which stands in for it beyond its edge.
+    pub shadow_mean: &'a wgpu::TextureView,
     pub params: &'a wgpu::Buffer,
 }
 
@@ -87,11 +89,13 @@ pub struct Clouds {
     noise: [(wgpu::ComputePipeline, wgpu::BindGroup, (u32, u32, u32)); 5],
     noise_ready: bool,
     shadow: Target,
+    shadow_mean: Target,
     panorama: Target,
     no_clouds: Target,
     no_shadow: Target,
     screen_layout: wgpu::BindGroupLayout,
     shadow_pass: (wgpu::ComputePipeline, wgpu::BindGroup),
+    mean_pass: (wgpu::ComputePipeline, wgpu::BindGroup),
     panorama_pass: (wgpu::ComputePipeline, wgpu::BindGroup),
     screen_pipeline: wgpu::ComputePipeline,
     current: Weather,
@@ -299,6 +303,23 @@ impl Clouds {
         };
         let shadow_pass = pass("clouds/shadow.wgsl", &shadow);
         let panorama_pass = pass("clouds/panorama.wgsl", &panorama);
+        let shadow_mean = Target::new(gpu, "cloud shadow mean", (1, 1), COLOR, none);
+        let mean_layout = LayoutBuilder::new()
+            .texture()
+            .storage_texture(COLOR)
+            .build(gpu, "cloud shadow mean");
+        let mean_module = shaders::module(&gpu.device, "clouds/shadow_mean.wgsl");
+        let mean_pass = (
+            gpu.compute_pipeline("cloud shadow mean", &mean_module, "main", &[&mean_layout]),
+            gpu.bind_group(
+                "cloud shadow mean",
+                &mean_layout,
+                &[
+                    wgpu::BindingResource::TextureView(&shadow.view),
+                    wgpu::BindingResource::TextureView(&shadow_mean.view),
+                ],
+            ),
+        );
         let screen_module = shaders::module(&gpu.device, "clouds/screen.wgsl");
         let screen_pipeline = gpu.compute_pipeline(
             "cloud screen",
@@ -320,11 +341,13 @@ impl Clouds {
             noise,
             noise_ready: false,
             shadow,
+            shadow_mean,
             panorama,
             no_clouds: constant(gpu, "no clouds", [0.0, 0.0, 0.0, 1.0]),
             no_shadow: constant(gpu, "no cloud shadow", [1.0; 4]),
             screen_layout,
             shadow_pass,
+            mean_pass,
             panorama_pass,
             screen_pipeline,
             current: weather,
@@ -342,6 +365,7 @@ impl Clouds {
         CloudSky {
             sky: &self.panorama.view,
             shadow: &self.shadow.view,
+            shadow_mean: &self.shadow_mean.view,
             params: &self.params,
         }
     }
@@ -352,6 +376,7 @@ impl Clouds {
         CloudSky {
             sky: &self.no_clouds.view,
             shadow: &self.no_shadow.view,
+            shadow_mean: &self.no_shadow.view,
             params: &self.params,
         }
     }
@@ -529,6 +554,10 @@ impl Clouds {
             pass.set_bind_group(0, group, &[]);
             pass.dispatch_workgroups(groups_for(size.0, 8), groups_for(size.1, 8), 1);
         }
+        // The shadow map's mean, for lighting beyond its edge.
+        pass.set_pipeline(&self.mean_pass.0);
+        pass.set_bind_group(0, &self.mean_pass.1, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
     }
 
     /// Records the clouds on screen, once this frame's depth is known. Afterwards
