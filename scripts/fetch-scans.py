@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Downloads the Poly Haven models a scene file refers to, verifying each file.
+"""Downloads the Poly Haven models and textures a file refers to, verifying each file.
 
-Models are CC0, from https://polyhaven.com. They are not stored in this repository.
+They are CC0, from https://polyhaven.com, and are not stored in this repository.
 
     python scripts/fetch-scans.py scenes/cove.txt [resolution]
 
-Paths in the scene file must look like ../target/scan/NAME/NAME.gltf.
+Models are found by their paths in `model` and `part` lines, which must look like
+../target/scan/NAME/NAME.gltf. A `surface NAME` line asks for a texture, with its height map
+as NAME_disp.png. Those lines are for generators (see scenes/harbour.surfaces), not the bake.
 """
 import hashlib
 import json
@@ -39,15 +41,20 @@ def fetch(entry, path):
 def main():
     scene, resolution = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "1k"
     with open(scene, encoding="utf-8") as f:
-        names = sorted(set(re.findall(r"^(?:model|part)\s+\S*/scan/([\w-]+)/", f.read(), re.M)))
+        text = f.read()
+    models = set(re.findall(r"^(?:model|part)\s+\S*/scan/([\w-]+)/", text, re.M))
+    surfaces = set(re.findall(r"^surface\s+([\w-]+)", text, re.M))
     root = os.path.join(os.path.dirname(os.path.abspath(scene)), "..", "target", "scan")
-    for name in names:
-        entry = json.loads(get(f"https://api.polyhaven.com/files/{name}"))["gltf"][resolution]["gltf"]
+    for name in sorted(models | surfaces):
+        files = json.loads(get(f"https://api.polyhaven.com/files/{name}"))
+        entry = files["gltf"][resolution]["gltf"]
         print(f"{name}...")
         # The scene refers to a fixed file name, whatever the resolution in the original.
         fetch(entry, os.path.join(root, name, f"{name}.gltf"))
         for relative, part in entry["include"].items():
             fetch(part, os.path.join(root, name, relative))
+        if name in surfaces:
+            fetch(files["Displacement"][resolution]["png"], os.path.join(root, name, f"{name}_disp.png"))
 
 
 if __name__ == "__main__":

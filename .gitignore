@@ -3,3 +3,4 @@
 /assets/
 /screenshots
 /.claude
+__pycache__/

@@ -16,6 +16,27 @@ pub const FLAG_LIT: u32 = 8;
 pub const FLAG_GLOW: u32 = 16;
 pub const FLAG_SOLID: u32 = 32;
 pub const FLAG_SORT: u32 = 64;
+/// The emitter has forces that vary through space or time, which take substeps.
+pub const FLAG_FORCES: u32 = 128;
+/// Its particles collide with something.
+pub const FLAG_COLLIDE: u32 = 256;
+
+/// Bits of [`Particle::flags`]: stuck where it hit, for the rest of its life.
+pub const PARTICLE_STUCK: u32 = 1;
+
+/// Values of [`EmitterRecord::response`].
+pub const RESPONSE_BOUNCE: u32 = 0;
+pub const RESPONSE_STICK: u32 = 1;
+pub const RESPONSE_KILL: u32 = 2;
+/// An [`EmitterRecord::event_target`] that sends nothing.
+pub const NO_TARGET: u32 = u32::MAX;
+
+/// The longest step forces that vary are integrated over, in seconds.
+pub const LONGEST_SUBSTEP: f32 = 1.0 / 30.0;
+/// Roughness length of the ground the wind blows over, in metres: open, grassy land.
+pub const WIND_ROUGHNESS: f32 = 0.03;
+/// How much the wind gusts above and below its mean.
+pub const GUSTINESS: f32 = 0.3;
 
 /// The air's temperature, which glowing particles cool towards, in kelvin.
 pub const AIR_TEMPERATURE: f32 = 300.0;
@@ -65,6 +86,19 @@ pub struct EmitterRecord {
     pub temperature_glow: [f32; 4],
     /// Henyey-Greenstein asymmetry in x; the rest is spare.
     pub phase: [f32; 4],
+    /// The weather's wind's share; curl noise's speed, eddy size and rate of change.
+    pub wind_curl: [f32; 4],
+    /// Buoyancy, attraction and vortex; then spare.
+    pub buoyancy_attract_vortex: [f32; 4],
+    /// Restitution and friction of bounces; then spare.
+    pub restitution_friction: [f32; 4],
+    /// What its particles collide with, as `COLLIDE_` bits, and what they do then.
+    pub collide_against: u32,
+    pub response: u32,
+    /// The emitter slot each hit sends an event to, or [`NO_TARGET`].
+    pub event_target: u32,
+    /// Particles this emitter spawns for each event it hears.
+    pub event_spawn: u32,
 }
 
 /// One particle. Twin of `Particle` in `particles/common.wgsl`.
@@ -85,7 +119,8 @@ pub struct Particle {
     pub rotation: f32,
     /// Temperature at birth, in kelvin; 0 for particles that do not glow.
     pub temperature: f32,
-    pub _pad: u32,
+    /// `PARTICLE_` bits.
+    pub flags: u32,
 }
 
 /// The GPU's running state for one emitter. Twin of `EmitterState` in `particles/common.wgsl`.
@@ -111,7 +146,11 @@ pub struct EmitterState {
     pub spawn_start: u32,
     pub update_start: u32,
     pub light_start: u32,
-    pub _pad: [u32; 4],
+    /// Events sent to this emitter this frame, which it spawns from next frame.
+    pub event_count: u32,
+    /// Events it spawns from this frame.
+    pub events_in: u32,
+    pub _pad: [u32; 2],
 }
 
 /// PCG hash: twin of `pcg` in `common/math.wgsl`.
@@ -198,7 +237,7 @@ pub fn spawn(e: &EmitterRecord, index: u32) -> Particle {
         index,
         rotation: TAU * r(8),
         temperature: hot_low + (hot_high - hot_low) * r(9),
-        _pad: 0,
+        flags: 0,
     }
 }
 
@@ -211,14 +250,127 @@ pub fn temperature(p: &Particle, e: &EmitterRecord) -> f32 {
     AIR_TEMPERATURE + (p.temperature - AIR_TEMPERATURE) * (-e.temperature_glow[2] * p.age).exp()
 }
 
-/// Moves a particle on by `seconds` under its emitter's forces. Twin of `step_particle`.
-///
-/// Gravity and linear drag are integrated exactly, so the result does not depend on how time is
-/// split into steps: a slow frame lands a particle where two fast ones would have.
-pub fn step(p: &mut Particle, e: &EmitterRecord, seconds: f32) {
-    let a = Vec3::from_slice(&e.acceleration_drag[..3]);
-    let k = e.acceleration_drag[3];
-    let h = seconds;
+/// The air particles move through this step: the time at its end, the weather's wind 10 m up,
+/// as (east, south), and the height the wind's profile starts from. Twin of the matching
+/// fields of `SimParams`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Air {
+    pub time: f32,
+    pub wind: [f32; 2],
+    pub floor: f32,
+}
+
+/// One of the hashed gradients of the noise lattice. Twin of `lattice_gradient`.
+fn lattice_gradient(cell: [i32; 3], seed: u32) -> Vec3 {
+    let h = pcg((cell[0] as u32).wrapping_add(pcg(
+        (cell[1] as u32).wrapping_add(pcg((cell[2] as u32).wrapping_add(seed)))
+    )));
+    Vec3::new(
+        hash_to_unit(h),
+        hash_to_unit(pcg(h)),
+        hash_to_unit(pcg(pcg(h))),
+    ) * 2.0
+        - Vec3::ONE
+}
+
+/// Gradient noise at `p`, and its gradient, from lattice `seed`, with quintic smoothing so the
+/// gradient is continuous. Twin of `gradient_noise`.
+pub fn gradient_noise(p: Vec3, seed: u32) -> (f32, Vec3) {
+    let i = p.floor();
+    let f = p - i;
+    let u = f * f * f * (f * (f * 6.0 - Vec3::splat(15.0)) + Vec3::splat(10.0));
+    let du = f * f * 30.0 * (f * (f - Vec3::splat(2.0)) + Vec3::ONE);
+    let c = [i.x as i32, i.y as i32, i.z as i32];
+    let g = |dx: i32, dy: i32, dz: i32| lattice_gradient([c[0] + dx, c[1] + dy, c[2] + dz], seed);
+    let (ga, gb, gc, gd) = (g(0, 0, 0), g(1, 0, 0), g(0, 1, 0), g(1, 1, 0));
+    let (ge, gf, gg, gh) = (g(0, 0, 1), g(1, 0, 1), g(0, 1, 1), g(1, 1, 1));
+    let va = ga.dot(f);
+    let vb = gb.dot(f - Vec3::new(1.0, 0.0, 0.0));
+    let vc = gc.dot(f - Vec3::new(0.0, 1.0, 0.0));
+    let vd = gd.dot(f - Vec3::new(1.0, 1.0, 0.0));
+    let ve = ge.dot(f - Vec3::new(0.0, 0.0, 1.0));
+    let vf = gf.dot(f - Vec3::new(1.0, 0.0, 1.0));
+    let vg = gg.dot(f - Vec3::new(0.0, 1.0, 1.0));
+    let vh = gh.dot(f - Vec3::new(1.0, 1.0, 1.0));
+    let k1 = vb - va;
+    let k2 = vc - va;
+    let k3 = ve - va;
+    let k4 = va - vb - vc + vd;
+    let k5 = va - vc - ve + vg;
+    let k6 = va - vb - ve + vf;
+    let k7 = -va + vb + vc - vd + ve - vf - vg + vh;
+    let value = va
+        + u.x * k1
+        + u.y * k2
+        + u.z * k3
+        + u.x * u.y * k4
+        + u.y * u.z * k5
+        + u.z * u.x * k6
+        + u.x * u.y * u.z * k7;
+    let gradient = ga
+        + u.x * (gb - ga)
+        + u.y * (gc - ga)
+        + u.z * (ge - ga)
+        + u.x * u.y * (ga - gb - gc + gd)
+        + u.y * u.z * (ga - gc - ge + gg)
+        + u.z * u.x * (ga - gb - ge + gf)
+        + u.x * u.y * u.z * (-ga + gb + gc - gd + ge - gf - gg + gh)
+        + du * (Vec3::new(k1, k2, k3)
+            + Vec3::new(u.y, u.z, u.x) * Vec3::new(k4, k5, k6)
+            + Vec3::new(u.z, u.x, u.y) * Vec3::new(k6, k4, k5)
+            + Vec3::new(u.y * u.z, u.z * u.x, u.x * u.y) * k7);
+    (value, gradient)
+}
+
+/// The curl of a field of three noises, which has no divergence: air that swirls without
+/// gathering or spreading. Twin of `curl_noise`.
+pub fn curl_noise(p: Vec3) -> Vec3 {
+    let (_, a) = gradient_noise(p, 0x68bc_21eb);
+    let (_, b) = gradient_noise(p, 0x02e5_be93);
+    let (_, c) = gradient_noise(p, 0x967a_889b);
+    Vec3::new(c.y - b.z, a.z - c.x, b.x - a.y)
+}
+
+/// The velocity of the air at `x` at `time`, and any other acceleration on a particle there,
+/// from its emitter's forces. Twin of `particle_forces`.
+fn forces(p: &Particle, e: &EmitterRecord, air: &Air, time: f32) -> (Vec3, Vec3) {
+    let x = Vec3::from(p.position);
+    let transform = Mat4::from_cols_array_2d(&e.transform);
+    let origin = transform.w_axis.truncate();
+    let mut moving = Vec3::ZERO;
+    let mut accel = Vec3::ZERO;
+    let [wind, curl_speed, curl_scale, curl_change] = e.wind_curl;
+    if wind != 0.0 {
+        // The wind 10 m up, brought to the particle's height by the log profile, gusting.
+        let height = (x.y - air.floor).max(0.5);
+        let profile = (height / WIND_ROUGHNESS).ln() / (10.0 / WIND_ROUGHNESS).ln();
+        let (gust, _) = gradient_noise(x * 0.02 + Vec3::new(time * 0.3, 0.0, 0.0), 0x1b87_3593);
+        let speed = profile * (1.0 + GUSTINESS * gust) * wind;
+        moving += Vec3::new(air.wind[0], 0.0, air.wind[1]) * speed;
+    }
+    if curl_speed != 0.0 {
+        let q = x / curl_scale.max(1.0e-3) + Vec3::splat(time * curl_change);
+        moving += curl_noise(q) * curl_speed;
+    }
+    let [buoyancy, attract, vortex, _] = e.buoyancy_attract_vortex;
+    if vortex != 0.0 {
+        let axis = transform.y_axis.truncate().normalize_or(Vec3::Y);
+        moving += axis.cross(x - origin) * vortex;
+    }
+    if attract != 0.0 {
+        accel += (origin - x).normalize_or_zero() * attract;
+    }
+    if buoyancy != 0.0 {
+        let kelvin = temperature(p, e);
+        if kelvin > 0.0 {
+            accel.y += 9.81 * buoyancy * (kelvin - AIR_TEMPERATURE) / kelvin;
+        }
+    }
+    (moving, accel)
+}
+
+/// Gravity and linear drag over `h` seconds towards terminal velocity `a / k`, exactly.
+fn exact_step(p: &mut Particle, a: Vec3, k: f32, h: f32) {
     let kh = k * h;
     // With e = exp(-k h): velocity becomes v e + a F and position moves by v F + a G, where
     // F = (1 - e) / k and G = (h - F) / k, the integrals of e over the step.
@@ -235,10 +387,43 @@ pub fn step(p: &mut Particle, e: &EmitterRecord, seconds: f32) {
     };
     let v = Vec3::from(p.velocity);
     let x = Vec3::from(p.position);
-    p.previous = p.position;
     p.position = (x + v * f + a * g).into();
     p.velocity = (v * decay + a * f).into();
-    p.age += h;
+}
+
+/// Moves a particle on by `seconds` in still air. See [`step_in`].
+pub fn step(p: &mut Particle, e: &EmitterRecord, seconds: f32) {
+    step_in(p, e, seconds, &Air::default());
+}
+
+/// Moves a particle on by `seconds`, ending at `air.time`, under its emitter's forces. Twin of
+/// `step_particle`.
+///
+/// Gravity and linear drag are integrated exactly, so with them alone the result does not
+/// depend on how time is split into steps: a slow frame lands a particle where two fast ones
+/// would have. Moving air pulls a particle through its drag, as an extra acceleration of drag
+/// times the air's velocity, which keeps the step exact for air that is steady; forces that vary
+/// through space or time take substeps of at most [`LONGEST_SUBSTEP`].
+pub fn step_in(p: &mut Particle, e: &EmitterRecord, seconds: f32, air: &Air) {
+    let start = p.position;
+    let g = Vec3::from_slice(&e.acceleration_drag[..3]);
+    let k = e.acceleration_drag[3];
+    if p.flags & PARTICLE_STUCK != 0 {
+        p.velocity = [0.0; 3];
+    } else if e.flags & FLAG_FORCES == 0 {
+        exact_step(p, g, k, seconds);
+    } else {
+        let steps = (seconds / LONGEST_SUBSTEP).ceil().max(1.0);
+        let h = seconds / steps;
+        let mut time = air.time - seconds;
+        for _ in 0..steps as u32 {
+            let (moving, accel) = forces(p, e, air, time);
+            exact_step(p, g + accel + moving * k, k, h);
+            time += h;
+        }
+    }
+    p.previous = start;
+    p.age += seconds;
 }
 
 /// Whether a particle has lived its life. Twin of `is_dead`.
@@ -348,7 +533,7 @@ mod tests {
     #[test]
     fn record_layouts_match_the_shaders() {
         // Sizes and alignment the WGSL structs have.
-        assert_eq!(std::mem::size_of::<EmitterRecord>(), 224);
+        assert_eq!(std::mem::size_of::<EmitterRecord>(), 288);
         assert_eq!(std::mem::size_of::<Particle>(), 64);
         assert_eq!(std::mem::size_of::<EmitterState>(), 64);
     }
@@ -365,6 +550,74 @@ mod tests {
         assert!((temperature(&p, &e) - 800.0).abs() < 1.0e-3);
         p.temperature = 0.0;
         assert_eq!(temperature(&p, &e), 0.0);
+    }
+
+    /// The noise's gradient is its true derivative, and the curl of three noises has no
+    /// divergence: air that swirls without gathering or spreading.
+    #[test]
+    fn curl_noise_neither_gathers_nor_spreads() {
+        let d = 1.0e-3;
+        let mut largest: f32 = 0.0;
+        for i in 0..200u32 {
+            let p = Vec3::new(
+                hash_to_unit(i * 3) * 20.0 - 10.0,
+                hash_to_unit(i * 3 + 1) * 20.0 - 10.0,
+                hash_to_unit(i * 3 + 2) * 20.0 - 10.0,
+            );
+            // The analytic gradient against central differences.
+            let (_, gradient) = gradient_noise(p, 5);
+            let numeric = Vec3::new(
+                gradient_noise(p + Vec3::X * d, 5).0 - gradient_noise(p - Vec3::X * d, 5).0,
+                gradient_noise(p + Vec3::Y * d, 5).0 - gradient_noise(p - Vec3::Y * d, 5).0,
+                gradient_noise(p + Vec3::Z * d, 5).0 - gradient_noise(p - Vec3::Z * d, 5).0,
+            ) / (2.0 * d);
+            assert!(
+                (gradient - numeric).length() < 0.02,
+                "{gradient} against {numeric}"
+            );
+            let c = curl_noise(p);
+            largest = largest.max(c.length());
+            let divergence = (curl_noise(p + Vec3::X * d).x - curl_noise(p - Vec3::X * d).x
+                + curl_noise(p + Vec3::Y * d).y
+                - curl_noise(p - Vec3::Y * d).y
+                + curl_noise(p + Vec3::Z * d).z
+                - curl_noise(p - Vec3::Z * d).z)
+                / (2.0 * d);
+            assert!(divergence.abs() < 0.05, "divergence {divergence} at {p}");
+        }
+        // The field is not trivially zero.
+        assert!(largest > 0.5, "{largest}");
+    }
+
+    /// Steady wind pulls a particle with drag up to the wind's speed at its height.
+    #[test]
+    fn wind_carries_particles_up_to_its_speed() {
+        let mut e = record();
+        e.acceleration_drag = [0.0, 0.0, 0.0, 2.0];
+        e.velocity_spread = [0.0; 4];
+        e.offset_cone = [0.0, 10.0, 0.0, 0.0];
+        e.wind_curl = [1.0, 0.0, 1.0, 0.0];
+        e.flags |= FLAG_FORCES;
+        let mut p = spawn(&e, 0);
+        let mut air = Air {
+            time: 0.0,
+            wind: [6.0, 0.0],
+            floor: 0.0,
+        };
+        for _ in 0..300 {
+            air.time += 1.0 / 60.0;
+            step_in(&mut p, &e, 1.0 / 60.0, &air);
+        }
+        // 10 m up, the profile is 1; gusts vary it by up to 30%.
+        let speed = p.velocity[0];
+        assert!((speed / 6.0 - 1.0).abs() < GUSTINESS + 0.02, "{speed}");
+        assert!(p.velocity[2].abs() < 1.0e-4);
+        // A stuck particle does not move.
+        let mut stuck = p;
+        stuck.flags = PARTICLE_STUCK;
+        let at = stuck.position;
+        step_in(&mut stuck, &e, 0.1, &air);
+        assert_eq!(stuck.position, at);
     }
 
     #[test]

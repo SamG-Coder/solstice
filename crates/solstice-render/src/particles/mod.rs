@@ -17,7 +17,7 @@
 pub mod effect;
 pub mod reference;
 
-pub use effect::{Blend, Curve, Effect, Emitter, Follow, Shading, Shape, Value};
+pub use effect::{Blend, Collide, Curve, Effect, Emitter, Follow, Response, Shading, Shape, Value};
 
 use crate::frame::Camera;
 use crate::gpu::{Gpu, LayoutBuilder, Target};
@@ -25,8 +25,9 @@ use crate::shaders;
 use effect::CURVE_ENTRIES;
 use glam::{Mat4, Vec3};
 use reference::{
-    EmitterRecord, EmitterState, Particle, FLAG_ADD, FLAG_GLOW, FLAG_LIT, FLAG_LIVE, FLAG_SOLID,
-    FLAG_SORT, FLAG_SURFACE, SHAPE_BOX, SHAPE_POINT, SHAPE_SPHERE,
+    EmitterRecord, EmitterState, Particle, FLAG_ADD, FLAG_COLLIDE, FLAG_FORCES, FLAG_GLOW,
+    FLAG_LIT, FLAG_LIVE, FLAG_SOLID, FLAG_SORT, FLAG_SURFACE, NO_TARGET, RESPONSE_BOUNCE,
+    RESPONSE_KILL, RESPONSE_STICK, SHAPE_BOX, SHAPE_POINT, SHAPE_SPHERE,
 };
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,9 @@ const DRAWS_OFFSET: u64 = 48;
 const LIGHT_BYTES: u64 = 32;
 const INDIRECT_BYTES: u64 = DRAWS_OFFSET + MAX_EMITTERS as u64 * 16;
 const STATE_BYTES: u64 = (MAX_EMITTERS * std::mem::size_of::<EmitterState>()) as u64;
+/// Events each emitter can take from one frame's hits. Twin of `EVENT_CAPACITY` in
+/// `particles/common.wgsl`.
+const EVENT_CAPACITY: usize = 256;
 /// Seconds a stopped emitter's slice is held after its longest-lived particle should have died.
 const RELEASE_MARGIN: f32 = 0.5;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -71,7 +75,8 @@ struct SimUniform {
     capacity: u32,
     light_interval: u32,
     ray_steps: u32,
-    _pad: [u32; 3],
+    time: f32,
+    wind: [f32; 2],
     camera_position: [f32; 4],
     camera_forward: [f32; 4],
 }
@@ -143,6 +148,8 @@ pub struct ParticleTargets {
     reactive: Target,
     copy_group: wgpu::BindGroup,
     scene_group: wgpu::BindGroup,
+    /// The opaque scene's depth and normals, which particles collide with.
+    opaque_group: wgpu::BindGroup,
 }
 
 impl ParticleTargets {
@@ -178,6 +185,7 @@ struct Pool {
     light: wgpu::Buffer,
     plan_group: wgpu::BindGroup,
     simulate_group: wgpu::BindGroup,
+    collide_group: wgpu::BindGroup,
     light_group: wgpu::BindGroup,
     draw_group: wgpu::BindGroup,
 }
@@ -186,6 +194,7 @@ struct Pool {
 struct PoolLayouts {
     plan: wgpu::BindGroupLayout,
     simulate: wgpu::BindGroupLayout,
+    collide: wgpu::BindGroupLayout,
     light: wgpu::BindGroupLayout,
     draw: wgpu::BindGroupLayout,
 }
@@ -197,6 +206,8 @@ pub struct Particles {
     layouts: PoolLayouts,
     inputs: LightInputs,
     light: wgpu::ComputePipeline,
+    collide: wgpu::ComputePipeline,
+    opaque_layout: wgpu::BindGroupLayout,
     scene_layout: wgpu::BindGroupLayout,
     copy_layout: wgpu::BindGroupLayout,
     plan: wgpu::ComputePipeline,
@@ -212,6 +223,8 @@ pub struct Particles {
     /// Which live slots draw solid particles, and whether any emitter sorts its particles.
     solid_slots: [bool; MAX_EMITTERS],
     sorting: bool,
+    /// Whether any emitter collides with anything.
+    colliding: bool,
     /// Whether the reactive mask holds anything, which a frame with no particles clears.
     reactive_dirty: std::cell::Cell<bool>,
     frame_group: wgpu::BindGroup,
@@ -227,6 +240,11 @@ pub struct Particles {
     serial: u32,
     /// Whether this frame simulates and draws anything.
     active: bool,
+    /// Seconds since the particles started, the wind 10 m up as (east, south), and the height
+    /// its profile starts from.
+    time: f32,
+    wind: [f32; 2],
+    wind_floor: f32,
     /// Each particle's light is worked out afresh once in this many frames, with ambient rays
     /// of this many steps.
     light_interval: u32,
@@ -243,6 +261,7 @@ impl Particles {
         frame: &wgpu::Buffer,
         capacity: u32,
         environment: &wgpu::BindGroupLayout,
+        waterline: &wgpu::BindGroupLayout,
         inputs: LightInputs,
     ) -> Self {
         let plan_layout = LayoutBuilder::new()
@@ -258,7 +277,20 @@ impl Particles {
             .storage_write()
             .storage_write()
             .storage_write()
+            .storage_write()
             .build(gpu, "particle simulate");
+        let collide_layout = LayoutBuilder::new()
+            .uniform()
+            .storage_read()
+            .storage_write()
+            .storage_write()
+            .storage_read()
+            .storage_write()
+            .build(gpu, "particle collide");
+        let opaque_layout = LayoutBuilder::new()
+            .texture_unfilterable()
+            .texture_unfilterable()
+            .build(gpu, "particle opaque scene");
         let light_layout = crate::shadow::ShadowMaps::add_to_layout(
             LayoutBuilder::new()
                 .uniform()
@@ -318,6 +350,12 @@ impl Particles {
             &shaders::module(&gpu.device, "particles/sort.wgsl"),
             "main",
             &[&simulate_layout],
+        );
+        let collide = gpu.compute_pipeline(
+            "particle collide",
+            &shaders::module(&gpu.device, "particles/collide.wgsl"),
+            "main",
+            &[&collide_layout, environment, &opaque_layout, waterline],
         );
         let light = gpu.compute_pipeline(
             "particle light",
@@ -493,6 +531,7 @@ impl Particles {
         let layouts = PoolLayouts {
             plan: plan_layout,
             simulate: simulate_layout,
+            collide: collide_layout,
             light: light_layout,
             draw: pool_draw_layout,
         };
@@ -502,6 +541,8 @@ impl Particles {
             layouts,
             inputs,
             light,
+            collide,
+            opaque_layout,
             scene_layout,
             copy_layout,
             plan,
@@ -515,6 +556,7 @@ impl Particles {
             draw_order: Vec::new(),
             solid_slots: [false; MAX_EMITTERS],
             sorting: false,
+            colliding: false,
             reactive_dirty: std::cell::Cell::new(false),
             frame_group,
             effects: Vec::new(),
@@ -525,10 +567,20 @@ impl Particles {
             parity: 0,
             serial: 0,
             active: false,
+            time: 0.0,
+            wind: [0.0; 2],
+            wind_floor: 0.0,
             light_interval: 1,
             ray_steps: 16,
             stats: StatsReadback::new(gpu),
         }
+    }
+
+    /// Sets the wind 10 m above `floor`, in m/s as (east, south), which carries particles that
+    /// follow the wind, by a log profile with height above `floor`.
+    pub fn set_air(&mut self, wind: [f32; 2], floor: f32) {
+        self.wind = wind;
+        self.wind_floor = floor;
     }
 
     /// Works out each particle's light afresh once in `frames` frames, staggered across them,
@@ -757,6 +809,9 @@ impl Particles {
     /// out.
     pub fn prepare(&mut self, gpu: &Gpu, camera: &Camera, seconds: f32, detail: f32) {
         let eye = camera.position;
+        self.time += seconds;
+        // Kept within a day, so that noise in time keeps its precision.
+        self.time %= 86_400.0;
         // Effects stopped long enough ago that nothing of theirs can be alive.
         for index in 0..self.effects.len() {
             let done = self.effects[index].as_mut().is_some_and(|live| {
@@ -764,11 +819,15 @@ impl Particles {
                     return false;
                 };
                 *stopped += seconds;
-                let longest = live
-                    .emitters
-                    .iter()
-                    .map(|e| e.longest_life)
-                    .fold(0.0, f32::max);
+                // Particles spawned on events may be born as late as their sender's last
+                // particle dies, so with events the lives add up along a chain of them.
+                let lives = live.emitters.iter().map(|e| e.longest_life);
+                let events = live.effect.emitters.iter().any(|e| e.on_event.is_some());
+                let longest = if events {
+                    lives.sum()
+                } else {
+                    lives.fold(0.0, f32::max)
+                };
                 *stopped > longest + RELEASE_MARGIN
             });
             if done {
@@ -788,6 +847,23 @@ impl Particles {
         let written = 1 - self.parity;
         for live in self.effects.iter_mut().flatten() {
             let stopped = live.stopped_for.is_some();
+            // Where each emitter's hits send their events: the slot of the emitter that spawns
+            // on them.
+            let targets: Vec<u32> = live
+                .effect
+                .emitters
+                .iter()
+                .map(|sender| {
+                    let event = sender.collide.as_ref().and_then(|c| c.event.as_ref());
+                    event
+                        .and_then(|event| {
+                            live.effect.emitters.iter().position(|e| {
+                                e.on_event.as_ref().is_some_and(|(name, _)| name == event)
+                            })
+                        })
+                        .map_or(NO_TARGET, |n| live.emitters[n].slot as u32)
+                })
+                .collect();
             for (number, emitter) in live.emitters.iter_mut().enumerate() {
                 let desc = &live.effect.emitters[number];
                 let params = &live.params;
@@ -800,7 +876,7 @@ impl Particles {
                 } else {
                     spawns_due(emitter, desc, params, seconds, detail)
                 };
-                let record = emitter_record(
+                let mut record = emitter_record(
                     desc,
                     params,
                     transform,
@@ -809,6 +885,7 @@ impl Particles {
                     live.serial,
                     number,
                 );
+                record.event_target = targets[number];
                 emitter.longest_life = emitter
                     .longest_life
                     .max(record.lifetime_size[0])
@@ -831,6 +908,10 @@ impl Particles {
         self.draw_order = (0..MAX_EMITTERS).filter(|&s| self.slots[s]).collect();
         self.solid_slots =
             std::array::from_fn(|s| self.slots[s] && records[s].flags & FLAG_SOLID != 0);
+        self.colliding = self
+            .draw_order
+            .iter()
+            .any(|&s| records[s].flags & FLAG_COLLIDE != 0);
         self.sorting = self
             .draw_order
             .iter()
@@ -885,8 +966,9 @@ impl Particles {
             capacity,
             light_interval: self.light_interval.max(1),
             ray_steps: self.ray_steps.max(1),
-            _pad: [0; 3],
-            camera_position: eye.extend(1.0).into(),
+            time: self.time,
+            wind: self.wind,
+            camera_position: eye.extend(self.wind_floor).into(),
             camera_forward: camera.forward().extend(0.0).into(),
         };
         queue.write_buffer(&self.pool.sim, 0, bytemuck::bytes_of(&sim));
@@ -918,6 +1000,31 @@ impl Particles {
         pass.dispatch_workgroups(1, 1, 1);
     }
 
+    /// Records this frame's collisions, after the simulation and before the light: against the
+    /// opaque scene in `targets`, the GI volume and the camera in `environment`, and the water's
+    /// height in `waterline`.
+    pub fn record_collide(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        environment: &wgpu::BindGroup,
+        targets: &ParticleTargets,
+        waterline: &wgpu::BindGroup,
+    ) {
+        if !self.active || !self.colliding {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("particle collide"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.collide);
+        pass.set_bind_group(0, &self.pool.collide_group, &[]);
+        pass.set_bind_group(1, environment, &[]);
+        pass.set_bind_group(2, &targets.opaque_group, &[]);
+        pass.set_bind_group(3, waterline, &[]);
+        pass.dispatch_workgroups_indirect(&self.pool.indirect, LIGHT_ARGS);
+    }
+
     /// Records the light each live particle receives this frame, after the simulation, with
     /// the renderer's environment group: the sun, its shadows, the sky, the GI volume and the
     /// scene's lights.
@@ -943,6 +1050,8 @@ impl Particles {
         size: (u32, u32),
         scene_depth: &wgpu::TextureView,
         scene_motion: &wgpu::TextureView,
+        opaque_depth: &wgpu::TextureView,
+        opaque_normal: &wgpu::TextureView,
     ) -> ParticleTargets {
         let depth = gpu
             .device
@@ -994,6 +1103,14 @@ impl Particles {
                 std::slice::from_ref(&view),
             ),
             scene_group: gpu.bind_group("particle scene depth", &self.scene_layout, &[view]),
+            opaque_group: gpu.bind_group(
+                "particle opaque scene",
+                &self.opaque_layout,
+                &[
+                    wgpu::BindingResource::TextureView(opaque_depth),
+                    wgpu::BindingResource::TextureView(opaque_normal),
+                ],
+            ),
         }
     }
 
@@ -1228,6 +1345,11 @@ impl Pool {
             cap * LIGHT_BYTES,
             wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         );
+        let events = gpu.storage_buffer(
+            "particle events",
+            (MAX_EMITTERS * EVENT_CAPACITY) as u64 * 32,
+            wgpu::BufferUsages::empty(),
+        );
         let sim = gpu.uniform_buffer("particle sim", std::mem::size_of::<SimUniform>() as u64);
         let draws = gpu.uniform_buffer("particle draws", MAX_EMITTERS as u64 * DRAW_STRIDE);
         fn whole(b: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
@@ -1269,6 +1391,19 @@ impl Pool {
                 whole(&particles),
                 whole(&free),
                 whole(&alive),
+                whole(&events),
+            ],
+        );
+        let collide_group = gpu.bind_group(
+            "particle collide",
+            &layouts.collide,
+            &[
+                whole(&sim),
+                whole(&emitters),
+                whole(&state),
+                whole(&particles),
+                whole(&alive),
+                whole(&events),
             ],
         );
         let draw_group = gpu.bind_group(
@@ -1301,6 +1436,7 @@ impl Pool {
             light,
             plan_group,
             simulate_group,
+            collide_group,
             light_group,
             draw_group,
         }
@@ -1423,6 +1559,19 @@ fn emitter_record(
     if desc.solid {
         flags |= FLAG_SOLID;
     }
+    let moving_air = [
+        v(&desc.wind),
+        v(&desc.curl[0]),
+        v(&desc.buoyancy),
+        v(&desc.attract),
+        v(&desc.vortex),
+    ];
+    if moving_air.iter().any(|&f| f != 0.0) {
+        flags |= FLAG_FORCES;
+    }
+    if desc.collide.is_some() {
+        flags |= FLAG_COLLIDE;
+    }
     // Only a slice the sort can address is sorted; the parser holds budgets to that, but an
     // effect built or changed in code may not have been through it.
     if desc.sort && emitter.budget <= effect::MAX_SORTED {
@@ -1477,6 +1626,35 @@ fn emitter_record(
             v(&desc.glow).clamp(0.0, 1.0),
         ],
         phase: [v(&desc.phase).clamp(-0.95, 0.95), 0.0, 0.0, 0.0],
+        wind_curl: [
+            v(&desc.wind),
+            v(&desc.curl[0]),
+            v(&desc.curl[1]).max(1.0e-3),
+            v(&desc.curl[2]),
+        ],
+        buoyancy_attract_vortex: [v(&desc.buoyancy), v(&desc.attract), v(&desc.vortex), 0.0],
+        restitution_friction: desc.collide.as_ref().map_or([0.0; 4], |c| {
+            [
+                v(&c.restitution).clamp(0.0, 1.0),
+                v(&c.friction).clamp(0.0, 1.0),
+                0.0,
+                0.0,
+            ]
+        }),
+        collide_against: desc.collide.as_ref().map_or(0, |c| c.against),
+        response: desc
+            .collide
+            .as_ref()
+            .map_or(RESPONSE_BOUNCE, |c| match c.response {
+                Response::Bounce => RESPONSE_BOUNCE,
+                Response::Stick => RESPONSE_STICK,
+                Response::Kill => RESPONSE_KILL,
+            }),
+        event_target: NO_TARGET,
+        event_spawn: desc
+            .on_event
+            .as_ref()
+            .map_or(0, |(_, count)| v(count).round().clamp(0.0, 64.0) as u32),
     }
 }
 
