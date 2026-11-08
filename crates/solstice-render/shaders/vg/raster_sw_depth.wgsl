@@ -26,10 +26,10 @@ const SLOPE_BIAS: f32 = 1.5;
 fn depth_bias(a: vec3f, b: vec3f, c: vec3f) -> f32 {
     let ab = b - a;
     let ac = c - a;
+    // Never zero: the rasterizer has already dropped triangles with no area. A triangle almost
+    // edge-on to the light gets a huge bias and is pushed past the far side, as the hardware
+    // does too, clamping to 1 and failing its depth test.
     let det = ab.x * ac.y - ac.x * ab.y;
-    if abs(det) < 1.0e-12 {
-        return 0.0;
-    }
     let dzdx = (ab.z * ac.y - ac.z * ab.y) / det;
     let dzdy = (ac.z * ab.x - ab.z * ac.x) / det;
     return SLOPE_BIAS * max(abs(dzdx), abs(dzdy));
