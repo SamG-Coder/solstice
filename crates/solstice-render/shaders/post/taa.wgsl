@@ -12,6 +12,13 @@
 @group(0) @binding(4) var history: texture_2d<f32>;
 @group(0) @binding(5) var linear_sampler: sampler;
 @group(0) @binding(6) var output: texture_storage_2d<rgba16float, write>;
+// How much of each scene pixel translucent particles cover. They have no motion of their own
+// in the scene's motion, so the history reprojected there shows what was behind them, or them
+// somewhere else: where they cover, history counts for less.
+@group(0) @binding(7) var reactive_tex: texture_2d<f32>;
+
+// The share of the current frame where particles cover a pixel fully.
+const REACTIVE_BLEND: f32 = 0.9;
 
 // Tonemap weights keep very bright samples from dominating the filter.
 fn compress(c: vec3f) -> vec3f {
@@ -89,6 +96,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var filter_total = 0.0;
     var closest_depth = 0.0;
     var closest_pixel = nearest;
+    var reactive = 0.0;
     let jitter_pixels = frame.jitter_ndc * 0.5 * frame.viewport * vec2f(1.0, -1.0);
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
@@ -105,6 +113,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             filtered += color * weight;
             filter_total += weight;
 
+            reactive = max(reactive, textureLoad(reactive_tex, p, 0).r);
             let depth = textureLoad(depth_tex, p, 0).r;
             if depth > closest_depth {
                 closest_depth = depth;
@@ -150,7 +159,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         // when the scene is moving, since resampled history gets softer with distance.
         let render_ratio = frame.viewport.x / f32(output_size.x);
         let moved = length((previous_uv - uv) * frame.viewport);
-        let blend = clamp(0.06 * render_ratio + moved * 0.012, 0.04, 0.3);
+        let blend = max(clamp(0.06 * render_ratio + moved * 0.012, 0.04, 0.3), reactive * REACTIVE_BLEND);
         result = mix(from_ycocg(clipped), current, blend);
     }
     textureStore(output, id.xy, vec4f(decompress(max(result, vec3f(0.0))), 1.0));

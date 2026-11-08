@@ -19,13 +19,14 @@ pub mod reference;
 
 pub use effect::{Blend, Curve, Effect, Emitter, Follow, Shading, Shape, Value};
 
-use crate::gpu::{Gpu, LayoutBuilder};
+use crate::frame::Camera;
+use crate::gpu::{Gpu, LayoutBuilder, Target};
 use crate::shaders;
 use effect::CURVE_ENTRIES;
 use glam::{Mat4, Vec3};
 use reference::{
-    EmitterRecord, EmitterState, Particle, FLAG_ADD, FLAG_GLOW, FLAG_LIT, FLAG_LIVE, FLAG_SURFACE,
-    SHAPE_BOX, SHAPE_POINT, SHAPE_SPHERE,
+    EmitterRecord, EmitterState, Particle, FLAG_ADD, FLAG_GLOW, FLAG_LIT, FLAG_LIVE, FLAG_SOLID,
+    FLAG_SORT, FLAG_SURFACE, SHAPE_BOX, SHAPE_POINT, SHAPE_SPHERE,
 };
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +56,11 @@ const STATE_BYTES: u64 = (MAX_EMITTERS * std::mem::size_of::<EmitterState>()) as
 const RELEASE_MARGIN: f32 = 0.5;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// The scene's depth and motion as compute passes write them, which solid particles draw into.
+const SCENE_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
+/// How much of each pixel particles cover, which the temporal filter trusts history less for.
+const REACTIVE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// Twin of `SimParams` in `particles/common.wgsl`.
 #[repr(C)]
@@ -66,6 +72,8 @@ struct SimUniform {
     light_interval: u32,
     ray_steps: u32,
     _pad: [u32; 3],
+    camera_position: [f32; 4],
+    camera_forward: [f32; 4],
 }
 
 /// A running effect.
@@ -126,11 +134,22 @@ pub struct LightInputs {
 }
 
 /// Size-dependent targets: the depth attachment particles test against, made from the scene's
-/// depth each frame.
+/// depth each frame; the scene's depth and motion, which solid particles draw into; and the
+/// reactive mask, how much of each pixel particles cover, for the temporal filter.
 pub struct ParticleTargets {
     depth: wgpu::TextureView,
+    scene_depth: wgpu::TextureView,
+    scene_motion: wgpu::TextureView,
+    reactive: Target,
     copy_group: wgpu::BindGroup,
     scene_group: wgpu::BindGroup,
+}
+
+impl ParticleTargets {
+    /// The reactive mask: 0 where no particle is drawn, up to 1 where one covers the pixel.
+    pub fn reactive(&self) -> &wgpu::TextureView {
+        &self.reactive.view
+    }
 }
 
 /// The buffers of a pool of one size, and their bind groups.
@@ -180,7 +199,16 @@ pub struct Particles {
     spawn: wgpu::ComputePipeline,
     update: wgpu::ComputePipeline,
     draw: wgpu::RenderPipeline,
+    solid: wgpu::RenderPipeline,
     depth_copy: wgpu::RenderPipeline,
+    sort: wgpu::ComputePipeline,
+    /// Live emitter slots, far to near: the order translucent ones are drawn in.
+    draw_order: Vec<usize>,
+    /// Which live slots draw solid particles, and whether any emitter sorts its particles.
+    solid_slots: [bool; MAX_EMITTERS],
+    sorting: bool,
+    /// Whether the reactive mask holds anything, which a frame with no particles clears.
+    reactive_dirty: std::cell::Cell<bool>,
     frame_group: wgpu::BindGroup,
     effects: Vec<Option<LiveEffect>>,
     generations: Vec<u32>,
@@ -280,6 +308,12 @@ impl Particles {
             "update",
             &[&simulate_layout],
         );
+        let sort = gpu.compute_pipeline(
+            "particle sort",
+            &shaders::module(&gpu.device, "particles/sort.wgsl"),
+            "main",
+            &[&simulate_layout],
+        );
         let light = gpu.compute_pipeline(
             "particle light",
             &shaders::module(&gpu.device, "particles/light.wgsl"),
@@ -306,6 +340,12 @@ impl Particles {
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         };
+        // The reactive mask keeps the most any particle covered each pixel.
+        let most = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Max,
+        };
         let draw = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -318,8 +358,9 @@ impl Particles {
                     buffers: &[],
                 },
                 primitive: Default::default(),
-                // Tested against the scene, which is nearer where its reversed depth is
-                // greater, and never written: particles do not hide one another.
+                // Tested against the scene and solid particles, which are nearer where their
+                // reversed depth is greater, and never written: translucent particles do not
+                // hide one another.
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: Some(false),
@@ -332,14 +373,68 @@ impl Particles {
                     module: &draw_module,
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOR_FORMAT,
-                        blend: Some(wgpu::BlendState {
-                            color: premultiplied,
-                            alpha: premultiplied,
+                    targets: &[
+                        Some(wgpu::ColorTargetState {
+                            format: COLOR_FORMAT,
+                            blend: Some(wgpu::BlendState {
+                                color: premultiplied,
+                                alpha: premultiplied,
+                            }),
+                            write_mask: wgpu::ColorWrites::ALL,
                         }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+                        Some(wgpu::ColorTargetState {
+                            format: REACTIVE_FORMAT,
+                            blend: Some(wgpu::BlendState {
+                                color: most,
+                                alpha: most,
+                            }),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                    ],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        // Solid particles are drawn before the rest, into the scene's colour, depth and motion,
+        // with depth tested and written as any surface's. They read nothing of the scene's
+        // depth, which they write.
+        let solid_layout = gpu
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("particle solid"),
+                bind_group_layouts: &[Some(&frame_layout), Some(&pool_draw_layout)],
+                immediate_size: 0,
+            });
+        let solid = gpu
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("particle solid"),
+                layout: Some(&solid_layout),
+                vertex: wgpu::VertexState {
+                    module: &draw_module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &draw_module,
+                    entry_point: Some("fs_solid"),
+                    compilation_options: Default::default(),
+                    targets: &[
+                        Some(COLOR_FORMAT.into()),
+                        Some(SCENE_DEPTH_FORMAT.into()),
+                        Some(MOTION_FORMAT.into()),
+                    ],
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -353,6 +448,7 @@ impl Particles {
                     bind_group_layouts: &[Some(&copy_layout)],
                     immediate_size: 0,
                 });
+        // A pass of its own, writing depth alone.
         let depth_copy = gpu
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -373,17 +469,11 @@ impl Particles {
                     bias: Default::default(),
                 }),
                 multisample: Default::default(),
-                // Shares the particles' pass, so it has their colour target, but writes none
-                // of it.
                 fragment: Some(wgpu::FragmentState {
                     module: &copy_module,
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: COLOR_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::empty(),
-                    })],
+                    targets: &[],
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -414,7 +504,13 @@ impl Particles {
             spawn,
             update,
             draw,
+            solid,
             depth_copy,
+            sort,
+            draw_order: Vec::new(),
+            solid_slots: [false; MAX_EMITTERS],
+            sorting: false,
+            reactive_dirty: std::cell::Cell::new(false),
             frame_group,
             effects: Vec::new(),
             generations: Vec::new(),
@@ -639,9 +735,11 @@ impl Particles {
         self.active
     }
 
-    /// Works out this frame's emitters, `seconds` after the last, with spawn rates scaled by
-    /// `detail`, and writes them for the GPU. Ends effects that have died out.
-    pub fn prepare(&mut self, gpu: &Gpu, camera: Vec3, seconds: f32, detail: f32) {
+    /// Works out this frame's emitters, seen from `camera`, `seconds` after the last, with
+    /// spawn rates scaled by `detail`, and writes them for the GPU. Ends effects that have died
+    /// out.
+    pub fn prepare(&mut self, gpu: &Gpu, camera: &Camera, seconds: f32, detail: f32) {
+        let eye = camera.position;
         // Effects stopped long enough ago that nothing of theirs can be alive.
         for index in 0..self.effects.len() {
             let done = self.effects[index].as_mut().is_some_and(|live| {
@@ -678,7 +776,7 @@ impl Particles {
                 let params = &live.params;
                 let transform = match desc.follow {
                     Follow::Effect => live.transform,
-                    Follow::Camera => Mat4::from_translation(camera) * live.transform,
+                    Follow::Camera => Mat4::from_translation(eye) * live.transform,
                 };
                 let request = if stopped {
                     0
@@ -705,6 +803,23 @@ impl Particles {
                 draws[at + 4..at + 8].copy_from_slice(&(emitter.slot as u32).to_le_bytes());
             }
         }
+        // Emitters are drawn far to near, by where their shapes are centred, so that a nearer
+        // effect's smoke lies over a farther one's.
+        let distance = |slot: usize| {
+            let r = &records[slot];
+            let centre = Mat4::from_cols_array_2d(&r.transform)
+                .transform_point3(Vec3::from_slice(&r.offset_cone[..3]));
+            centre.distance_squared(eye)
+        };
+        self.draw_order = (0..MAX_EMITTERS).filter(|&s| self.slots[s]).collect();
+        self.solid_slots =
+            std::array::from_fn(|s| self.slots[s] && records[s].flags & FLAG_SOLID != 0);
+        self.sorting = self
+            .draw_order
+            .iter()
+            .any(|&s| records[s].flags & FLAG_SORT != 0);
+        self.draw_order
+            .sort_by(|&a, &b| distance(b).total_cmp(&distance(a)));
 
         // New emitters start with an empty slice: every slot free, nothing alive.
         let queue = &gpu.queue;
@@ -754,6 +869,8 @@ impl Particles {
             light_interval: self.light_interval.max(1),
             ray_steps: self.ray_steps.max(1),
             _pad: [0; 3],
+            camera_position: eye.extend(1.0).into(),
+            camera_forward: camera.forward().extend(0.0).into(),
         };
         queue.write_buffer(&self.pool.sim, 0, bytemuck::bytes_of(&sim));
         self.stats.live = self.slots;
@@ -801,13 +918,14 @@ impl Particles {
         pass.dispatch_workgroups_indirect(&self.pool.indirect, LIGHT_ARGS);
     }
 
-    /// The depth target and bind groups for drawing at one size, over a scene whose depth is
-    /// `scene_depth`.
+    /// The targets for drawing at one size, over a scene whose depth and motion are
+    /// `scene_depth` and `scene_motion`: what the temporal filter reads, with or without water.
     pub fn targets(
         &self,
         gpu: &Gpu,
         size: (u32, u32),
         scene_depth: &wgpu::TextureView,
+        scene_motion: &wgpu::TextureView,
     ) -> ParticleTargets {
         let depth = gpu
             .device
@@ -826,9 +944,30 @@ impl Particles {
                 view_formats: &[],
             })
             .create_view(&Default::default());
+        let reactive = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("particle reactive"),
+            size: wgpu::Extent3d {
+                width: size.0.max(1),
+                height: size.1.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: REACTIVE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
         let view = wgpu::BindingResource::TextureView(scene_depth);
+        self.reactive_dirty.set(false);
         ParticleTargets {
             depth,
+            scene_depth: scene_depth.clone(),
+            scene_motion: scene_motion.clone(),
+            reactive: Target {
+                view: reactive.create_view(&Default::default()),
+                texture: reactive,
+            },
             copy_group: gpu.bind_group(
                 "particle depth copy",
                 &self.copy_layout,
@@ -838,9 +977,25 @@ impl Particles {
         }
     }
 
-    /// Draws every emitter's particles over `color`. With `overdraw`, `color` is cleared first
-    /// and each layer of particle adds a step of the overdraw view's heat, so with nothing
-    /// running the view is black.
+    /// Sorts the particles of every emitter that asks for it far to near, after their light is
+    /// worked out and before they are drawn.
+    pub fn record_sort(&self, encoder: &mut wgpu::CommandEncoder) {
+        if !self.active || !self.sorting {
+            return;
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("particle sort"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.sort);
+        pass.set_bind_group(0, &self.pool.simulate_group, &[]);
+        pass.dispatch_workgroups(MAX_EMITTERS as u32, 1, 1);
+    }
+
+    /// Draws every emitter's particles over `color`: solid ones first, into the scene's depth
+    /// and motion too, then the rest far to near. With `overdraw`, `color` is cleared first and
+    /// each layer of particle adds a step of the overdraw view's heat, so with nothing running
+    /// the view is black.
     pub fn record_draw(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -848,55 +1003,135 @@ impl Particles {
         targets: &ParticleTargets,
         overdraw: bool,
     ) {
-        if !self.active && !overdraw {
-            return;
-        }
-        let load = if overdraw {
-            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
-        } else {
-            wgpu::LoadOp::Load
+        let clear_color = |cleared: &mut bool| {
+            if overdraw && !*cleared {
+                *cleared = true;
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+            } else {
+                wgpu::LoadOp::Load
+            }
         };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("particle draw"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color,
+        let mut cleared = false;
+        let attach = |view, load| {
+            Some(wgpu::RenderPassColorAttachment {
+                view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load,
                     store: wgpu::StoreOp::Store,
                 },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &targets.depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+            })
+        };
         if !self.active {
+            // Nothing to draw: only clear what a view or the temporal filter would read.
+            if overdraw || self.reactive_dirty.get() {
+                let load = clear_color(&mut cleared);
+                let mut colors = vec![attach(
+                    targets.reactive(),
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                )];
+                if overdraw {
+                    colors.push(attach(color, load));
+                }
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("particle clear"),
+                    color_attachments: &colors,
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.reactive_dirty.set(false);
+            }
             return;
         }
-        pass.set_pipeline(&self.depth_copy);
-        pass.set_bind_group(0, &targets.copy_group, &[]);
-        pass.draw(0..3, 0..1);
-
-        pass.set_pipeline(&self.draw);
-        pass.set_bind_group(0, &self.frame_group, &[]);
-        pass.set_bind_group(2, &targets.scene_group, &[]);
-        for slot in (0..MAX_EMITTERS).filter(|&s| self.slots[s]) {
+        let depth_attachment = |load| {
+            Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &targets.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            })
+        };
+        let draw_slot = |pass: &mut wgpu::RenderPass<'_>, slot: usize| {
             pass.set_bind_group(
                 1,
                 &self.pool.draw_group,
                 &[(slot as u64 * DRAW_STRIDE) as u32],
             );
             pass.draw_indirect(&self.pool.indirect, DRAWS_OFFSET + slot as u64 * 16);
+        };
+
+        // The scene's depth, for the hardware to test against.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("particle depth copy"),
+                color_attachments: &[],
+                depth_stencil_attachment: depth_attachment(wgpu::LoadOp::Clear(0.0)),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.depth_copy);
+            pass.set_bind_group(0, &targets.copy_group, &[]);
+            pass.draw(0..3, 0..1);
         }
+
+        // Solid particles, as surfaces: colour, depth and motion.
+        let solids: Vec<usize> = self
+            .draw_order
+            .iter()
+            .copied()
+            .filter(|&s| self.solid_slots[s])
+            .collect();
+        if !solids.is_empty() {
+            let load = clear_color(&mut cleared);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("particle solid"),
+                color_attachments: &[
+                    attach(color, load),
+                    attach(&targets.scene_depth, wgpu::LoadOp::Load),
+                    attach(&targets.scene_motion, wgpu::LoadOp::Load),
+                ],
+                depth_stencil_attachment: depth_attachment(wgpu::LoadOp::Load),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.solid);
+            pass.set_bind_group(0, &self.frame_group, &[]);
+            for slot in solids {
+                draw_slot(&mut pass, slot);
+            }
+        }
+
+        // The rest, far to near, over everything, marking where they cover in the reactive
+        // mask.
+        let load = clear_color(&mut cleared);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("particle draw"),
+            color_attachments: &[
+                attach(color, load),
+                attach(
+                    targets.reactive(),
+                    wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                ),
+            ],
+            depth_stencil_attachment: depth_attachment(wgpu::LoadOp::Load),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.draw);
+        pass.set_bind_group(0, &self.frame_group, &[]);
+        pass.set_bind_group(2, &targets.scene_group, &[]);
+        for &slot in self.draw_order.iter().filter(|&&s| !self.solid_slots[s]) {
+            draw_slot(&mut pass, slot);
+        }
+        self.reactive_dirty.set(true);
     }
 
     /// Copies this frame's counters for the statistics, when the last copy has been read.
@@ -1164,6 +1399,12 @@ fn emitter_record(
     }
     if desc.shading == Shading::Lit {
         flags |= FLAG_LIT;
+    }
+    if desc.solid {
+        flags |= FLAG_SOLID;
+    }
+    if desc.sort {
+        flags |= FLAG_SORT;
     }
     if hot_high.max(hot_low) > 0.0 && v(&desc.glow) > 0.0 {
         flags |= FLAG_GLOW;

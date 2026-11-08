@@ -392,21 +392,39 @@ before premultiplying. A distant chimney's smoke fades into the haze exactly as 
 **Motion and TAA.** Translucent sprites over a moving scene are what TAA handles worst: it
 reprojects by the opaque scene's motion and keeps the particle's colour as stale history.
 - **Sprites are drawn with the jittered projection,** so TAA anti-aliases their edges.
-- **A reactive mask.** Each particle writes its opacity into a small R8 target, with a max
-  blend. TAA lowers the weight of history and widens its colour clip where that is high. This is
-  what Unreal's responsive AA and FSR's reactive mask do. Rain streaks and sparks then stay sharp
-  instead of smearing.
-- **Solid particles** (alpha-tested sparks, debris, later meshes) write their own depth and
-  motion, from the particle's position this frame and last, over the composite's. TAA then
-  follows them as it follows any surface.
+- **A reactive mask.** Each translucent particle writes how much of a pixel it covers into an
+  R8 target at render size, with a max blend. TAA takes the most in each pixel's 3×3
+  neighbourhood, and where it is high, weights the current frame up to 90% rather than 4–30%.
+  This is what Unreal's responsive AA and FSR's reactive mask do.
+  - **Faint particles are marked by presence, not just opacity:** four times their opacity, up
+    to 1. They are what TAA loses most easily. A small, faint particle's neighbourhood looks much
+    like the wall behind it, so the colour clip keeps the wall's history and the particle fades
+    into a smear. Bright, solid-looking ones are kept by the clip alone.
+  - A frame with no particles clears the mask once, so it never keeps an old frame's marks.
+- **Solid particles** (`render sprite solid`: sparks, debris, later meshes) are opaque where
+  their shape is more than half covered. They write their own depth and motion into the scene's
+  targets that TAA reads: the motion runs from where the particle is now, unjittered, to where
+  it stood last frame. TAA then follows them as it follows any surface. Translucent particles
+  behind them are hidden, and fade softly into them.
+- **Three passes.** A solid particle writes the scene's depth, which translucent ones read for
+  their soft fade, and one pass can't do both. So drawing is:
+  1. the depth copy;
+  2. solid particles, if any, into colour, depth and motion;
+  3. translucent particles, into colour and the reactive mask.
 
 **Sorting.** Only where it shows.
 - **Not sorted:** additive emitters (sparks, fire's glow), and tiny particles such as rain,
   splashes, spray and snow. Their order is invisible.
-- **Sorted back to front:** large, dark, alpha-blended emitters such as smoke and dust. Each
-  sorted emitter's draw list is sorted by depth with a bitonic sort in workgroup memory:
-  32-bit keys of 16-bit depth and a 16-bit index, at most 16,384 particles per sorted emitter.
-- **Between emitters:** drawn far to near by the centres of their bounds.
+- **Sorted back to front** (`render sprite sort`): large, dark, alpha-blended emitters such as
+  smoke and dust.
+  - After the light pass, one workgroup per emitter sorts its whole alive list in workgroup
+    memory, with a bitonic network, and rewrites the list from the keys.
+  - A key is the particle's depth along the view, on a log scale in 20 bits, farthest
+    smallest, above the particle's place in its slice in 12 bits.
+  - 4,096 keys of four bytes fill the 16 KiB of workgroup memory WebGPU promises, so a sorted
+    emitter's budget is at most 4,096, which the parser enforces. Larger sorted emitters would
+    need a sort across several dispatches.
+- **Between emitters:** drawn far to near by where their shapes are centred.
 
 **Shadows from particles** (step 8). The sun's shadow maps are cached and rarely redrawn, so
 particles cannot go into them. Instead, a small per-frame map of opacity seen from the sun:
@@ -590,15 +608,47 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
    bookkeeping, and the rest is mostly the two GI traces and the 12-tap shadow. That is over the
    budget for heavy rain on Low. Rain's drops are small and fast, so step 5 should give them a
    cheaper light, such as the sky and the sun's shadow without GI traces.
-3. **Motion, TAA and sorting.**
+3. **Motion, TAA and sorting.** *Built; in review.*
    - The reactive mask and its use in TAA.
    - Solid particles' depth and motion.
    - The bitonic sort, and ordering between emitters.
-   - Tests:
-     - A moving solid particle's motion vector lands it on its last frame's pixel.
-     - Streaks don't leave a trail under a moving camera, measured against TAA off.
-     - Sorted output matches a CPU sort.
-     - With the reactive mask removed, the ghosting test fails.
+   - Tests, each mutation-checked: 12 bugs were put back in turn, and each made a test fail.
+     - A solid particle moving across the view writes its own depth, and the motion that takes
+       it to last frame's place, to within 10%; the wall beside it does not move.
+     - A small, faint particle moving fast keeps its contrast under TAA. Without the mask it
+       fell to a quarter of its contrast, and with the mask marking by opacity alone, to half.
+     - Sorted lists of 3, 100, 1,000 and 4,096 particles run far to near and hold each particle
+       once; an unsorted emitter is left alone.
+     - Nearer emitters draw over farther ones, in either order of starting.
+
+   The built-in fountain now uses both: its jet's drops are solid, and its mist is sorted.
+
+   **With no particles,** the cove's final image differs from `main`'s as much as two runs of
+   the same build differ from each other: a mean of 0.09 levels in 255, on about 11% of pixels,
+   from the live sea and sky. The reactive mask is cleared, and TAA is unchanged there.
+
+   **In a browser** (Chromium's WebGPU), the sorted mist and solid drops draw with no GPU
+   errors: the sort's 16 KiB of workgroup memory and the solid pass's R32Float and Rg32Float
+   attachments, written without blending, are accepted.
+
+   **Cost** at 1280×720 in the cove, with the same method as before. The figures are
+   simulate, light and sort, then draw:
+
+   | Case | RTX 5080, High | Integrated, Low |
+   |---|---|---|
+   | The fountain, its mist now sorted | 0.07, 0.06 ms | 0.47, 0.21 ms |
+   | 100,000 drops (35,000 on Low) | 0.17, 0.08 ms | 2.0, 0.53 ms |
+   | 4,096 large sorted smoke puffs (1,425 on Low) | 0.14, 0.95 ms | 0.47, 2.7 ms |
+   | 10,000 solid sparks (3,300 on Low) | 0.04, 0.03 ms | 0.12, 0.18 ms |
+
+   - **The sort's cost on the integrated GPU is mostly waiting.** About 0.3 ms, even for a few
+     hundred particles: a bitonic network of n keys takes about log²(n)/2 stages, each ending
+     at a workgroup barrier.
+     - Letting each lane own a run of neighbouring keys, so that the stages within a run need
+       no barrier, would cut that.
+     - So would sorting every other frame, since the order changes slowly.
+   - **The smoke's draw is overdraw:** large puffs covering the same pixels many times. That is
+     what step 7's half-resolution drawing is for.
 4. **Forces and collision.**
    - Wind from the weather, brought down to the particle's height with the log profile the sea
      uses, plus gusts; curl noise, buoyancy, attract and vortex.
