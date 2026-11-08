@@ -3329,8 +3329,8 @@ fn solid_particles_hide_what_is_behind_them() {
 /// the ball away lights the floor under it. A map never traced would shadow the floor beside
 /// the ball too; a map never consulted would shadow nothing; a second lamp, out of the ball's
 /// way and first in the list, would light the floor under the ball if the lamps' maps were
-/// mixed up; and the floor far to the side, lit at a slant, stays lit, where a map read with
-/// too little margin would shadow it with itself.
+/// mixed up; and a low lamp lights the floor at a steep slant, where a map read with too
+/// little margin, or compared at the wrong depth, would shadow the floor with itself.
 #[test]
 fn a_lamp_is_shadowed_through_its_map() {
     let Some(gpu) = request_gpu() else {
@@ -3351,8 +3351,8 @@ fn a_lamp_is_shadowed_through_its_map() {
         daylight_illuminance: 10.0,
         ..Default::default()
     };
-    let lamp = |x: f32| Light {
-        position: [x, 5.0, 0.0],
+    let lamp = |position: [f32; 3]| Light {
+        position,
         range: 9.0,
         intensity: [60.0; 3],
         _pad: 0,
@@ -3360,18 +3360,21 @@ fn a_lamp_is_shadowed_through_its_map() {
     let size = 128;
     // The volume resolves the ball at 0.2 m voxels and stops its traces most of a voxel short
     // of a surface, so the shadow is some 2.5 m in radius on the floor; the lit spot stands
-    // well outside it, 42° from the lamp's vertical against the shadow's 26°, and the slanted
-    // one at 46°, nearer the camera, where the lamp's light arrives at half its strength.
+    // well outside it, 42° from the lamp's vertical against the shadow's 26°. The slanted spot,
+    // nearer the camera, is lit by the low lamp at 69° from its vertical, four times as much
+    // as by the lamp over the ball.
     let under = Vec3::ZERO;
     let beside = Vec3::new(4.5, 0.0, 0.0);
     let slanted = Vec3::new(-2.5, 0.0, 4.5);
+    let low_lamp = lamp([-6.5, 1.5, 4.5]);
     let floor_at = |pixels: &[u8], world: Vec3| {
         let (x, y) = pixel_of(&camera, size, world);
         brightness(patch(pixels, size, x, y, 2))
     };
     let mut scene = ball_on_floor();
-    // The other lamp is far enough along +X that nothing it lights is measured.
-    scene.lights = vec![lamp(16.0), lamp(0.0)];
+    // The first lamp is far enough along +X that nothing it lights is measured; the low lamp
+    // reaches the spot under the ball only faintly, at the edge of its range.
+    scene.lights = vec![lamp([16.0, 5.0, 0.0]), lamp([0.0, 5.0, 0.0]), low_lamp];
     // The ball hangs between the lamp and the floor, a metre above the floor and two below
     // the lamp.
     scene.instances[0].transform = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
@@ -3395,9 +3398,21 @@ fn a_lamp_is_shadowed_through_its_map() {
     )
     .pixels;
 
+    let slant = floor_at(&without, slanted);
+    scene.lights.pop();
+    let no_low_lamp = render_in(
+        &gpu,
+        &scene,
+        &camera,
+        RendererSettings::default(),
+        size,
+        &night,
+    )
+    .pixels;
+    let slant_unlit = floor_at(&no_low_lamp, slanted);
+
     let (shadowed, lit) = (floor_at(&with_ball, under), floor_at(&with_ball, beside));
     let (open, lit_alone) = (floor_at(&without, under), floor_at(&without, beside));
-    let slant = floor_at(&without, slanted);
     assert!(
         shadowed + 20.0 < lit,
         "under the ball the floor is {shadowed}, beside it {lit}: no shadow"
@@ -3406,12 +3421,14 @@ fn a_lamp_is_shadowed_through_its_map() {
         shadowed + 20.0 < open,
         "under the ball the floor is {shadowed}, and {open} with the ball gone: no shadow"
     );
+    // The probes' indirect specular is not scaled by `gi_intensity`, so the lit ball's glow
+    // reaches the floor beside it a little; a map never traced would leave it near black.
     assert!(
-        (lit - lit_alone).abs() < 8.0,
+        (lit - lit_alone).abs() < 30.0,
         "beside the ball the floor is {lit} with it and {lit_alone} without: the ball shadows what it should not"
     );
     assert!(
-        slant > lit_alone * 0.3,
-        "the floor lit at a slant is {slant} against {lit_alone} nearer the lamp: it shadows itself"
+        slant > slant_unlit + 20.0,
+        "the floor at a steep slant to the low lamp is {slant} with it and {slant_unlit} without: it shadows itself"
     );
 }

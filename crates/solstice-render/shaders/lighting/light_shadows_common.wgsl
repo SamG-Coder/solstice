@@ -40,8 +40,8 @@ fn light_shadow(index: u32, from_light: vec3f, distance: f32, voxel: f32, normal
     let p = (oct_encode(from_light / distance) * 0.5 + 0.5) * size - 0.5;
     let base = vec2i(floor(p));
     let f = p - vec2f(base);
-    // The plane's distance from the light along its normal.
-    let plane = dot(from_light, normal);
+    // The plane's distance from the light along its normal, which faces the light.
+    let plane = -dot(from_light, normal);
     var lit = 0.0;
     for (var i = 0; i < 4; i++) {
         let corner = vec2i(i % 2, i / 2);
@@ -50,7 +50,7 @@ fn light_shadow(index: u32, from_light: vec3f, distance: f32, voxel: f32, normal
         let ray = oct_decode((vec2f(texel) + 0.5) / size * 2.0 - 1.0);
         // Where this texel's ray meets the plane; the point's own distance where the ray runs
         // along the plane or away from it.
-        let towards = dot(ray, normal);
+        let towards = -dot(ray, normal);
         let along = select(distance, plane / towards, towards > 0.05);
         let far = textureLoad(light_shadows, texel, i32(index), 0).r;
         lit += weight * select(0.0, 1.0, far >= along - voxel * 2.0);
