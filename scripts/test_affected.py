@@ -92,6 +92,8 @@ class ChangedFiles(unittest.TestCase):
             git("init", "-q")
             git("config", "user.email", "test@example.com")
             git("config", "user.name", "test")
+            # A developer's global signing setting must not reach these throwaway commits.
+            git("config", "commit.gpgsign", "false")
             os.makedirs(os.path.join(root, "crates/world/src"))
             with open(os.path.join(root, "crates/world/src/x.rs"), "w") as f:
                 f.write("pub fn x() {}\n" * 20)
