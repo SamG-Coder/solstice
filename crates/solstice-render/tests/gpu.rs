@@ -1429,3 +1429,46 @@ fn what_stands_out_of_the_sea_is_not_covered_by_it() {
         at(64, 120)
     );
 }
+
+#[test]
+fn the_bed_shows_through_shallow_water_and_not_through_deep() {
+    let Some(gpu) = request_gpu() else { return };
+    // Looking down into a clear sea over the white floor, away from the ball: under 30 cm of
+    // water the floor shows bright; under 30 m the water absorbs what it reflects, and the
+    // sea is dark. Water that hid its bed at any depth, or showed it at every depth, fails.
+    let size = 64;
+    let brightness = |depth: f32| {
+        let camera = Camera {
+            position: Vec3::new(40.0, depth + 4.0, 0.0),
+            yaw: -1.57,
+            pitch: -1.3,
+            ..Default::default()
+        };
+        let pixels = render_sea(
+            &gpu,
+            &camera,
+            "ocean",
+            depth,
+            DebugView::Lit,
+            Quality::High,
+            size,
+        );
+        // The middle of the view, clear of the sun's highlight at the edges.
+        let mut sum = 0.0;
+        let mut count = 0.0;
+        for y in size / 4..size * 3 / 4 {
+            for x in size / 4..size * 3 / 4 {
+                let i = ((y * size + x) * 4) as usize;
+                sum += pixels[i..i + 3].iter().map(|&c| c as f32).sum::<f32>() / 3.0;
+                count += 1.0;
+            }
+        }
+        sum / count
+    };
+    let shallow = brightness(0.3);
+    let deep = brightness(30.0);
+    assert!(
+        shallow > deep * 1.5 + 10.0,
+        "the bed under 30 cm of water ({shallow}) is not brighter than 30 m of sea ({deep})"
+    );
+}
