@@ -9,3 +9,10 @@ surface cobblestone_floor_07
 surface granite_tile_04
 # The market square's paving.
 surface square_cobblestone
+
+# Limewashed plaster, tinted house by house.
+surface white_stucco
+# Canal-tile roofs.
+surface clay_roof_tiles_02
+# Painted timber for shutters and doors, tinted.
+surface distressed_painted_planks

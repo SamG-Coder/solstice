@@ -18,6 +18,9 @@ part ../target/town/town.gltf mole 0 0 0 0 1
 # ---- Plain shapes for everything later steps replace, to judge scale and composition.
 part ../target/town/town.gltf massing 0 0 0 0 1
 
+# ---- The houses, each in its place in the kit.
+model ../target/town/houses.gltf 0 0 0 0 1
+
 # ---- The dressed stone over the solids: walls, paving and copings, placed whole.
 model ../target/town/stone.gltf 0 0 0 0 1
 

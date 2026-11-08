@@ -2,6 +2,7 @@
 
 use crate::geometry::Geometry;
 use glam::{Quat, Vec3};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
@@ -38,6 +39,8 @@ pub struct File {
     nodes: Vec<String>,
     images: Vec<String>,
     textures: Vec<String>,
+    /// Each surface's colour, normal and roughness textures, so that tints of it share them.
+    surfaces: HashMap<(&'static str, bool), (usize, usize, usize)>,
 }
 
 impl File {
@@ -61,10 +64,21 @@ impl File {
     /// the texture's own transform scales them to its repeat.
     pub fn textured(&mut self, material: &Textured) -> usize {
         let name = material.surface;
-        let mut map =
-            |kind: &str| self.texture(format!("../scan/{name}/textures/{name}_{kind}_2k.jpg"));
-        let (color, normal) = (map("diff"), map("nor_gl"));
-        let roughness = map(if material.arm { "arm" } else { "rough" });
+        let (color, normal, roughness) = match self.surfaces.get(&(name, material.arm)) {
+            Some(&maps) => maps,
+            None => {
+                let mut map = |kind: &str| {
+                    self.texture(format!("../scan/{name}/textures/{name}_{kind}_2k.jpg"))
+                };
+                let maps = (
+                    map("diff"),
+                    map("nor_gl"),
+                    map(if material.arm { "arm" } else { "rough" }),
+                );
+                self.surfaces.insert((name, material.arm), maps);
+                maps
+            }
+        };
         let scale = 1.0 / material.metres;
         let [red, green, blue] = material.tint;
         let transform =
