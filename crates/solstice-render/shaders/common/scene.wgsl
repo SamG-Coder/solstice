@@ -54,9 +54,13 @@ struct Instance {
     texture_info: u32,
     // How brightly the material's own light shines here: 1 as it is, 0 dark.
     glow: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // Where this instance's bones start in the bone texture, or NO_BONES.
+    bones: u32,
+    // What to add to a cluster's number to find its bone list.
+    bone_lists: i32,
+    // The farthest its pose carries anything, in world units. Added to spheres it can't track
+    // bone by bone: its nodes, and its LOD spheres, so that both sides of a LOD choice agree.
+    lod_margin: f32,
 }
 
 struct Material {

@@ -486,6 +486,8 @@ impl CullPipelines {
             .storage_read()
             .storage_read()
             .texture_unfilterable()
+            .texture_unfilterable()
+            .texture_uint()
             .build(gpu, "cull scene");
         let work_layout = LayoutBuilder::new()
             .storage_write()
@@ -536,6 +538,8 @@ impl CullPipelines {
                 scene.nodes.as_entire_binding(),
                 scene.clusters.as_entire_binding(),
                 wgpu::BindingResource::TextureView(hzb),
+                wgpu::BindingResource::TextureView(&scene.skins.bones_view),
+                wgpu::BindingResource::TextureView(&scene.skins.lists_view),
             ],
         )
     }

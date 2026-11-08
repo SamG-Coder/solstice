@@ -171,6 +171,7 @@ impl Rasterizer {
             .storage_read()
             .storage_read()
             .storage_read()
+            .texture_unfilterable()
             .build(gpu, "raster");
         let vis_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT)
@@ -407,6 +408,7 @@ impl Rasterizer {
                     scene.vertices.as_entire_binding(),
                     work.visible.as_entire_binding(),
                     work.state().as_entire_binding(),
+                    wgpu::BindingResource::TextureView(&scene.skins.bones_view),
                 ],
             ),
             mask: self.masked.as_ref().map(|masked| {

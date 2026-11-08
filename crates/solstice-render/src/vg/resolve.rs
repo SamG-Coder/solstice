@@ -67,6 +67,7 @@ impl Resolve {
             .storage_read()
             .storage_read()
             .storage_read()
+            .texture_unfilterable()
             .build(gpu, "resolve data");
         let output_layout = LayoutBuilder::new()
             .storage_texture(ALBEDO_FORMAT)
@@ -121,6 +122,7 @@ impl Resolve {
                     scene.vertices.as_entire_binding(),
                     scene.triangles.as_entire_binding(),
                     scene.materials.as_entire_binding(),
+                    wgpu::BindingResource::TextureView(&scene.skins.bones_view),
                 ],
             ),
             output: gpu.bind_group(

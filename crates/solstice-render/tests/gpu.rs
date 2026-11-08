@@ -1,6 +1,7 @@
 //! End-to-end tests on a real GPU. They pass trivially, with a note, if none is available.
 
 use glam::{Mat4, Quat, Vec2, Vec3};
+use solstice_asset::PackedSkin;
 use solstice_asset::{Instance, Light, LoadedScene, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
     build_virtual_mesh, compress_textures, masked_mip_chain, mip_chain, paginate, BuildOptions,
@@ -252,10 +253,15 @@ fn read_pixels(gpu: &Gpu, target: &wgpu::Texture, size: u32) -> Vec<u8> {
 /// Uncovered pixels inside the silhouette of a unit sphere `distance` away, in a white-on-black
 /// image of a sphere centred on the view.
 fn holes_in_sphere(pixels: &[u8], size: u32, distance: f32, fov_y: f32) -> u32 {
+    holes_within(pixels, size, distance, fov_y, 0.95)
+}
+
+/// The same, only as far out as `fraction` of the sphere's radius on screen.
+fn holes_within(pixels: &[u8], size: u32, distance: f32, fov_y: f32, fraction: f32) -> u32 {
     let angular = (1.0 / distance).asin();
     let half = size as f32 * 0.5;
     let radius = angular.tan() / (fov_y * 0.5).tan() * half;
-    let inner = (radius * 0.95).min(half - 2.0);
+    let inner = (radius * fraction).min(half - 2.0);
     let mut holes = 0;
     for y in 0..size {
         for x in 0..size {
@@ -4087,5 +4093,338 @@ fn distant_cut_outs_keep_their_coverage_and_hold_still() {
     assert!(
         shimmer < 8.0,
         "pixels of the distant card change by {shimmer} a frame"
+    );
+}
+
+/// A sphere with one skeleton of two bones stacked up its height, the lower carrying the bottom
+/// half and the upper carrying the top, blended across the middle band, on a floor.
+fn skinned_ball_on_floor() -> SceneAsset {
+    use solstice_asset::{Bone, Skeleton};
+    let mut scene = red_ball_on_floor();
+    let source = sphere(4);
+    let skins: Vec<PackedSkin> = source
+        .vertices
+        .iter()
+        .map(|vertex| {
+            let blend = ((vertex.position.y + 0.3) / 0.6).clamp(0.0, 1.0);
+            PackedSkin::new([0, 1, 0, 0], [1.0 - blend, blend, 0.0, 0.0])
+        })
+        .collect();
+    scene.meshes[0] =
+        solstice_builder::build_skinned_mesh(&source, &skins, &BuildOptions::default());
+    let bone = |name: &str, parent, y: f32| Bone {
+        name: name.to_owned(),
+        parent,
+        translation: Vec3::new(0.0, y, 0.0),
+        rotation: glam::Quat::IDENTITY,
+        // The bones' places in the mesh, which is where the file binds them.
+        inverse_bind: Mat4::from_translation(Vec3::new(0.0, -y, 0.0)),
+        center: Vec3::ZERO,
+        radius: 1.1,
+    };
+    scene.skeletons = vec![Skeleton {
+        bones: vec![bone("root", None, 0.0), bone("top", Some(0), 0.0)],
+    }];
+    scene.poses = vec![0];
+    scene.instance_poses = vec![0];
+    scene
+}
+
+/// Poses the top bone of [`skinned_ball_on_floor`], in the mesh's own space.
+fn pose_top(stage: &mut Stage, top: Mat4, jump: bool) {
+    let bones = [Mat4::IDENTITY, top];
+    let taken = if jump {
+        stage.renderer.place_pose(0, &bones)
+    } else {
+        stage.renderer.set_pose(0, &bones)
+    };
+    assert!(taken);
+}
+
+#[test]
+fn in_its_bind_pose_a_skinned_mesh_looks_as_a_rigid_one_does() {
+    let Some(gpu) = request_gpu() else { return };
+    let (camera, sun) = (over_the_floor(), low_sun());
+    let size = 192;
+    let settings = RendererSettings {
+        debug_view: DebugView::Normals,
+        ..untemporal()
+    };
+    let mut rigid = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    rigid.frames(&gpu, &camera, &sun, 3);
+    let mut skinned = Stage::new(&gpu, &skinned_ball_on_floor(), settings, size);
+    skinned.frames(&gpu, &camera, &sun, 3);
+    // Two builds of one surface, whose clusters differ, so close rather than equal.
+    let (rigid, skinned) = (rigid.pixels(&gpu), skinned.pixels(&gpu));
+    let differing = rigid
+        .chunks_exact(4)
+        .zip(skinned.chunks_exact(4))
+        .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 6))
+        .count();
+    assert!(differing < 100, "{differing} pixels differ");
+}
+
+#[test]
+fn a_pose_moves_what_is_skinned_to_it_with_its_normals_and_its_shadow() {
+    let Some(gpu) = request_gpu() else { return };
+    let probe = ShadowProbe::new(1.0, 192);
+    let sun = low_sun();
+    let mut stage = Stage::new(&gpu, &skinned_ball_on_floor(), untemporal(), probe.size);
+    stage.frames(&gpu, &probe.camera, &sun, 8);
+    let pixels = stage.pixels(&gpu);
+    assert!(probe.red(&pixels, 0.0), "the ball isn't where it stands");
+    assert!(probe.shade(&pixels, 0.0) < 0.6, "it casts no shadow");
+
+    // The top bone takes all of what is above the band across by 3 m, the rest stays.
+    pose_top(
+        &mut stage,
+        Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)),
+        true,
+    );
+    stage.frames(&gpu, &probe.camera, &sun, 2);
+    let pixels = stage.pixels(&gpu);
+    // The top of the ball went with its bone.
+    let (x, y) = pixel_of(&probe.camera, probe.size, Vec3::new(3.0, 1.75, 0.0));
+    let [r, g, _] = patch(&pixels, probe.size, x, y, 1);
+    assert!(r > 2.0 * g, "the top of the ball didn't go with its bone");
+}
+
+#[test]
+fn a_cut_through_a_bending_mesh_has_no_holes_from_near_or_far() {
+    let Some(gpu) = request_gpu() else { return };
+    // Stays white where the ball is.
+    let mut scene = SceneAsset {
+        materials: vec![white_material()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let source = sphere(7);
+    let skins: Vec<PackedSkin> = source
+        .vertices
+        .iter()
+        .map(|vertex| {
+            let blend = ((vertex.position.y + 0.4) / 0.8).clamp(0.0, 1.0);
+            PackedSkin::new([0, 1, 0, 0], [1.0 - blend, blend, 0.0, 0.0])
+        })
+        .collect();
+    scene.meshes.push(solstice_builder::build_skinned_mesh(
+        &source,
+        &skins,
+        &BuildOptions::default(),
+    ));
+    let bone = |parent| solstice_asset::Bone {
+        parent,
+        inverse_bind: Mat4::IDENTITY,
+        center: Vec3::ZERO,
+        radius: 1.1,
+        ..Default::default()
+    };
+    scene.skeletons = vec![solstice_asset::Skeleton {
+        bones: vec![bone(None), bone(Some(0))],
+    }];
+    scene.poses = vec![0];
+    scene.instance_poses = vec![0];
+
+    const SIZE: u32 = 512;
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut used_software = false;
+    let mut used_hardware = false;
+    for distance in [12.0_f32, 5.0, 2.5, 1.6] {
+        let camera = Camera {
+            position: Vec3::new(0.0, 0.0, distance),
+            fov_y: 50.0_f32.to_radians(),
+            near: 0.05,
+            ..Default::default()
+        };
+        let mut stage = Stage::new(&gpu, &scene, settings, SIZE);
+        // Twists the top half about the vertical, moving every vertex above the band a different
+        // way from the ones below it. Blending the two turns narrows the waist a little, so only
+        // what stays inside that is looked at.
+        for frame in 0..4 {
+            let angle = 0.25 + frame as f32 * 0.3;
+            pose_top(&mut stage, Mat4::from_rotation_y(angle), false);
+            stage.frames(&gpu, &camera, &darkness(), 2);
+            let pixels = stage.pixels(&gpu);
+            let holes = holes_within(&pixels, SIZE, distance, 50.0_f32.to_radians(), 0.8);
+            assert_eq!(
+                holes, 0,
+                "{holes} holes at distance {distance}, frame {frame}"
+            );
+        }
+        let stats = stage.renderer.stats();
+        assert!(stats.clusters > 0, "nothing was drawn");
+        used_software |= stats.software_clusters > 0;
+        used_hardware |= stats.software_clusters < stats.clusters;
+    }
+    assert!(
+        used_software && used_hardware,
+        "both rasterizers should draw it"
+    );
+}
+
+#[test]
+fn a_moving_pose_shows_its_motion_and_stops_showing_it_when_it_stops() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 128;
+    let camera = over_the_floor();
+    let settings = RendererSettings {
+        debug_view: DebugView::Motion,
+        ..untemporal()
+    };
+    let mut stage = Stage::new(&gpu, &skinned_ball_on_floor(), settings, size);
+    let environment = low_sun();
+    let colours = |pixels: &[u8], x: f32| {
+        let (bx, by) = pixel_of(&camera, size, Vec3::new(x, 1.75, 0.0));
+        let (fx, fy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
+        (
+            patch(pixels, size, bx, by, 1),
+            patch(pixels, size, fx, fy, 1),
+        )
+    };
+
+    stage.frames(&gpu, &camera, &environment, 4);
+    let mut x = 0.0;
+    for _ in 0..6 {
+        x += 0.1;
+        pose_top(&mut stage, Mat4::from_translation(Vec3::X * x), false);
+        stage.frames(&gpu, &camera, &environment, 1);
+    }
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        ball[0] > floor[0] + 30.0,
+        "the top of the ball moving right shows no motion: {ball:?} against {floor:?}"
+    );
+
+    stage.frames(&gpu, &camera, &environment, 1);
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        (ball[0] - floor[0]).abs() < 10.0,
+        "it still shows motion after it stopped: {ball:?} against {floor:?}"
+    );
+
+    // A jump shows no motion, and neither does the first pose a character is given.
+    x += 2.0;
+    pose_top(&mut stage, Mat4::from_translation(Vec3::X * x), true);
+    stage.frames(&gpu, &camera, &environment, 1);
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        (ball[0] - floor[0]).abs() < 10.0,
+        "the pose that jumped shows motion: {ball:?} against {floor:?}"
+    );
+}
+
+/// A cut-out card on one bone, for the bone to turn over.
+fn skinned_card_scene() -> SceneAsset {
+    let mut scene = card_scene(0, true, half_cut);
+    let source = card_mesh(true, 8);
+    let skins = vec![PackedSkin::new([0; 4], [1.0, 0.0, 0.0, 0.0]); source.vertices.len()];
+    scene.meshes[0] =
+        solstice_builder::build_skinned_mesh(&source, &skins, &BuildOptions::default());
+    scene.skeletons = vec![solstice_asset::Skeleton {
+        bones: vec![solstice_asset::Bone {
+            inverse_bind: Mat4::IDENTITY,
+            center: Vec3::ZERO,
+            radius: 1.0,
+            ..Default::default()
+        }],
+    }];
+    scene.poses = vec![0];
+    scene.instance_poses = vec![0];
+    scene
+}
+
+/// A bone turning a cut-out half way round takes its hole with it, on both rasterizers.
+#[test]
+fn a_skinned_cut_out_keeps_its_holes_where_its_bones_take_it() {
+    let Some(gpu) = request_gpu() else { return };
+    let scene = skinned_card_scene();
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    for (distance, software) in [(1.0, false), (14.0, true)] {
+        let camera = Camera {
+            position: Vec3::new(0.0, 0.0, distance),
+            ..Default::default()
+        };
+        let mut stage = Stage::new(&gpu, &scene, settings, 256);
+        assert!(stage
+            .renderer
+            .place_pose(0, &[Mat4::from_rotation_z(std::f32::consts::PI)]));
+        stage.frames(&gpu, &camera, &darkness(), 8);
+        assert_eq!(
+            stage.renderer.stats().software_clusters > 0,
+            software,
+            "at {distance} m"
+        );
+        let pixels = stage.pixels(&gpu);
+        let at = |x: f32| {
+            let (px, py) = pixel_of(&camera, 256, Vec3::new(x, 0.0, 0.0));
+            brightness(patch(&pixels, 256, px, py, 0))
+        };
+        // The texture's left half is the hole, and its left half now lies on the right.
+        let (solid, hole) = (at(-0.25), at(0.25));
+        assert!(hole < 5.0, "at {distance} m the hole shows {hole}");
+        assert!(
+            solid > 100.0,
+            "at {distance} m the solid part shows {solid}"
+        );
+    }
+}
+
+/// A cut-out's shadow follows its bones too: a bone turns the card half way round, and the
+/// shadow's hole goes with it.
+#[test]
+fn a_skinned_cut_outs_shadow_has_its_holes_where_its_bones_take_them() {
+    let Some(gpu) = request_gpu() else { return };
+    let card = Mat4::from_translation(Vec3::new(0.0, 1.0, 0.0))
+        * Mat4::from_rotation_x(-std::f32::consts::FRAC_PI_2)
+        * Mat4::from_scale(Vec3::new(2.0, 2.0, 1.0));
+    let source = card_mesh(true, 8);
+    let mut scene = card_over_floor(&source, card);
+    let skins = vec![PackedSkin::new([0; 4], [1.0, 0.0, 0.0, 0.0]); source.vertices.len()];
+    scene.meshes[0] =
+        solstice_builder::build_skinned_mesh(&source, &skins, &BuildOptions::default());
+    scene.skeletons = skinned_card_scene().skeletons;
+    scene.poses = vec![0];
+    scene.instance_poses = vec![0, solstice_asset::NO_POSE];
+    let sun_direction = Vec3::new(0.5, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(-0.5, 2.0, 2.5),
+        pitch: -0.7,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut stage = Stage::new(&gpu, &scene, settings, 512);
+    assert!(stage
+        .renderer
+        .place_pose(0, &[Mat4::from_rotation_z(std::f32::consts::PI)]));
+    stage.frames(&gpu, &camera, &sun, 8);
+    let pixels = stage.pixels(&gpu);
+    let floor = |local_x: f32| {
+        let point = card.transform_point3(Vec3::new(local_x, 0.0, 0.0));
+        let spot = point - sun_direction * (point.y / sun_direction.y);
+        let (px, py) = pixel_of(&camera, 512, spot);
+        brightness(patch(&pixels, 512, px, py, 1))
+    };
+    // Turned over, the solid half is on the -X side.
+    let (solid, hole) = (floor(-0.25), floor(0.25));
+    assert!(
+        solid + 30.0 < hole,
+        "the floor is {solid} behind the solid half and {hole} through the hole"
     );
 }

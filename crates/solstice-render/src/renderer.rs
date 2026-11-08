@@ -431,6 +431,29 @@ impl Renderer {
         self.scene.instance_table.transform(instance)
     }
 
+    /// How many poses the scene can hold at once: one for each placed character.
+    pub fn pose_count(&self) -> u32 {
+        self.scene.skins.pose_count()
+    }
+
+    /// The skeleton of a pose.
+    pub fn pose_skeleton(&self, pose: u32) -> Option<&solstice_asset::Skeleton> {
+        self.scene.skins.skeleton(pose)
+    }
+
+    /// Poses a character from the next frame on: `bones` are its bones' places in the mesh's own
+    /// space, in the skeleton's order, with no scale. Returns false, and does nothing, if the
+    /// pose doesn't exist, or `bones` is not as long as its skeleton.
+    pub fn set_pose(&mut self, pose: u32, bones: &[Mat4]) -> bool {
+        self.scene.skins.set(pose, bones, false)
+    }
+
+    /// Poses a character as a jump rather than a motion, as for a respawn: it shows no motion
+    /// getting there. Otherwise as [`Self::set_pose`].
+    pub fn place_pose(&mut self, pose: u32, bones: &[Mat4]) -> bool {
+        self.scene.skins.set(pose, bones, true)
+    }
+
     /// An instance's bounding sphere in the world, as its centre and radius.
     pub fn instance_bounds(&self, instance: u32) -> Option<(Vec3, f32)> {
         self.scene.instance_table.world_sphere(instance)

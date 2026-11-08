@@ -16,6 +16,7 @@
 
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
+#include "common/skin.wgsl"
 #include "vg/pass_view.wgsl"
 
 struct QueueEntry {
@@ -50,6 +51,9 @@ const SOFTWARE_MAX_DIAMETER_TEXELS: f32 = 16.0;
 @group(0) @binding(2) var<storage, read> nodes: array<Node>;
 @group(0) @binding(3) var<storage, read> clusters: array<Cluster>;
 @group(0) @binding(4) var hzb: texture_2d<f32>;
+@group(0) @binding(5) var bone_texture: texture_2d<f32>;
+// Each skinned cluster's bones, four to a word, by its number plus `Instance.bone_lists`.
+@group(0) @binding(6) var cluster_bone_lists: texture_2d<u32>;
 
 @group(1) @binding(0) var<storage, read_write> state: CullState;
 @group(1) @binding(1) var<storage, read_write> queue: array<QueueEntry>;
@@ -213,8 +217,9 @@ fn request_texture_detail(cluster: Cluster, instance: Instance, distance: f32) {
 
 fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     let cluster = clusters[cluster_index];
-    let center = transform_point(instance, cluster.center);
-    let radius = cluster.radius * instance.max_scale;
+    let sphere = posed_sphere(instance, cluster_index, cluster);
+    let center = sphere.xyz;
+    let radius = sphere.w;
     if !in_frustum(center, radius) {
         return;
     }
@@ -249,6 +254,53 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     }
     request_texture_detail(cluster, instance, length(center - view.camera_position) - radius);
     atomicAdd(&state.triangle_count, cluster_triangle_count(cluster));
+}
+
+// A cluster's bounding sphere where the pose has put it, in the world. Each vertex's place is a
+// blend of its place under each of its bones, so it lies inside the union of the cluster's
+// sphere moved by each bone of the cluster, which is what this bounds.
+fn posed_sphere(instance: Instance, cluster_index: u32, c: Cluster) -> vec4f {
+    if !instance_skinned(instance) {
+        return vec4f(transform_point(instance, c.center), c.radius * instance.max_scale);
+    }
+    let at = u32(i32(cluster_index) + instance.bone_lists);
+    let list = textureLoad(
+        cluster_bone_lists,
+        vec2u(at % BONE_TEXTURE_WIDTH, at / BONE_TEXTURE_WIDTH),
+        0,
+    );
+    // Too many bones to list: the whole mesh's reach bounds it.
+    if (list.x & 0xffffu) == 0xffu {
+        return vec4f(
+            transform_point(instance, c.center),
+            c.radius * instance.max_scale + instance.lod_margin,
+        );
+    }
+    // Sixteen bones in four words, ascending, with unused slots repeating the last.
+    var sum = vec3f(0.0);
+    var count = 0u;
+    var moved: array<vec3f, 16>;
+    var last = 0u;
+    for (var slot = 0u; slot < 16u; slot++) {
+        let bone = (list[slot / 4u] >> ((slot % 4u) * 8u)) & 0xffu;
+        if slot > 0u && bone <= last {
+            break;
+        }
+        last = bone;
+        let place = skin_point(bone_rows(instance.bones, bone, false), c.center);
+        moved[count] = place;
+        sum += place;
+        count += 1u;
+    }
+    let center = sum / f32(count);
+    var reach = 0.0;
+    for (var i = 0u; i < count; i++) {
+        reach = max(reach, distance(moved[i], center));
+    }
+    return vec4f(
+        transform_point(instance, center),
+        (reach + c.radius) * instance.max_scale,
+    );
 }
 
 // Whether this view draws an instance at all.
@@ -300,7 +352,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     // If even the coarsest parent below is good enough, everything below is finer
     // than required and this subtree cannot contribute to the cut.
     let lod_center = transform_point(instance, node.lod_center);
-    let lod_radius = node.lod_radius * instance.max_scale;
+    let lod_radius = node.lod_radius * instance.max_scale + instance.lod_margin;
     let scaled_error = node.max_parent_error * instance.max_scale;
     let parent_pixels = projected_error(lod_center, lod_radius, scaled_error);
     if parent_pixels <= view.lod_threshold {
@@ -308,7 +360,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let center = transform_point(instance, node.center);
-    let radius = node.radius * instance.max_scale;
+    let radius = node.radius * instance.max_scale + instance.lod_margin;
     if !in_frustum(center, radius) {
         return;
     }
@@ -343,7 +395,7 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
         let cluster_index = node.first + i;
         let cluster = clusters[cluster_index];
         let own_center = transform_point(instance, cluster.lod_center);
-        let own_radius = cluster.lod_radius * instance.max_scale;
+        let own_radius = cluster.lod_radius * instance.max_scale + instance.lod_margin;
         let own_error = cluster.lod_error * instance.max_scale;
         if projected_error(own_center, own_radius, own_error) <= view.lod_threshold
             || (cluster.counts & CLUSTER_CHILDREN_MISSING) != 0u {

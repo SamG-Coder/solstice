@@ -6,11 +6,12 @@
 
 use crate::gpu::Gpu;
 use crate::motion::{FrameChanges, InstanceTable};
+use crate::skin::{pose_addresses, GpuSkins, NO_BONES};
 use crate::streaming::textures::TierPlan;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use solstice_asset::paged::{PagedScene, BASE_TEXTURE_EDGE, PAGE_BYTES};
-use solstice_asset::{Material, TextureEncoding, TextureLayer};
+use solstice_asset::{Material, TextureEncoding, TextureLayer, NO_POSE};
 
 /// Twin of `Instance` in `common/scene.wgsl`.
 #[repr(C)]
@@ -30,7 +31,12 @@ pub struct GpuInstance {
     texture_info: u32,
     /// How brightly the material's own light shines here: 1 as it is, 0 dark.
     glow: f32,
-    _pad: [f32; 3],
+    /// Where this instance's bones start in the bone texture, or [`NO_BONES`].
+    bones: u32,
+    /// What to add to a cluster's number to find its bone list.
+    bone_lists: i32,
+    /// The farthest its pose carries anything, in world units.
+    lod_margin: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<GpuInstance>() == 208);
@@ -78,6 +84,15 @@ impl GpuInstance {
 
     pub(crate) fn glow(&self) -> f32 {
         self.glow
+    }
+
+    /// Sets how far its pose carries anything, in the mesh's own units.
+    pub(crate) fn set_lod_margin(&mut self, margin: f32) {
+        self.lod_margin = margin * self.max_scale;
+    }
+
+    pub(crate) fn lod_margin(&self) -> f32 {
+        self.lod_margin
     }
 
     pub(crate) fn set_glow(&mut self, glow: f32) {
@@ -137,6 +152,8 @@ pub struct GpuScene {
     pub has_masked: bool,
     /// The CPU's copy of `instances`, and what has changed in it.
     pub instance_table: InstanceTable,
+    /// Bones for the scene's poses, and each skinned cluster's bone list.
+    pub skins: GpuSkins,
     pub light_count: u32,
     /// Longest root-to-leaf path over all meshes, which sets the traversal dispatch count.
     pub max_hierarchy_depth: u32,
@@ -157,6 +174,7 @@ impl GpuScene {
         plan: Option<TierPlan>,
     ) -> Self {
         let (instances, gpu_index) = gpu_instances(scene);
+        let skins = GpuSkins::new(gpu, scene, &gpu_index);
         let materials = starting_materials(scene);
         let (textures, texture_summary) = upload_textures(gpu, scene, upper_textures, plan);
 
@@ -190,6 +208,7 @@ impl GpuScene {
             gpu_instance_count: instances.len() as u32,
             has_masked: instances.iter().any(|i| i.has_flag(INSTANCE_MASKED)),
             instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
+            skins,
             light_count: scene.lights.len() as u32,
             max_hierarchy_depth: scene.hierarchy_depth,
             source_triangles: scene.source_triangles,
@@ -200,6 +219,7 @@ impl GpuScene {
     /// Applies this frame's changes to instances and uploads them. Returns what changed, so that
     /// the cached views holding it can be drawn again.
     pub fn update_instances(&mut self, gpu: &Gpu) -> FrameChanges {
+        self.skins.update(gpu, &mut self.instance_table);
         let changes = self.instance_table.advance();
         for range in &changes.ranges {
             let offset = (range.start * std::mem::size_of::<GpuInstance>()) as u64;
@@ -243,7 +263,8 @@ fn texture_info(material: Option<&Material>) -> u32 {
 fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
     let mut out = Vec::with_capacity(scene.instances.len());
     let mut index = Vec::with_capacity(scene.instances.len());
-    for instance in &scene.instances {
+    let (addresses, _) = pose_addresses(scene);
+    for (number, instance) in scene.instances.iter().enumerate() {
         let mesh = &scene.meshes[instance.mesh as usize];
         let Some(root_node) = mesh.root_node else {
             index.push(None);
@@ -279,8 +300,18 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
             max_scale: max_scale(linear),
             texture_info: texture_info(scene.materials.get(instance.material as usize)),
             glow: 1.0,
-            _pad: [0.0; 3],
+            bones: NO_BONES,
+            bone_lists: 0,
+            lod_margin: 0.0,
         });
+        // Bends if it follows a pose and its mesh was built to. It is then always drawn afresh.
+        let pose = scene.instance_poses.get(number).copied().unwrap_or(NO_POSE);
+        if let (Some(lists), true) = (mesh.bone_lists, pose != NO_POSE) {
+            let gpu = out.last_mut().expect("just pushed");
+            gpu.bones = addresses[pose as usize];
+            gpu.bone_lists = lists;
+            gpu.set_flag(INSTANCE_MOVABLE, true);
+        }
     }
     (out, index)
 }
@@ -681,9 +712,9 @@ mod tests {
                 max_scale,
                 texture_info,
                 glow,
-                _pad,
-                _pad + 4,
-                _pad + 8,
+                bones,
+                bone_lists,
+                lod_margin,
             ]
         );
     }

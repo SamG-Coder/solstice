@@ -177,6 +177,12 @@ impl InstanceTable {
         true
     }
 
+    /// Sets how far an instance's pose carries anything, by its place on the GPU.
+    pub(crate) fn set_lod_margin(&mut self, gpu_index: u32, margin: f32) {
+        self.data[gpu_index as usize].set_lod_margin(margin);
+        self.changed.push(gpu_index);
+    }
+
     /// Whether the GI voxels hold an instance: if it is static, or movable but stays in them.
     fn in_gi(&self, i: usize) -> bool {
         !self.data[i].has_flag(INSTANCE_MOVABLE) || self.data[i].has_flag(INSTANCE_STAYS_IN_GI)
@@ -199,7 +205,7 @@ impl InstanceTable {
         let world = self.data[i].worlds().0;
         (
             world.transform_point3(center),
-            radius * self.data[i].max_scale(),
+            radius * self.data[i].max_scale() + self.data[i].lod_margin(),
         )
     }
 
