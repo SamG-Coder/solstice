@@ -151,15 +151,21 @@ impl WaterTargets {
             calm: Target::new(gpu, "water calm", size, CALM_FORMAT, render),
             // Particles are drawn over it.
             color: Target::new(gpu, "scene with water", size, COLOR_FORMAT, render),
-            // Solid particles draw their depth and motion into these two.
+            // Solid particles draw their depth and motion into these two, and tests read them.
             scene_depth: Target::new(
                 gpu,
                 "scene depth with water",
                 size,
                 SCENE_DEPTH_FORMAT,
-                render,
+                render | wgpu::TextureUsages::COPY_SRC,
             ),
-            motion: Target::new(gpu, "scene motion with water", size, MOTION_FORMAT, render),
+            motion: Target::new(
+                gpu,
+                "scene motion with water",
+                size,
+                MOTION_FORMAT,
+                render | wgpu::TextureUsages::COPY_SRC,
+            ),
             size,
             generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }

@@ -393,9 +393,13 @@ before premultiplying. A distant chimney's smoke fades into the haze exactly as 
 reprojects by the opaque scene's motion and keeps the particle's colour as stale history.
 - **Sprites are drawn with the jittered projection,** so TAA anti-aliases their edges.
 - **A reactive mask.** Each translucent particle writes how much of a pixel it covers into an
-  R8 target at render size, with a max blend. TAA takes the most in each pixel's 3×3
-  neighbourhood, and where it is high, weights the current frame up to 90% rather than 4–30%.
-  This is what Unreal's responsive AA and FSR's reactive mask do.
+  R8 target at render size, with a max blend. Where the mask is high, TAA weights the current
+  frame up to 60% rather than 4–30%. This is what Unreal's responsive AA and FSR's reactive mask
+  do.
+  - **At the pixel alone, and not all the way.** Read over a pixel's neighbourhood, the mask
+    spread a hard-edged band of little history around every particle. At 90%, TAA all but
+    stopped under a large plume of smoke, and what showed through lost its anti-aliasing. 60%
+    keeps a small, faint particle moving fast at about three quarters of its contrast.
   - **Faint particles are marked by presence, not just opacity:** four times their opacity, up
     to 1. They are what TAA loses most easily. A small, faint particle's neighbourhood looks much
     like the wall behind it, so the colour clip keeps the wall's history and the particle fades
@@ -422,8 +426,9 @@ reprojects by the opaque scene's motion and keeps the particle's colour as stale
   - A key is the particle's depth along the view, on a log scale in 20 bits, farthest
     smallest, above the particle's place in its slice in 12 bits.
   - 4,096 keys of four bytes fill the 16 KiB of workgroup memory WebGPU promises, so a sorted
-    emitter's budget is at most 4,096, which the parser enforces. Larger sorted emitters would
-    need a sort across several dispatches.
+    emitter's budget is at most 4,096, which the parser enforces. An effect changed in code
+    past that is drawn unsorted, with a warning, and the shader also refuses to sort more than
+    it can hold. Larger sorted emitters would need a sort across several dispatches.
 - **Between emitters:** drawn far to near by where their shapes are centred.
 
 **Shadows from particles** (step 8). The sun's shadow maps are cached and rarely redrawn, so
@@ -612,11 +617,19 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
    - The reactive mask and its use in TAA.
    - Solid particles' depth and motion.
    - The bitonic sort, and ordering between emitters.
-   - Tests, each mutation-checked: 12 bugs were put back in turn, and each made a test fail.
+   - Tests, each mutation-checked: 18 bugs were put back in turn, and each made a test fail.
+     The CPU's and the shader's refusals to sort too many guard the same case, so they were
+     removed together.
+     - An emitter changed in code to a budget too large to sort keeps its particles whole.
+     - Sorting follows a turned camera.
+     - The reactive mask is clear once particles stop.
+     - A solid particle hides a translucent one behind it.
+     - The solid particle's depth and motion are checked with a sea too, where they go into the
+       water's targets.
      - A solid particle moving across the view writes its own depth, and the motion that takes
        it to last frame's place, to within 10%; the wall beside it does not move.
-     - A small, faint particle moving fast keeps its contrast under TAA. Without the mask it
-       fell to a quarter of its contrast, and with the mask marking by opacity alone, to half.
+     - A small, faint particle moving fast keeps about three quarters of its contrast under
+       TAA. Without the mask it fell to a quarter.
      - Sorted lists of 3, 100, 1,000 and 4,096 particles run far to near and hold each particle
        once; an unsorted emitter is left alone.
      - Nearer emitters draw over farther ones, in either order of starting.

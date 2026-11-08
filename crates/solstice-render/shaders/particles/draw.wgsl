@@ -7,7 +7,10 @@
 //
 // Its light was worked out once for the whole particle by particles/light.wgsl: here it is
 // scattered towards the eye by the emitter's phase function, its glow added, and the haze
-// between it and the eye laid over it, as over everything else. Motion comes in a later step.
+// between it and the eye laid over it, as over everything else.
+//
+// Translucent particles mark how much of each pixel they cover in the reactive mask, for the
+// temporal filter; solid ones are drawn first, by `fs_solid`, into the scene's depth and motion.
 
 #include "common/frame.wgsl"
 #include "particles/common.wgsl"

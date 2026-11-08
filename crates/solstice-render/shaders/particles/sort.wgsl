@@ -35,11 +35,15 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
     if lane == 0u {
         var found = 0u;
         if (emitter.flags & FLAG_LIVE) != 0u && (emitter.flags & FLAG_SORT) != 0u {
-            found = min(atomicLoad(&state[e].alive[written]), MOST_SORTED);
+            found = atomicLoad(&state[e].alive[written]);
         }
-        keys[0] = found;
+        // More than fits is left unsorted, rather than sorted wrongly: the keys hold a place
+        // in the slice in 12 bits. The CPU never asks to sort so many.
+        keys[0] = select(found, 0u, found > MOST_SORTED || emitter.budget > MOST_SORTED);
     }
     let count = workgroupUniformLoad(&keys[0]);
+    // Every lane has read the count before the first lane's keys overwrite it.
+    workgroupBarrier();
     if count < 2u {
         return;
     }

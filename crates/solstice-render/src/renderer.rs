@@ -592,6 +592,13 @@ impl Renderer {
     /// The scene's depth and motion as the temporal filter reads them, for tests that check
     /// what was drawn into them.
     #[cfg(test)]
+    pub(crate) fn reactive_mask(&self) -> Option<&wgpu::Texture> {
+        Some(self.sized.as_ref()?.particles.reactive_texture())
+    }
+
+    /// The scene's depth and motion as the temporal filter reads them, for tests that check
+    /// what was drawn into them.
+    #[cfg(test)]
     pub(crate) fn scene_depth_and_motion(&self) -> Option<(&wgpu::Texture, &wgpu::Texture)> {
         let sized = self.sized.as_ref()?;
         Some(match &sized.water {

@@ -150,6 +150,11 @@ impl ParticleTargets {
     pub fn reactive(&self) -> &wgpu::TextureView {
         &self.reactive.view
     }
+
+    #[cfg(test)]
+    pub(crate) fn reactive_texture(&self) -> &wgpu::Texture {
+        &self.reactive.texture
+    }
 }
 
 /// The buffers of a pool of one size, and their bind groups.
@@ -578,6 +583,18 @@ impl Particles {
     /// emitter slots are full. An effect started while the pool is nearly full gets smaller
     /// budgets than it asks for.
     pub fn spawn(&mut self, effect: &Effect, transform: Mat4) -> Option<EffectId> {
+        for emitter in effect
+            .emitters
+            .iter()
+            .filter(|e| e.sort && e.budget > effect::MAX_SORTED)
+        {
+            log::warn!(
+                "emitter {} sorts its particles but has a budget of {}, over the {} that can be sorted; it is drawn unsorted",
+                emitter.name,
+                emitter.budget,
+                effect::MAX_SORTED
+            );
+        }
         let budgets: Vec<u32> = effect.emitters.iter().map(|e| e.budget).collect();
         let Some(emitters) = self.place(&budgets) else {
             log::warn!("no room for another particle effect");
@@ -955,7 +972,10 @@ impl Particles {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: REACTIVE_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // Tests read it back.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = wgpu::BindingResource::TextureView(scene_depth);
@@ -1403,7 +1423,9 @@ fn emitter_record(
     if desc.solid {
         flags |= FLAG_SOLID;
     }
-    if desc.sort {
+    // Only a slice the sort can address is sorted; the parser holds budgets to that, but an
+    // effect built or changed in code may not have been through it.
+    if desc.sort && emitter.budget <= effect::MAX_SORTED {
         flags |= FLAG_SORT;
     }
     if hot_high.max(hot_low) > 0.0 && v(&desc.glow) > 0.0 {

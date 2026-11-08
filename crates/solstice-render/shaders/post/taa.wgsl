@@ -17,8 +17,9 @@
 // somewhere else: where they cover, history counts for less.
 @group(0) @binding(7) var reactive_tex: texture_2d<f32>;
 
-// The share of the current frame where particles cover a pixel fully.
-const REACTIVE_BLEND: f32 = 0.9;
+// The share of the current frame where particles cover a pixel fully. Not all of it: under a
+// large plume of smoke, what shows through still needs some history to stay anti-aliased.
+const REACTIVE_BLEND: f32 = 0.6;
 
 // Tonemap weights keep very bright samples from dominating the filter.
 fn compress(c: vec3f) -> vec3f {
@@ -96,7 +97,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var filter_total = 0.0;
     var closest_depth = 0.0;
     var closest_pixel = nearest;
-    var reactive = 0.0;
+    // At this pixel alone: taken over the neighbourhood, it would spread a hard-edged band of
+    // little history around every particle.
+    let reactive = textureLoad(reactive_tex, nearest, 0).r;
     let jitter_pixels = frame.jitter_ndc * 0.5 * frame.viewport * vec2f(1.0, -1.0);
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
@@ -113,7 +116,6 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             filtered += color * weight;
             filter_total += weight;
 
-            reactive = max(reactive, textureLoad(reactive_tex, p, 0).r);
             let depth = textureLoad(depth_tex, p, 0).r;
             if depth > closest_depth {
                 closest_depth = depth;

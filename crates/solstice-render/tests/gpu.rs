@@ -3223,3 +3223,36 @@ fn moving_translucent_particles_stay_bright_under_the_temporal_filter() {
         "with the filter {filtered}, without {still}"
     );
 }
+
+/// A solid particle hides a translucent one behind it, as any surface would.
+#[test]
+fn solid_particles_hide_what_is_behind_them() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let mut stage = light_stage(&gpu, &wall(0.0), DebugView::Albedo, size);
+    let solid = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 2\n color 1 0 0 1\n render sprite solid shading=unlit",
+    )
+    .unwrap();
+    let behind = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 3\n color 0 0 1 1\n render sprite soft=0 shading=unlit",
+    )
+    .unwrap();
+    // The translucent one is started first and is farther; either way the solid one is in front.
+    for (effect, z) in [(&behind, -8.0), (&solid, -5.0)] {
+        stage
+            .renderer
+            .particles()
+            .spawn(effect, Mat4::from_translation(Vec3::new(0.0, 0.0, z)))
+            .unwrap();
+    }
+    stage.frames(&gpu, &camera, &darkness(), 4);
+    let [r, _, b] = patch(&stage.pixels(&gpu), size, size / 2, size / 2, 0).map(srgb_to_linear);
+    assert!(r > 0.9 && b < 0.02, "red {r}, blue {b}");
+}
