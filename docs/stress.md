@@ -342,8 +342,8 @@ shadow-map distances, a cluster builder question.
 
 Fixed and in pull requests: shadow caster culling (#25, merged), cloud shadows beyond their map
 (#26, merged), the cull lists' overflow counter and capacity (#27 and #31), light tiles (#30,
-merged), movable casters culled once (#32), and the cascades through the software rasterizer
-(fix 6).
+merged), movable casters culled once (#32, merged), and the cascades through the software
+rasterizer (#35, merged).
 
 Found and not yet fixed, in order of how much they would give:
 
