@@ -647,5 +647,6 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
         gameplay: Vec::new(),
         collide: Vec::new(),
         ground: None,
+        ..Default::default()
     }
 }
