@@ -72,6 +72,85 @@ pub fn environment_group(
     )
 }
 
+/// Pixels along each side of a light tile, and words each tile holds in the tile buffer: its
+/// count of lights, then their indices. Twins of `lighting/light_tiles_common.wgsl`.
+pub const TILE_SIZE: u32 = 16;
+pub const TILE_WORDS: u32 = 128;
+
+/// The pass that finds which local lights reach each tile of the screen, so that lighting
+/// loops over those alone. With no lights in the scene it is skipped, and the tiles, zero
+/// from creation, say so.
+pub struct LightTiles {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+
+impl LightTiles {
+    pub fn new(gpu: &Gpu, environment: &wgpu::BindGroupLayout) -> Self {
+        let layout = LayoutBuilder::new()
+            .texture_unfilterable()
+            .storage_read()
+            .storage_write()
+            .build(gpu, "light tiles");
+        let module = shaders::module(&gpu.device, "lighting/light_tiles.wgsl");
+        Self {
+            pipeline: gpu.compute_pipeline("light tiles", &module, "main", &[&layout, environment]),
+            layout,
+        }
+    }
+
+    /// How many tiles cover a viewport of `size`.
+    pub fn tiles(size: (u32, u32)) -> (u32, u32) {
+        (groups_for(size.0, TILE_SIZE), groups_for(size.1, TILE_SIZE))
+    }
+
+    /// The buffer holding the tiles of a viewport of `size`, empty until the pass has run.
+    pub fn buffer(gpu: &Gpu, size: (u32, u32)) -> wgpu::Buffer {
+        let (across, down) = Self::tiles(size);
+        gpu.storage_buffer(
+            "light tiles",
+            u64::from(across) * u64::from(down) * u64::from(TILE_WORDS) * 4,
+            wgpu::BufferUsages::empty(),
+        )
+    }
+
+    pub fn bind_group(
+        &self,
+        gpu: &Gpu,
+        depth: &wgpu::TextureView,
+        scene: &GpuScene,
+        tiles: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        gpu.bind_group(
+            "light tiles",
+            &self.layout,
+            &[
+                wgpu::BindingResource::TextureView(depth),
+                scene.lights.as_entire_binding(),
+                tiles.as_entire_binding(),
+            ],
+        )
+    }
+
+    pub fn record(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        group: &wgpu::BindGroup,
+        environment: &wgpu::BindGroup,
+        size: (u32, u32),
+    ) {
+        let (across, down) = Self::tiles(size);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("light tiles"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, group, &[]);
+        pass.set_bind_group(1, environment, &[]);
+        pass.dispatch_workgroups(across, down, 1);
+    }
+}
+
 /// The pass that combines all lighting into the HDR scene colour.
 pub struct DeferredLighting {
     layout: wgpu::BindGroupLayout,
@@ -94,6 +173,7 @@ impl DeferredLighting {
             .storage_read()
             .texture()
             .texture()
+            .storage_read()
             .build(gpu, "deferred");
         let module = shaders::module(&gpu.device, "lighting/deferred.wgsl");
         Self {
@@ -114,6 +194,7 @@ impl DeferredLighting {
         shadows: &ShadowMaps,
         scene: &GpuScene,
         clouds: &CloudBindings,
+        light_tiles: &wgpu::Buffer,
     ) -> [wgpu::BindGroup; 2] {
         let tex = |view| wgpu::BindingResource::TextureView(view);
         let group = |parity: usize| {
@@ -134,6 +215,7 @@ impl DeferredLighting {
                     scene.lights.as_entire_binding(),
                     tex(&clouds.screen[parity].view),
                     tex(&self.milky_way.view),
+                    light_tiles.as_entire_binding(),
                 ],
             )
         };
