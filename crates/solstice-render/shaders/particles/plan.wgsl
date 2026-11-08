@@ -29,11 +29,13 @@ fn plan(@builtin(local_invocation_index) e: u32) {
         // New particles take slots from the top of the free list, as many as it holds.
         let free = atomicLoad(&state[e].free_count);
         // Last frame's events, which this emitter spawns from first.
-        let events_in = min(atomicLoad(&state[e].event_count), EVENT_CAPACITY);
+        let events_sent = atomicLoad(&state[e].event_count);
+        let events_in = min(events_sent, EVENT_CAPACITY);
         state[e].events_in = events_in;
         let wanted = emitter.spawn_request + events_in * emitter.event_spawn;
         spawn = min(wanted, free);
-        state[e].dropped += wanted - spawn;
+        // What didn't fit, and what the events past the emitter's capacity would have spawned.
+        state[e].dropped += wanted - spawn + (events_sent - events_in) * emitter.event_spawn;
         state[e].spawn_first = free - spawn;
         atomicStore(&state[e].free_count, free - spawn);
         state[e].spawn_index = state[e].spawned;

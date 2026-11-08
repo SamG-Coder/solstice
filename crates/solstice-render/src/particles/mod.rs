@@ -819,11 +819,15 @@ impl Particles {
                     return false;
                 };
                 *stopped += seconds;
-                let longest = live
-                    .emitters
-                    .iter()
-                    .map(|e| e.longest_life)
-                    .fold(0.0, f32::max);
+                // Particles spawned on events may be born as late as their sender's last
+                // particle dies, so with events the lives add up along a chain of them.
+                let lives = live.emitters.iter().map(|e| e.longest_life);
+                let events = live.effect.emitters.iter().any(|e| e.on_event.is_some());
+                let longest = if events {
+                    lives.sum()
+                } else {
+                    lives.fold(0.0, f32::max)
+                };
                 *stopped > longest + RELEASE_MARGIN
             });
             if done {

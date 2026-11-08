@@ -469,8 +469,9 @@ picks the ones it needs, as `collide depth field water` then `bounce`, `stick` o
 `restitution=`, `friction=` and `event=`:
 - **`depth`.** This frame's opaque depth and normals, so a particle bounces off exactly what is
   drawn.
-  - It touches the surface once its centre is within its radius of it, and is taken to be
-    behind it, not in it, once more than 0.3 m or four radii behind.
+  - It touches the plane of the surface drawn at its pixel once its centre is within its radius
+    of it. A particle that began the frame behind that plane passed behind what is drawn, and is
+    left alone.
   - It is detailed, but blind off screen and behind things.
 - **`field`.** The GI volume's distance field: everywhere within the volume, on screen or not,
   at 0.2 m near the camera and coarser further off. This is Niagara's distance-field collision.
@@ -478,20 +479,28 @@ picks the ones it needs, as `collide depth field water` then `bounce`, `stick` o
     on. So a particle's path this frame is marched from where it started, in steps no longer
     than that distance, which can't pass through a surface. It touches where the distance first
     falls within its reach: its radius, or half a voxel.
-  - The normal is the field's gradient.
+  - The normal is the field's gradient. A particle in touch with a surface remembers that normal
+    in its flags, because under the ridge of a coarser level the gradient points the wrong way.
+  - One that began the frame already within reach keeps its movement along the surface and loses
+    any into it.
 - **`water`.** The water's height now, from the water-line map within 64 m and the calm level
-  beyond it.
+  beyond it. A particle more than 25 cm under it when the frame began stays under.
 - **Birth.** A particle collides only from 0.05 s after its birth, so it can leave what it was
   born on, such as a fountain's drops the ground.
 - **What a hit does.** Only a particle moving into the surface bounces, sticks, dies or sends an
-  event; one resting on it is held at its surface.
+  event.
   - **Bounce** keeps the restitution's share of speed into the surface, and loses the
     friction's share along it.
+  - **Resting.** A bouncing particle moving into the surface slower than two frames' fall is
+    resting rather than landing. It is held at the surface and sends no event, and slides on it,
+    losing the friction times the speed the surface took from it (Coulomb's law).
   - **Stick** marks the particle, which then only ages.
   - **Kill** ages it out at once: it is drawn as nothing and freed the next frame.
 - **Events.** A hit's `event=NAME` reaches each emitter of the effect that spawns on it
   (`spawn event=NAME count=N`).
-  - Each emitter takes up to 256 events a frame, into its own slice of an event buffer.
+  - An event has one listener; the parser refuses two.
+  - Each emitter takes up to 256 events a frame, into its own slice of an event buffer. What
+    those past it would have spawned counts as dropped.
   - The next frame it spawns N particles at each, before any by rate. They leave the surface
     with the emitter's velocity turned so that its up is the surface's normal.
   - The parser refuses an event that no emitter of the effect spawns on.
@@ -716,15 +725,20 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
        gusts; curl noise, buoyancy, attract and vortex.
      - Collision against depth, the distance field and the water, with bounce, stick and kill.
      - Events between emitters.
-     - Tests, each mutation-checked: 12 bugs were put back in turn, and each made a test fail.
+     - Tests, each mutation-checked: 25 bugs were put back in turn, and each made a test fail.
        - Under every force at once, the GPU's particles are where the CPU reference puts them,
-         to within 2 µm.
+         to within 0.1 mm (2 µm measured).
        - Curl noise has no divergence, and the noise's gradient matches finite differences.
        - Wind carries a particle with drag up to its speed.
        - Particles thrown at a floor in view never fall through it, by depth or by the field.
        - A dropped particle rebounds to its restitution squared of its fall.
        - Drops landing on the sea die there, and each sends three splash particles.
        - Sticking particles stay where they landed.
+       - A landing particle slides on, by depth or by the field, until friction stops it.
+       - A resting particle sends no more events.
+       - Events past the limit count as dropped.
+       - What is already behind a surface, or under the water, stays there.
+       - An effect with events lasts until its last child could have died.
 
      The built-in fountain's drops now die where they land, and its mist drifts on the
      weather's wind and swirls.

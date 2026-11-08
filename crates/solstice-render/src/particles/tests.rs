@@ -346,7 +346,7 @@ fn forced_trajectories_match_the_reference() {
         }
         let error = (Vec3::from(p.position) - Vec3::from(expected.position)).length();
         worst = worst.max(error);
-        assert!(error < 2.0e-3, "particle {} is {error} m off", p.index);
+        assert!(error < 1.0e-4, "particle {} is {error} m off", p.index);
     }
     // They really were pushed about: the wind is taking them east, at over a metre a second
     // already.
@@ -1551,6 +1551,190 @@ fn bounces_keep_the_energy_their_restitution_allows() {
         (rebound - 0.02 - fall * 0.25).abs() < 0.08,
         "rebounded to {rebound} m from {fall} m"
     );
+}
+
+/// A particle landing with sideways speed slides on, whether the floor is found by depth or by
+/// the field, and friction brings it to rest about where Coulomb's law says.
+#[test]
+fn sliding_particles_keep_moving_until_friction_stops_them() {
+    for against in ["depth", "field"] {
+        let mut travel = [0.0; 2];
+        for (result, friction) in travel.iter_mut().zip([0.0, 0.5]) {
+            let Some(mut ground) = Ground::new(0.0, None) else {
+                return;
+            };
+            let effect = Effect::parse(&format!(
+                "emitter e\n budget 20\n spawn burst=10\n lifetime 100\n shape box 0.2 0.02 0.2\n offset -1 0.3 0\n velocity 2 0 0\n size 0.04\n gravity\n collide {against} bounce restitution=0 friction={friction}"
+            ))
+            .unwrap();
+            ground
+                .renderer
+                .particles()
+                .spawn(&effect, Mat4::IDENTITY)
+                .unwrap();
+            for _ in 0..90 {
+                ground.frame();
+            }
+            let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+            assert_eq!(live.len(), 10);
+            *result = live.iter().map(|p| p.position[0] + 1.0).sum::<f32>() / 10.0;
+            if friction > 0.0 {
+                let fastest = live
+                    .iter()
+                    .map(|p| Vec3::from(p.velocity).length())
+                    .fold(0.0, f32::max);
+                assert!(fastest < 0.05, "{against}: still moving at {fastest} m/s");
+            }
+        }
+        // Two metres a second for a second and a half.
+        assert!(travel[0] > 2.5, "{against}: slid only {} m", travel[0]);
+        // 0.41 m of sliding, plus what it travelled before it landed, less what landing took.
+        assert!(
+            travel[1] > 0.05 && travel[1] < 0.8,
+            "{against}: with friction it went {} m",
+            travel[1]
+        );
+    }
+}
+
+/// A particle resting on the ground lands once: its landing sends an event, and lying there
+/// sends no more.
+#[test]
+fn resting_particles_send_no_more_events() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter e
+          budget 50
+          spawn burst=50
+          lifetime 100
+          shape box 2 0.1 2
+          offset 0 1 -1
+          size 0.04
+          gravity
+          collide depth bounce restitution=0 friction=1 event=hit
+        emitter child
+          budget 1000
+          spawn event=hit count=1
+          lifetime 100
+          size 0.01
+        ",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..70 {
+        ground.frame();
+    }
+    let settled = ground.emitters()[1].0.spawned;
+    assert!((50..=100).contains(&settled), "{settled} events to land");
+    for _ in 0..30 {
+        ground.frame();
+    }
+    assert_eq!(ground.emitters()[1].0.spawned, settled);
+}
+
+/// Hits past what an emitter takes in a frame are counted as dropped, not lost unseen.
+#[test]
+fn events_past_the_limit_count_as_dropped() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter e
+          budget 400
+          spawn burst=400
+          lifetime 100
+          shape box 1 0 1
+          offset 0 1 -1
+          size 0.01
+          gravity
+          collide depth kill event=hit
+        emitter child
+          budget 1000
+          spawn event=hit count=1
+          lifetime 100
+          size 0.01
+        ",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..50 {
+        ground.frame();
+    }
+    let emitters = ground.emitters();
+    assert!(emitters[0].1.is_empty(), "every drop landed");
+    let child = emitters[1].0;
+    assert!(child.dropped > 0, "they all landed in the same few frames");
+    assert_eq!(child.spawned + child.dropped, 400);
+}
+
+/// What is already behind a surface when the frame begins stays there, rather than being moved
+/// onto it: a particle under the floor, or a bubble under the sea.
+#[test]
+fn particles_behind_a_surface_are_left_alone() {
+    let cases = [
+        (0.0, None, "depth bounce", -0.2),
+        (-12.0, Some(0.0), "water kill", -1.0),
+    ];
+    for (floor, sea, collide, start) in cases {
+        let Some(mut ground) = Ground::new(floor, sea) else {
+            return;
+        };
+        let effect = Effect::parse(&format!(
+            "emitter e\n budget 40\n spawn burst=20\n lifetime 100\n shape box 2 0 2\n offset 0 {start} -1\n velocity 0 -0.2 0\n size 0.02\n collide {collide}"
+        ))
+        .unwrap();
+        ground
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::IDENTITY)
+            .unwrap();
+        for _ in 0..30 {
+            ground.frame();
+        }
+        let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+        assert_eq!(live.len(), 20, "{collide}");
+        assert!(
+            live.iter().all(|p| p.position[1] < start),
+            "{collide}: a particle was moved up"
+        );
+    }
+}
+
+/// An effect whose emitters spawn on events lasts until the last of those could have died: they
+/// can be born as late as their sender's last particle dies.
+#[test]
+fn effects_with_events_outlast_their_senders_children() {
+    let Some(mut rig) = Rig::new(1000) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter e\n budget 100\n spawn rate=60\n lifetime 0.5\n collide depth kill event=hit\nemitter child\n budget 100\n spawn event=hit count=1\n lifetime 0.5",
+    )
+    .unwrap();
+    let id = rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    rig.frame(1.0 / 30.0);
+    rig.particles.stop(id);
+    // Past either life and the margin, but not their sum and the margin.
+    for _ in 0..36 {
+        rig.frame(1.0 / 30.0);
+    }
+    assert!(rig.particles.is_running(id));
+    for _ in 0..12 {
+        rig.frame(1.0 / 30.0);
+    }
+    assert!(!rig.particles.is_running(id));
 }
 
 /// Drops falling on the sea die where they meet it, each sending its splash: the splash

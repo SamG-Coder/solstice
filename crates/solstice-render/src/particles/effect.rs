@@ -369,6 +369,21 @@ impl Effect {
                 ));
             }
         }
+        // And by one emitter only: an event goes to a single emitter's slice.
+        for (n, emitter) in effect.emitters.iter().enumerate() {
+            let Some((event, _)) = &emitter.on_event else {
+                continue;
+            };
+            let again = effect.emitters[n + 1..]
+                .iter()
+                .find(|e| e.on_event.as_ref().is_some_and(|(name, _)| name == event));
+            if let Some(other) = again {
+                return Err(format!(
+                    "emitters {} and {} both spawn on event {event}; only one may",
+                    emitter.name, other.name
+                ));
+            }
+        }
         for emitter in &effect.emitters {
             if emitter.sort && emitter.budget > MAX_SORTED {
                 return Err(format!(
@@ -769,6 +784,7 @@ fn module(
         }
         "collide" => {
             words.only(keyword, &["restitution", "friction", "event"])?;
+            let mut responses = 0;
             let mut collide = Collide {
                 against: 0,
                 response: Response::Bounce,
@@ -781,9 +797,14 @@ fn module(
                     "depth" => collide.against |= COLLIDE_DEPTH,
                     "field" => collide.against |= COLLIDE_FIELD,
                     "water" => collide.against |= COLLIDE_WATER,
-                    "bounce" => collide.response = Response::Bounce,
-                    "stick" => collide.response = Response::Stick,
-                    "kill" => collide.response = Response::Kill,
+                    "bounce" | "stick" | "kill" => {
+                        responses += 1;
+                        collide.response = match *word {
+                            "bounce" => Response::Bounce,
+                            "stick" => Response::Stick,
+                            _ => Response::Kill,
+                        };
+                    }
                     _ => {
                         return Err(format!(
                             "collide takes depth, field or water, then bounce, stick or kill, not {word:?}"
@@ -793,6 +814,9 @@ fn module(
             }
             if collide.against == 0 {
                 return Err("collide needs something to hit: depth, field or water".into());
+            }
+            if responses > 1 {
+                return Err("collide takes one of bounce, stick or kill".into());
             }
             if let Some(v) = words.option("restitution") {
                 collide.restitution = single(v, params, "restitution")?;
@@ -804,6 +828,9 @@ fn module(
                 let [name] = v else {
                     return Err("event takes a name".into());
                 };
+                if !is_name(name) {
+                    return Err(format!("{name:?} isn't a name for an event"));
+                }
                 collide.event = Some((*name).to_owned());
             }
             emitter.collide = Some(collide);
@@ -998,6 +1025,18 @@ mod tests {
                 "line 2: \"heat\" is neither",
             ),
             ("emitter e\nparam p 1", "line 2: parameters come before"),
+            (
+                "emitter e\n collide depth bounce stick",
+                "line 2: collide takes one of",
+            ),
+            (
+                "emitter e\n collide depth event=2b",
+                "line 2: \"2b\" isn't a name",
+            ),
+            (
+                "emitter a\n collide depth event=x\nemitter b\n spawn event=x count=1\nemitter c\n spawn event=x count=1",
+                "emitters b and c both spawn on event x",
+            ),
             ("budget 3", "line 1: budget must come after"),
             (
                 "emitter e\n color life 0.5=1 1 1 1 0.2=1 1 1 1",
