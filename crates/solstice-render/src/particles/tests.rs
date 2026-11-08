@@ -1349,6 +1349,15 @@ struct Ground {
 
 impl Ground {
     fn new(floor: f32, sea_level: Option<f32>) -> Option<Self> {
+        Self::build(floor, sea_level, None)
+    }
+
+    /// The floor at height 0 with a wall across it at `x`, 6 m high.
+    fn with_wall(x: f32) -> Option<Self> {
+        Self::build(0.0, None, Some(x))
+    }
+
+    fn build(floor: f32, sea_level: Option<f32>, wall: Option<f32>) -> Option<Self> {
         use solstice_builder::{build_virtual_mesh, paginate, BuildOptions, Mesh, Vertex};
         let gpu = request_gpu()?;
         let errors: Arc<Mutex<Vec<String>>> = Default::default();
@@ -1366,6 +1375,16 @@ impl Ground {
             });
         }
         ground.indices = vec![0, 2, 1, 0, 3, 2];
+        if let Some(x) = wall {
+            for (y, z) in [(0.0, -40.0), (0.0, 40.0), (6.0, 40.0), (6.0, -40.0)] {
+                ground.vertices.push(Vertex {
+                    position: Vec3::new(x, y, z),
+                    normal: -Vec3::X,
+                    uv: glam::Vec2::new(y, z),
+                });
+            }
+            ground.indices.extend([4, 5, 6, 4, 6, 7]);
+        }
         let scene = solstice_asset::SceneAsset {
             meshes: vec![build_virtual_mesh(&ground, &BuildOptions::default())],
             materials: vec![solstice_asset::Material {
@@ -1598,28 +1617,110 @@ fn sliding_particles_keep_moving_until_friction_stops_them() {
 }
 
 /// A particle resting on the ground lands once: its landing sends an event, and lying there
-/// sends no more.
+/// sends no more. That holds seen from a shallow angle, and pressed there by a force other than
+/// gravity.
 #[test]
 fn resting_particles_send_no_more_events() {
+    // What brings it down, how large it is, how far below the origin the effect stands, and
+    // whether the camera looks along the ground from far away.
+    let cases = [
+        ("gravity", 0.04, 0.0, false),
+        ("gravity", 0.2, 0.0, true),
+        ("attract 15", 0.04, 50.0, false),
+    ];
+    for (force, size, below, grazing) in cases {
+        let Some(mut ground) = Ground::new(0.0, None) else {
+            return;
+        };
+        if grazing {
+            ground.camera = Camera {
+                position: Vec3::new(0.0, 1.5, 30.0),
+                ..Default::default()
+            };
+        }
+        let height = 1.0 + below;
+        let effect = Effect::parse(&format!(
+            "
+            emitter e
+              budget 50
+              spawn burst=50
+              lifetime 100
+              shape box 2 0.1 2
+              offset 0 {height} -1
+              size {size}
+              {force}
+              collide depth bounce restitution=0 friction=1 event=hit
+            emitter child
+              budget 1000
+              spawn event=hit count=1
+              lifetime 100
+              size 0.01
+            ",
+        ))
+        .unwrap();
+        ground
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::from_translation(Vec3::new(0.0, -below, 0.0)))
+            .unwrap();
+        for _ in 0..70 {
+            ground.frame();
+        }
+        let settled = ground.emitters()[1].0.spawned;
+        assert!(
+            (50..=100).contains(&settled),
+            "{force}: {settled} events to land"
+        );
+        for _ in 0..30 {
+            ground.frame();
+        }
+        assert_eq!(ground.emitters()[1].0.spawned, settled, "{force}, {size}");
+    }
+}
+
+/// What is born on a surface can leave it, though under the field's ridge the field points the
+/// wrong way, and what is spawned by an event knows which side of the surface is open.
+#[test]
+fn particles_born_on_a_surface_know_which_side_is_open() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter e\n budget 40\n spawn burst=20\n lifetime 100\n shape box 1 0 1\n offset 0 0.03 -1\n velocity 0 0.5 0\n size 0.02\n collide field kill",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..20 {
+        ground.frame();
+    }
+    let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+    assert_eq!(live.len(), 20, "leaving the floor isn't a hit");
+
     let Some(mut ground) = Ground::new(0.0, None) else {
         return;
     };
     let effect = Effect::parse(
         "
-        emitter e
-          budget 50
-          spawn burst=50
+        emitter drops
+          budget 20
+          spawn burst=20
           lifetime 100
-          shape box 2 0.1 2
+          shape box 2 0 2
           offset 0 1 -1
-          size 0.04
+          size 0.01
           gravity
-          collide depth bounce restitution=0 friction=1 event=hit
+          collide depth kill event=hit
         emitter child
-          budget 1000
+          budget 40
           spawn event=hit count=1
           lifetime 100
-          size 0.01
+          velocity 0 -0.5 0
+          size 0.02
+          collide field bounce restitution=0
         ",
     )
     .unwrap();
@@ -1628,15 +1729,46 @@ fn resting_particles_send_no_more_events() {
         .particles()
         .spawn(&effect, Mat4::IDENTITY)
         .unwrap();
-    for _ in 0..70 {
+    for _ in 0..90 {
         ground.frame();
     }
-    let settled = ground.emitters()[1].0.spawned;
-    assert!((50..=100).contains(&settled), "{settled} events to land");
-    for _ in 0..30 {
+    let emitters = ground.emitters();
+    assert_eq!(emitters[1].1.len(), 20);
+    let lowest = emitters[1]
+        .1
+        .iter()
+        .map(|p| p.position[1])
+        .fold(f32::MAX, f32::min);
+    assert!(lowest > -0.25, "a child went down to {lowest} m");
+}
+
+/// A particle sliding along the floor still finds a wall in its way.
+#[test]
+fn sliding_particles_stop_at_a_wall() {
+    let Some(mut ground) = Ground::with_wall(1.5) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter e\n budget 20\n spawn burst=10\n lifetime 100\n shape box 0.2 0.02 0.2\n offset -2 0.3 0\n velocity 12 0 0\n size 0.04\n gravity\n collide field bounce restitution=0 friction=0",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..60 {
         ground.frame();
     }
-    assert_eq!(ground.emitters()[1].0.spawned, settled);
+    let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+    assert_eq!(live.len(), 10);
+    let furthest = live.iter().map(|p| p.position[0]).fold(f32::MIN, f32::max);
+    // Sliding on at 12 m/s would have taken them to x = 9. Within a voxel of the wall's foot the
+    // field is blurred, and one may slip a little further.
+    assert!(furthest < 3.0, "a particle reached x = {furthest}");
+    assert!(furthest > 0.5, "they never got there: {furthest}");
+    let stopped = live.iter().filter(|p| p.position[0] < 1.9).count();
+    assert!(stopped >= 8, "only {stopped} of 10 stopped at the wall");
 }
 
 /// Hits past what an emitter takes in a frame are counted as dropped, not lost unseen.

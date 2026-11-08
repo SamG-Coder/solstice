@@ -481,22 +481,25 @@ picks the ones it needs, as `collide depth field water` then `bounce`, `stick` o
     falls within its reach: its radius, or half a voxel.
   - The normal is the field's gradient. A particle in touch with a surface remembers that normal
     in its flags, because under the ridge of a coarser level the gradient points the wrong way.
-  - One that began the frame already within reach keeps its movement along the surface and loses
-    any into it.
+  - One that began the frame within reach, and remembers touching, keeps its movement along the
+    surface and loses any into it. Its path, lifted three voxels off the surface, is still marched
+    for another surface ahead of it, so a wall stops it and anything lower than that doesn't.
+    At the foot of a thin wall the field is blurred by a voxel, and a fast particle can slip
+    through there.
+  - One within reach that remembers nothing was born there, and is left alone until it is out of
+    reach. Particles spawned by an event remember the surface they were born on.
 - **`water`.** The water's height now, from the water-line map within 64 m and the calm level
   beyond it. A particle more than 25 cm under it when the frame began stays under.
-- **Birth.** A particle collides only from 0.05 s after its birth, so it can leave what it was
-  born on, such as a fountain's drops the ground.
 - **What a hit does.** Only a particle moving into the surface bounces, sticks, dies or sends an
   event.
   - **Bounce** keeps the restitution's share of speed into the surface, and loses the
     friction's share along it.
-  - **Resting.** A bouncing particle moving into the surface slower than two frames' fall is
-    resting rather than landing. It is held at the surface and sends no event, and slides on it,
+  - **Resting.** A bouncing particle moving into the surface slower than two frames' worth of
+    what pushes it there is resting rather than landing. It is held at the surface and sends no event, and slides on it,
     losing the friction times the speed the surface took from it (Coulomb's law).
   - **Stick** marks the particle, which then only ages.
   - **Kill** ages it out at once: it is drawn as nothing and freed the next frame.
-- **Events.** A hit's `event=NAME` reaches each emitter of the effect that spawns on it
+- **Events.** A hit's `event=NAME` reaches the emitter of the effect that spawns on it
   (`spawn event=NAME count=N`).
   - An event has one listener; the parser refuses two.
   - Each emitter takes up to 256 events a frame, into its own slice of an event buffer. What
@@ -725,7 +728,7 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
        gusts; curl noise, buoyancy, attract and vortex.
      - Collision against depth, the distance field and the water, with bounce, stick and kill.
      - Events between emitters.
-     - Tests, each mutation-checked: 25 bugs were put back in turn, and each made a test fail.
+     - Tests, each mutation-checked: 31 bugs were put back in turn, and each made a test fail.
        - Under every force at once, the GPU's particles are where the CPU reference puts them,
          to within 0.1 mm (2 µm measured).
        - Curl noise has no divergence, and the noise's gradient matches finite differences.
@@ -735,7 +738,9 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
        - Drops landing on the sea die there, and each sends three splash particles.
        - Sticking particles stay where they landed.
        - A landing particle slides on, by depth or by the field, until friction stops it.
-       - A resting particle sends no more events.
+       - A resting particle sends no more events, at a shallow view or pressed by other forces.
+       - What is born on a surface can leave it, and an event's child knows the open side.
+       - A sliding particle still stops at a wall.
        - Events past the limit count as dropped.
        - What is already behind a surface, or under the water, stays there.
        - An effect with events lasts until its last child could have died.

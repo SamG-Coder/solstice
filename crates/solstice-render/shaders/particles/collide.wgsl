@@ -10,15 +10,14 @@
 //   beyond it.
 //
 // A particle counts as touching once its centre is within its radius of the surface, so it rests
-// on a surface rather than sinking into it, and collides only from 0.05 s after its birth, so
-// that it can leave what it was born on. It must also have begun the frame on the surface's open
+// on a surface rather than sinking into it. It must have begun the frame on the surface's open
 // side, so that one passing behind a thin thing drawn in front, or moving under the water, is
 // left alone.
 //
-// Only a particle moving into the surface faster than two frames' fall bounces or sends an
-// event. A bouncing one slower than that is resting: it is held at the surface and slides on it,
-// losing speed to friction as Coulomb's law has it, the friction times the speed the surface
-// took from it.
+// A bouncing particle moving into the surface slower than two frames' worth of what pushes it
+// there is resting: it is held at the surface, sends no event, and slides on it, losing speed to
+// friction as Coulomb's law has it, the friction times the speed the surface took from it.
+// Sticking and dying particles do so at any speed into the surface.
 
 #include "common/environment.wgsl"
 #include "common/wetness.wgsl"
@@ -36,26 +35,16 @@
 @group(3) @binding(0) var<uniform> waterline: WaterlineParams;
 @group(3) @binding(1) var waterline_map: texture_2d<f32>;
 
-// Seconds after birth before a particle collides.
-const COLLIDE_GRACE: f32 = 0.05;
 // How far under the water's surface a particle may have begun the frame and still land on it.
 const WATER_DEPTH_TOLERANCE: f32 = 0.25;
 
-// A particle in touch with a surface remembers so in its flags, with that surface's normal in the
-// top 24 bits: the field holds no sign, and under the ridge of a coarser level its gradient would
-// point down, the way a particle leaves.
-const PARTICLE_IN_CONTACT: u32 = 2u;
-const NORMAL_STEPS: f32 = 4095.0;
-
-fn pack_contact(n: vec3f) -> u32 {
-    let e = vec2u(round((oct_encode(n) * 0.5 + 0.5) * NORMAL_STEPS));
-    return PARTICLE_IN_CONTACT | (e.x << 8u) | (e.y << 20u);
-}
-
-fn unpack_contact(flags: u32) -> vec3f {
-    let e = vec2f(f32((flags >> 8u) & 0xfffu), f32(flags >> 20u)) / NORMAL_STEPS;
-    return oct_decode(e * 2.0 - 1.0);
-}
+// Normals this much apart, or more, are a different surface from the one a particle is sliding
+// on, rather than that surface rising. (Either sign: the gradient flips under a level's ridge.)
+const SAME_SURFACE: f32 = 0.5;
+// How nearly the field's gradient must agree with a surface remembered to update it.
+const SAME_DIRECTION: f32 = 0.9;
+// The shallowest view of a surface allowed for in how far along the view a particle may be from it.
+const GRAZING: f32 = 0.05;
 
 var<workgroup> group_emitter: u32;
 
@@ -64,10 +53,12 @@ struct Contact {
     hit: bool,
     point: vec3f,
     normal: vec3f,
+    // No hit, but near enough to a surface to keep remembering it.
+    within_reach: bool,
 }
 
 fn no_contact() -> Contact {
-    return Contact(false, vec3f(0.0), vec3f(0.0, 1.0, 0.0));
+    return Contact(false, vec3f(0.0), vec3f(0.0, 1.0, 0.0), false);
 }
 
 fn against_water(start: vec3f, x: vec3f, radius: f32) -> Contact {
@@ -81,11 +72,12 @@ fn against_water(start: vec3f, x: vec3f, radius: f32) -> Contact {
     if x.y - radius >= height || start.y < height - radius - WATER_DEPTH_TOLERANCE {
         return no_contact();
     }
-    return Contact(true, vec3f(x.x, height, x.z), vec3f(0.0, 1.0, 0.0));
+    return Contact(true, vec3f(x.x, height, x.z), vec3f(0.0, 1.0, 0.0), false);
 }
 
-// The surface the field puts `distance` from `x`, or nothing where it has no direction.
-fn field_contact(x: vec3f, level: u32, distance: f32) -> Contact {
+// The surface the field puts `distance` from `x`. Where the field has no direction, as exactly on
+// a ridge, it is the side remembered, or nothing.
+fn field_contact(x: vec3f, level: u32, distance: f32, remembered: vec3f) -> Contact {
     // The field's gradient points away from the nearest surface.
     let d = volume_params.levels[level].w;
     let gradient = vec3f(
@@ -94,53 +86,82 @@ fn field_contact(x: vec3f, level: u32, distance: f32) -> Contact {
         sample_volume(x + vec3f(0.0, 0.0, d), level).a - sample_volume(x - vec3f(0.0, 0.0, d), level).a,
     );
     if length(gradient) < 1.0e-6 {
-        return no_contact();
+        if dot(remembered, remembered) == 0.0 {
+            return no_contact();
+        }
+        return Contact(true, x - remembered * distance, remembered, false);
     }
     let normal = normalize(gradient);
-    return Contact(true, x - normal * distance, normal);
+    return Contact(true, x - normal * distance, normal, false);
 }
 
 // The field holds the distance to the nearest surface, which is no help in telling which side
 // of a thin surface a point is on. So the particle's path this frame is marched from where it
 // started, in steps no longer than that distance, which cannot pass through a surface, and it
-// touches where the distance first falls within its reach. One that began the frame already
-// within reach, resting or sliding on a surface, keeps its movement along the surface and loses
-// any into it, by the normal at its start, which is on the open side. It isn't moved nearer: to
-// a voxel's resolution, the field's distance may put the surface below the true one, and under
-// that the gradient would send it further down.
+// touches where the distance first falls within its reach.
+//
+// One that began the frame already within reach, and remembers touching, is resting or sliding
+// on that surface. It keeps its movement along the surface and loses any into it, by the normal
+// on the side remembered, and its path, lifted off that surface, is still marched for any other
+// surface ahead of it. It
+// isn't moved nearer: to a voxel's resolution, the field's distance may put the surface below
+// the true one, and under that the gradient would send it further down.
+//
+// One within reach that remembers nothing was born there, and which side it is on can't be told:
+// it may be under the ridge, where the gradient points down. So it is left alone until it is out
+// of reach. (Particles spawned by an event remember the surface they were born on.)
 fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Contact {
     let path = end - start;
     let length_of_path = length(path);
     let direction = select(vec3f(0.0, -1.0, 0.0), path / length_of_path, length_of_path > 1.0e-6);
+    // The normal of the surface the particle began the frame on, if it did.
+    var resting_on = vec3f(0.0);
+    // How far off that surface the rest of the path is marched, three voxels, so that what is
+    // found is something else, with a clean normal: nearer the surface the field is too blurred
+    // in a corner to tell the two apart. What stands lower than that isn't seen.
+    var lift = 0.0;
     var t = 0.0;
     for (var step = 0u; step < 12u; step++) {
-        let x = start + direction * t;
+        let x = start + resting_on * lift + direction * t;
         let level = volume_level_at(x, 0u);
         if level >= VOLUME_LEVELS {
-            return no_contact();
+            break;
         }
         let voxel = volume_params.levels[level].w;
         let distance = sample_volume(x, level).a;
         let reach = max(radius, voxel * 0.5);
         if distance < reach {
-            let contact = field_contact(x, level, distance);
-            if step == 0u && contact.hit {
-                // The side it was on while in contact, if it was.
-                let n = contact.normal * select(1.0, -1.0, dot(contact.normal, remembered) < 0.0);
-                let away = dot(path, n);
-                if away >= 0.0 {
+            let contact = field_contact(x, level, distance, remembered);
+            if step == 0u {
+                if !contact.hit || dot(remembered, remembered) == 0.0 {
                     return no_contact();
                 }
-                return Contact(true, end - n * away - n * radius, n);
+                // The gradient follows the surface as it curves, on the side remembered. A sudden
+                // change is the blur of a corner, not this surface: what's there is found below.
+                let facing = contact.normal * select(1.0, -1.0, dot(contact.normal, remembered) < 0.0);
+                resting_on = select(remembered, facing, dot(facing, remembered) > SAME_DIRECTION);
+                lift = voxel * 3.0;
+            } else if contact.hit && abs(dot(contact.normal, resting_on)) < SAME_SURFACE {
+                return Contact(true, contact.point - resting_on * lift, contact.normal, false);
             }
-            return contact;
         }
         if t >= length_of_path {
-            return no_contact();
+            break;
         }
         t = min(t + max(distance - reach * 0.5, voxel * 0.25), length_of_path);
     }
-    return no_contact();
+    let n = resting_on;
+    let away = dot(path, n);
+    if dot(n, n) == 0.0 {
+        return no_contact();
+    }
+    if away >= 0.0 {
+        // Leaving, but still within reach: it may come back, and will need to know its side.
+        var leaving = no_contact();
+        leaving.within_reach = true;
+        return leaving;
+    }
+    return Contact(true, end - n * away - n * radius, n, false);
 }
 
 fn against_depth(start: vec3f, x: vec3f, radius: f32) -> Contact {
@@ -162,12 +183,17 @@ fn against_depth(start: vec3f, x: vec3f, radius: f32) -> Contact {
     // which on a slanted surface is some way from the particle's own ray.
     let surface = frame.near / depth;
     let thickness = max(0.3, radius * 4.0);
-    if abs(clip.w - surface) > thickness {
+    if abs(clip.w - surface) > thickness / GRAZING {
+        return no_contact();
+    }
+    // A height above a surface seen at a shallow angle is much further than that along the view.
+    let normal = oct_decode(textureLoad(scene_normal, pixel, 0).xy);
+    let view = normalize(x - frame.camera_position);
+    if abs(clip.w - surface) > thickness / max(abs(dot(normal, view)), GRAZING) {
         return no_contact();
     }
     // Exactly, then, against the plane of the surface at the pixel's centre, where its depth is
     // exact (it was drawn with the jitter).
-    let normal = oct_decode(textureLoad(scene_normal, pixel, 0).xy);
     let drawn = reconstruct_world(frame, vec2f(pixel) + 0.5, depth);
     let above = dot(x - drawn, normal);
     if above >= radius || above < -thickness {
@@ -181,7 +207,7 @@ fn against_depth(start: vec3f, x: vec3f, radius: f32) -> Contact {
     }
     // The particle's foot on the plane, so that one resting there is held where it is.
     let point = x - normal * above;
-    return Contact(true, point, normal);
+    return Contact(true, point, normal, false);
 }
 
 @compute @workgroup_size(64)
@@ -215,13 +241,11 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
     }
     let slot = alive[written * sim.capacity + emitter.base + i];
     var p = particles[slot];
-    // A particle just born may be touching what it was born on, such as a fountain's drops the
-    // ground, where which side it is on is unclear: it has a moment to leave first.
-    if is_dead(p) || (p.flags & PARTICLE_STUCK) != 0u || p.age < COLLIDE_GRACE {
+    if is_dead(p) || (p.flags & PARTICLE_STUCK) != 0u {
         return;
     }
-    let radius = p.size * 0.5;
     let touching = (p.flags & PARTICLE_IN_CONTACT) != 0u;
+    let radius = p.size * 0.5;
     let remembered = select(vec3f(0.0), unpack_contact(p.flags), touching);
     var contact = no_contact();
     if (emitter.collide_against & COLLIDE_WATER) != 0u {
@@ -234,7 +258,7 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
         contact = against_field(p.previous, p.position, radius, remembered);
     }
     if !contact.hit {
-        if touching {
+        if touching && !contact.within_reach {
             p.flags &= PARTICLE_STUCK;
             particles[slot] = p;
         }
@@ -245,8 +269,14 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
     let into = dot(p.velocity, n);
     let resting = contact.point + n * radius;
     let rf = emitter.restitution_friction;
-    // Slower into the surface than two frames' fall: resting on it, not landing.
-    let rest_speed = 2.0 * length(emitter.acceleration_drag.xyz) * sim.seconds + 0.05;
+    // Slower into the surface than two frames of what pushes it there: resting, not landing.
+    var push = dot(emitter.acceleration_drag.xyz, n);
+    if (emitter.flags & FLAG_FORCES) != 0u && into < 0.0 {
+        let air = Air(sim.time, sim.wind, sim.camera_position.w);
+        let forces = particle_forces(p, emitter, air, sim.time);
+        push += dot(forces[1] + forces[0] * emitter.acceleration_drag.w, n);
+    }
+    let rest_speed = 2.0 * abs(push) * sim.seconds + 0.05;
     if into >= 0.0 || (emitter.response == RESPONSE_BOUNCE && into > -rest_speed) {
         // Kept out of the surface, and sliding on it with friction.
         if dot(p.position - contact.point, n) < radius {

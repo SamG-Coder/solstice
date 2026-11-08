@@ -163,6 +163,22 @@ fn local_velocity(e: Emitter, index: u32) -> vec3f {
 
 // A particle born from an event: at the hit, leaving the surface, with the emitter's velocity
 // turned so that its up is the surface's normal.
+// A particle in touch with a surface remembers so in its flags, with that surface's normal in the
+// top 24 bits: the distance field holds no sign, and under the ridge of a coarser level its
+// gradient points down, the way a particle leaves.
+const PARTICLE_IN_CONTACT: u32 = 2u;
+const NORMAL_STEPS: f32 = 4095.0;
+
+fn pack_contact(n: vec3f) -> u32 {
+    let e = vec2u(round((oct_encode(n) * 0.5 + 0.5) * NORMAL_STEPS));
+    return PARTICLE_IN_CONTACT | (e.x << 8u) | (e.y << 20u);
+}
+
+fn unpack_contact(flags: u32) -> vec3f {
+    let e = vec2f(f32((flags >> 8u) & 0xfffu), f32(flags >> 20u)) / NORMAL_STEPS;
+    return oct_decode(e * 2.0 - 1.0);
+}
+
 fn event_particle(e: Emitter, index: u32, event: Event) -> Particle {
     var p = spawn_particle(e, index);
     let up = normalize(event.normal);
@@ -170,6 +186,7 @@ fn event_particle(e: Emitter, index: u32, event: Event) -> Particle {
     p.position = event.position + up * 0.01;
     p.previous = p.position;
     p.velocity = orthonormal_basis(up) * vec3f(v.x, v.z, v.y);
+    p.flags = pack_contact(up);
     return p;
 }
 

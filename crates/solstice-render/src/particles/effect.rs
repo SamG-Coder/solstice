@@ -130,7 +130,7 @@ pub struct Collide {
     pub restitution: Value,
     /// The share of speed along the surface lost on a bounce, `0..1`.
     pub friction: Value,
-    /// An event each hit sends, which emitters spawning on it hear.
+    /// An event each hit sends, which the emitter spawning on it hears.
     pub event: Option<String>,
 }
 
