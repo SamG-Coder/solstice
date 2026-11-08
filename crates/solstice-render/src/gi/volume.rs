@@ -1,6 +1,7 @@
 //! The world-space scene representation that indirect rays trace.
 
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
+use crate::lighting::LightShadows;
 use crate::profiler::{section, Profiler};
 use crate::scene::GpuScene;
 use crate::shaders;
@@ -157,6 +158,7 @@ impl GiVolume {
         scene: &GpuScene,
         work: &CullWork,
         environment_layout: &wgpu::BindGroupLayout,
+        light_shadows: &wgpu::TextureView,
     ) -> Self {
         let voxels =
             gpu.storage_buffer("gi voxels", TOTAL_VOXELS * 12, wgpu::BufferUsages::COPY_DST);
@@ -214,6 +216,7 @@ impl GiVolume {
             .storage_read()
             .storage_write()
             .storage_read()
+            .texture_array_unfilterable()
             .build(gpu, "gi light");
         let write_layout = LayoutBuilder::new()
             .uniform()
@@ -292,6 +295,7 @@ impl GiVolume {
                             voxels.as_entire_binding(),
                             radiance.as_entire_binding(),
                             scene.lights.as_entire_binding(),
+                            wgpu::BindingResource::TextureView(light_shadows),
                         ],
                     ),
                     write_group: gpu.bind_group(
@@ -538,6 +542,7 @@ impl GiVolume {
         cull_scene: &wgpu::BindGroup,
         cull_work: &CullWork,
         environment: &wgpu::BindGroup,
+        light_shadows: &LightShadows,
         first_slot: u32,
         work: &VolumeWork,
         profiler: Option<&Profiler>,
@@ -575,6 +580,10 @@ impl GiVolume {
             mark(encoder, section::GI_FLOOD);
             mark(encoder, section::GI_WRITE);
         }
+        // The lights' shadow maps are traced through the volume as it now stands, for the
+        // voxel light pass and the lighting pass after it.
+        mark(encoder, section::LIGHT_SHADOWS);
+        light_shadows.record(encoder, environment);
         mark(encoder, section::GI_LIGHT);
 
         let groups = groups_for(RESOLUTION, 4);
