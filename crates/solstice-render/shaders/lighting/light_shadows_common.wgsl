@@ -28,7 +28,7 @@ fn light_shadow_texel(texel: vec2i) -> vec2i {
 // surface with `normal` that the volume resolves with voxels `voxel` across: 1 in full view, 0
 // behind something, in between across a texel of the map. Each of the four texels around the
 // point's direction is compared where its own ray meets the point's surface, taken as a
-// plane, so that a surface seen at a slant does not shadow itself where a neighbouring texel
+// plane, or at the point's own distance if that is nearer, so that a surface seen at a slant does not shadow itself where a neighbouring texel
 // reaches it nearer the light. The point's own surface stands in the volume, and the trace
 // stops most of a voxel short of any surface, so the light must fall two voxels short of the
 // plane before the point counts as shadowed. Lights beyond the map's layers are never shadowed.
@@ -40,7 +40,9 @@ fn light_shadow(index: u32, from_light: vec3f, distance: f32, voxel: f32, normal
     let p = (oct_encode(from_light / distance) * 0.5 + 0.5) * size - 0.5;
     let base = vec2i(floor(p));
     let f = p - vec2f(base);
-    // The plane's distance from the light along its normal, which faces the light.
+    // The plane's distance from the light along its normal, which faces the light. It is
+    // negative for a lamp nearer its surface than the lookup's lift off it. The volume cannot
+    // resolve so close a lamp's rays towards the surface, so they count as lit.
     let plane = -dot(from_light, normal);
     var lit = 0.0;
     for (var i = 0; i < 4; i++) {

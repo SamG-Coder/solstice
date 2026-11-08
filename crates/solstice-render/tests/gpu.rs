@@ -3488,6 +3488,11 @@ fn a_low_lamp_fades_smoothly_along_the_floor() {
             worst < 8.0,
             "a step of {worst} in the falloff from {height} m up: {run:?}"
         );
+        assert!(
+            run[0] > 40.0,
+            "the floor nearest the lamp {height} m up is {}: nothing to fade",
+            run[0]
+        );
     }
 }
 
@@ -3507,12 +3512,14 @@ fn a_lamp_in_a_coarser_level_lights_the_floor_near_the_camera() {
 /// A wall just beyond a point of the floor, as seen from a low lamp, does not shadow the point:
 /// the map's rays stop at the wall, and a ray skimming the floor would meet the floor's plane
 /// past it. The floor 0.5 m before the wall stays near the same floor with the wall gone. The
-/// wall is black, or the light on it would turn the exposure down across the whole image; the
-/// margin covers what its shape still does to the exposure.
+/// wall is black, so that it sends no light of its own to the floor, and the exposure is held
+/// so that the wall's filling part of the image does not change it.
 #[test]
 fn a_wall_beyond_the_floor_does_not_shadow_it() {
     let Some(gpu) = request_gpu() else { return };
-    let (mut scene, camera, night) = lamp_on_bare_floor([-8.0, 1.0, 0.0]);
+    let (mut scene, camera, mut night) = lamp_on_bare_floor([-8.0, 1.0, 0.0]);
+    // Well above what the image measures, so the exposure stays at its darkest limit.
+    night.daylight_illuminance = 1500.0;
     let settings = RendererSettings::default;
     let open = render_in(&gpu, &scene, &camera, settings(), 256, &night).pixels;
     // A metre and a half thick, for the volume's 0.2 m voxels; the camera sees over it to the
@@ -3538,7 +3545,7 @@ fn a_wall_beyond_the_floor_does_not_shadow_it() {
             floor_brightness(&open, &camera, 1.0, z),
         );
         assert!(
-            (near - far).abs() < 30.0,
+            (near - far).abs() < 5.0,
             "the floor 0.5 m before the wall, at z {z}, is {near} with it and {far} without"
         );
     }

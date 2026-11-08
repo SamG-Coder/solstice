@@ -169,13 +169,17 @@ struct VolumeHit {
     radiance: vec3f,
 }
 
+// How close to a surface counts as a hit for lighting, in voxels: generous, so that thin walls
+// stop light.
+const LIGHTING_HIT_VOXELS: f32 = 0.85;
+
 // Sphere traces the GI volume. `start` skips self-intersection near the ray's origin.
 fn trace_volume(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32) -> VolumeHit {
-    return trace_volume_with(origin, direction, start, max_t, max_steps, 0.85);
+    return trace_volume_with(origin, direction, start, max_t, max_steps, LIGHTING_HIT_VOXELS);
 }
 
-// `hit_voxels` is how close counts as a hit, in voxels. Lighting uses a generous value, so that
-// thin walls stop light. Reflections can use less, so that thin objects look thin.
+// `hit_voxels` is how close counts as a hit, in voxels. Reflections can use less than lighting,
+// so that thin objects look thin.
 fn trace_volume_with(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32, hit_voxels: f32) -> VolumeHit {
     return trace_volume_levels(origin, direction, start, max_t, max_steps, hit_voxels, false);
 }
@@ -183,9 +187,10 @@ fn trace_volume_with(origin: vec3f, direction: vec3f, start: f32, max_t: f32, ma
 // For rays that may head towards the camera, as a lamp's do when it stands further out than
 // the camera. Each step looks for the finest level from the top: a ray keeping the level it
 // started in would judge everything near the camera by that level's coarse voxels, and its
-// threshold would stop it well short of a floor it only skims.
+// threshold would stop it well short of a floor it only skims. A ray still in the coarser level
+// is judged by it, so a low lamp's light can stop a little short just inside a level's edge.
 fn trace_volume_inwards(origin: vec3f, direction: vec3f, start: f32, max_t: f32, max_steps: u32) -> VolumeHit {
-    return trace_volume_levels(origin, direction, start, max_t, max_steps, 0.85, true);
+    return trace_volume_levels(origin, direction, start, max_t, max_steps, LIGHTING_HIT_VOXELS, true);
 }
 
 // `any_level` looks for the finest level at every step; otherwise a ray only ever moves out to
@@ -205,7 +210,7 @@ fn trace_volume_levels(origin: vec3f, direction: vec3f, start: f32, max_t: f32, 
         let s = sample_volume(p, level);
         // A hit needs the ray to be closing in on a surface, measured within a single level:
         // distances from different levels are not comparable. Without this, a ray skimming away
-        // from flat ground falsely hits it on entering a coarser level, where the threshold
+        // from flat ground falsely hits it on changing to a coarser level, where the threshold
         // doubles, which draws the boundaries of the levels onto glossy surfaces as lines.
         let approaching = level == measured_level && s.a <= previous_distance;
         measured_level = level;
