@@ -12,6 +12,11 @@ use std::f32::consts::TAU;
 pub const FLAG_LIVE: u32 = 1;
 pub const FLAG_ADD: u32 = 2;
 pub const FLAG_SURFACE: u32 = 4;
+pub const FLAG_LIT: u32 = 8;
+pub const FLAG_GLOW: u32 = 16;
+
+/// The air's temperature, which glowing particles cool towards, in kelvin.
+pub const AIR_TEMPERATURE: f32 = 300.0;
 
 /// Values of [`EmitterRecord::shape_kind`].
 pub const SHAPE_POINT: u32 = 0;
@@ -54,6 +59,10 @@ pub struct EmitterRecord {
     pub soft: f32,
     /// The effect's scale, which particle sizes are multiplied by.
     pub scale: f32,
+    /// Temperature's range at birth in kelvin, then cooling per second and emissivity.
+    pub temperature_glow: [f32; 4],
+    /// Henyey-Greenstein asymmetry in x; the rest is spare.
+    pub phase: [f32; 4],
 }
 
 /// One particle. Twin of `Particle` in `particles/common.wgsl`.
@@ -72,7 +81,9 @@ pub struct Particle {
     /// come from this, not from the slot it happens to occupy.
     pub index: u32,
     pub rotation: f32,
-    pub _pad: [u32; 2],
+    /// Temperature at birth, in kelvin; 0 for particles that do not glow.
+    pub temperature: f32,
+    pub _pad: u32,
 }
 
 /// The GPU's running state for one emitter. Twin of `EmitterState` in `particles/common.wgsl`.
@@ -93,10 +104,12 @@ pub struct EmitterState {
     pub spawn_index: u32,
     /// This frame: how many particles the update ages.
     pub update_count: u32,
-    /// This frame: the first workgroup of this emitter in the spawn and update dispatches.
+    /// This frame: the first workgroup of this emitter in the spawn, update and light
+    /// dispatches.
     pub spawn_start: u32,
     pub update_start: u32,
-    pub _pad: [u32; 5],
+    pub light_start: u32,
+    pub _pad: [u32; 4],
 }
 
 /// PCG hash: twin of `pcg` in `common/math.wgsl`.
@@ -172,6 +185,7 @@ pub fn spawn(e: &EmitterRecord, index: u32) -> Particle {
     let velocity = transform.transform_vector3(direction * speed);
 
     let [life_low, life_high, size_low, size_high] = e.lifetime_size;
+    let [hot_low, hot_high, _, _] = e.temperature_glow;
     Particle {
         position: position.into(),
         age: 0.0,
@@ -181,8 +195,18 @@ pub fn spawn(e: &EmitterRecord, index: u32) -> Particle {
         size: (size_low + (size_high - size_low) * r(6)) * e.scale,
         index,
         rotation: TAU * r(8),
-        _pad: [0; 2],
+        temperature: hot_low + (hot_high - hot_low) * r(9),
+        _pad: 0,
     }
+}
+
+/// A particle's temperature now: from its temperature at birth, cooling exponentially towards
+/// the air's. Twin of `particle_temperature`.
+pub fn temperature(p: &Particle, e: &EmitterRecord) -> f32 {
+    if p.temperature <= 0.0 {
+        return 0.0;
+    }
+    AIR_TEMPERATURE + (p.temperature - AIR_TEMPERATURE) * (-e.temperature_glow[2] * p.age).exp()
 }
 
 /// Moves a particle on by `seconds` under its emitter's forces. Twin of `step_particle`.
@@ -322,9 +346,23 @@ mod tests {
     #[test]
     fn record_layouts_match_the_shaders() {
         // Sizes and alignment the WGSL structs have.
-        assert_eq!(std::mem::size_of::<EmitterRecord>(), 192);
+        assert_eq!(std::mem::size_of::<EmitterRecord>(), 224);
         assert_eq!(std::mem::size_of::<Particle>(), 64);
         assert_eq!(std::mem::size_of::<EmitterState>(), 64);
+    }
+
+    /// A glowing particle cools exponentially towards the air, and one with no temperature
+    /// stays at none.
+    #[test]
+    fn glowing_particles_cool_towards_the_air() {
+        let mut e = record();
+        e.temperature_glow = [1300.0, 1300.0, (2.0f32).ln(), 1.0];
+        let mut p = spawn(&e, 0);
+        assert_eq!(temperature(&p, &e), 1300.0);
+        p.age = 1.0;
+        assert!((temperature(&p, &e) - 800.0).abs() < 1.0e-3);
+        p.temperature = 0.0;
+        assert_eq!(temperature(&p, &e), 0.0);
     }
 
     #[test]

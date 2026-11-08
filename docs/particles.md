@@ -169,12 +169,12 @@ need them.
 |---|---|
 | Spawn | **`spawn rate=`** per second, **`burst=`** at the start and **`every=`** seconds after, `event=` from another emitter, `distance=` per metre moved (trails); **`follow camera`** or **`follow effect`**; **`budget`** |
 | Shape | **`point`**, **`sphere R [surface]`**, **`box X Y Z`**, **`offset`**, `disc`, `cone`, and two that join the scene: `sea crests` (where waves break) and `surf` (where the sea rises against a face) |
-| Initial attributes | **`lifetime`**, **`velocity X Y Z cone= spread=`**, `terminal` and inherited velocity, **`size`**, **`color`**, **`brightness`**, rotation (random for now), `flipbook` frame, `temperature` |
+| Initial attributes | **`lifetime`**, **`velocity X Y Z cone= spread=`**, `terminal` and inherited velocity, **`size`**, **`color`**, **`brightness`**, rotation (random for now), `flipbook` frame, **`temperature`** in kelvin |
 | Forces | **`gravity`**, **`drag`** (linear; quadratic and `terminal` later), `wind`, `curl` noise, `buoyancy` (hot gas rising and cooling), `attract` to a point, `vortex` |
-| Over life | **`color life`** (with opacity), **`size life`**, `spin`; `temperature` cooling for fire and sparks |
+| Over life | **`color life`** (with opacity), **`size life`**, `spin`; **`cooling`** towards the air, and **`glow`** (emissivity), for fire and sparks |
 | Collision | `collide` against `depth`, `field` (the GI volume's distance field), `cover` (the top-down cover map) and `water`; then `bounce`, `stick`, or `kill`, with an optional `event=` |
 | Kill | **by age**; by leaving the follow box; below the water |
-| Render | **`sprite`** facing the camera (velocity and up later), **`blend=alpha`** or **`add`**, **`soft=`** fade distance, **`opacity=`**; `streak`, `flipbook`, later `mesh`; shading `lit` or `emissive` (unlit until step 2); `shadow` to cast one |
+| Render | **`sprite`** facing the camera (velocity and up later), **`blend=alpha`** or **`add`**, **`soft=`** fade distance, **`opacity=`**, **`shading=lit`** (the default) or **`unlit`**, **`phase=`** asymmetry; `streak`, `flipbook`, later `mesh`; `shadow` to cast one |
 
 **How modules run.** Modules are not compiled into a shader per emitter, as Niagara does. Each
 emitter becomes a fixed record on the GPU (`EmitterRecord`, 192 bytes): its values, worked out
@@ -219,14 +219,17 @@ slice of it, its `budget`, and keeps its own free list and alive list there.
   - the position at the start of its last step, for motion vectors, and its size;
   - its spawn index, which seeds its random values, and its rotation, with 8 bytes spare for
     later steps' temperature and flipbook frame.
-- **Its light is 16 bytes more,** in a separate buffer written by the lighting pass (below).
+- **Its light is 32 bytes more,** in a separate buffer written by the lighting pass (below):
+  five colours in the shared-exponent RGB9E5 form, a word each, with the transmittance through
+  the haze, a count of ambient samples, and the spawn index of the particle the light belongs
+  to.
 - **The pool's size** is set by quality:
 
   | Quality | Particles | Memory |
   |---|---|---|
-  | High | 262,144 | 20 MB |
-  | Medium | 131,072 | 10 MB |
-  | Low | 65,536 | 5 MB |
+  | High | 262,144 | 25 MB |
+  | Medium | 131,072 | 13 MB |
+  | Low | 65,536 | 6 MB |
 
   An effect started while the pool is nearly full gets smaller budgets than it asks for, down
   to the largest free run of slots; with none, it does not start. Changing quality makes a new
@@ -309,23 +312,75 @@ can't depth-test against. A tiny full-screen pass copies it into a Depth32Float 
 hidden particle fragments are rejected before shading. That matters most for overdraw on
 integrated GPUs. Particles test against it but never write it.
 
-**Lit translucent particles.** Light is worked out once per particle, in compute, not per pixel.
-That is the main saving over shading each fragment, and on a small sprite it looks the same.
+**Lit translucent particles.** Light is worked out once per particle, in compute, not per pixel
+(`particles/light.wgsl`, after the simulation, in the `particles` profiler section). That is the
+main saving over shading each fragment, and on a small sprite it looks the same.
 - **Sun:** the sun's light through the atmosphere and the clouds' shadow, times its cascaded
-  shadow at the particle. Particles larger than 2 m sample four points across themselves, so a
-  smoke column is lit along its length.
-- **Sky:** the sky's light, clouds included, as a first-order spherical harmonic, made once a
-  frame by a tiny pass. It is darkened by how enclosed the particle is, from the GI volume's
-  distance field, so smoke in an archway is darker than smoke in the open.
-- **Bounce:** two short traces of the GI volume per particle per frame, in directions that
-  rotate from frame to frame, averaged in the particle over about eight frames. Spray by a sunlit
-  cliff picks up its colour. Beyond the volume, the sky alone.
-- **Local lights:** the scene's lights within range, as the lighting pass has them.
-- **Emissive:** fire glows by temperature, from Planck's law, in the same physical units as the
-  sun. Bloom and exposure then treat it as they treat any bright pixel, with no special case.
-- **What each pixel does:** the stored light is applied with the emitter's Henyey-Greenstein
-  phase towards the eye, so mist and spray glow when backlit by a low sun. Flipbooks with
-  normals shade by them. Then the particle's colour is premultiplied by its opacity.
+  shadow at the particle. Particles larger than a metre also take the shadow at four points
+  across themselves, so a smoke column is lit along its length.
+- **Ambient, the sky and light bounced off the scene together:** each time a particle is lit,
+  it traces one direction and its opposite through the GI volume. A hit gives the scene's light
+  there, and a miss the sky, or a share of the horizon below it. The particle keeps a running
+  average of up to 16 samples. Smoke in an archway is darker than smoke in the open, and spray
+  by a sunlit cliff takes its colour. A new particle starts from the open sky's average. Beyond
+  the volume, the sky alone.
+  - This replaced the plan's sky harmonics and separate enclosure term: one estimate gives both,
+    and needs no extra pass.
+- **Local lights:** each of the scene's lights in range.
+  - **Not by screen tile.** The lighting pass's tiles cut each tile's lights to the depth range
+    of the opaque surfaces in it. A particle in front of those surfaces, such as smoke before a
+    wall, would miss lights that do reach it, so particles loop over the scene's lights instead,
+    as the voxel pass does.
+  - **Only the two strongest are traced.** Tracing a light through the GI volume, to stop it
+    shining through walls, costs far more than the rest of the loop. So only the two strongest
+    lights at each particle are traced, and the rest, each fainter, count as open.
+  - **What that costs:** the `particles` section for 40,000 particles lit every frame, at High,
+    among lights of 8 m range scattered over 12 m (the ignored test
+    `particle_light_cost_with_many_lights`), in milliseconds:
+
+    | Lights | RTX 5080 | Integrated |
+    |---|---|---|
+    | 0 | 0.07 | 4.9 |
+    | 16 | 0.09 | 5.8 |
+    | 64 | 0.10 | 5.5 |
+    | 256 | 0.16 | 7.0 |
+
+    The trade-off: a third light behind a wall counts as open, and as a particle moves, two
+    lights can trade places. A light traced as blocked can then show as open, so light can leak
+    or flicker by walls in rooms with three or more lamps near each other.
+
+    Tracing every light in range cost 0.32 ms at 64 lights and 2.5 ms at 256 on the RTX 5080,
+    and 17 ms at 64 on the integrated GPU. The loop still visits every light, so it grows with
+    the scene's light count. A few hundred lights is comfortable; past about a thousand, lights
+    should be gathered per cell of a coarse grid in front of the camera, as Unreal's
+    translucency lighting volume does.
+- **Glow:** a black body's light at the particle's temperature, from Planck's law integrated
+  against the CIE colour matching functions (Wyman, Sloan and Shirley's fit), times the
+  emitter's `glow`. Its luminance in candela per square metre is scaled to the scene's units as
+  daylight is, taking full daylight on the ground as 100,000 lux. Bloom and exposure then treat
+  it as they treat any bright pixel, with no special case.
+- **Haze:** what the aerial perspective adds over black between the particle and the eye, and
+  what it lets through, per particle.
+- **What each sprite does:** its colour, as an albedo, scatters the stored light towards the
+  eye. The sun goes through the emitter's Henyey-Greenstein phase, scaled to average 1 over
+  every direction, so that a particle is taken as thick enough to scatter all it does not pass
+  on. A white particle that scatters evenly is as bright in the sun as a white surface facing it,
+  and mist and spray glow when backlit by a low sun. Then its glow is added, the haze laid over,
+  and the result premultiplied by its opacity. Unlit particles skip the scattering.
+- **Cost, by quality.** On High each particle is lit every frame. On Medium and Low it is lit
+  afresh once every 2 and 4 frames, a workgroup at a time, so that those not due sit idle. In
+  between it keeps the light it had. New particles head their emitter's list, so they share the
+  workgroups lit in their first frame. The ambient rays take 16, 12 and 8 steps.
+  - A particle's place in the list moves as others are born and die, so each records the frame
+    it was last lit. One that has waited a full turn is lit whatever its workgroup: none waits
+    longer than 2 or 4 frames.
+  - Ambient light is stored with random rounding, so slow changes average out rather than
+    stall on RGB9E5's precision.
+  - The scene's GI intensity scales it, as it scales surfaces' indirect light.
+  - A slice given to a new emitter has its light cleared, so no particle can take the light its
+    slot's last owner had.
+- **Additive particles** cover nothing, so the haze over what is behind them is already there:
+  they add only their own light, dimmed by the air between.
 
 **Soft particles.** Each fragment fades by its distance to the scene's depth over the emitter's
 `soft` distance, so smoke never shows a hard line where it crosses the ground or the water. It
@@ -496,16 +551,45 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
    bytes in place to 64-bit numbers. A mapped range is only promised 4-byte alignment, and with
    this step's extra buffers the AMD driver gave no more, so the viewer panicked. The bytes are
    now copied out instead.
-2. **Lighting and haze.**
-   - Per-particle light: sun, cascaded shadow and cloud shadow; the sky's harmonics with
-     enclosure; GI bounce; local lights.
-   - Phase functions, emissive by temperature, and aerial perspective.
-   - The `particle light` view.
-   - Tests:
-     - A particle in a shadow is darker than one in the sun, by the shadow's amount.
-     - At equal distance, a particle hazes exactly as an opaque surface does.
-     - A particle beside a red wall picks up red.
-     - Emissive particles reach bloom.
+2. **Lighting and haze.** *Built; in review.*
+   - Per-particle light: sun, cascaded shadow and cloud shadow; ambient from rays through the
+     GI volume, which gives the sky with enclosure and the bounce together; local lights.
+   - Phase functions, glow by temperature with `temperature`, `cooling` and `glow`, and aerial
+     perspective; `shading=lit` (the default) or `unlit`.
+   - The `particle-light` debug view, number 14.
+   - Tests, each mutation-checked: 19 bugs were put back in turn, and each made a test fail.
+     - RGB9E5 holds every channel to within a step of its largest, and a black body at 2,042 K,
+       the freezing point of platinum, has the luminance that once defined the candela,
+       60 cd/cm², to within 3%.
+     - A black additive particle in the haze leaves the wall behind it as it was.
+     - An effect started in a just-ended effect's slice shows none of its glow, even at Low.
+     - While an emitter keeps spawning, Medium and Low bring all of a cloud into a newly risen
+       sun within six frames, as High does.
+     - With GI turned off, a particle in shadow is dark.
+     - Local lights light particles in range, the ball stops a lamp from lighting a particle
+       behind it, and lights beyond the two traced still count.
+     - A particle in the ball's shadow is darker than one in the sun, in the light view and in
+       the final image.
+     - When the sun moves, a particle's light follows within a few frames at every quality.
+     - 600 m off, a particle hazes as the glowing wall beside it does.
+     - Beside a sunlit red ball, a particle's light is redder than beside a white one.
+     - A particle that scatters onward glows far brighter with the sun ahead than behind.
+     - A particle at 2,400 K glows orange and blooms; with no temperature, it doesn't.
+     - Temperatures at birth match the CPU reference, and cooling follows its exponential.
+
+   **Cost** at 1280×720 in the cove, with the same method as step 1. The figures are
+   simulate-and-light, then draw:
+
+   | Case | RTX 5080, High | Integrated, Low |
+   |---|---|---|
+   | The fountain, close | 0.06, 0.03 ms | 0.18, 0.20 ms |
+   | 100,000 lit drops (35,000 on Low) | 0.17, 0.06 ms | 2.0, 0.52 ms |
+
+   On the integrated GPU, lighting every particle every frame cost 4.4 ms for the 35,000 drops;
+   lit once in four frames, with overdue particles lit too, it is 2.0 ms. Of what remains, about 0.7 ms is simulation and
+   bookkeeping, and the rest is mostly the two GI traces and the 12-tap shadow. That is over the
+   budget for heavy rain on Low. Rain's drops are small and fast, so step 5 should give them a
+   cheaper light, such as the sky and the sun's shadow without GI traces.
 3. **Motion, TAA and sorting.**
    - The reactive mask and its use in TAA.
    - Solid particles' depth and motion.
