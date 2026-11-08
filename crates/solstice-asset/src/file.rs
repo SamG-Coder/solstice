@@ -18,7 +18,9 @@ use crate::gpu::{PackedCluster, PackedNode};
 use crate::paged::{
     upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
 };
-use crate::scene::{Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint};
+use crate::scene::{
+    GameFile, Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::fmt;
@@ -29,6 +31,9 @@ const VERSION: u32 = 4;
 const DEFLATE_LEVEL: u8 = 9;
 /// The optional section holding the scene's [`Sea`]: its level, then its ocean's text.
 const SEA_TAG: [u8; 4] = *b"SEA ";
+/// The optional section holding the scene's gameplay: how many [`GameFile`]s, then each one's
+/// name and text. Written only for scenes that have gameplay.
+const GAME_TAG: [u8; 4] = *b"GAME";
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +45,7 @@ pub enum DecodeError {
     BadTextures,
     BadPages,
     BadSea,
+    BadGameplay,
 }
 
 impl fmt::Display for DecodeError {
@@ -59,6 +65,7 @@ impl fmt::Display for DecodeError {
             Self::BadTextures => write!(f, "the texture data does not match its stated format"),
             Self::BadPages => write!(f, "the page tables are inconsistent"),
             Self::BadSea => write!(f, "the sea's description is not text"),
+            Self::BadGameplay => write!(f, "the scene's gameplay files are malformed"),
         }
     }
 }
@@ -217,7 +224,56 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
         contents.extend_from_slice(sea.ocean.as_bytes());
         w.section(SEA_TAG, &contents);
     }
+    if !scene.gameplay.is_empty() {
+        w.section(GAME_TAG, &encode_gameplay(&scene.gameplay));
+    }
     w.finish()
+}
+
+/// A gameplay section's contents: a count, then each file's name and text, each a length and
+/// its UTF-8 bytes.
+fn encode_gameplay(files: &[GameFile]) -> Vec<u8> {
+    let mut bytes = (files.len() as u32).to_le_bytes().to_vec();
+    for file in files {
+        for text in [&file.name, &file.text] {
+            bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+    }
+    bytes
+}
+
+fn decode_gameplay(mut bytes: &[u8]) -> Result<Vec<GameFile>, DecodeError> {
+    fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], DecodeError> {
+        let (head, rest) = bytes
+            .split_at_checked(len)
+            .ok_or(DecodeError::BadGameplay)?;
+        *bytes = rest;
+        Ok(head)
+    }
+    fn number(bytes: &mut &[u8]) -> Result<usize, DecodeError> {
+        let word = take(bytes, 4)?;
+        Ok(u32::from_le_bytes(word.try_into().expect("four bytes")) as usize)
+    }
+    fn text(bytes: &mut &[u8]) -> Result<String, DecodeError> {
+        let len = number(bytes)?;
+        String::from_utf8(take(bytes, len)?.to_vec()).map_err(|_| DecodeError::BadGameplay)
+    }
+    let count = number(&mut bytes)?;
+    // Each file takes at least eight bytes, so a count beyond that is a lie, not a large file.
+    if count > bytes.len() / 8 {
+        return Err(DecodeError::BadGameplay);
+    }
+    let mut files = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = text(&mut bytes)?;
+        let text = text(&mut bytes)?;
+        files.push(GameFile { name, text });
+    }
+    if !bytes.is_empty() {
+        return Err(DecodeError::BadGameplay);
+    }
+    Ok(files)
 }
 
 /// Parses an unpacked manifest. `data_offset` is where the file's data area begins.
@@ -294,6 +350,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let upper_mip_offsets: Vec<u64> = r.slice()?;
 
     let mut sea = None;
+    let mut gameplay = Vec::new();
     while !r.bytes.is_empty() {
         let tag: [u8; 4] = r.pod()?;
         let contents: Vec<u8> = r.slice()?;
@@ -305,6 +362,8 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
                 level: f32::from_le_bytes(*level),
                 ocean: String::from_utf8(text.to_vec()).map_err(|_| DecodeError::BadSea)?,
             });
+        } else if tag == GAME_TAG {
+            gameplay = decode_gameplay(&contents)?;
         }
     }
 
@@ -322,6 +381,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         lights,
         viewpoint: (has_viewpoint != 0).then_some(viewpoint),
         sea,
+        gameplay,
         hierarchy_depth,
         source_triangles,
         unique_triangles,
@@ -712,6 +772,65 @@ mod tests {
         assert_eq!(decode(&encode(&loaded)).unwrap().scene.sea, Some(sea));
         // And a scene without one has none.
         assert_eq!(decode(&encode(&sample_scene())).unwrap().scene.sea, None);
+    }
+
+    #[test]
+    fn gameplay_travels_with_its_scene() {
+        let mut loaded = sample_scene();
+        let files = vec![
+            GameFile {
+                name: "cove/gate.actor".to_string(),
+                text: "name gate\nscript gate.star\n".to_string(),
+            },
+            GameFile {
+                name: "cove/gate.star".to_string(),
+                text: "def on_begin(self):\n    pass  # «unicode» too\n".to_string(),
+            },
+            GameFile::default(),
+        ];
+        loaded.scene.gameplay = files.clone();
+        assert_eq!(decode(&encode(&loaded)).unwrap().scene.gameplay, files);
+    }
+
+    #[test]
+    fn a_scene_without_gameplay_is_written_exactly_as_before() {
+        // No section at all, so viewers from before gameplay read it as they always did.
+        let plain = sample_scene();
+        let manifest = encode_manifest(&plain.scene);
+        assert!(!manifest.windows(4).any(|w| w == GAME_TAG));
+        let mut with = sample_scene();
+        with.scene.gameplay = vec![GameFile {
+            name: "a".to_string(),
+            text: "b".to_string(),
+        }];
+        let longer = encode_manifest(&with.scene);
+        assert_eq!(&longer[..manifest.len()], &manifest[..]);
+        assert_eq!(decode_manifest(&manifest, 0).unwrap().gameplay, vec![]);
+    }
+
+    #[test]
+    fn broken_gameplay_is_an_error_not_a_guess() {
+        let good = encode_gameplay(&[GameFile {
+            name: "a.star".to_string(),
+            text: "x = 1\n".to_string(),
+        }]);
+        assert!(decode_gameplay(&good).is_ok());
+        for cut in 0..good.len() {
+            assert_eq!(
+                decode_gameplay(&good[..cut]),
+                Err(DecodeError::BadGameplay),
+                "cut at {cut}"
+            );
+        }
+        let mut extra = good.clone();
+        extra.push(0);
+        assert_eq!(decode_gameplay(&extra), Err(DecodeError::BadGameplay));
+        let mut huge = good.clone();
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_gameplay(&huge), Err(DecodeError::BadGameplay));
+        let mut not_text = good;
+        not_text[8] = 0xff;
+        assert_eq!(decode_gameplay(&not_text), Err(DecodeError::BadGameplay));
     }
 
     #[test]

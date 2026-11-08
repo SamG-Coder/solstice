@@ -173,15 +173,15 @@ An actor file follows the style of the `.ocean` and `.weather` files:
 ```text
 # scenes/cove/gate.actor
 name gate
-mesh large_iron_gate                 # a mesh already in the scene file
-collider box 1.7 2.4 0.1
+mesh ../../target/scan/large_iron_gate/large_iron_gate.gltf 1.15   # a model, and its scale
+collider box 1.7 2.4 0.1             # from step 5
 script gate.star
 property open_seconds float 2.5      # editable per placement in the scene
 property locked bool false
 ```
 
 A scene places it as it places models, at x, y, z and a yaw in degrees, with its own settings:
-`actor gate.actor 20.7 0 0 90 locked=true`.
+`actor cove/gate.actor 20.7 0 0 90 locked=true`.
 
 **Which ECS.** Both candidates were measured, by moving 10,000 entities by their velocity 100
 times, natively and on the web, set up as for the scripting benchmarks below (one run each):
@@ -769,6 +769,62 @@ def on_hour(self, hour):
 - **Input actions** are a text file mapping actions to keys, mouse, gamepad and touch, so the
   same game works on a phone.
 
+**As built (step 4, `crates/solstice-game`):**
+- **Actor files** are as above, with these differences from the plan:
+  - `mesh` names a glTF file, relative to the actor file, and a scale. The bake places it
+    wherever the scene places the actor, as one or more instances, and they move with it.
+  - `camera X Y Z` makes an actor the player's, with its eye there.
+  - `collider` comes with physics, in step 5.
+  - Properties are `bool`, `int`, `float`, `text` (one word) and `vec3`. A scene line sets a
+    vector as `x,y,z`.
+- **In the scene file.** The bake carries a scene's gameplay in an optional `GAME` section. It
+  holds named text files: each actor file and script, the input actions, and `scene.game`, the
+  scene's `actor` lines with the instances each actor's mesh became. The section knows nothing
+  of what is in it. A scene without actors has no section, so it is written byte for byte as
+  before. The bake checks every actor, setting and script, and stops at the first mistake, with
+  its line.
+- **Input** (`.input` files, or built-in actions). An action's value is the sum of its
+  controls, times their scales.
+  - Buttons and sticks add up to between -1 and 1.
+  - Movement (the mouse, and dragging on the screen) is in pixels a second. It builds up until
+    a step uses it, over the time since the step before. So `self.yaw += input("turn") * dt`
+    turns as far at 144 frames a second, where most frames run no step, as at 60. Looking up
+    and down follows it every frame.
+  - Sticks have a dead zone, and press their action pushed either way.
+  - A tap presses its action without holding it.
+- **Play mode** (`Play`) runs the frame, then says which instances moved and where the
+  player's eye is.
+  - Each actor is drawn between its last two steps, and only when it moved.
+  - Looking up and down (`look_up`) moves the camera alone, per frame. Turning is the
+    player's own yaw, which its script sets.
+- **Viewers.**
+  - Natively, `viewer SCENE --play` plays the scene, with keys and the mouse. It reloads
+    scripts from `--scripts DIR` (by default `scenes`) when they change, checking twice a
+    second. `--play --capture` runs a game headless, pressing whatever `--press ACTION@FRAME`
+    names.
+  - On the web, the plain build offers *Play* on scenes with a game, which reloads the page
+    with the gameplay build. That build reads keys, the mouse, standard-layout gamepads and
+    touch: a stick under the left thumb, looking under the right, and taps. It shows what
+    scripts log, and their errors, in a panel.
+  - Gamepads natively are left for later: they need a crate of their own (`gilrs`).
+  - With actors but no player, the keys both fly the camera and reach the game.
+  - Keys typed into the page's own controls don't reach the game.
+- **Left for later.** An actor's instances are movable from the start, so a gate that seldom
+  moves still has its own shadow pass and leaves the GI voxels. Making them movable only once
+  they move, or keeping them in GI, waits until a scene has enough actors for it to matter.
+- **Maths.** Starlark has no maths module, so the engine gives `sin`, `cos`, `atan2` and
+  `sqrt`.
+- **Until physics,** the player walks at a fixed height, through walls.
+- **Cost** (`tools/gameplay-bench/b_play`, 9800X3D, warm runs):
+  - **Play mode's own work.** Each frame it maps input, works out where each actor is drawn,
+    and moves the instances of those that moved. That is about 0.09 µs an actor that stands
+    still, on the web and natively.
+  - **Turning actors.** With a thousand actors, each with a ticking script that turns it, a
+    frame takes 0.75 µs an actor on the web, and 1.3 µs natively, scripts included.
+  - **Downloads.** The plain web viewer grows by 879 bytes gzipped (387,396 to 388,275), for
+    reading the gameplay section. The gameplay build is 2.15 MB gzipped, and is fetched only to
+    play.
+
 ## Steps
 
 Each step is its own PR, with mutation-tested tests, measured costs (natively and on the web),
@@ -799,17 +855,19 @@ your go-ahead, and nothing is published without asking.
      0.15 ms a step on the web; perhaps 0.3 ms on an integrated-GPU laptop, within the world's
      line of the budget. Every entity with a transform is worked out every step. If scenes grow
      past that, skipping what hasn't moved comes next.
-3. **Scripting.** *In review.* `solstice-script` with Starlark: actor scripts, properties and
+3. **Scripting.** *Done.* `solstice-script` with Starlark: actor scripts, properties and
    `self.vars`, events, timers, the engine API table and its generated bindings, hot reload,
    step and memory caps, and errors with file and line. The benchmarks are run again in place.
    - Tests: hot reload keeps state; a runaway script is stopped and reported, at the same point
      natively and on the web; a broken reload keeps the old script running.
-4. **Scenes, actors and play mode.** `.actor` files, `actor` lines in scene files and their
+4. **Scenes, actors and play mode.** *In review.* `.actor` files, `actor` lines in scene files and their
    tagged section, input actions, a player camera, and *Play* in both viewers, with the second
    web build.
    - Tests: actor files and scene lines read back what they wrote, and report mistakes clearly;
      an action reaches a script from each kind of input; a scene without gameplay loads into the
      plain viewer exactly as before.
+   - Demo: in the cove, walk up to the fort's gate and press E, and it rises
+     (`viewer assets/cove.solstice --play`, or *Play* on the web page).
 5. **Physics for walking.** `solstice-physics`: collision baked and fetched on *Play*, bodies,
    sensors, the character controller, a debug view of colliders, wasm SIMD, and determinism
    measured.

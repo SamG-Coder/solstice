@@ -8,7 +8,9 @@
 //! See `docs/streaming.md` for the rules that keep a partly loaded scene watertight.
 
 use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
-use crate::scene::{Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint};
+use crate::scene::{
+    GameFile, Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint,
+};
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
@@ -104,6 +106,8 @@ pub struct PagedScene {
     pub lights: Vec<Light>,
     pub viewpoint: Option<Viewpoint>,
     pub sea: Option<Sea>,
+    /// The scene's gameplay files, if it has any.
+    pub gameplay: Vec<GameFile>,
     /// Longest root-to-leaf path over all meshes, which sets the traversal dispatch count.
     pub hierarchy_depth: u32,
     /// Triangles drawn if every instance used its finest LOD.

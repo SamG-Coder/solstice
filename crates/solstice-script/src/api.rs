@@ -127,6 +127,10 @@ fn set_timer<'v>(
     Ok(handle)
 }
 
+fn angle(value: Value) -> anyhow::Result<f64> {
+    number(value).ok_or_else(|| anyhow::anyhow!("an angle must be a number, not {value}"))
+}
+
 #[starlark_module]
 pub(crate) fn engine(builder: &mut GlobalsBuilder) {
     /// A vector: `vec3(1, 0, 0)`.
@@ -137,6 +141,33 @@ pub(crate) fn engine(builder: &mut GlobalsBuilder) {
                 Ok(Vec3Value(glam::Vec3::new(x as f32, y as f32, z as f32)))
             }
             _ => anyhow::bail!("vec3 takes three numbers"),
+        }
+    }
+
+    /// The sine of an angle in radians. Starlark has no maths module, so the engine gives the
+    /// few functions games need.
+    fn sin<'v>(radians: Value<'v>) -> anyhow::Result<f64> {
+        Ok(angle(radians)?.sin())
+    }
+
+    /// The cosine of an angle in radians.
+    fn cos<'v>(radians: Value<'v>) -> anyhow::Result<f64> {
+        Ok(angle(radians)?.cos())
+    }
+
+    /// The angle, in radians, from the +x axis to the point (x, y): `atan2(y, x)`.
+    fn atan2<'v>(y: Value<'v>, x: Value<'v>) -> anyhow::Result<f64> {
+        match (number(y), number(x)) {
+            (Some(y), Some(x)) => Ok(y.atan2(x)),
+            _ => anyhow::bail!("atan2 takes two numbers"),
+        }
+    }
+
+    /// The square root of a number, which must not be negative.
+    fn sqrt<'v>(value: Value<'v>) -> anyhow::Result<f64> {
+        match number(value) {
+            Some(n) if n >= 0.0 => Ok(n.sqrt()),
+            _ => anyhow::bail!("sqrt takes a number that isn't negative, not {value}"),
         }
     }
 

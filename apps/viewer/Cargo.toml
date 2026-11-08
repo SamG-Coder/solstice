@@ -9,8 +9,21 @@ license.workspace = true
 name = "solstice_viewer"
 crate-type = ["cdylib", "rlib"]
 
+# The native viewer always has play mode; only the web's plain build goes without.
+[[bin]]
+name = "viewer"
+path = "src/main.rs"
+required-features = ["gameplay"]
+
+# Play mode: a scene's game, with scripts. On by default; the plain web viewer is built without
+# it, so a page that only looks at scenes downloads none of it (docs/gameplay.md, Viewers).
+[features]
+default = ["gameplay"]
+gameplay = ["dep:solstice-game"]
+
 [dependencies]
 solstice-asset.workspace = true
+solstice-game = { workspace = true, optional = true }
 solstice-render.workspace = true
 glam.workspace = true
 log.workspace = true

@@ -13,6 +13,6 @@ pub mod scene;
 pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedVertex};
 pub use paged::{LoadedScene, PagedScene};
 pub use scene::{
-    Instance, Light, Material, SceneAsset, Sea, TextureEncoding, TextureLayer, Viewpoint,
+    GameFile, Instance, Light, Material, SceneAsset, Sea, TextureEncoding, TextureLayer, Viewpoint,
     VirtualMesh,
 };

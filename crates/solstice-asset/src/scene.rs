@@ -174,6 +174,16 @@ pub struct Sea {
     pub ocean: String,
 }
 
+/// One text file of a scene's gameplay: an actor file, a script, the input actions, or the list
+/// of placed actors. Carried as it was written, by the name it was written under, so the scene
+/// file needs no knowledge of what is in it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GameFile {
+    /// Its path relative to the scene's text file, with `/` between folders.
+    pub name: String,
+    pub text: String,
+}
+
 /// A complete, self-contained scene.
 #[derive(Clone, Debug, Default)]
 pub struct SceneAsset {
@@ -187,6 +197,8 @@ pub struct SceneAsset {
     pub textures: Vec<TextureLayer>,
     pub viewpoint: Option<Viewpoint>,
     pub sea: Option<Sea>,
+    /// The scene's gameplay, if it has any. Empty for a scene that is only looked at.
+    pub gameplay: Vec<GameFile>,
 }
 
 impl SceneAsset {
