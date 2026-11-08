@@ -215,3 +215,69 @@ the far lamps change nothing; the near lamp comes last in the list so that a til
 wrong index would pick a far one. Four mutations fail it: no light listed, planes shrunk by the
 range, the depth range shrunk, and the lighting pass reading the list's position as the index.
 
+### Round 3: other sizes, other weather, other hours
+
+The round-2 scene with fixes 1 to 4, at other sizes and under other skies. Still camera unless
+said; the last frame's GPU times.
+
+| View | Total | Passes over 0.3 ms |
+|---|---|---|
+| Hill, 1920×1080, fair 10:00 | 5.9 | raster 1 3.21, cull 1 0.68, screen gi 0.46, clouds on screen 0.27 |
+| Hill, 2560×1440 | 10.3 | raster 1 4.80, screen gi 2.19, cull 1 0.94, clouds on screen 0.37, resolve 0.37, lighting 0.34 |
+| Courtyard, 2560×1440 | 13.2 | lighting 7.28, screen gi 1.77, raster 1 1.65, gi light 0.81, resolve 0.37, post 0.33 |
+| Hill, storm at 18:40 | 3.4 | raster 1 1.71, cull 1 0.47 |
+| Beach, storm at 18:40 | 5.7 | screen gi 2.90, raster 1 0.90, raster 2 0.42, cull 1 0.34 |
+| Courtyard, clear at 23:00 | 3.3 | lighting 0.85, gi light 0.80, raster 1 0.58, screen gi 0.33 |
+| Overview, clear at 23:00 | 3.6 | raster 1 1.81, cull 1 0.53, resolve 0.32 |
+| Hill, streamed (128 MB geometry, 64 MB textures) | 6.5 | raster 1 4.15, cull 1 0.49, post 0.37, gi light 0.36 |
+
+Flyovers: **1080p, fair: avg 10.4 ms, p95 21.9, worst 57.7**, 335 of 3,570 frames over 16.7 ms;
+shadows 1.18 / 8.05 / 19.4, raster 1 3.00 / 5.63 / 11.5, screen gi 0.63 / 1.93 / 7.8, up to 154 M
+triangles. **720p, storm at 18:40: avg 12.3 ms, p95 34.0, worst 66.1**, 723 frames over 16.7 ms;
+shadows 4.68 / 26.2 / 60.4, and the far cascade overflowed even the doubled list in one frame
+(450,685 clusters dropped).
+
+What this round found:
+
+- **A low sun blows the far cascades up.** At 18:40 the sun is near the horizon, so a cascade's
+  orthographic volume, 900 m deep towards the sun, lies along the ground, and the receiver
+  planes, open towards the sun, admit the whole wood behind the slice: every tree for 900 m
+  casts a long shadow into the view, as it truly does. The far cascade selected 1.24 million
+  clusters standing still and more than 2.1 million at some point in the flight. Correct, and
+  60 ms. The way out is not to cull casters that really shadow the view but to draw them more
+  cheaply: the software rasterizer for the pixel-sized foliage clusters that make up most of
+  the list (the main view sends 98% of its clusters there), and for the far cascade a coarser
+  LOD than its texel for leaves, which the camera cannot resolve anyway at that distance.
+- **The main view itself approaches the list.** 851,000 clusters at 1080p and 1,207,000 at
+  1440p, against the new cap of 2,097,152; 4K would pass it. Those are 94 to 132 million
+  triangles, forty to fifty per pixel, from foliage whose clusters stay fine under a one-pixel
+  error threshold. The software rasterizer carries it at 3.2 and 4.8 ms, but this is the ceiling.
+- **Local-light visibility scales with pixels times overlap.** The courtyard's torches cost
+  0.87 ms at 720p and 7.3 ms at 1440p: thirty lights in range of every pixel, each traced 16 steps
+  through the GI volume. The tiles (fix 4) removed the loop over the other 450 lights; what is
+  left is the traces. A cheaper visibility for local lights (a small shadow map or a cached
+  voxel occlusion per light, traced once per frame rather than once per pixel per light) is the
+  next step there.
+- **Screen GI at grazing light.** 2.9 ms on the beach at dusk in a storm, against 0.3 by day:
+  the probes' screen traces run long when the whole view is dim and in shadow. Not investigated.
+- **Streaming holds.** With 128 MB of geometry pages and 64 MB of textures, the hill view settled
+  in 2.5 s with 615 of 4,720 pages, nothing evicted and nothing short of room, and the shadow
+  cascade that frame drew 83,000 clusters from what had arrived.
+- Textures at 2048 (31 layers, BC7 and BC5) cost nothing measurable over 1024 in these passes.
+
+### Where things stand
+
+Fixed and in pull requests: shadow caster culling (#25, merged), cloud shadows beyond their map
+(#26, merged), the cull lists' overflow counter and capacity (#27, merged), light tiles (#30).
+
+Found and not yet fixed, in order of how much they would give:
+
+1. Shadow cascades redrawn through the hardware rasterizer for pixel-sized clusters, and at full
+   texel LOD for leaves the camera cannot resolve: 2 to 60 ms a redraw in dense woods, worst
+   with a low sun.
+2. Local-light visibility traced per pixel per light: 7 ms at 1440p where thirty torches overlap.
+3. Haze fixed at 0.0011 per metre: a clear day has the air of a hazy one, which long views show.
+4. The voxel light pass loops over every light per voxel; per-block lists would cut its loop
+   as the tiles did the lighting pass's, though not its traces.
+5. Forty to fifty triangles a pixel from foliage at a one-pixel error threshold, which is the
+   main view's own ceiling on small GPUs.
