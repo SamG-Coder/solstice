@@ -82,7 +82,7 @@ Not in the first version, with room left for each:
 - **Nanite skinning.** Unreal 5.5 and later draw skeletal meshes through Nanite. The cluster
   hierarchy is built in bind pose, and bounds are computed from the bones' transforms, so the
   hardware rasterizer can be used (Epic's *Nanite Foliage* documentation). Epic has published
-  little more, so the skinning design here is our own, and step 8 proves it out before anything
+  little more, so the skinning design here is our own, and step 6 proves it out before anything
   depends on it.
 - **Godot.** A tree of nodes, signals for events, and GDScript: a Python-like language written
   for the engine, with optional static types and hot reload. It is the clearest example of an
@@ -458,7 +458,7 @@ rasterizers, the visibility buffer and resolve. They do not get a separate path.
   - Vertices are skinned where they are used, as Unreal does: there is no pre-skinned copy, so
     no extra memory, and it works whatever the LOD cut and whatever has streamed in.
   - If the cost proves too high, the fallback is a compute pass that skins only the visible
-    clusters into a scratch buffer each frame. Step 8 measures both.
+    clusters into a scratch buffer each frame. Step 6 measures both.
   - Dual-quaternion skinning, for shoulders and wrists that would otherwise pinch, is an option
     to judge on real characters.
 - **Moving things in the rest of the renderer:**
@@ -558,25 +558,30 @@ your go-ahead, and nothing is published without asking.
 4. **Scenes, actors and play mode.** `.actor` files, `actor` lines in scene files and their
    tagged section, input actions, a player camera, and *Play* in both viewers, with the second
    web build.
-5. **Physics.** `solstice-physics`: collision baked into `COLL`, bodies, sensors, the character
-   controller, a debug view of colliders, wasm SIMD, and determinism measured.
-6. **The sea in physics.** The CPU wave query, checked against the GPU's waves, and buoyancy: the
-   ship floats, and a rowing boat can be pushed about.
-7. **Gameplay and the environment.** The `Environment` API and its events; lights switched by
-   gameplay; viewer controls as overrides.
-8. **Skinned virtual geometry.** Importing skins, weights through the DAG, per-cluster bone
+5. **Physics for walking.** `solstice-physics`: collision baked into `COLL`, bodies, sensors,
+   the character controller, a debug view of colliders, wasm SIMD, and determinism measured.
+   - Demo: a capsule walks the fort, climbs the stair to the rampart, and opens the gate.
+6. **Skinned virtual geometry.** Importing skins, weights through the DAG, per-cluster bone
    lists and bounds, and skinning in both rasterizers, resolve and shadows, with motion vectors.
    - First a character in its bind pose, compared with the static import; then one looping clip.
    - The cost is measured, against the scratch-buffer fallback.
-9. **Animation.** Clips and their compression, blends, blend spaces, state machines, root motion,
+7. **Animation.** Clips and their compression, blends, blend spaces, state machines, root motion,
    notifies, and animation LOD.
-10. **IK and secondary motion.** Two-bone IK, foot placement, look-at, FABRIK, and spring chains.
+   - Demo: the capsule becomes a character that idles, walks and runs.
+8. **IK and secondary motion.** Two-bone IK, foot placement, look-at, FABRIK, and spring chains.
+   - Demo: feet planted on the stair and the uneven courtyard. This is the first playable
+     milestone: a character in the fort.
+9. **Gameplay and the environment.** The `Environment` API and its events; lights switched by
+   gameplay; viewer controls as overrides.
+10. **The sea in physics.** The CPU wave query, checked against the GPU's waves, and buoyancy: the
+    ship floats, and a rowing boat can be pushed about.
 11. **A playable cove.** Walk a character through the fort, open the gate, row out to the ship,
     and see the lanterns lit at dusk. README, screenshots and costs on the RTX 5080 and on the
     integrated-GPU tier. Published only with your go-ahead.
 
-Steps 1–4 come first in that order. After them, physics (5–6) and characters (8–10) depend only
-on 1–4, so either can go first, as you prefer. Step 7 can go anywhere after 4.
+The steps run in this order. The first playable thing is a character in the fort (chosen on
+8 November 2026), so walking, skinning and animation (5–8) come before the environment and the
+sea (9–10).
 
 ## Risks
 
@@ -595,7 +600,7 @@ on 1–4, so either can go first, as you prefer. Step 7 can go anywhere after 4.
   wetness water-line map all do. Step 1 handles each one, and anything new must say how it treats
   moving things.
 - **Skinned virtual geometry is new ground.** Unreal only shipped it in 5.5, and has published
-  little about it. Step 8 starts with a bind-pose comparison, so any crack or LOD error shows up
+  little about it. Step 6 starts with a bind-pose comparison, so any crack or LOD error shows up
   before animation depends on it.
 - **Content.** Characters and animations need a CC0 source, or yours.
 - **Determinism across native and the web** depends on Rapier's option and on avoiding
