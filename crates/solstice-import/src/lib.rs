@@ -7,6 +7,7 @@
 //! Features the renderer cannot show yet are reported in [`Imported::warnings`], never
 //! silently dropped.
 
+pub mod character;
 mod material;
 
 use glam::{Mat3, Mat4, Vec2, Vec3};

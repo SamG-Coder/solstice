@@ -629,6 +629,74 @@ character, not just MakeHuman's. Its first job, before any of it is written, is 
 default MakeHuman character as it stands and see what actually goes wrong, since the reports
 above are secondhand.
 
+**What went wrong, first hand** (step 6). A default dressed character, with the game-engine
+rig, exported with Blender 5.2's glTF writer as it comes:
+- **The body's helper geometry was exported.** MakeHuman builds the body with helpers: a skirt
+  and tights for fitting clothes, a stand-in for each eye, and joint markers. A mask modifier
+  hides them, and the writer doesn't apply modifiers unless asked. Seen in the engine, the man
+  wore a long skin-coloured dress and a strip over his face.
+- **The body under the clothes poked through them.** The clothes hide it with more masks.
+- **Eight of MakeHuman's own shape keys came out as morph targets,** named like `$md-$ca-$ma-$yn`.
+  They are its mix of body shapes, which belongs baked into the mesh.
+- **Every material was blended,** even the skin. Most had only their colour texture: no normal
+  map, and no roughness, so the skin was flat. Clothes kept their colour and normal maps.
+- **Some vertices had more than four weights.** The writer kept the four strongest and
+  renormalised them, which is fine.
+- **Space and scale were right:** metres, Y up, 1.67 m tall, 53 bones.
+
+The tool fixes all of these, and the checks find each one in the file as it was. The masked
+helper geometry can't be seen in a glTF, so the tool checks it in Blender, before exporting.
+
+**As built (step 6):**
+- **`characters/keeper.py`** makes the fort's keeper with MPFB 2: the body's sliders, the
+  game-engine rig, a skin, eyes, brows, lashes, teeth, tongue, hair, a work suit and shoes, all
+  from MakeHuman's CC0 system assets. Make and export it with
+  `python tools/blender/make_character.py characters/keeper.py target/characters/keeper.glb`.
+  The output stays out of the repository, as the scanned models do.
+  - The asset pack is kept at `D:\SolsticeAssets\makehuman`, with where it came from and its
+    checksum, since MakeHuman's community services are shutting down.
+  - MPFB needs Blender's user preferences, so the character is made without
+    `--factory-startup`. The export runs with it.
+- **`tools/blender/solstice_export.py`** works as planned above, with these details:
+  - Masks are carried out by deleting what they hide, vertex by vertex, rather than by
+    applying the modifiers. They sit after the armature modifier, which must stay live, and
+    Blender warns that applying a modifier that isn't first may not give what is expected.
+  - Each material is baked at 1024 by 1024: base colour (Cycles' diffuse colour pass), tangent
+    normals, and roughness. Metallic comes from the material's own constant. No cavity is baked
+    yet.
+  - A material is cut out (alpha mode MASK) only if over 0.1% of the texels it covers are
+    see-through. MakeHuman wires alpha into every material, so otherwise the suit, the eyes
+    and the teeth would all be alpha tested. On the keeper, only the brows, lashes and hair
+    are.
+  - A bake writes every material of a mesh at once, so each bake gives the materials it isn't
+    for a scratch image.
+  - Bones removed because they deform nothing take their vertex groups with them.
+  - `--as-is` exports with Blender's own defaults, to show what the tool is for. Its checks
+    fail.
+- **The checks** are in `solstice-import` (`character.rs`), run as
+  `bake --check-character FILE.glb --roles RIG.roles`. Problems are listed, and the tool fails
+  if there are any.
+  - A leaf bone that deforms nothing must go. An inner one stays, since others hang from it.
+    So does one the role file names.
+  - `characters/rigs/game_engine.roles` names a role for each of the rig's 53 bones.
+- **Tests.**
+  - The checker's unit tests write small skinned glTFs by hand, and run in CI.
+  - `tools/blender/tests/run_tests.py` runs Blender, so it runs locally, not in CI. It builds
+    a small character with every fault built in (`faulty_character.py`): a mask, a vertex group
+    that isn't a bone, a shape key, six weights a vertex, idle bones, and a blended material
+    see-through in part. Exported with the tool, each fault is fixed and the checks pass;
+    exported as it is, they fail.
+  - It then makes and exports the keeper twice from scratch: the two files are the same to the
+    byte. Exported as it is, the keeper fails the checks too.
+- **Cost.**
+  - Making and exporting the keeper takes about 16 seconds.
+  - The file is 11.8 MB: 38,462 triangles, 22,088 vertices, 12 materials, 53 bones.
+  - The default export was 25.8 MB and 68,608 triangles. Most of the difference is the hidden
+    geometry gone, and the textures baked down to 1024.
+- **Left for the renderer.** It draws cut-out materials as opaque, as it does the ship's
+  sails, so the keeper's hair, brows and lashes show as dark cards until alpha testing is
+  added.
+
 ### Skinning in virtual geometry
 
 Skinned meshes go through the same pipeline as everything else: the cluster DAG, streaming, both
@@ -872,7 +940,7 @@ your go-ahead, and nothing is published without asking.
    sensors, the character controller, a debug view of colliders, wasm SIMD, and determinism
    measured.
    - Demo: a capsule walks the fort, climbs the stair to the rampart, and opens the gate.
-6. **The character and the export tool.** The Blender script that makes the MakeHuman
+6. **The character and the export tool.** *In review.* The Blender script that makes the MakeHuman
    character, and `tools/blender/solstice_export.py`. Installing MPFB 2 waits for your go-ahead.
    - First, a default character exported as MPFB 2 does it, to see what goes wrong.
    - Tests: the export's checks fail on a deliberately broken character, and pass on the real
