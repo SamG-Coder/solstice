@@ -3194,6 +3194,7 @@ version = "0.2.0"
 dependencies = [
  "allocative",
  "anyhow",
+ "getrandom 0.4.3",
  "glam 0.30.10",
  "solstice-world",
  "starlark",

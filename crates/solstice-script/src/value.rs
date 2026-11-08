@@ -1,23 +1,23 @@
 //! Values that outlive a script call, and the Starlark types for vectors and entities.
 //!
 //! Starlark values live on a heap that is dropped when a step's script calls end. Anything a
-//! script keeps, in a property or in `self.vars`, is stored as a [`ScriptValue`] instead: plain
-//! data, `Send + Sync`, which the world can hold as a component.
+//! script keeps, in a property or in `self.vars`, or sends with an event, is stored as a
+//! [`ScriptValue`] instead: plain data, `Send + Sync`, which the world can hold as a component.
 
 use allocative::Allocative;
 use glam::Vec3;
 use solstice_world::Entity;
 use starlark::any::ProvidesStaticType;
-use starlark::collections::SmallMap;
+use starlark::collections::StarlarkHasher;
 use starlark::starlark_simple_value;
 use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::float::StarlarkFloat;
 use starlark::values::list::{AllocList, ListRef};
-use starlark::values::none::NoneType;
+use starlark::values::tuple::TupleRef;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value, ValueLike};
 use starlark_derive::starlark_value;
-use std::collections::BTreeMap;
 use std::fmt;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 /// A value a script keeps from one step to the next.
@@ -28,11 +28,19 @@ pub enum ScriptValue {
     Int(i64),
     Float(f64),
     Str(Arc<str>),
+    /// Kept in single precision, as places are: a kept `0.1` comes back a little off.
     Vec3(Vec3),
     Entity(Entity),
     List(Vec<ScriptValue>),
-    Dict(BTreeMap<String, ScriptValue>),
+    /// A dict with string keys, in the order its keys were added, as Starlark keeps them.
+    Dict(Vec<(String, ScriptValue)>),
 }
+
+/// How deeply a kept value may nest lists and dicts. Deeper, or one that contains itself, is
+/// refused rather than followed until the stack runs out.
+pub const MAX_DEPTH: u32 = 64;
+/// How many values one kept value may hold in all, counting everything nested.
+pub const MAX_VALUES: u32 = 100_000;
 
 impl ScriptValue {
     /// The value on a Starlark heap.
@@ -46,8 +54,9 @@ impl ScriptValue {
             Self::Vec3(v) => heap.alloc(Vec3Value(*v)),
             Self::Entity(e) => heap.alloc(EntityValue(*e)),
             Self::List(items) => heap.alloc(AllocList(items.iter().map(|i| i.to_starlark(heap)))),
-            Self::Dict(map) => heap.alloc(AllocDict(
-                map.iter()
+            Self::Dict(entries) => heap.alloc(AllocDict(
+                entries
+                    .iter()
                     .map(|(k, v)| (heap.alloc(k.as_str()), v.to_starlark(heap))),
             )),
         }
@@ -55,8 +64,23 @@ impl ScriptValue {
 
     /// The value a Starlark value holds, if it is one a script can keep: none, a bool, an int
     /// that fits 64 bits, a float, a string, a vector, an entity, or a list, tuple or dict of
-    /// those, with string keys.
+    /// those, with string keys, nested at most [`MAX_DEPTH`] deep and holding at most
+    /// [`MAX_VALUES`] in all.
     pub fn from_starlark(value: Value) -> Result<Self, String> {
+        let mut budget = MAX_VALUES;
+        Self::convert(value, 0, &mut budget)
+    }
+
+    fn convert(value: Value, depth: u32, budget: &mut u32) -> Result<Self, String> {
+        if depth > MAX_DEPTH {
+            return Err(format!(
+                "a kept value can nest at most {MAX_DEPTH} deep, and can't contain itself"
+            ));
+        }
+        if *budget == 0 {
+            return Err(format!("a kept value can hold at most {MAX_VALUES} values"));
+        }
+        *budget -= 1;
         if value.is_none() {
             return Ok(Self::None);
         }
@@ -78,41 +102,48 @@ impl ScriptValue {
         if let Some(e) = value.downcast_ref::<EntityValue>() {
             return Ok(Self::Entity(e.0));
         }
-        if let Some(list) = ListRef::from_value(value) {
-            return list
+        let items = ListRef::from_value(value)
+            .map(|list| list.content())
+            .or_else(|| TupleRef::from_value(value).map(|tuple| tuple.content()));
+        if let Some(items) = items {
+            return items
                 .iter()
-                .map(Self::from_starlark)
-                .collect::<Result<_, _>>()
-                .map(Self::List);
-        }
-        if let Some(tuple) = starlark::values::tuple::TupleRef::from_value(value) {
-            return tuple
-                .iter()
-                .map(Self::from_starlark)
+                .map(|&item| Self::convert(item, depth + 1, budget))
                 .collect::<Result<_, _>>()
                 .map(Self::List);
         }
         if let Some(dict) = DictRef::from_value(value) {
-            let mut map = BTreeMap::new();
+            let mut entries = Vec::with_capacity(dict.len());
             for (key, item) in dict.iter() {
                 let key = key.unpack_str().ok_or_else(|| {
                     format!("a dict kept by a script needs string keys, not {key}")
                 })?;
-                map.insert(key.to_owned(), Self::from_starlark(item)?);
+                entries.push((key.to_owned(), Self::convert(item, depth + 1, budget)?));
             }
-            return Ok(Self::Dict(map));
+            return Ok(Self::Dict(entries));
         }
-        // A big int, or one that only fits as i64.
+        // An int too large for 32 bits but not for 64.
         if value.get_type() == "int" {
             if let Ok(i) = value.to_str().parse::<i64>() {
                 return Ok(Self::Int(i));
             }
+            return Err("an int kept by a script must fit in 64 bits".to_owned());
         }
         Err(format!(
-            "a {} can't be kept from one step to the next",
-            value.get_type()
+            "{} can't be kept from one step to the next",
+            with_article(value.get_type())
         ))
     }
+}
+
+/// "a list", "an int".
+fn with_article(noun: &str) -> String {
+    let article = if noun.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "an"
+    } else {
+        "a"
+    };
+    format!("{article} {noun}")
 }
 
 impl From<f64> for ScriptValue {
@@ -151,7 +182,21 @@ impl From<Entity> for ScriptValue {
     }
 }
 
+/// A number, as scripts give them: an int of any size, or a float.
+pub(crate) fn number(value: Value) -> Option<f64> {
+    if let Some(i) = value.unpack_i32() {
+        return Some(f64::from(i));
+    }
+    if let Some(f) = value.downcast_ref::<StarlarkFloat>() {
+        return Some(f.0);
+    }
+    (value.get_type() == "int")
+        .then(|| value.to_str().parse::<f64>().ok())
+        .flatten()
+}
+
 /// A vector, as scripts see it: `v.x`, `v.y`, `v.z`, `+`, `-`, and `*` or `/` by a number.
+/// Vectors can't be dict keys: as in Python, floats that look equal often aren't.
 #[derive(Clone, Copy, Debug, PartialEq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct Vec3Value(#[allocative(skip)] pub Vec3);
 
@@ -161,14 +206,6 @@ impl fmt::Display for Vec3Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "vec3({}, {}, {})", self.0.x, self.0.y, self.0.z)
     }
-}
-
-/// A number a vector can be scaled by.
-fn number(value: Value) -> Option<f32> {
-    value
-        .unpack_i32()
-        .map(|i| i as f32)
-        .or_else(|| value.downcast_ref::<StarlarkFloat>().map(|f| f.0 as f32))
 }
 
 #[starlark_value(type = "vec3")]
@@ -204,16 +241,16 @@ impl<'v> StarlarkValue<'v> for Vec3Value {
     }
 
     fn mul(&self, rhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
-        number(rhs).map(|n| Ok(heap.alloc(Self(self.0 * n))))
+        number(rhs).map(|n| Ok(heap.alloc(Self(self.0 * n as f32))))
     }
 
     fn rmul(&self, lhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
-        number(lhs).map(|n| Ok(heap.alloc(Self(self.0 * n))))
+        number(lhs).map(|n| Ok(heap.alloc(Self(self.0 * n as f32))))
     }
 
     fn div(&self, rhs: Value<'v>, heap: Heap<'v>) -> starlark::Result<Value<'v>> {
         match number(rhs) {
-            Some(n) => Ok(heap.alloc(Self(self.0 / n))),
+            Some(n) => Ok(heap.alloc(Self(self.0 / n as f32))),
             None => starlark::values::ValueError::unsupported_with(self, "/", rhs),
         }
     }
@@ -223,7 +260,8 @@ impl<'v> StarlarkValue<'v> for Vec3Value {
     }
 }
 
-/// An entity, as scripts see it: something to send events to, or to look up.
+/// An entity, as scripts see it: something to send events to, or to look up. Entities can be
+/// dict keys, for sets of them such as what is in range.
 #[derive(Clone, Copy, Debug, PartialEq, ProvidesStaticType, NoSerialize, Allocative)]
 pub struct EntityValue(#[allocative(skip)] pub Entity);
 
@@ -240,11 +278,12 @@ impl<'v> StarlarkValue<'v> for EntityValue {
     fn equals(&self, other: Value<'v>) -> starlark::Result<bool> {
         Ok(other.downcast_ref::<Self>().is_some_and(|o| o.0 == self.0))
     }
-}
 
-/// Keeps `NoneType` and `SmallMap` in use for the types other modules build.
-#[allow(dead_code)]
-type Unused = (NoneType, SmallMap<String, ()>);
+    fn write_hash(&self, hasher: &mut StarlarkHasher) -> starlark::Result<()> {
+        hasher.write_u64(self.0.to_bits().get());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -253,12 +292,15 @@ mod tests {
 
     #[test]
     fn values_come_back_as_they_went_in() {
-        let mut dict = BTreeMap::new();
-        dict.insert("speed".to_owned(), ScriptValue::Float(2.5));
-        dict.insert(
-            "path".to_owned(),
-            ScriptValue::List(vec![ScriptValue::Vec3(Vec3::X)]),
-        );
+        let dict = vec![
+            ("speed".to_owned(), ScriptValue::Float(2.5)),
+            (
+                "path".to_owned(),
+                ScriptValue::List(vec![ScriptValue::Vec3(Vec3::X)]),
+            ),
+            // Out of order: dicts keep the order keys were added.
+            ("alpha".to_owned(), ScriptValue::None),
+        ];
         let values = [
             ScriptValue::None,
             ScriptValue::Bool(true),
@@ -275,6 +317,32 @@ mod tests {
                 let back = ScriptValue::from_starlark(value.to_starlark(module.heap()));
                 assert_eq!(back.as_ref(), Ok(value));
             }
+        });
+    }
+
+    #[test]
+    fn deep_or_huge_values_are_refused_not_followed() {
+        Module::with_temp_heap(|module| {
+            let heap = module.heap();
+            let mut deep = ScriptValue::None;
+            for _ in 0..=MAX_DEPTH {
+                deep = ScriptValue::List(vec![deep]);
+            }
+            let err = ScriptValue::from_starlark(deep.to_starlark(heap)).unwrap_err();
+            assert!(err.contains("deep"), "{err}");
+            let wide = ScriptValue::List(vec![ScriptValue::Int(1); MAX_VALUES as usize]);
+            let err = ScriptValue::from_starlark(wide.to_starlark(heap)).unwrap_err();
+            assert!(err.contains("at most"), "{err}");
+        });
+    }
+
+    #[test]
+    fn numbers_of_every_size_scale_vectors() {
+        Module::with_temp_heap(|module| {
+            let big = module.heap().alloc(3_000_000_000_i64);
+            assert_eq!(number(big), Some(3.0e9));
+            assert_eq!(with_article("int"), "an int");
+            assert_eq!(with_article("list"), "a list");
         });
     }
 }

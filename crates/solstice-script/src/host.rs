@@ -6,23 +6,32 @@
 //! every actor, by a script or by Rust.
 //!
 //! Each step, in `PrePhysics`, handlers run in a fixed order: beginnings, then events in the
-//! order they were sent, then ticks, each in the world's order of entities.
+//! order they were sent, then ticks, each in the world's order of entities. An event sent by a
+//! handler, or by Rust during the fixed step, is handled the next step.
 //!
 //! **Loading.** A script is parsed, run once, and frozen. Its handlers are then shared by every
 //! actor that uses it. Loading a script again under the same name replaces it at once: actors
 //! keep their state, which lives in their components, and run the new handlers from their next
-//! call. A script that fails to load leaves the one before running, and reports why.
+//! call. A script that fails to load leaves the one before running, and reports why. Loading is
+//! not part of a recording, so a run with a reload in it replays only with the same reload.
 //!
-//! **Limits.** Each call has a budget of work, counted in Starlark's own steps, so that it stops
-//! at the same point natively and on the web, and of memory. A handler that runs out of either,
-//! or fails any other way, stops; its error, with file and line, is reported; and it changes
-//! nothing. The actor carries on with its next call.
+//! **A failing handler changes nothing.** It works on a copy of its actor, which is written back
+//! only if it succeeds, and what it asks of the world (events, timers) is held back until then
+//! too. Its log lines are kept either way, to show why it failed.
+//!
+//! **Limits.** Each call has a budget of work, counted in Starlark's own ticks (each function
+//! call and each turn of a loop), so that it stops at the same point natively and on the web. It
+//! has a budget of memory too, which is best effort: Starlark checks it every thousand ticks or
+//! so, and the host once more as the call ends, and a 64-bit build uses more than the web's
+//! 32-bit one, so a call close to the limit may pass on one and fail on the other. A handler
+//! that runs out of either, or fails any other way, stops, reports its error with file and line,
+//! and changes nothing. The actor carries on with its next call.
 
 use crate::actor::ActorValue;
-use crate::api::{engine, Context, Timers};
+use crate::api::{engine, Context, Effects, ScriptTimer, TimerChange, Timers};
 use crate::value::ScriptValue;
-use glam::{EulerRot, Quat, Vec3};
-use solstice_world::{Entity, Schedule, TickGroup, Transform, World, STEP_SECONDS};
+use glam::{EulerRot, Quat};
+use solstice_world::{steps_for, Entity, Schedule, TickGroup, Transform, World, STEP_SECONDS};
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
 use starlark::syntax::{AstModule, Dialect};
@@ -32,6 +41,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// Event names the engine uses itself, which scripts can't send: their handlers run on the
+/// engine's own schedule.
+pub const RESERVED_EVENTS: [&str; 2] = ["begin", "tick"];
+
+/// The most errors and log lines kept between takings. More are counted, but dropped.
+const MAX_KEPT: usize = 10_000;
+
 /// An actor's script: which one, and the values it keeps.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Script {
@@ -40,7 +56,7 @@ pub struct Script {
     /// The properties the actor's file declares, which the script can read and set as
     /// `self.<name>`, but not add to.
     pub properties: BTreeMap<String, ScriptValue>,
-    /// Anything else the script keeps: `self.vars.<name>`.
+    /// Anything else the script keeps: `self.vars.<name>`, listed in name order.
     pub vars: BTreeMap<String, ScriptValue>,
     /// Whether `on_begin` has run.
     begun: bool,
@@ -58,15 +74,14 @@ impl Script {
         self.properties.insert(name.to_owned(), value.into());
         self
     }
-}
 
-/// An entity's name, for scripts to `find` it by.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Name(pub Arc<str>);
-
-impl Name {
-    pub fn new(name: &str) -> Self {
-        Self(Arc::from(name))
+    /// A copy for a new actor, such as one spawned like another: the same script and values,
+    /// but its `on_begin` still to run.
+    pub fn fresh(&self) -> Self {
+        Self {
+            begun: false,
+            ..self.clone()
+        }
     }
 }
 
@@ -79,11 +94,37 @@ pub struct ScriptEvent {
     pub args: Vec<ScriptValue>,
 }
 
+impl ScriptEvent {
+    /// An event for one actor.
+    pub fn to(entity: Entity, name: &str) -> Self {
+        Self {
+            to: Some(entity),
+            name: Arc::from(name),
+            args: Vec::new(),
+        }
+    }
+
+    /// An event for every actor whose script handles it.
+    pub fn all(name: &str) -> Self {
+        Self {
+            to: None,
+            name: Arc::from(name),
+            args: Vec::new(),
+        }
+    }
+
+    /// Adds an argument, passed to the handler after `self`.
+    pub fn arg(mut self, value: impl Into<ScriptValue>) -> Self {
+        self.args.push(value.into());
+        self
+    }
+}
+
 /// A script that failed to load, or a handler that failed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptError {
-    /// The step it happened on.
-    pub step: u64,
+    /// The step a handler failed on, or none for a script that failed to load.
+    pub step: Option<u64>,
     pub script: Arc<str>,
     /// The actor whose handler failed, or none for a script that failed to load.
     pub entity: Option<Entity>,
@@ -99,19 +140,19 @@ pub struct ScriptLog {
     pub text: String,
 }
 
-/// How much one handler call may do.
+/// How much one handler call, or loading one script, may do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Limits {
-    /// Starlark's steps of work: each statement and loop turn counts.
+    /// Starlark's ticks of work: each function call and each turn of a loop counts one.
     pub work: u64,
-    /// Bytes of memory the call may hold.
+    /// Bytes of memory it may hold.
     pub memory: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        // About 2 ms of work on the web: a hundred times what a handler usually needs, and
-        // short enough that a runaway one costs one hitch of a frame rather than a stall.
+        // A hundred times what a handler usually needs. A runaway one is stopped in under 4 ms
+        // on the web: one hitch, not a hang.
         Self {
             work: 100_000,
             memory: 16 << 20,
@@ -133,15 +174,19 @@ pub struct ScriptHost {
     pub limits: Limits,
     errors: Vec<ScriptError>,
     log: Vec<ScriptLog>,
+    /// Errors and log lines dropped since they were last taken, past [`MAX_KEPT`].
+    dropped: usize,
     timers: Timers,
     /// Scripts named by actors but never loaded, reported once each.
     missing: HashSet<Arc<str>>,
 }
 
-/// The language scripts are written in: Starlark, with types and f-strings.
+/// The language scripts are written in: Starlark, with types and f-strings, and without `load`,
+/// since scripts don't load each other.
 fn dialect() -> Dialect {
     Dialect {
         enable_f_strings: true,
+        enable_load: false,
         ..Dialect::Extended
     }
 }
@@ -160,8 +205,17 @@ impl ScriptHost {
             limits: Limits::default(),
             errors: Vec::new(),
             log: Vec::new(),
+            dropped: 0,
             timers: Timers::default(),
             missing: HashSet::new(),
+        }
+    }
+
+    fn report(&mut self, error: ScriptError) {
+        if self.errors.len() < MAX_KEPT {
+            self.errors.push(error);
+        } else {
+            self.dropped += 1;
         }
     }
 
@@ -178,8 +232,16 @@ impl ScriptHost {
                 {
                     let mut eval = Evaluator::new(&module);
                     eval.set_max_tick_count(limits.work)?;
+                    eval.set_max_heap_size(limits.memory)?;
                     eval.eval_module(ast, globals)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                }
+                let used = module.heap().peak_allocated_bytes();
+                if used > limits.memory {
+                    anyhow::bail!(
+                        "loading used {used} bytes of memory, more than the {} it may",
+                        limits.memory
+                    );
                 }
                 module.freeze().map_err(|e| anyhow::anyhow!("{e:?}"))
             })?;
@@ -187,7 +249,14 @@ impl ScriptHost {
             for handler in module.names() {
                 let handler = handler.as_str();
                 if handler.starts_with("on_") {
-                    handlers.insert(handler.to_owned(), module.get(handler)?);
+                    let value = module.get(handler)?;
+                    if value.value().get_type() != "function" {
+                        anyhow::bail!(
+                            "`{handler}` is a handler's name, so it must be a function, not {}",
+                            value.value().get_type()
+                        );
+                    }
+                    handlers.insert(handler.to_owned(), value);
                 }
             }
             Ok(Class {
@@ -203,12 +272,12 @@ impl ScriptHost {
             }
             Err(error) => {
                 let error = ScriptError {
-                    step: 0,
+                    step: None,
                     script: name,
                     entity: None,
                     message: error.to_string(),
                 };
-                self.errors.push(error.clone());
+                self.report(error.clone());
                 Err(error)
             }
         }
@@ -229,6 +298,12 @@ impl ScriptHost {
         std::mem::take(&mut self.log)
     }
 
+    /// How many errors and log lines were dropped, past ten thousand untaken, since this was
+    /// last asked.
+    pub fn take_dropped(&mut self) -> usize {
+        std::mem::take(&mut self.dropped)
+    }
+
     /// Adds the system that runs scripts each step, in `PrePhysics`.
     pub fn install(host: &Rc<RefCell<Self>>, schedule: &mut Schedule) {
         let host = host.clone();
@@ -243,6 +318,12 @@ impl ScriptHost {
 
     /// Runs this step's handlers: beginnings, then events, then ticks.
     pub fn run(&mut self, world: &mut World) {
+        // Timers that fire once, and have, are forgotten.
+        let step = world.step();
+        self.timers
+            .set
+            .retain(|_, timer| timer.done_by.is_none_or(|done| done >= step));
+
         let mut calls: Vec<(Entity, String, Vec<ScriptValue>)> = Vec::new();
         let actors: Vec<(Entity, Arc<str>, bool)> = world
             .entities
@@ -252,8 +333,8 @@ impl ScriptHost {
             .collect();
         for (_, class, _) in &actors {
             if !self.classes.contains_key(class) && self.missing.insert(class.clone()) {
-                self.errors.push(ScriptError {
-                    step: world.step(),
+                self.report(ScriptError {
+                    step: Some(step),
                     script: class.clone(),
                     entity: None,
                     message: format!("no script named `{class}` is loaded"),
@@ -325,11 +406,14 @@ impl ScriptHost {
         let (yaw, pitch, roll) = transform.rotation.to_euler(EulerRot::YXZ);
         let step = world.step();
         let limits = self.limits;
+        let mut effects = Effects::default();
 
         let result = Module::with_temp_heap(|module| -> Result<_, String> {
             let heap = module.heap();
             // The script's view of the actor is a copy on the call's heap, made straight from
-            // its component.
+            // its component. Holding Starlark values in Rust across the call is sound because
+            // Starlark collects garbage only between a module's top-level statements, never
+            // inside a function call.
             let actor = {
                 let script = world
                     .entities
@@ -345,35 +429,62 @@ impl ScriptHost {
                 )
             };
             let context = Context {
-                world: RefCell::new(&mut *world),
+                world: &*world,
                 actor: entity,
-                timers: RefCell::new(&mut self.timers),
-                log: RefCell::new(&mut self.log),
+                timers: &self.timers,
+                effects: RefCell::new(Effects::default()),
             };
-            let mut eval = Evaluator::new(&module);
-            eval.extra = Some(&context);
-            eval.set_max_tick_count(limits.work)
-                .map_err(|e| e.to_string())?;
-            eval.set_max_heap_size(limits.memory)
-                .map_err(|e| e.to_string())?;
-            let mut values = vec![actor];
-            values.extend(args.iter().map(|arg| arg.to_starlark(heap)));
-            // SAFETY: this ties the handler's frozen heap to the call's module, which keeps it
-            // alive for as long as the module, and so the call, lasts.
-            let function = unsafe { function.owned_frozen_value(module.frozen_heap()) };
-            eval.eval_function(function.to_value(), &values, &[])
-                .map_err(|e| e.to_string())?;
-            // Starlark checks the heap only now and then while a call runs, so check it once
-            // more at the end: a call that went over fails, whenever it did.
-            let used = heap.peak_allocated_bytes();
-            if used > limits.memory {
-                return Err(format!(
-                    "the call used {} bytes of memory, more than the {} it may",
-                    used, limits.memory
-                ));
-            }
-            ActorValue::state(actor)
+            let outcome = (|| -> Result<_, String> {
+                let mut eval = Evaluator::new(&module);
+                eval.extra = Some(&context);
+                eval.set_max_tick_count(limits.work)
+                    .map_err(|e| e.to_string())?;
+                eval.set_max_heap_size(limits.memory)
+                    .map_err(|e| e.to_string())?;
+                let mut values = vec![actor];
+                values.extend(args.iter().map(|arg| arg.to_starlark(heap)));
+                // Allocating the handler on the call's frozen heap keeps its own heap alive for
+                // as long as the call.
+                let function = module.frozen_heap().alloc(function).to_value();
+                eval.eval_function(function, &values, &[])
+                    .map_err(|e| e.to_string())?;
+                // Starlark checks the heap only now and then while a call runs, so check it once
+                // more at the end: a call that went over fails, whenever it did.
+                let used = heap.peak_allocated_bytes();
+                if used > limits.memory {
+                    return Err(format!(
+                        "the call used {used} bytes of memory, more than the {} it may",
+                        limits.memory
+                    ));
+                }
+                let state = ActorValue::state(actor)?;
+                if !state.position.is_finite() || !state.yaw.is_finite() {
+                    return Err(format!(
+                        "self.position ({}) and self.yaw ({}) must be finite",
+                        state.position, state.yaw
+                    ));
+                }
+                Ok(state)
+            })();
+            effects = context.effects.into_inner();
+            outcome
         });
+
+        // Log lines are kept whatever happened, to show why a handler failed.
+        for text in effects.log.drain(..) {
+            if self.log.len() < MAX_KEPT {
+                self.log.push(ScriptLog { step, entity, text });
+            } else {
+                self.dropped += 1;
+            }
+        }
+        if effects.dropped_lines > 0 {
+            self.log.push(ScriptLog {
+                step,
+                entity,
+                text: format!("({} more lines dropped)", effects.dropped_lines),
+            });
+        }
 
         match result {
             Ok(state) => {
@@ -391,20 +502,58 @@ impl ScriptHost {
                     }
                     Err(_) => false,
                 };
-                if !placed && (state.position != Vec3::ZERO || state.yaw != 0.0) {
-                    world.commands().insert_one(
-                        entity,
-                        Transform::from_translation(state.position)
-                            .with_rotation(Quat::from_rotation_y(state.yaw)),
-                    );
+                if !placed && (state.position != transform.translation || state.yaw != yaw) {
+                    // Added at once, so the actor's next call this step sees where it is.
+                    world
+                        .entities
+                        .insert_one(
+                            entity,
+                            Transform::from_translation(state.position)
+                                .with_rotation(Quat::from_rotation_y(state.yaw)),
+                        )
+                        .expect("the actor was just found");
+                }
+                for event in effects.sends {
+                    world.send(event);
+                }
+                for change in effects.timers {
+                    self.change_timer(world, entity, change);
                 }
             }
-            Err(message) => self.errors.push(ScriptError {
-                step,
+            Err(message) => self.report(ScriptError {
+                step: Some(step),
                 script: class,
                 entity: Some(entity),
                 message: format!("{handler}: {message}"),
             }),
+        }
+    }
+
+    /// Sets or cancels a timer a handler asked for, now that it has succeeded.
+    fn change_timer(&mut self, world: &mut World, owner: Entity, change: TimerChange) {
+        match change {
+            TimerChange::Set {
+                handle,
+                seconds,
+                repeat,
+                event,
+            } => {
+                let (id, done_by) = if repeat {
+                    (world.every(seconds, event), None)
+                } else {
+                    let id = world.after(seconds, event);
+                    (id, Some(world.step() + steps_for(seconds)))
+                };
+                self.timers.next = self.timers.next.max(handle);
+                self.timers
+                    .set
+                    .insert(handle, ScriptTimer { id, owner, done_by });
+            }
+            TimerChange::Cancel(handle) => {
+                if let Some(timer) = self.timers.set.remove(&handle) {
+                    world.cancel(timer.id);
+                }
+            }
         }
     }
 }

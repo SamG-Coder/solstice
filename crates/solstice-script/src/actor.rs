@@ -125,7 +125,7 @@ impl<'v> ActorValue<'v> {
                 .map(|(name, value)| {
                     ScriptValue::from_starlark(*value)
                         .map(|v| (name.clone(), v))
-                        .map_err(|e| format!("{kind} {name}: {e}"))
+                        .map_err(|e| format!("{kind}{name}: {e}"))
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()
         };
@@ -174,12 +174,7 @@ impl<'v> StarlarkValue<'v> for ActorValue<'v> {
                 self.position.set(position.0);
             }
             "yaw" => {
-                let yaw = new_value.unpack_i32().map(|i| i as f32).or_else(|| {
-                    new_value
-                        .downcast_ref::<StarlarkFloat>()
-                        .map(|f| f.0 as f32)
-                });
-                let Some(yaw) = yaw else {
+                let Some(yaw) = crate::value::number(new_value).map(|n| n as f32) else {
                     return Err(
                         anyhow::anyhow!("self.yaw must be a number, not {new_value}").into(),
                     );

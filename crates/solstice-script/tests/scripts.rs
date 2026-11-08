@@ -254,9 +254,21 @@ def on_tick(self, dt):
     assert_eq!(var(&game, counter, "count"), Some(ScriptValue::Int(1)));
     // Stopped by counting work, not time: always at the same point, the same natively and on
     // the web (tools/gameplay-bench, b_script).
-    assert_eq!(host.borrow_mut().take_log().len(), 101);
+    // A call keeps 100 lines, and one more says how many were dropped. A Starlark upgrade may
+    // change how work is counted, and so how many lines are dropped, but never between two runs,
+    // or two platforms, of the same build.
+    let first = host.borrow_mut().take_log();
     steps(&mut game, 1);
-    assert_eq!(host.borrow_mut().take_log().len(), 101);
+    let second = host.borrow_mut().take_log();
+    assert_eq!(first.len(), 101);
+    assert!(
+        first[100].text.ends_with("more lines dropped)"),
+        "{}",
+        first[100].text
+    );
+    let texts =
+        |log: &[solstice_script::ScriptLog]| log.iter().map(|l| l.text.clone()).collect::<Vec<_>>();
+    assert_eq!(texts(&first), texts(&second));
 }
 
 #[test]
@@ -499,9 +511,285 @@ fn the_api_reference_lists_every_engine_function() {
         "vec3", "send", "after", "every", "cancel", "find", "input", "held", "pressed", "now",
         "log",
     ] {
+        let heading = format!("def {name}(");
         assert!(
-            reference.contains(name),
+            reference.contains(&heading),
             "{name} missing from:\n{reference}"
         );
     }
+}
+
+fn close(value: Option<ScriptValue>, expected: f64) -> bool {
+    matches!(value, Some(ScriptValue::Float(x)) if (x - expected).abs() < 1.0e-9)
+}
+
+#[test]
+fn a_failing_handler_sends_nothing_and_sets_no_timer_but_its_log_stays() {
+    let source = r#"
+def on_begin(self):
+    send(self.entity, "ping")
+    after(0.01, "ping")
+    log("before failing")
+    fail("x")
+
+def on_ping(self):
+    self.vars.pinged = True
+"#;
+    let (mut game, host) = game_with(&[("flaky", source)]);
+    let actor = game.world.spawn((Script::new("flaky"),));
+    steps(&mut game, 5);
+    assert_eq!(
+        var(&game, actor, "pinged"),
+        None,
+        "a held-back event or timer went out"
+    );
+    let log = host.borrow_mut().take_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].text, "before failing");
+    // The failed call's timer handle wasn't taken either: the next timer set gets handle 1.
+    host.borrow_mut()
+        .load(
+            "flaky",
+            "def on_tick(self, dt):\n    self.vars.handle = after(1, \"ping\")\n",
+        )
+        .unwrap();
+    steps(&mut game, 1);
+    assert_eq!(var(&game, actor, "handle"), Some(ScriptValue::Int(1)));
+}
+
+#[test]
+fn an_actor_without_a_transform_keeps_every_move_in_a_step() {
+    let source = r#"
+def on_begin(self):
+    self.position = vec3(5, 0, 0)
+
+def on_tick(self, dt):
+    self.position += vec3(0, 0, 1)
+"#;
+    let (mut game, host) = game_with(&[("mover", source)]);
+    let actor = game.world.spawn((Script::new("mover"),));
+    steps(&mut game, 1);
+    assert!(host.borrow_mut().take_errors().is_empty());
+    let at = game
+        .world
+        .entities
+        .get::<&Transform>(actor)
+        .unwrap()
+        .translation;
+    assert_eq!(at, Vec3::new(5.0, 0.0, 1.0));
+}
+
+#[test]
+fn an_actor_begins_once_its_script_is_loaded() {
+    let (mut game, host) = game_with(&[]);
+    let actor = game.world.spawn((Script::new("late"),));
+    steps(&mut game, 2);
+    host.borrow_mut()
+        .load("late", "def on_begin(self):\n    self.vars.begun = now()\n")
+        .unwrap();
+    steps(&mut game, 2);
+    assert!(close(var(&game, actor, "begun"), 3.0 * STEP_SECONDS));
+}
+
+#[test]
+fn events_from_several_senders_reach_each_listener_in_the_order_sent() {
+    let sender = r#"
+def on_tick(self, dt):
+    if now() < 1.5 * dt:
+        for target in find("listener"):
+            send(target, "hear", self.word)
+"#;
+    let listener = "def on_hear(self, word):\n    self.vars.heard = self.vars.heard + [word] if hasattr(self.vars, \"heard\") else [word]\n";
+    let (mut game, host) = game_with(&[("sender", sender), ("listener", listener)]);
+    let a = game
+        .world
+        .spawn((Name::new("listener"), Script::new("listener")));
+    game.world
+        .spawn((Script::new("sender").with_property("word", "one"),));
+    let b = game
+        .world
+        .spawn((Name::new("listener"), Script::new("listener")));
+    game.world
+        .spawn((Script::new("sender").with_property("word", "two"),));
+    steps(&mut game, 3);
+    assert!(host.borrow_mut().take_errors().is_empty());
+    let both = ScriptValue::List(["one", "two"].map(ScriptValue::from).to_vec());
+    assert_eq!(var(&game, a, "heard"), Some(both.clone()));
+    assert_eq!(var(&game, b, "heard"), Some(both));
+}
+
+#[test]
+fn an_event_an_actor_sends_itself_is_handled_the_next_step() {
+    let source = r#"
+def on_begin(self):
+    send(self.entity, "echo", now())
+
+def on_echo(self, sent):
+    self.vars.delay = now() - sent
+"#;
+    let (mut game, host) = game_with(&[("echo", source)]);
+    let actor = game.world.spawn((Script::new("echo"),));
+    steps(&mut game, 3);
+    assert!(host.borrow_mut().take_errors().is_empty());
+    assert!(close(var(&game, actor, "delay"), STEP_SECONDS));
+}
+
+#[test]
+fn a_move_to_infinity_is_refused() {
+    let source = "def on_tick(self, dt):\n    self.position = vec3(1e39, 0, 0)\n";
+    let (mut game, host) = game_with(&[("wild", source)]);
+    let actor = game
+        .world
+        .spawn((Transform::default(), Script::new("wild")));
+    steps(&mut game, 1);
+    let errors = host.borrow_mut().take_errors();
+    assert!(
+        errors[0].message.contains("must be finite"),
+        "{}",
+        errors[0].message
+    );
+    let at = game
+        .world
+        .entities
+        .get::<&Transform>(actor)
+        .unwrap()
+        .translation;
+    assert_eq!(at, Vec3::ZERO);
+}
+
+#[test]
+fn entities_can_be_dict_keys() {
+    let source = r#"
+def on_tick(self, dt):
+    seen = {}
+    for other in find("thing"):
+        seen[other] = True
+    self.vars.count = len(seen)
+    self.vars.self_seen = self.entity in seen
+"#;
+    let (mut game, host) = game_with(&[("counter", source)]);
+    let actor = game
+        .world
+        .spawn((Name::new("thing"), Script::new("counter")));
+    game.world.spawn((Name::new("thing"),));
+    steps(&mut game, 1);
+    assert!(host.borrow_mut().take_errors().is_empty());
+    assert_eq!(var(&game, actor, "count"), Some(ScriptValue::Int(2)));
+    assert_eq!(
+        var(&game, actor, "self_seen"),
+        Some(ScriptValue::Bool(true))
+    );
+}
+
+#[test]
+fn a_value_that_contains_itself_is_refused_not_crashed_on() {
+    let source = r#"
+def on_tick(self, dt):
+    ring = []
+    ring.append(ring)
+    if self.how == "keep":
+        self.vars.ring = ring
+    else:
+        send(self.entity, "ring", ring)
+"#;
+    let (mut game, host) = game_with(&[("ouroboros", source)]);
+    game.world
+        .spawn((Script::new("ouroboros").with_property("how", "keep"),));
+    game.world
+        .spawn((Script::new("ouroboros").with_property("how", "send"),));
+    steps(&mut game, 1);
+    let errors = host.borrow_mut().take_errors();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(
+        errors.iter().all(|e| e.message.contains("contain itself")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn the_engines_own_events_cant_be_sent() {
+    for name in ["begin", "tick"] {
+        let source = format!("def on_tick(self, dt):\n    send(self.entity, \"{name}\")\n");
+        let (mut game, host) = game_with(&[("cheat", &source)]);
+        game.world.spawn((Script::new("cheat"),));
+        steps(&mut game, 1);
+        let errors = host.borrow_mut().take_errors();
+        assert!(
+            errors[0].message.contains("engine's own"),
+            "{}",
+            errors[0].message
+        );
+    }
+}
+
+#[test]
+fn loading_a_script_is_limited_too() {
+    let mut host = ScriptHost::new();
+    let hog = host
+        .load(
+            "hog",
+            "def f(n):\n    return str(n) * 1000000\n\nbig = [f(i) for i in range(100)]\n",
+        )
+        .unwrap_err();
+    assert!(
+        hog.message.contains("memory") || hog.message.to_lowercase().contains("heap"),
+        "{}",
+        hog.message
+    );
+    assert_eq!(hog.step, None);
+    let spin = host
+        .load(
+            "spin",
+            "def f():\n    for i in range(1000000000):\n        pass\n\nf()\n",
+        )
+        .unwrap_err();
+    assert!(spin.message.contains("ticks"), "{}", spin.message);
+    let odd = host.load("odd", "on_tick = 3\n").unwrap_err();
+    assert!(
+        odd.message.contains("must be a function"),
+        "{}",
+        odd.message
+    );
+    assert!(!host.is_loaded("hog") && !host.is_loaded("spin") && !host.is_loaded("odd"));
+}
+
+#[test]
+fn an_actor_cannot_cancel_anothers_timer() {
+    let owner = r#"
+def on_begin(self):
+    self.vars.rings = 0
+    every(0.05, "ring")
+
+def on_ring(self):
+    self.vars.rings += 1
+"#;
+    let thief = "def on_tick(self, dt):\n    self.vars.cancelled = cancel(1)\n";
+    let (mut game, host) = game_with(&[("owner", owner), ("thief", thief)]);
+    let bell = game.world.spawn((Script::new("owner"),));
+    let other = game.world.spawn((Script::new("thief"),));
+    steps(&mut game, 30);
+    let rings = var(&game, bell, "rings");
+    steps(&mut game, 30);
+    assert!(host.borrow_mut().take_errors().is_empty());
+    assert_eq!(
+        var(&game, other, "cancelled"),
+        Some(ScriptValue::Bool(false))
+    );
+    assert!(
+        matches!(rings, Some(ScriptValue::Int(n)) if n > 0),
+        "{rings:?}"
+    );
+    assert_ne!(var(&game, bell, "rings"), rings, "the bell stopped ringing");
+}
+
+#[test]
+fn rust_builds_events_for_scripts_in_one_line() {
+    let event = ScriptEvent::all("lock").arg(2.5).arg("now");
+    assert_eq!(event.to, None);
+    assert_eq!(
+        event.args,
+        vec![ScriptValue::Float(2.5), ScriptValue::from("now")]
+    );
+    let actor = Entity::DANGLING;
+    assert_eq!(ScriptEvent::to(actor, "poke").to, Some(actor));
 }

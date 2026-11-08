@@ -5,12 +5,13 @@
 //! * [`ScriptEvent`]: events between scripts, and from Rust to scripts.
 //! * [`ScriptValue`]: what a script keeps from one step to the next.
 
-pub mod actor;
+mod actor;
 mod api;
 pub mod host;
 pub mod value;
 
 pub use host::{
-    api_reference, Limits, Name, Script, ScriptError, ScriptEvent, ScriptHost, ScriptLog,
+    api_reference, Limits, Script, ScriptError, ScriptEvent, ScriptHost, ScriptLog, RESERVED_EVENTS,
 };
+pub use solstice_world::Name;
 pub use value::ScriptValue;
