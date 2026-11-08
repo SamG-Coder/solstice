@@ -16,6 +16,7 @@
 
 use glam::{DVec2, DVec3, Vec2, Vec3};
 use rustc_hash::FxHashMap;
+use solstice_asset::PackedSkin;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -60,6 +61,7 @@ const MAX_EXTRAPOLATION: f64 = 16.0;
 ///
 /// Vertices for which `is_locked` returns true never move, and neither do the ends
 /// of any edge that is not shared by exactly two triangles.
+#[cfg(test)]
 pub fn simplify(
     triangles: &[Triangle],
     positions: &[Vec3],
@@ -67,7 +69,37 @@ pub fn simplify(
     target_triangles: usize,
     is_locked: impl Fn(u32) -> bool,
 ) -> Simplified {
-    Simplifier::new(triangles, positions, attributes, &is_locked).run(target_triangles)
+    simplify_skinned(
+        triangles,
+        positions,
+        attributes,
+        None,
+        target_triangles,
+        is_locked,
+    )
+}
+
+/// What [`simplify_skinned`] needs of a skinned mesh.
+#[derive(Clone, Copy)]
+pub struct SkinCost<'a> {
+    /// Each welded position's skin.
+    pub skins: &'a [PackedSkin],
+    /// How far, in world units, a vertex may land from where it belongs in a pose if its weights
+    /// change completely: the error a change of weights counts for.
+    pub error_per_change: f32,
+}
+
+/// [`simplify`] for a mesh that bends: a collapse also pays for changing the weights of what it
+/// moves, so joints, where weights change fastest, are kept longer than a flat surface would be.
+pub fn simplify_skinned(
+    triangles: &[Triangle],
+    positions: &[Vec3],
+    attributes: &[Attribute],
+    skin: Option<SkinCost<'_>>,
+    target_triangles: usize,
+    is_locked: impl Fn(u32) -> bool,
+) -> Simplified {
+    Simplifier::new(triangles, positions, attributes, skin, &is_locked).run(target_triangles)
 }
 
 /// A symmetric 4x4 error quadric plus the accumulated area weight.
@@ -171,6 +203,9 @@ impl Ord for Candidate {
 
 struct Simplifier<'a> {
     attributes: &'a [Attribute],
+    skin: Option<SkinCost<'a>>,
+    /// Pose error built up at each local vertex by earlier collapses, in world units.
+    skin_errors: Vec<f64>,
     /// Global position id per local vertex.
     global: Vec<u32>,
     positions: Vec<DVec3>,
@@ -194,6 +229,7 @@ impl<'a> Simplifier<'a> {
         input: &[Triangle],
         positions: &[Vec3],
         attributes: &'a [Attribute],
+        skin: Option<SkinCost<'a>>,
         is_locked: &dyn Fn(u32) -> bool,
     ) -> Self {
         let mut remap: FxHashMap<u32, u32> = FxHashMap::default();
@@ -260,6 +296,8 @@ impl<'a> Simplifier<'a> {
         let alive = vec![true; alive_count];
         Self {
             attributes,
+            skin,
+            skin_errors: vec![0.0; vertex_count],
             global,
             positions: local_positions,
             locked,
@@ -330,10 +368,23 @@ impl<'a> Simplifier<'a> {
         let target = self.positions[to as usize];
         let length_squared = self.positions[from as usize].distance_squared(target);
         let texture = self.texture_error(from, to) * TEXTURE_ERROR_WEIGHT;
+        let skin = self.skin_error(from, to);
         quadric.mean_squared_distance(target)
             + texture * texture
+            + skin * skin
             + length_squared
                 * (EDGE_LENGTH_WEIGHT + NORMAL_DIFFERENCE_WEIGHT * self.normal_difference(from, to))
+    }
+
+    /// How far from its place a vertex could land in a pose if `from` took on `to`'s weights,
+    /// including what earlier collapses already cost at `from`.
+    fn skin_error(&self, from: u32, to: u32) -> f64 {
+        let Some(skin) = self.skin else {
+            return 0.0;
+        };
+        let of = |v: u32| skin.skins[self.global[v as usize] as usize];
+        f64::from(of(from).difference(of(to)) * skin.error_per_change)
+            + self.skin_errors[from as usize]
     }
 
     /// How far the texture would slide across the surface if `from` collapsed into `to`, in world
@@ -495,10 +546,13 @@ impl<'a> Simplifier<'a> {
         merged.add(&self.quadrics[from as usize]);
         let texture_error = self.texture_error(from, to);
         let weighted = texture_error * TEXTURE_ERROR_WEIGHT;
+        let skin_error = self.skin_error(from, to);
         self.max_error = self
             .max_error
             .max(merged.mean_squared_distance(target))
-            .max(weighted * weighted);
+            .max(weighted * weighted)
+            .max(skin_error * skin_error);
+        self.skin_errors[to as usize] = self.skin_errors[to as usize].max(skin_error);
         self.quadrics[to as usize] = merged;
         self.texture_errors[to as usize] = self.texture_errors[to as usize].max(texture_error);
 

@@ -60,6 +60,131 @@ pub struct PackedVertex {
     pub data: [u16; 8],
 }
 
+/// How many bones a cluster's list can name. A cluster using more is drawn with the bounds of its
+/// whole mesh, see [`BONES_OVERFLOW`].
+pub const CLUSTER_BONES: usize = 16;
+
+/// The bones of a skinned cluster, in ascending order, for working out where it is in a pose.
+/// Unused slots repeat the last bone, so a loop stops at the first entry not above the one before.
+pub type ClusterBones = [u8; CLUSTER_BONES];
+
+/// The start of a bone list whose cluster uses more bones than a list can name: the only list
+/// that ever descends at its start, which marks it. It is drawn with the bounds of the whole mesh.
+pub const BONES_OVERFLOW: [u8; 2] = [255, 0];
+
+/// Makes a cluster's bone list from the bones its vertices use, in any order.
+pub fn cluster_bones(mut bones: Vec<u8>) -> ClusterBones {
+    bones.sort_unstable();
+    bones.dedup();
+    let mut list = [0; CLUSTER_BONES];
+    if bones.len() > CLUSTER_BONES {
+        list[..BONES_OVERFLOW.len()].copy_from_slice(&BONES_OVERFLOW);
+        return list;
+    }
+    let last = bones.last().copied().unwrap_or(0);
+    list.fill(last);
+    list[..bones.len()].copy_from_slice(&bones);
+    list
+}
+
+/// The four bones that move a vertex, and how much each does: 8 bytes beside its [`PackedVertex`].
+///
+/// Bones are numbered as the skeleton numbers them. Weights sum to exactly 255, and the used bones
+/// come first in ascending order. Two clusters sharing a vertex therefore hold identical bytes,
+/// and sum the same terms in the same order, so the skinned position is the same to the last bit
+/// on both sides of the seam.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
+pub struct PackedSkin {
+    pub joints: [u8; 4],
+    pub weights: [u8; 4],
+}
+
+impl PackedSkin {
+    /// Quantises influences as a file gives them, in any order, with weights that need not sum
+    /// to one. Weights are rounded so that they sum to 255 exactly, by giving the leftover to
+    /// those that rounding hurt most. With no weight at all, it follows the first bone wholly.
+    pub fn new(joints: [u8; 4], weights: [f32; 4]) -> Self {
+        let mut merged: Vec<(u8, f32)> = Vec::with_capacity(4);
+        for (&joint, &weight) in joints.iter().zip(&weights) {
+            let weight = if weight.is_finite() {
+                weight.max(0.0)
+            } else {
+                0.0
+            };
+            if weight > 0.0 {
+                match merged.iter_mut().find(|(j, _)| *j == joint) {
+                    Some(entry) => entry.1 += weight,
+                    None => merged.push((joint, weight)),
+                }
+            }
+        }
+        if merged.is_empty() {
+            merged.push((joints[0], 1.0));
+        }
+        let sum: f32 = merged.iter().map(|m| m.1).sum();
+        let mut scaled: Vec<(u8, u32, f32)> = merged
+            .iter()
+            .map(|&(joint, weight)| {
+                let exact = weight / sum * 255.0;
+                (joint, exact.floor() as u32, exact - exact.floor())
+            })
+            .collect();
+        let short = 255 - scaled.iter().map(|m| m.1).sum::<u32>();
+        // Largest remainder first; the bone's number settles ties, so the result is repeatable.
+        scaled.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+        for entry in scaled.iter_mut().take(short as usize) {
+            entry.1 += 1;
+        }
+        scaled.retain(|entry| entry.1 > 0);
+        scaled.sort_unstable_by_key(|entry| entry.0);
+
+        let mut out = Self::default();
+        for (slot, entry) in scaled.iter().enumerate() {
+            out.joints[slot] = entry.0;
+            out.weights[slot] = entry.1 as u8;
+        }
+        out
+    }
+
+    /// The bones with any weight.
+    pub fn bones(self) -> impl Iterator<Item = u8> {
+        self.joints
+            .into_iter()
+            .zip(self.weights)
+            .filter(|(_, weight)| *weight > 0)
+            .map(|(joint, _)| joint)
+    }
+
+    /// How much of a vertex's weight must move to turn one skin into the other, from 0 to 1.
+    pub fn difference(self, other: Self) -> f32 {
+        let weight_of = |skin: Self, bone: u8| {
+            skin.joints
+                .into_iter()
+                .zip(skin.weights)
+                .find(|(joint, weight)| *joint == bone && *weight > 0)
+                .map_or(0, |(_, weight)| i32::from(weight))
+        };
+        let moved: i32 = self
+            .bones()
+            .map(|bone| (weight_of(self, bone) - weight_of(other, bone)).abs())
+            .sum::<i32>()
+            + other
+                .bones()
+                .filter(|&bone| weight_of(self, bone) == 0)
+                .map(|bone| weight_of(other, bone))
+                .sum::<i32>();
+        moved as f32 / 510.0
+    }
+}
+
+/// How many [`PackedVertex`]-sized records hold the skins of a skinned cluster's vertices. They
+/// follow the cluster's vertices, two skins a record, so only skinned meshes pay for them, and a
+/// page needs no separate part for them.
+pub const fn skin_records(vertex_count: u32) -> u32 {
+    vertex_count.div_ceil(2)
+}
+
 /// One leaf of the LOD DAG: up to [`MAX_CLUSTER_TRIANGLES`] triangles.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -113,6 +238,17 @@ impl PackedCluster {
     pub fn triangle_count(&self) -> u32 {
         (self.counts >> 8) & 0xff
     }
+
+    /// How many records of the page this cluster's vertices take: its vertices, then, in a
+    /// skinned mesh, their skins.
+    pub fn vertex_records(&self, skinned: bool) -> u32 {
+        self.vertex_count()
+            + if skinned {
+                skin_records(self.vertex_count())
+            } else {
+                0
+            }
+    }
 }
 
 /// Packs three cluster-local vertex indices into one `u32`.
@@ -129,4 +265,73 @@ const _: () = {
     assert!(std::mem::size_of::<PackedVertex>() == 16);
     assert!(std::mem::size_of::<PackedCluster>() == 48);
     assert!(std::mem::size_of::<PackedNode>() == 48);
+    assert!(std::mem::size_of::<PackedSkin>() == 8);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_skin_sums_to_255_and_lists_its_bones_in_order() {
+        let skin = PackedSkin::new([9, 2, 5, 7], [0.1, 0.4, 0.3, 0.2]);
+        assert_eq!(skin.joints, [2, 5, 7, 9]);
+        assert_eq!(skin.weights.iter().map(|&w| u32::from(w)).sum::<u32>(), 255);
+        assert_eq!(skin.weights, [102, 77, 51, 25]);
+        let thirds = PackedSkin::new([1, 2, 3, 0], [1.0, 1.0, 1.0, 0.0]);
+        assert_eq!(thirds.weights, [85, 85, 85, 0]);
+        assert_eq!(thirds.joints, [1, 2, 3, 0]);
+    }
+
+    #[test]
+    fn the_same_influences_in_any_order_pack_the_same() {
+        let a = PackedSkin::new([4, 1, 0, 0], [0.75, 0.25, 0.0, 0.0]);
+        let b = PackedSkin::new([1, 4, 8, 0], [0.25, 0.75, 0.0, 0.0]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn repeats_merge_and_nothing_means_the_first_bone() {
+        let repeated = PackedSkin::new([3, 3, 6, 0], [0.25, 0.25, 0.5, 0.0]);
+        assert_eq!(repeated.joints, [3, 6, 0, 0]);
+        assert_eq!(repeated.weights, [128, 127, 0, 0]);
+        let empty = PackedSkin::new([7, 2, 0, 0], [0.0, f32::NAN, -1.0, 0.0]);
+        assert_eq!(empty.joints[0], 7);
+        assert_eq!(empty.weights, [255, 0, 0, 0]);
+    }
+
+    #[test]
+    fn how_different_two_skins_are() {
+        let hip = PackedSkin::new([1, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let knee = PackedSkin::new([2, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]);
+        let between = PackedSkin::new([1, 2, 0, 0], [0.5, 0.5, 0.0, 0.0]);
+        assert_eq!(hip.difference(hip), 0.0);
+        assert!((hip.difference(knee) - 1.0).abs() < 1.0e-6);
+        assert!((hip.difference(between) - 0.5).abs() < 0.01);
+        assert_eq!(hip.difference(between), between.difference(hip));
+    }
+
+    #[test]
+    fn a_bone_list_is_sorted_padded_and_marks_overflow() {
+        let list = cluster_bones(vec![7, 3, 3, 9]);
+        assert_eq!(&list[..4], &[3, 7, 9, 9]);
+        assert!(list[3..].iter().all(|&b| b == 9));
+        assert_eq!(cluster_bones(Vec::new()), [0; CLUSTER_BONES]);
+        let full = cluster_bones((0..CLUSTER_BONES as u8).rev().collect());
+        assert_eq!(full[0], 0);
+        assert_eq!(full[CLUSTER_BONES - 1], CLUSTER_BONES as u8 - 1);
+        let over = cluster_bones((0..=CLUSTER_BONES as u8).collect());
+        assert_eq!(over[..2], BONES_OVERFLOW);
+    }
+
+    #[test]
+    fn a_skinned_cluster_takes_a_record_per_two_vertices() {
+        let cluster = PackedCluster {
+            counts: 7,
+            ..Default::default()
+        };
+        assert_eq!(cluster.vertex_records(false), 7);
+        assert_eq!(cluster.vertex_records(true), 11);
+        assert_eq!(skin_records(8), 4);
+    }
+}

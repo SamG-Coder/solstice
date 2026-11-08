@@ -81,6 +81,9 @@ pub struct MeshInfo {
     pub quant_step: f32,
     pub uv_origin: [f32; 2],
     pub uv_step: [f32; 2],
+    /// In a skinned mesh: what to add to one of its clusters' numbers to find its bone list in
+    /// [`PagedScene::cluster_bones`].
+    pub bone_lists: Option<i32>,
 }
 
 /// The resident part of a scene: all of it is uploaded when the scene opens.
@@ -128,6 +131,15 @@ pub struct PagedScene {
 
     /// Where the data area begins in the file. Set when a file is read.
     pub data_offset: u64,
+
+    /// Each skinned cluster's bones, by [`MeshInfo::bone_lists`].
+    pub cluster_bones: Vec<crate::gpu::ClusterBones>,
+    /// See [`crate::SceneAsset::skeletons`].
+    pub skeletons: Vec<crate::skeleton::Skeleton>,
+    /// See [`crate::SceneAsset::poses`].
+    pub poses: Vec<u32>,
+    /// See [`crate::SceneAsset::instance_poses`].
+    pub instance_poses: Vec<u32>,
 }
 
 impl PagedScene {

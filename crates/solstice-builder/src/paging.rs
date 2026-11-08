@@ -36,6 +36,9 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
         hierarchy_depth: 1,
         source_triangles: scene.total_source_triangles(),
         unique_triangles: scene.unique_source_triangles(),
+        skeletons: scene.skeletons.clone(),
+        poses: scene.poses.clone(),
+        instance_poses: scene.instance_poses.clone(),
         ..Default::default()
     };
 
@@ -51,7 +54,11 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
             quant_step: mesh.quant_step,
             uv_origin: mesh.uv_origin,
             uv_step: mesh.uv_step,
+            bone_lists: mesh
+                .skinned()
+                .then(|| out.cluster_bones.len() as i32 - cluster_base as i32),
         });
+        out.cluster_bones.extend_from_slice(&mesh.cluster_bones);
         out.hierarchy_depth = out.hierarchy_depth.max(mesh.hierarchy_depth);
         out.nodes.extend(mesh.nodes.iter().map(|node| PackedNode {
             first: node.first
@@ -103,7 +110,11 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
         let mesh = &scene.meshes[item.mesh as usize];
         let local = |c: u32| &mesh.clusters[(c - item.cluster_base) as usize];
         let range = item.set.first_cluster..item.set.first_cluster + item.set.cluster_count;
-        let extra_vertices: u32 = range.clone().map(|c| local(c).vertex_count()).sum();
+        let skinned = mesh.skinned();
+        let extra_vertices: u32 = range
+            .clone()
+            .map(|c| local(c).vertex_records(skinned))
+            .sum();
         let extra_triangles: u32 = range.clone().map(|c| local(c).triangle_count()).sum();
         let extra_bytes = extra_vertices as usize * std::mem::size_of::<PackedVertex>()
             + extra_triangles as usize * 4;
@@ -137,7 +148,8 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
             let packed = &mut out.clusters[c as usize];
             packed.vertex_offset = vertices.len() as u32;
             packed.triangle_offset = triangles.len() as u32;
-            vertices.extend_from_slice(&mesh.vertices[v..v + cluster.vertex_count() as usize]);
+            let records = cluster.vertex_records(skinned) as usize;
+            vertices.extend_from_slice(&mesh.vertices[v..v + records]);
             triangles.extend_from_slice(&mesh.triangles[t..t + cluster.triangle_count() as usize]);
         }
         current.vertex_count = vertices.len() as u32;
@@ -299,6 +311,57 @@ mod tests {
             meshes,
             materials: vec![Material::default()],
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_skinned_cluster_keeps_its_skins_behind_its_vertices_in_its_page() {
+        use solstice_asset::PackedSkin;
+        let source = bumpy_sphere(4);
+        let skins: Vec<PackedSkin> = (0..source.vertices.len())
+            .map(|i| PackedSkin::new([(i % 7) as u8, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]))
+            .collect();
+        let scene = SceneAsset {
+            meshes: vec![crate::build_skinned_mesh(
+                &source,
+                &skins,
+                &BuildOptions::default(),
+            )],
+            instances: vec![Instance {
+                mesh: 0,
+                material: 0,
+                transform: Mat4::IDENTITY,
+            }],
+            materials: vec![Material::default()],
+            skeletons: vec![solstice_asset::Skeleton::default()],
+            poses: vec![0],
+            instance_poses: vec![0],
+            ..Default::default()
+        };
+        let loaded = paginate(&scene);
+        let paged = &loaded.scene;
+        assert_eq!(paged.poses, [0]);
+        assert_eq!(paged.instance_poses, [0]);
+        assert_eq!(paged.meshes[0].bone_lists, Some(0));
+        assert_eq!(paged.cluster_bones.len(), paged.clusters.len());
+        for set in &paged.sets {
+            let page = loaded.page(set.page);
+            let info = paged.pages[set.page as usize];
+            let records: &[PackedVertex] =
+                bytemuck::cast_slice(&page[..info.vertex_count as usize * 16]);
+            for c in set.first_cluster..set.first_cluster + set.cluster_count {
+                let cluster = paged.clusters[c as usize];
+                let source_cluster = scene.meshes[0].clusters[c as usize];
+                let (at, from) = (
+                    cluster.vertex_offset as usize,
+                    source_cluster.vertex_offset as usize,
+                );
+                let count = cluster.vertex_records(true) as usize;
+                assert_eq!(
+                    records[at..at + count],
+                    scene.meshes[0].vertices[from..from + count]
+                );
+            }
         }
     }
 

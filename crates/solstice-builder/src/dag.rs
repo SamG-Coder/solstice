@@ -1,21 +1,21 @@
 //! Builds the cluster LOD DAG and packs it for the GPU.
 
 use crate::bounds::Sphere;
-use crate::group::{group_clusters, GroupInput};
+use crate::group::{group_clusters, GroupInput, MAX_GROUP_SIZE, MAX_SKINNED_GROUP_SIZE};
 use crate::hierarchy::{build_hierarchy, Leaf};
 use crate::mesh::Mesh;
 use crate::partition::{partition_triangles, ClusterLimits};
-use crate::simplify::{simplify, Attribute, Corner, Triangle};
+use crate::simplify::{simplify_skinned, Attribute, Corner, SkinCost, Triangle};
 use crate::thin::{find_pieces, set_aside_wide_pieces, thin, NEW_POSITION};
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use solstice_asset::gpu::{
-    encode_uv_density, pack_triangle, CLUSTER_UV_DENSITY_SHIFT, MAX_CLUSTER_TRIANGLES,
-    MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
+    cluster_bones, encode_uv_density, pack_triangle, ClusterBones, CLUSTER_UV_DENSITY_SHIFT,
+    MAX_CLUSTER_TRIANGLES, MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
 };
 use solstice_asset::paged::{ClusterSet, ROOT_ROUND};
-use solstice_asset::{PackedCluster, PackedVertex, VirtualMesh};
+use solstice_asset::{PackedCluster, PackedSkin, PackedVertex, VirtualMesh};
 use std::ops::Range;
 
 /// Tuning parameters for [`build_virtual_mesh`].
@@ -44,6 +44,14 @@ impl Default for BuildOptions {
 /// How far the grid of a mesh made of separate pieces extends beyond its bounds on each side, as a
 /// fraction of its largest dimension.
 const FOLIAGE_GRID_MARGIN: f32 = 0.25;
+
+/// How much of a bent mesh's error to allow for beyond its error in the bind pose: simplified
+/// bind-pose geometry can come out further from the truth once it bends.
+const SKIN_BEND_MARGIN: f32 = 1.25;
+
+/// How far a vertex could land from its place in a pose if its weights changed completely, as a
+/// fraction of the mesh's size. It decides how long joints are kept.
+const SKIN_ERROR_FRACTION: f32 = 0.025;
 
 /// A cluster during the build. LOD links are filled in as the DAG grows.
 struct BuildCluster {
@@ -80,6 +88,8 @@ struct BuiltGroup {
 /// Mesh data after welding onto the 16-bit grid.
 struct WeldedMesh {
     positions: Vec<Vec3>,
+    /// Each position's skin, if the mesh is skinned.
+    skins: Option<Vec<PackedSkin>>,
     attributes: Vec<Attribute>,
     triangles: Vec<Triangle>,
     origin: Vec3,
@@ -90,10 +100,28 @@ struct WeldedMesh {
 
 /// Converts a triangle mesh to a cluster LOD DAG.
 pub fn build_virtual_mesh(mesh: &Mesh, options: &BuildOptions) -> VirtualMesh {
-    let mut welded = weld(mesh, 0.0);
+    build(mesh, None, options)
+}
+
+/// As [`build_virtual_mesh`], for a mesh that bends: `skins` holds each of its vertices' skins.
+///
+/// The DAG is built in the bind pose. Vertices welded together have the same skin, or they would
+/// not stay together in a pose, so simplification keeps each vertex's weights, and a change of
+/// weights counts in the error of what it simplifies.
+pub fn build_skinned_mesh(
+    mesh: &Mesh,
+    skins: &[PackedSkin],
+    options: &BuildOptions,
+) -> VirtualMesh {
+    assert_eq!(mesh.vertices.len(), skins.len(), "one skin per vertex");
+    build(mesh, Some(skins), options)
+}
+
+fn build(mesh: &Mesh, skins: Option<&[PackedSkin]>, options: &BuildOptions) -> VirtualMesh {
+    let mut welded = weld(mesh, skins, 0.0);
     // Thinned foliage grows, so give it room on the grid beyond its original bounds.
     if !find_pieces(&welded.triangles, |_| false).pieces.is_empty() {
-        welded = weld(mesh, FOLIAGE_GRID_MARGIN);
+        welded = weld(mesh, skins, FOLIAGE_GRID_MARGIN);
     }
     let source_triangles = welded.triangles.len() as u64;
     let limits = ClusterLimits {
@@ -150,6 +178,11 @@ fn build_level(
     let partition = group_clusters(&GroupInput {
         triangles: &cluster_triangles,
         bounds: &cluster_bounds,
+        max_group_size: if welded.skins.is_some() {
+            MAX_SKINNED_GROUP_SIZE
+        } else {
+            MAX_GROUP_SIZE
+        },
     });
 
     // A vertex used by two different groups is on a boundary and must not move.
@@ -177,6 +210,8 @@ fn build_level(
         /// May refer to `new_positions` through `NEW_POSITION`.
         triangles: Vec<Triangle>,
         new_positions: Vec<Vec3>,
+        /// The position each of `new_positions` was moved from.
+        new_sources: Vec<u32>,
     }
 
     let clusters_view: &[BuildCluster] = clusters;
@@ -196,6 +231,7 @@ fn build_level(
             let mut found = find_pieces(&triangles, |v| shared[v as usize]);
             set_aside_wide_pieces(&triangles, &mut found, &welded_view.positions);
             let mut new_positions = Vec::new();
+            let mut new_sources = Vec::new();
             let mut thinning_error = 0.0f32;
             let mut reduced = Vec::with_capacity(triangles.len());
             if !found.pieces.is_empty() {
@@ -209,6 +245,7 @@ fn build_level(
                 );
                 reduced.extend(thinned.triangles);
                 new_positions = thinned.positions;
+                new_sources = thinned.sources;
                 thinning_error = thinned.error;
             }
             let rest: Vec<Triangle> = if found.pieces.is_empty() {
@@ -218,11 +255,16 @@ fn build_level(
             };
             let mut simplified_error = 0.0f32;
             if !rest.is_empty() {
+                let skin = welded_view.skins.as_ref().map(|skins| SkinCost {
+                    skins,
+                    error_per_change: welded_view.step * 65535.0 * SKIN_ERROR_FRACTION,
+                });
                 let simplify_to = |count: usize| {
-                    simplify(
+                    simplify_skinned(
                         &rest,
                         &welded_view.positions,
                         &welded_view.attributes,
+                        skin,
                         count,
                         |v| shared[v as usize],
                     )
@@ -277,6 +319,7 @@ fn build_level(
                 error,
                 triangles: reduced,
                 new_positions,
+                new_sources,
             })
         })
         .collect();
@@ -288,8 +331,14 @@ fn build_level(
             result.map(|mut result| {
                 if !result.new_positions.is_empty() {
                     let base = welded.positions.len() as u32;
-                    for &p in &result.new_positions {
-                        welded.positions.push(welded.snap(p));
+                    for (&p, &source) in result.new_positions.iter().zip(&result.new_sources) {
+                        let snapped = welded.snap(p);
+                        welded.positions.push(snapped);
+                        // A piece keeps its skin when it is moved.
+                        if let Some(skins) = &mut welded.skins {
+                            let skin = skins[source as usize];
+                            skins.push(skin);
+                        }
                     }
                     for triangle in &mut result.triangles {
                         for corner in triangle {
@@ -430,7 +479,7 @@ impl WeldedMesh {
 ///
 /// Welding *after* snapping guarantees one grid position has one topological
 /// vertex. Triangles that collapse to a line under quantisation are dropped.
-fn weld(mesh: &Mesh, margin: f32) -> WeldedMesh {
+fn weld(mesh: &Mesh, input_skins: Option<&[PackedSkin]>, margin: f32) -> WeldedMesh {
     let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
     let (mut uv_min, mut uv_max) = (Vec2::splat(f32::MAX), Vec2::splat(f32::MIN));
     for vertex in &mesh.vertices {
@@ -448,19 +497,27 @@ fn weld(mesh: &Mesh, margin: f32) -> WeldedMesh {
     let step = ((max - min).max_element() / 65535.0).max(1.0e-9);
     let uv_step = ((uv_max - uv_min) / 65535.0).max(Vec2::splat(1.0e-9));
 
-    let mut position_ids: FxHashMap<[u16; 3], u32> = FxHashMap::default();
+    // A skin belongs to a position, so vertices that differ in skin are different positions,
+    // free to part in a pose.
+    let mut position_ids: FxHashMap<([u16; 3], PackedSkin), u32> = FxHashMap::default();
     let mut attribute_ids: FxHashMap<[u32; 4], u32> = FxHashMap::default();
     let mut positions = Vec::new();
+    let mut skins = input_skins.map(|_| Vec::new());
     let mut attributes = Vec::new();
 
     let corners: Vec<Corner> = mesh
         .vertices
         .iter()
-        .map(|vertex| {
+        .enumerate()
+        .map(|(index, vertex)| {
             let grid = ((vertex.position - min) / step).round().as_uvec3();
             let key = [grid.x as u16, grid.y as u16, grid.z as u16];
-            let position = *position_ids.entry(key).or_insert_with(|| {
+            let skin = input_skins.map_or(PackedSkin::default(), |s| s[index]);
+            let position = *position_ids.entry((key, skin)).or_insert_with(|| {
                 positions.push(min + Vec3::new(key[0] as f32, key[1] as f32, key[2] as f32) * step);
+                if let Some(skins) = &mut skins {
+                    skins.push(skin);
+                }
                 positions.len() as u32 - 1
             });
 
@@ -505,6 +562,7 @@ fn weld(mesh: &Mesh, margin: f32) -> WeldedMesh {
 
     WeldedMesh {
         positions,
+        skins,
         attributes,
         triangles,
         origin: min,
@@ -551,13 +609,19 @@ fn pack(
         return out;
     }
 
+    // Both sides of the choice between a group and its parents use the same margin.
+    let bend = if welded.skins.is_some() {
+        SKIN_BEND_MARGIN
+    } else {
+        1.0
+    };
     // Sibling sets: children of one group, then parentless clusters in small runs.
     let mut sibling_sets: Vec<SiblingSet> = groups
         .iter()
         .map(|group| SiblingSet {
             members: group.children.clone(),
             parent_bounds: group.lod_bounds,
-            parent_error: group.error,
+            parent_error: group.error * bend,
             round: group.round,
             generated: group.generated.clone(),
         })
@@ -584,8 +648,10 @@ fn pack(
             let packed = pack_cluster(
                 welded,
                 &clusters[member as usize],
+                bend,
                 &mut out.vertices,
                 &mut out.triangles,
+                &mut out.cluster_bones,
             );
             out.clusters.push(packed);
         }
@@ -628,22 +694,38 @@ fn pack(
 fn pack_cluster(
     welded: &WeldedMesh,
     cluster: &BuildCluster,
+    bend: f32,
     vertices: &mut Vec<PackedVertex>,
     triangles: &mut Vec<u32>,
+    bones: &mut Vec<ClusterBones>,
 ) -> PackedCluster {
     let vertex_offset = vertices.len() as u32;
     let triangle_offset = triangles.len() as u32;
     let mut local: FxHashMap<Corner, u8> = FxHashMap::default();
+    let mut skins: Vec<PackedSkin> = Vec::new();
 
     for triangle in &cluster.triangles {
         let indices = triangle.map(|corner| {
             *local.entry(corner).or_insert_with(|| {
                 vertices.push(pack_vertex(welded, corner));
+                if let Some(all) = &welded.skins {
+                    skins.push(all[corner.position as usize]);
+                }
                 u8::try_from(vertices.len() as u32 - 1 - vertex_offset)
                     .expect("cluster exceeds 8-bit vertex indexing")
             })
         });
         triangles.push(pack_triangle(indices[0], indices[1], indices[2]));
+    }
+    if welded.skins.is_some() {
+        // Two to a record, right behind the cluster's vertices.
+        for pair in skins.chunks(2) {
+            let second = pair.get(1).copied().unwrap_or_default();
+            vertices.push(bytemuck::cast([pair[0], second]));
+        }
+        bones.push(cluster_bones(
+            skins.iter().flat_map(|s| s.bones()).collect(),
+        ));
     }
 
     PackedCluster {
@@ -651,7 +733,7 @@ fn pack_cluster(
         radius: cluster.bounds.radius,
         lod_center: cluster.lod_bounds.center.to_array(),
         lod_radius: cluster.lod_bounds.radius,
-        lod_error: cluster.lod_error,
+        lod_error: cluster.lod_error * bend,
         vertex_offset,
         triangle_offset,
         counts: local.len() as u32
@@ -934,6 +1016,7 @@ pub(crate) mod tests {
     #[test]
     fn uv_density_measures_repeats_per_unit() {
         let welded = WeldedMesh {
+            skins: None,
             positions: vec![Vec3::ZERO, Vec3::X * 2.0, Vec3::Y * 2.0],
             attributes: vec![
                 Attribute {
@@ -1122,6 +1205,185 @@ pub(crate) mod tests {
                 "cracks at threshold {threshold}"
             );
         }
+    }
+
+    /// A sphere's skins: four bones stacked up its height, blending into each other.
+    fn stacked_skins(mesh: &Mesh) -> Vec<PackedSkin> {
+        mesh.vertices
+            .iter()
+            .map(|vertex| {
+                let height = (vertex.position.y + 1.2) / 2.4 * 3.0;
+                let lower = (height.floor() as i32).clamp(0, 2);
+                let blend = (height - lower as f32).clamp(0.0, 1.0);
+                PackedSkin::new(
+                    [lower as u8, lower as u8 + 1, 0, 0],
+                    [1.0 - blend, blend, 0.0, 0.0],
+                )
+            })
+            .collect()
+    }
+
+    /// Reads the position on the grid and the skin of a cluster's vertex.
+    fn skinned_vertex(mesh: &VirtualMesh, cluster: u32, local: u32) -> ([u16; 3], PackedSkin) {
+        let cluster = mesh.clusters[cluster as usize];
+        let data = mesh.vertices[(cluster.vertex_offset + local) as usize].data;
+        let record =
+            mesh.vertices[(cluster.vertex_offset + cluster.vertex_count() + local / 2) as usize];
+        let pair: [PackedSkin; 2] = bytemuck::cast(record);
+        ([data[0], data[1], data[2]], pair[(local % 2) as usize])
+    }
+
+    #[test]
+    fn a_vertex_shared_between_clusters_has_the_same_skin_in_all_of_them() {
+        let source = bumpy_sphere(5);
+        let skins = stacked_skins(&source);
+        let mesh = build_skinned_mesh(&source, &skins, &BuildOptions::default());
+        assert!(mesh.skinned());
+        let mut seen: FxHashMap<[u16; 3], PackedSkin> = FxHashMap::default();
+        let mut shared = 0;
+        for cluster in 0..mesh.clusters.len() as u32 {
+            for local in 0..mesh.clusters[cluster as usize].vertex_count() {
+                let (grid, skin) = skinned_vertex(&mesh, cluster, local);
+                match seen.get(&grid) {
+                    Some(other) => {
+                        shared += 1;
+                        assert_eq!(*other, skin, "a vertex differs between clusters");
+                    }
+                    None => {
+                        seen.insert(grid, skin);
+                    }
+                }
+            }
+        }
+        assert!(shared > 0);
+    }
+
+    /// Where a vertex goes in a pose: each bone turns about the Z axis at its own height.
+    fn posed(mesh: &VirtualMesh, cluster: u32, local: u32) -> [u32; 3] {
+        let (grid, skin) = skinned_vertex(mesh, cluster, local);
+        let p = mesh.quant_origin
+            + Vec3::new(grid[0] as f32, grid[1] as f32, grid[2] as f32) * mesh.quant_step;
+        let mut sum = Vec3::ZERO;
+        for (joint, weight) in skin.joints.iter().zip(skin.weights) {
+            let angle = f32::from(*joint) * 0.4;
+            let pivot = Vec3::Y * (f32::from(*joint) - 1.5);
+            let moved = glam::Quat::from_rotation_z(angle) * (p - pivot) + pivot;
+            sum += moved * f32::from(weight) / 255.0;
+        }
+        sum.to_array().map(f32::to_bits)
+    }
+
+    #[test]
+    fn every_cut_of_a_skinned_mesh_is_watertight_in_a_pose() {
+        let source = bumpy_sphere(5);
+        let skins = stacked_skins(&source);
+        let mesh = build_skinned_mesh(&source, &skins, &BuildOptions::default());
+        for threshold in [0.0, 0.002, 0.01, 0.05, 0.3, 10.0] {
+            let cut = select_cut(&mesh, &|_, error| error, threshold);
+            assert!(!cut.is_empty());
+            let mut uses: FxHashMap<([u32; 3], [u32; 3]), u32> = FxHashMap::default();
+            for &index in &cut {
+                let cluster = mesh.clusters[index as usize];
+                for t in 0..cluster.triangle_count() {
+                    let packed = mesh.triangles[(cluster.triangle_offset + t) as usize];
+                    let corners =
+                        unpack_triangle(packed).map(|local| posed(&mesh, index, u32::from(local)));
+                    for side in 0..3 {
+                        let (a, b) = (corners[side], corners[(side + 1) % 3]);
+                        *uses.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+                    }
+                }
+            }
+            let open = uses.values().filter(|&&count| count != 2).count();
+            assert_eq!(open, 0, "cracks at threshold {threshold}");
+        }
+    }
+
+    #[test]
+    fn a_cluster_lists_every_bone_its_vertices_use() {
+        let source = bumpy_sphere(5);
+        let skins = stacked_skins(&source);
+        let mesh = build_skinned_mesh(&source, &skins, &BuildOptions::default());
+        assert_eq!(mesh.cluster_bones.len(), mesh.clusters.len());
+        for cluster in 0..mesh.clusters.len() as u32 {
+            let list = &mesh.cluster_bones[cluster as usize];
+            for local in 0..mesh.clusters[cluster as usize].vertex_count() {
+                let (_, skin) = skinned_vertex(&mesh, cluster, local);
+                for bone in skin.bones() {
+                    assert!(list.contains(&bone), "bone {bone} isn't on {list:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_change_of_weights_counts_in_the_error() {
+        let source = bumpy_sphere(5);
+        // One bone everywhere, for a skinned mesh whose weights never change.
+        let same = vec![PackedSkin::new([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]); source.vertices.len()];
+        let rigid = build_skinned_mesh(&source, &same, &BuildOptions::default());
+        // Bones change sharply and often, so that simplifying must cross many boundaries.
+        let hard: Vec<PackedSkin> = source
+            .vertices
+            .iter()
+            .map(|vertex| {
+                let band = (((vertex.position.y + 1.2) * 12.0) as i32).rem_euclid(2) as u8;
+                PackedSkin::new([band, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])
+            })
+            .collect();
+        let bent = build_skinned_mesh(&source, &hard, &BuildOptions::default());
+        let worst = |mesh: &VirtualMesh| {
+            mesh.clusters
+                .iter()
+                .map(|c| c.lod_error)
+                .fold(0.0_f32, f32::max)
+        };
+        assert!(
+            worst(&bent) > worst(&rigid),
+            "{} is not above {}",
+            worst(&bent),
+            worst(&rigid)
+        );
+    }
+
+    /// Cards like hair: lots of separate quads, each with its own seams, so clusters are as full
+    /// of vertices as they can be, and a set of them is as large as a set can be.
+    #[test]
+    fn a_full_set_of_skinned_cards_fits_in_a_page() {
+        let mut source = Mesh::default();
+        for i in 0..6000u32 {
+            let (x, z) = ((i % 80) as f32 * 0.03, (i / 80) as f32 * 0.03);
+            let base = source.vertices.len() as u32;
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                source.vertices.push(Vertex {
+                    position: Vec3::new(x + u * 0.02, v * 0.02, z),
+                    normal: Vec3::Z,
+                    uv: Vec2::new(i as f32 + u, v),
+                });
+            }
+            source
+                .indices
+                .extend([0, 1, 2, 0, 2, 3].map(|corner| base + corner));
+        }
+        let skins =
+            vec![PackedSkin::new([0, 0, 0, 0], [1.0, 0.0, 0.0, 0.0]); source.vertices.len()];
+        let mesh = build_skinned_mesh(&source, &skins, &BuildOptions::default());
+        let page = solstice_asset::paged::PAGE_BYTES;
+        for set in &mesh.sets {
+            let bytes: usize = mesh.clusters[set.first_cluster as usize..]
+                [..set.cluster_count as usize]
+                .iter()
+                .map(|c| c.vertex_records(true) as usize * 16 + c.triangle_count() as usize * 4)
+                .sum();
+            assert!(bytes <= page, "a set takes {bytes} bytes, more than a page");
+        }
+    }
+
+    #[test]
+    fn a_rigid_mesh_carries_no_skin() {
+        let mesh = built(4);
+        assert!(!mesh.skinned());
+        assert!(mesh.cluster_bones.is_empty());
     }
 
     #[test]

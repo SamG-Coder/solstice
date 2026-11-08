@@ -861,6 +861,27 @@ rasterizers, the visibility buffer and resolve. They do not get a separate path.
     to places, so a moving hull would wrongly lose its wet band, and carry none. Moving things
     get their own wetness later, with the rain work.
 
+**As built (step 7, the format and the DAG).** The plan above is simplified in three ways, each
+checked on the keeper (38,462 triangles, 628 clusters in 12 meshes):
+
+- **A vertex names its bones directly,** by the skeleton's own numbers, rather than through its
+  cluster's list. Skeletons have at most 256 bones, so 8 bits is enough, and resolve and the
+  rasterizers skip a lookup per influence. A skin is 8 bytes behind its cluster's vertices in the
+  page, two to a 16-byte record, so a page needs no new part.
+- **The cluster's list is only for culling,** and a cluster's bounds stay its bind-pose sphere: the
+  skinned position lies inside the sphere moved by each of its bones, so a union of those moved
+  spheres contains it. No per-bone radii are stored.
+- **Clusters are not grouped by bones.** On the keeper 626 of 628 clusters use 16 bones or fewer,
+  most under 8. The two that don't are coarse ones around the hands, drawn with the whole mesh's
+  bounds rather than losing influences, so no weights are dropped.
+
+Simplification keeps every vertex's weights, since a collapse only removes vertices. Moving a
+vertex's weights counts in the error: 2.5% of the mesh's size for a whole change. A skin is welded
+as part of a position, so two vertices differing in skin stay apart in a pose. Thinned pieces such
+as hair cards keep their source vertices' skins. Scene files gain an optional `SKIN` section, so
+older files and readers are unaffected. The importer keeps a skin only when asked
+(`ImportOptions::skinned`); otherwise a skinned model is still imported unposed, as before.
+
 ### The animation runtime
 
 `solstice-anim`, on the CPU, in Rust:

@@ -3198,6 +3198,7 @@ dependencies = [
 name = "solstice-import"
 version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "glam 0.33.12",
  "gltf",
  "png 0.17.16",

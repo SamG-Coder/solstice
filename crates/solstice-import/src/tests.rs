@@ -229,6 +229,7 @@ fn fit_size_scales_centres_and_grounds_the_model() {
         texture_size: 4,
         fit_size: Some(4.0),
         ground: false,
+        skinned: false,
     };
     let scene = import_gltf(&path, &options).unwrap().scene;
     let transform = scene.instances[0].transform;
@@ -260,6 +261,7 @@ fn ground_plane_lies_under_the_model_and_faces_up() {
         texture_size: 4,
         fit_size: None,
         ground: true,
+        skinned: false,
     };
     let scene = import_gltf(&path, &options).unwrap().scene;
     assert_eq!(scene.instances.len(), 2);
@@ -303,6 +305,7 @@ fn ground_plane_uses_the_authored_ground() {
         texture_size: 4,
         fit_size: None,
         ground: true,
+        skinned: false,
     };
     let scene = import_gltf(&path, &options).unwrap().scene;
     assert!(scene.instances[1].transform.w_axis.y.abs() < 1.0e-4);
@@ -317,6 +320,7 @@ fn fit_and_ground_plane_agree_on_the_ground_height() {
         texture_size: 4,
         fit_size: Some(2.0),
         ground: true,
+        skinned: false,
     };
     let scene = import_gltf(&path, &options).unwrap().scene;
     let (model, floor) = (scene.instances[0].transform, scene.instances[1].transform);
