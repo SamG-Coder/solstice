@@ -1,6 +1,6 @@
 //! End-to-end tests on a real GPU. They pass trivially, with a note, if none is available.
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Quat, Vec2, Vec3};
 use solstice_asset::{Instance, Light, LoadedScene, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
@@ -130,6 +130,9 @@ struct Run {
     triangles: u32,
     clusters: u32,
     software_clusters: u32,
+    /// Clusters the last shadow cascade redrawn sent to the software rasterizer.
+    shadow_software_clusters: u32,
+    shadow_clusters: u32,
 }
 
 /// Renders a few frames in darkness, fails on any validation error, and reads back the result.
@@ -182,6 +185,8 @@ fn render_in(
         triangles: stats.triangles,
         clusters: stats.clusters,
         software_clusters: stats.software_clusters,
+        shadow_software_clusters: stats.shadow_software_clusters,
+        shadow_clusters: stats.shadow_clusters,
     }
 }
 
@@ -1039,6 +1044,68 @@ fn tiled_lights_reach_what_is_in_their_range_and_nothing_else() {
     assert!(
         difference < 1.0,
         "far lamps changed the picture by {difference} per channel on average"
+    );
+}
+
+/// Small casters are drawn into the shadow maps by the software rasterizer: a ball 20 cm
+/// across is one cluster, under sixteen texels wide in the nearest cascade, so it takes that
+/// path, and if it drew nothing the ball would cast no shadow. Under a low sun the shadow
+/// falls on the floor half a metre from the ball, where it must be darker than the same floor
+/// with no ball; and the cascade must report that every cluster but the floor's one, which is
+/// too large for software, went that way, so that the shadow cannot be the hardware's.
+#[test]
+fn small_casters_shadow_through_the_software_rasterizer() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 2.5),
+        yaw: 0.0,
+        pitch: -0.7,
+        ..Default::default()
+    };
+    // Low enough that the shadow lands well clear of the ball, beyond the reach of the
+    // screen-space contact shadows, which would darken the floor next to it on their own.
+    let sun_direction = Vec3::new(5.0, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let size = 256;
+    let settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let (radius, centre) = (0.1, Vec3::new(0.0, 0.1, 0.0));
+    let mut scene = ball_on_floor();
+    scene.instances[0].transform =
+        Mat4::from_scale_rotation_translation(Vec3::splat(radius), Quat::IDENTITY, centre);
+    let run = render_in(&gpu, &scene, &camera, settings, size, &sun);
+    assert!(
+        run.shadow_software_clusters > 0
+            && run.shadow_software_clusters + 1 == run.shadow_clusters,
+        "{} of the cascade's {} clusters went to the software rasterizer; all but the floor's should",
+        run.shadow_software_clusters,
+        run.shadow_clusters
+    );
+    let with_ball = run.pixels;
+    scene.instances.remove(0);
+    let floor = render_in(&gpu, &scene, &camera, settings, size, &sun).pixels;
+    // Where the ball's centre casts to on the floor, on screen.
+    let on_floor = centre - sun_direction * (centre.y / sun_direction.y);
+    let clip = camera.projection(1.0) * camera.view() * on_floor.extend(1.0);
+    let ndc = clip.truncate() / clip.w;
+    let (px, py) = (
+        ((ndc.x * 0.5 + 0.5) * size as f32) as u32,
+        ((0.5 - ndc.y * 0.5) * size as f32) as u32,
+    );
+    let shadowed = brightness(patch(&with_ball, size, px, py, 2));
+    let lit = brightness(patch(&floor, size, px, py, 2));
+    assert!(
+        shadowed + 30.0 < lit,
+        "the floor at ({px}, {py}) is {shadowed} with the ball and {lit} without: no shadow"
     );
 }
 

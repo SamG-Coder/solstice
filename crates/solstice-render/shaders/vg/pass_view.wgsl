@@ -32,6 +32,8 @@ struct PassView {
     receiver_plane_count: u32,
     // Which instances the view draws: one of the INSTANCES_ constants.
     instance_filter: u32,
+    // For a depth map drawn by the software rasterizer: which drawing this is, 1 to 255.
+    stamp: u32,
     receiver_planes: array<vec4f, 6>,
     // Towards the light, for a shadow view.
     eye_light: vec3f,

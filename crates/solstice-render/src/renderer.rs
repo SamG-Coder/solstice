@@ -206,6 +206,8 @@ pub struct FrameStats {
     /// frames to arrive, and a redraw is skipped over while the last is still in flight.
     pub shadow_clusters: u32,
     pub shadow_triangles: u32,
+    /// How many of those clusters went to the software rasterizer.
+    pub shadow_software_clusters: u32,
     /// Queue entries and clusters the main view, and that cascade, lost for want of room in
     /// their lists. Zero unless the scene has outgrown them, in which case the image, or the
     /// shadow, has holes.
@@ -665,6 +667,7 @@ impl Renderer {
             streaming: self.streamer.stats(),
             particles: self.particles.stats(),
             shadow_clusters: self.aux_work.stats().clusters(),
+            shadow_software_clusters: self.aux_work.stats().software_clusters(),
             shadow_triangles: self.aux_work.stats().triangles(),
             dropped: self.main_work.stats().dropped(),
             shadow_dropped: self.aux_work.stats().dropped(),
@@ -819,6 +822,7 @@ impl Renderer {
         self.shadows.record(
             &mut encoder,
             &self.cull,
+            &self.rasterizer,
             &self.scene,
             &self.aux_cull_scene,
             &self.aux_work,
@@ -1230,7 +1234,7 @@ impl Renderer {
             eye_near: 0.0,
             receiver_plane_count: 0,
             instance_filter: InstanceFilter::All as u32,
-            _pad: 0,
+            stamp: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             _pad2: 0.0,
