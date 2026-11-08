@@ -52,7 +52,8 @@ pub struct ResolveBindings {
 }
 
 impl Resolve {
-    pub fn new(gpu: &Gpu) -> Self {
+    /// `wetness` is the layout of the third bind group, from [`crate::ocean::waterline`].
+    pub fn new(gpu: &Gpu, wetness: &wgpu::BindGroupLayout) -> Self {
         let data_layout = LayoutBuilder::new()
             .uniform()
             .storage_read()
@@ -87,7 +88,7 @@ impl Resolve {
                 "resolve",
                 &module,
                 "main",
-                &[&data_layout, &output_layout],
+                &[&data_layout, &output_layout, wetness],
             ),
             data_layout,
             output_layout,
@@ -147,6 +148,7 @@ impl Resolve {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         bindings: &ResolveBindings,
+        wetness: &wgpu::BindGroup,
         size: (u32, u32),
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -156,6 +158,7 @@ impl Resolve {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bindings.data, &[]);
         pass.set_bind_group(1, &bindings.output, &[]);
+        pass.set_bind_group(2, wetness, &[]);
         pass.dispatch_workgroups(groups_for(size.0, 8), groups_for(size.1, 8), 1);
     }
 }

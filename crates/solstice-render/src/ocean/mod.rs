@@ -25,6 +25,7 @@ pub mod sea;
 pub mod seabed;
 pub mod spectrum;
 pub mod surface;
+pub mod waterline;
 pub mod waves;
 
 pub use sea::Sea;

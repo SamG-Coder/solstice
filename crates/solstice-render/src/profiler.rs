@@ -10,11 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 19] = [
+pub const SECTIONS: [&str; 20] = [
     "sky",
     "clouds",
     "ocean",
     "shadows",
+    "wet line",
     "gi cull",
     "gi voxelize",
     "gi flood",
@@ -38,25 +39,27 @@ pub mod section {
     /// The sea's waves.
     pub const OCEAN: usize = 2;
     pub const SHADOWS: usize = 3;
-    pub const GI_CULL: usize = 4;
-    pub const GI_VOXELIZE: usize = 5;
-    pub const GI_FLOOD: usize = 6;
-    pub const GI_WRITE: usize = 7;
-    pub const GI_LIGHT: usize = 8;
+    /// Where the sea stands and has stood, for wetness.
+    pub const WATERLINE: usize = 4;
+    pub const GI_CULL: usize = 5;
+    pub const GI_VOXELIZE: usize = 6;
+    pub const GI_FLOOD: usize = 7;
+    pub const GI_WRITE: usize = 8;
+    pub const GI_LIGHT: usize = 9;
     /// Culling and rasterizing what was visible last frame, then the occlusion pyramid.
-    pub const CULL_FIRST: usize = 9;
-    pub const RASTER_FIRST: usize = 10;
+    pub const CULL_FIRST: usize = 10;
+    pub const RASTER_FIRST: usize = 11;
     /// Culling and rasterizing what that revealed.
-    pub const CULL_SECOND: usize = 11;
-    pub const RASTER_SECOND: usize = 12;
-    pub const RESOLVE: usize = 13;
-    pub const CLOUDS_ON_SCREEN: usize = 14;
-    pub const SCREEN_GI: usize = 15;
-    pub const LIGHTING: usize = 16;
+    pub const CULL_SECOND: usize = 12;
+    pub const RASTER_SECOND: usize = 13;
+    pub const RESOLVE: usize = 14;
+    pub const CLOUDS_ON_SCREEN: usize = 15;
+    pub const SCREEN_GI: usize = 16;
+    pub const LIGHTING: usize = 17;
     /// The sea's surface, drawn and shaded.
-    pub const WATER: usize = 17;
-    pub const POST: usize = 18;
-    pub const END: usize = 19;
+    pub const WATER: usize = 18;
+    pub const POST: usize = 19;
+    pub const END: usize = 20;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;
