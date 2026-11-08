@@ -69,22 +69,27 @@ The origin is the middle of the quay's edge, at sea level. The sea stands at hei
 |---|---|---|---|
 | Harbour basin | x -75 to 0, z -45 to 50 | 75 × 95 m | seabed -3.5 m at the quay, -7 m at the mouth |
 | Quay | x 0 to 10, z -48 to 50 | 98 × 10 m | deck 1.9 m |
-| Water stairs | z -10, cut into the quay | 2 m wide, 10 steps | |
+| Water stairs | z -10, cut into the quay | 2 m wide, 13 steps of 16 cm | |
 | North mole | from (0, -48), curving to (-92, -66) | 100 m long, 7 m wide | deck 3.2 m, seaward parapet to 4.4 m |
 | Lighthouse | (-92, -64) | tower 18 m, base ⌀ 7 m, top ⌀ 4.8 m, lantern 4 m | lamp 22 m |
 | Timber pier | from (0, 40) west, T-head at x -44 | 44 × 3 m, head 20 × 5 m | deck 1.5 m |
 | Quay-front row | x 11 to 23, z -46 to 50 | 12 houses, 6–8 m wide, 3 storeys, eaves 9.5 m, ridge 13 m | 1.9 m |
 | Market square | x 24 to 56, z -14 to 16 | 32 × 30 m | 3.0 m, falling 1:60 towards the sea |
 | Fountain | (39, 0) | basin ⌀ 5 m, column 2.4 m | |
-| Net Lane | z -30, x 26 to 120 | 3.2 m wide, rises 1:10, with steps | 2.5 to 12 m |
-| Chapel Steps | z 25, x 26 to 120 | 2.6 m wide, three flights of steps | 3 to 12 m |
+| Net Lane | z -30, x 11 to 120 | 3.2 m wide, climbing 1:4 by ramps and flights of steps | 2.5 to 19 m |
+| Chapel Steps | z 25, x 11 to 120 | 2.6 m wide, flights of steps | 3 to 19 m |
 | Upper Street | x 70, z -34 to 29 | 4 m wide | 7 to 8 m |
 | Warehouse | x 14 to 38, z -46 to -36 | 24 × 10 m, 8 m to the ridge | 2 m |
 | Chapel | (95, 35) | nave 9 × 18 m, tower 5 × 5 × 22 m | 12 m |
-| Town wall and gate | x about 125 to 133, z -70 to 70 | 6.5 m high, opening 3.4 m | 13 m |
+| Town wall and gate | x about 125 to 133, z -70 to 70 | 6.5 m high, opening 3.4 m | 20 m |
 | Beach | z 50 to 140, running south-west | 110 m long, 30 m wide, slope 1:12 | -1 to 2 m |
 | South headland, north cliffs | z 140 and beyond; z -130 to -60 | scans 87 m wide, 24 m high | to 30 m |
-| Ground behind the town | x 133 and beyond | rising to 45 m at x 300 | |
+| Ground behind the town | x 133 and beyond | rising to 52 m at x 300 | |
+
+The front row is broken three times: Net Lane at z -30, a 3.2 m passage from the water stairs up to
+the square at z -10, and Chapel Steps at z 25. Above Upper Street the ground climbs 1 in 4, steeper
+than the first plan's 1 in 10, because captures from the water showed one flat row of houses. Now
+each row stands clear above the one in front, as in a real hillside port.
 
 The player's round, from the gate to the lighthouse and along the beach, is about 450 m: four
 minutes on foot, without stopping. The land continues as an island, as the cove's does, so its
@@ -122,13 +127,13 @@ Everything is CC0 and fetched by script. None of it is committed.
   `treasure_chest` (in the warehouse), `tree_small_02`, `fern_02`.
 
 **From Poly Haven, as textures.** The same site publishes each texture as a tiled glTF, so the
-importer already reads them, and `fetch-scans.py` gains `surface` lines to fetch them: cobblestones,
+importer already reads them, and `fetch-scans.py` gains `surface` lines (from step 2, the first to use them) to fetch them: cobblestones,
 cut granite blocks, plaster and limewash, clay roof tiles, weathered planks and sand, with their
 height maps.
 
 **Made by a new tool, because no CC0 scan exists.** Poly Haven has no period houses, no small
-boats, no lighthouse and no fountain. `tools/townkit` is a small Rust program that generates them
-as a glTF kit into `target/town/`, from the fetched textures:
+boats, no lighthouse and no fountain. `apps/townkit` is a small Rust program that generates them
+as glTF into `target/town/`, from the fetched textures:
 - houses, from eight plans with variation: window reveals, shutters, doors, chimneys, eaves, and
   roofs with real tile geometry;
 - the quay, mole, steps and paving, displaced from the textures' height maps, as virtual geometry
@@ -164,13 +169,13 @@ cove's gate is.
 
 | Name | From | Looking at | Best at |
 |---|---|---|---|
-| The harbour mouth | On the water, (-150, 3, -20) | The whole front: mole, ship, quay, town rising behind | Dusk |
+| The harbour mouth | On the water, (-190, 3, 10) | The whole front: mole, ship, quay, town rising behind | Dusk |
 | The quay | (5, 3.5, 44) | North along the quay, the ship on the left | Morning |
 | The square | (28, 4.7, 14) | Across the fountain to Net Lane | Noon |
-| Net Lane | (60, 7, -30) | Down the lane to the masts and the water | Night, lamps lit |
+| Net Lane | (60, 6.2, -30) | Down the lane to the masts and the water | Night, lamps lit |
 | The lighthouse | From the mole, (-40, 5, -60) | The lighthouse against the afterglow | Dusk |
-| The beach | (-20, 1.6, 95) | The wet sand, back towards the pier and town | Sunset |
-| Above the town | From the chapel tower, (95, 34, 35) | Roofs, harbour, sea | Dusk |
+| The beach | (-38, 2.4, 95) | The wet sand, back towards the pier and town | Sunset |
+| Above the town | From the chapel tower, (95, 40, 24.5) | Roofs, harbour, sea | Dusk |
 
 A **75 second flyover** (`scenes/harbour_flyover.txt`, as the cove's): in from the sea past the
 pinnace, around the lighthouse, along the mole, low over the moored boats, up the water stairs,
@@ -226,10 +231,10 @@ in radius and about 1.8 m tall. So the scene is built to make that easy:
 Each step is its own PR off `main`, reviewed by a separate agent, with captures from several
 viewpoints and times of day judged as a whole picture, and costs measured.
 
-1. **The kit and the blockout.** `tools/townkit`; `fetch-scans.py` for textures; terrain, quay,
-   mole and the basin, in plain materials, with the sea. Judge scale and composition from every
-   viewpoint.
-2. **Stone.** Real stone courses and paving on the quay, mole, steps and square; the pier; props
+1. **The kit and the blockout.** `apps/townkit`; terrain, quay, mole and the basin, and plain
+   shapes for everything else, in plain materials, with the sea. Judge scale and composition from
+   every viewpoint.
+2. **Stone.** `fetch-scans.py` for textures; real stone courses and paving on the quay, mole, steps and square; the pier; props
    along the quay.
 3. **The houses.** The eight plans and their variations; the quay-front row and the back rows.
 4. **The town.** Lanes and steps; the warehouse; the chapel; the wall and gate; the fountain, with
@@ -246,13 +251,13 @@ viewpoints and times of day judged as a whole picture, and costs measured.
 
 ## Decisions
 
-These are recommendations, for you to confirm or change.
+Approved on 2026-11-09, all five as recommended.
 
 1. **The look.** I recommend an Atlantic town of about 1860, Galicia or northern Portugal: limewash
    and granite with terracotta roofs. It gives colour for GI to bleed, stands up to rain and
    sunshine, and suits the cast-iron lamps and the fort's stone. The alternative is Cornish slate
    and granite, moodier but greyer.
-2. **Houses and boats by our own tool.** I recommend `tools/townkit`, since nothing CC0 exists. The
+2. **Houses and boats by our own tool.** I recommend `apps/townkit`, since nothing CC0 exists. The
    alternative is building them in Blender by script, which is slower to iterate on.
 3. **Lamps at dusk.** Script control of lights is gameplay step 10, which comes after 0.3. I
    recommend a small general renderer change now: a light or glow can be marked *night-only*, and
@@ -267,8 +272,10 @@ These are recommendations, for you to confirm or change.
 
 ## Risks
 
-- **House detail against download size.** Real tile geometry on 34 houses is the largest cost. The
+- **House detail against download size.** Real tile geometry on about 60 houses is the largest cost. The
   roofs are instanced by plan, so a house shared by three plots costs once.
+- **The seabed map is a square around the camera.** From well above the town (over 100 m) its edge
+  shows as a straight line where the water's colour changes. The flyover stays below that height.
 - **Waves pass through the mole.** The FFT sea knows only depth, so a shallow basin stands in for
   shelter. The boats' bobbing is scripted, so it may disagree a little with the waves.
 - **Wet bands stay where they are.** A boat that moves carries no wet band of its own
