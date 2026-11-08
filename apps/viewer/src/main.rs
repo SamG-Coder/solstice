@@ -532,7 +532,7 @@ mod native {
         );
         if stats.dropped > 0 || stats.shadow_dropped > 0 {
             println!(
-                "WARNING: the cull lists overflowed: {} dropped in the main view, {} in the shadow cascade",
+                "WARNING: the cull lists overflowed: {} dropped in the main view, {} in the last shadow cascade redrawn",
                 stats.dropped, stats.shadow_dropped
             );
         }
@@ -753,13 +753,13 @@ mod native {
             report_stability(&changes);
         }
 
+        if dropped > 0 || shadow_dropped > 0 {
+            println!(
+                "WARNING: the cull lists overflowed: up to {dropped} dropped in the main view, {shadow_dropped} in the last shadow cascade redrawn each frame"
+            );
+        }
         let errors = errors.lock().expect("error sink");
         if errors.is_empty() {
-            if dropped > 0 || shadow_dropped > 0 {
-                println!(
-                    "WARNING: the cull lists overflowed: up to {dropped} dropped in the main view, {shadow_dropped} in a shadow cascade"
-                );
-            }
             println!("no GPU errors");
             Ok(())
         } else {
