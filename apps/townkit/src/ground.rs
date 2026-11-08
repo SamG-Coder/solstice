@@ -30,7 +30,7 @@ pub const CELL: f32 = 1.0;
 pub const QUAY_DECK: f32 = 1.9;
 /// The x the land starts at along the quay: inside the quay's solid, so that the jump from
 /// seabed to land is hidden.
-const QUAY_SHORE: f32 = 3.0;
+const QUAY_SHORE: f32 = 4.0;
 const DEEP: f32 = 11.0;
 /// The ground at the town wall. The upper town climbs steeply to it, so that from the water each
 /// row of houses stands clear above the one in front.
@@ -55,7 +55,7 @@ const COAST: [(f32, f32); 17] = [
     (-90.0, -30.0),
     (-75.0, -15.0),
     (-62.0, -4.0),
-    (-52.0, QUAY_SHORE),
+    (-54.0, QUAY_SHORE),
     (50.0, QUAY_SHORE),
     (54.0, -20.0),
     (60.0, -25.0),
@@ -68,7 +68,7 @@ const COAST: [(f32, f32); 17] = [
 
 /// How much of this z lies along the quay, where the coast is built rather than natural.
 fn quay_share(z: f32) -> f32 {
-    smoothstep(-62.0, -50.0, z) * (1.0 - smoothstep(50.0, 56.0, z))
+    smoothstep(-66.0, -54.0, z) * (1.0 - smoothstep(50.0, 56.0, z))
 }
 
 /// How far east the waterline lies at `z`.
@@ -88,10 +88,14 @@ fn shoreline(z: f32) -> f32 {
 
 /// The town's ground, by how far inland: level along the quay, a step up to the market square,
 /// then the climb to the town wall and the hill behind.
-fn town(x: f32) -> f32 {
+fn town(x: f32, z: f32) -> f32 {
     if x < 10.0 {
-        // Just under the quay's deck, which covers it.
-        return QUAY_DECK - 0.2;
+        // Just under the quay's deck where it covers the land; level with it beyond the ends.
+        return if z > -52.0 && z < 50.0 {
+            QUAY_DECK - 0.2
+        } else {
+            QUAY_DECK
+        };
     }
     let square = 3.0 + (x - 24.0).max(0.0) / 60.0;
     if x <= 56.0 {
@@ -125,7 +129,7 @@ pub fn height(x: f32, z: f32) -> f32 {
     } else {
         let rolling = fbm(Vec3::new(x, 0.0, z) * 0.02, 4, 401) * 5.0;
         let wild = smoothstep(133.0, 190.0, x).max(smoothstep(62.0, 110.0, z.abs()));
-        let levels = town(x) + rolling * wild;
+        let levels = town(x, z) + rolling * wild;
         // A beach rises 1 in 12 from the waterline to its crest, then meets the town's levels.
         let beach = inland / 12.0;
         let backed = lerp(beach, levels.max(beach), smoothstep(30.0, 70.0, inland));

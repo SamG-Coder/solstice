@@ -68,19 +68,19 @@ The origin is the middle of the quay's edge, at sea level. The sea stands at hei
 | Place | Where | Size | Height above the sea |
 |---|---|---|---|
 | Harbour basin | x -75 to 0, z -45 to 50 | 75 × 95 m | seabed -3.5 m at the quay, -7 m at the mouth |
-| Quay | x 0 to 10, z -48 to 50 | 98 × 10 m | deck 1.9 m |
+| Quay | x 0 to 10, z -52 to 50 | 102 × 10 m | deck 1.9 m |
 | Water stairs | z -10, cut into the quay | 2 m wide, 13 steps of 16 cm | |
-| North mole | from (0, -48), curving to (-92, -66) | 100 m long, 7 m wide | deck 3.2 m, seaward parapet to 4.4 m |
+| North mole | from the quay at (0, -48), curving to (-92, -65) | 100 m long, 7 m wide | deck 3.2 m, seaward parapet to 4.4 m |
 | Lighthouse | (-92, -64) | tower 18 m, base ⌀ 7 m, top ⌀ 4.8 m, lantern 4 m | lamp 22 m |
-| Timber pier | from (0, 40) west, T-head at x -44 | 44 × 3 m, head 20 × 5 m | deck 1.5 m |
-| Quay-front row | x 11 to 23, z -46 to 50 | 12 houses, 6–8 m wide, 3 storeys, eaves 9.5 m, ridge 13 m | 1.9 m |
+| Timber pier | from (0, 40) west, T-head at x -44 | 44 × 3 m, head 20 × 5 m | deck 1.58 m, two steps down from the quay |
+| Quay-front row | x 11 to 23, z -46 to 50 | 12 houses, 4.5–8 m wide, 3 storeys, eaves 9.5 m, ridge 13 m | 1.9 m |
 | Market square | x 24 to 56, z -14 to 16 | 32 × 30 m | 3.0 m, falling 1:60 towards the sea |
 | Fountain | (39, 0) | basin ⌀ 5 m, column 2.4 m | |
 | Net Lane | z -30, x 11 to 120 | 3.2 m wide, climbing 1:4 by ramps and flights of steps | 2.5 to 19 m |
 | Chapel Steps | z 25, x 11 to 120 | 2.6 m wide, flights of steps | 3 to 19 m |
 | Upper Street | x 70, z -34 to 29 | 4 m wide | 7 to 8 m |
 | Warehouse | x 14 to 38, z -46 to -36 | 24 × 10 m, 8 m to the ridge | 2 m |
-| Chapel | (95, 35) | nave 9 × 18 m, tower 5 × 5 × 22 m | 12 m |
+| Chapel | (95, 36) | nave 9 × 18 m, door on Chapel Steps; tower 5 × 5 × 22 m on its seaward side | 12 m |
 | Town wall and gate | x about 125 to 133, z -70 to 70 | 6.5 m high, opening 3.4 m | 20 m |
 | Beach | z 50 to 140, running south-west | 110 m long, 30 m wide, slope 1:12 | -1 to 2 m |
 | South headland, north cliffs | z 140 and beyond; z -130 to -60 | scans 87 m wide, 24 m high | to 30 m |
@@ -175,7 +175,7 @@ cove's gate is.
 | Net Lane | (60, 6.2, -30) | Down the lane to the masts and the water | Night, lamps lit |
 | The lighthouse | From the mole, (-40, 5, -60) | The lighthouse against the afterglow | Dusk |
 | The beach | (-38, 2.4, 95) | The wet sand, back towards the pier and town | Sunset |
-| Above the town | From the chapel tower, (95, 40, 24.5) | Roofs, harbour, sea | Dusk |
+| Above the town | From the chapel tower, (88, 38, 30.5) | Roofs, harbour, sea | Dusk |
 
 A **75 second flyover** (`scenes/harbour_flyover.txt`, as the cove's): in from the sea past the
 pinnace, around the lighthouse, along the mole, low over the moored boats, up the water stairs,
@@ -242,7 +242,7 @@ viewpoints and times of day judged as a whole picture, and costs measured.
 5. **The lighthouse and the lamps.** The lighthouse, the lamp posts and wall lamps, window glow,
    and the lamps coming on at dusk. Needs PR #41 merged.
 6. **The sea and the shore.** A `harbour.ocean` for the sheltered basin; the beach, rocks and
-   cliffs; the wet bands judged in sunlight.
+   cliffs, with rock armour where the land meets the sea abruptly at the quay's two ends; the wet bands judged in sunlight.
 7. **The boats.** The small boats and the ship, moored and bobbing by script.
 8. **The interactions.** The gate and doors, with the rooms behind them.
 9. **Collision.** With gameplay step 5: walls, steps, edges and the doors.

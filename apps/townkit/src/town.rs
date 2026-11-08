@@ -13,6 +13,8 @@ const STAIR_GOING: f32 = 0.3;
 const STAIR_STEPS: usize = 13;
 const STAIRS_Z: f32 = -10.0;
 const STAIRS_WIDTH: f32 = 2.0;
+/// The pier's deck, two of the same steps below the quay.
+const PIER_DECK: f32 = QUAY_DECK - 2.0 * STAIR_RISE;
 
 /// The quay: its wall leans back a little as it rises, as harbour walls do.
 fn quay_length(geometry: &mut Geometry, from: f32, to: f32) {
@@ -31,7 +33,7 @@ fn quay_length(geometry: &mut Geometry, from: f32, to: f32) {
 pub fn quay() -> Geometry {
     let mut g = Geometry::default();
     let (north, south) = (STAIRS_Z - STAIRS_WIDTH * 0.5, STAIRS_Z + STAIRS_WIDTH * 0.5);
-    quay_length(&mut g, -48.0, north);
+    quay_length(&mut g, -52.0, north);
     quay_length(&mut g, south, 50.0);
     let run = STAIR_GOING * STAIR_STEPS as f32;
     g.cuboid(
@@ -51,7 +53,8 @@ pub fn quay() -> Geometry {
 /// The mole's centre line, from the quay's north end out to the lighthouse.
 fn mole_point(t: f32) -> Vec2 {
     let [a, b, c, d] = [
-        Vec2::new(0.0, -48.0),
+        // Starting well inside the quay, so that their edges meet with no gap.
+        Vec2::new(6.0, -48.0),
         Vec2::new(-35.0, -50.0),
         Vec2::new(-65.0, -62.0),
         Vec2::new(-92.0, -65.0),
@@ -63,6 +66,8 @@ fn mole_point(t: f32) -> Vec2 {
 /// Deck height of the mole, which climbs from the quay by a ramp.
 const MOLE_DECK: f32 = 3.2;
 const RAMP: f32 = 16.0;
+/// How far the mole runs level with the quay, inside it, before its ramp begins.
+const RAMP_START: f32 = 6.0;
 const PARAPET: f32 = 1.2;
 const MOLE_STATIONS: usize = 48;
 
@@ -84,7 +89,8 @@ pub fn mole() -> Geometry {
             let after = points[(i + 1).min(MOLE_STATIONS)];
             let tangent = (after - before).normalize();
             let seaward = Vec2::new(-tangent.y, tangent.x);
-            let deck = QUAY_DECK + (MOLE_DECK - QUAY_DECK) * (along / RAMP).clamp(0.0, 1.0);
+            let deck =
+                QUAY_DECK + (MOLE_DECK - QUAY_DECK) * ((along - RAMP_START) / RAMP).clamp(0.0, 1.0);
             [
                 (4.8, FOOTING),
                 (3.5, deck + PARAPET),
@@ -267,7 +273,7 @@ fn row(m: &mut Massing, min: Vec2, max: Vec2, houses: u32, along_z: bool) {
                 Vec2::new(min.x + end, max.y),
             )
         };
-        building(m, a, b, 7.6 + shift, 11.1 + shift, along_z);
+        building(m, a, b, 9.5 + shift, 13.0 + shift, along_z);
     }
 }
 
@@ -293,13 +299,14 @@ pub fn massing() -> Massing {
     for (min, max, houses, along_z) in [
         (block(26.0, -28.0, 56.0, -16.0), 4, false),
         (block(26.0, 17.0, 56.0, 23.6), 4, false),
-        (block(57.0, -14.0, 66.0, 16.0), 4, true),
-        (block(38.0, -46.0, 66.0, -32.0), 4, false),
-        (block(26.0, 26.5, 66.0, 44.0), 5, false),
-        (block(74.0, -46.0, 104.0, -32.0), 4, false),
-        (block(74.0, -28.0, 86.0, 22.0), 6, true),
+        (block(57.0, -14.0, 68.0, 16.0), 4, true),
+        (block(38.0, -46.0, 68.0, -32.0), 4, false),
+        (block(26.0, 26.5, 68.0, 44.0), 5, false),
+        (block(72.0, -46.0, 104.0, -32.0), 4, false),
+        (block(72.0, -28.0, 84.0, 22.0), 6, true),
         (block(92.0, -28.0, 104.0, 18.0), 6, true),
-        (block(108.0, -46.0, 120.0, 22.0), 8, true),
+        (block(108.0, -46.0, 120.0, -32.0), 2, true),
+        (block(108.0, -28.0, 120.0, 22.0), 6, true),
         (block(108.0, 26.0, 120.0, 46.0), 3, true),
     ]
     .map(|(b, n, a)| (b.0, b.1, n, a))
@@ -309,22 +316,27 @@ pub fn massing() -> Massing {
 
     let (min, max) = block(14.0, -46.0, 38.0, -36.0);
     building(&mut m, min, max, 5.5, 8.0, false);
-    // The chapel: a nave and a square tower.
+    // The chapel: a nave with its door on Chapel Steps, and a square tower on its seaward side.
     let (min, max) = block(90.5, 27.0, 99.5, 45.0);
     building(&mut m, min, max, 7.0, 11.0, true);
-    let foot = ground::height(95.0, 25.0);
+    let foot = ground::height(85.5, 28.0).min(ground::height(90.5, 33.0));
     m.stone.cuboid(
-        Vec3::new(92.5, foot - SINK, 22.0),
-        Vec3::new(97.5, foot + 22.0, 27.0),
+        Vec3::new(85.5, foot - SINK, 28.0),
+        Vec3::new(90.5, foot + 22.0, 33.0),
     );
 
-    // The town wall, with the gate's opening at z = 0.
-    for (from, to) in [(-70.0, -1.7), (1.7, 70.0)] {
-        let foot = ground::height(128.0, (from + to) * 0.5).min(ground::height(128.0, from));
-        m.stone.cuboid(
-            Vec3::new(127.0, foot - SINK * 4.0, from),
-            Vec3::new(129.0, foot + 6.5, to),
-        );
+    // The town wall, stepping with the ground in lengths, with the gate's opening at z = 0.
+    for (from, to) in [(-70.0_f32, -1.7_f32), (1.7, 70.0)] {
+        let lengths = ((to - from) / 8.0).round();
+        let step = (to - from) / lengths;
+        for i in 0..lengths as u32 {
+            let (a, b) = (from + step * i as f32, from + step * (i + 1) as f32);
+            let (ground_a, ground_b) = (ground::height(128.0, a), ground::height(128.0, b));
+            m.stone.cuboid(
+                Vec3::new(127.0, ground_a.min(ground_b) - SINK * 4.0, a),
+                Vec3::new(129.0, ground_a.max(ground_b) + 6.5, b),
+            );
+        }
     }
 
     // The lighthouse: a tapering tower, then its lantern.
@@ -332,11 +344,17 @@ pub fn massing() -> Massing {
     m.stone.frustum(base, 3.5, 2.4, 18.0, 32);
     m.timber.frustum(base + Vec3::Y * 18.0, 1.4, 1.4, 4.0, 16);
 
-    // The timber pier and its T-head.
+    // The timber pier and its T-head, two steps down from the quay.
     m.timber
-        .cuboid(Vec3::new(-44.0, 0.9, 38.5), Vec3::new(0.0, 1.5, 41.5));
-    m.timber
-        .cuboid(Vec3::new(-49.0, 0.9, 30.0), Vec3::new(-44.0, 1.5, 50.0));
+        .cuboid(Vec3::new(-44.0, 0.9, 38.5), Vec3::new(0.0, PIER_DECK, 41.5));
+    m.timber.cuboid(
+        Vec3::new(-0.3, 0.9, 38.5),
+        Vec3::new(0.0, QUAY_DECK - STAIR_RISE, 41.5),
+    );
+    m.timber.cuboid(
+        Vec3::new(-49.0, 0.9, 30.0),
+        Vec3::new(-44.0, PIER_DECK, 50.0),
+    );
 
     // A merchant ship alongside the quay, and small boats on their moorings.
     m.timber
@@ -375,7 +393,23 @@ mod tests {
     #[test]
     fn the_water_stairs_reach_below_the_sea_within_the_collision_limit() {
         assert!(QUAY_DECK - STAIR_RISE * (STAIR_STEPS as f32) < 0.0);
-        assert!(STAIR_RISE <= 0.17);
+        const { assert!(STAIR_RISE <= 0.17) };
+    }
+
+    #[test]
+    fn the_ground_stays_below_every_tread_of_the_water_stairs() {
+        let run = STAIR_GOING * STAIR_STEPS as f32;
+        for step in 0..STAIR_STEPS {
+            let top = QUAY_DECK - STAIR_RISE * (step + 1) as f32;
+            let inner = run - STAIR_GOING * step as f32;
+            for x in [inner - STAIR_GOING, inner] {
+                // The mesh is straight between its grid corners, one metre apart.
+                let (low, t) = (x.floor(), x.fract());
+                let surface = ground::height(low, STAIRS_Z) * (1.0 - t)
+                    + ground::height(low + 1.0, STAIRS_Z) * t;
+                assert!(surface < top, "step {step} is buried at {x}: {surface}");
+            }
+        }
     }
 
     #[test]
@@ -387,6 +421,6 @@ mod tests {
             })
             .sum();
         assert!((90.0..110.0).contains(&length), "{length}");
-        assert!((MOLE_DECK - QUAY_DECK) / RAMP < 1.0 / 10.0);
+        const { assert!((MOLE_DECK - QUAY_DECK) / RAMP < 1.0 / 10.0) };
     }
 }
