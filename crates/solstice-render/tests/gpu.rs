@@ -2863,3 +2863,119 @@ fn hot_particles_glow_as_black_bodies_and_bloom() {
     // Without a temperature, nothing but the film grain.
     assert!(brightness(patch(&cold, size, size / 2, size / 2, 1)) < 3.0);
 }
+
+/// Measures what local lights add to particle lighting: a cloud of lit particles among `n`
+/// lights, for n of 0, 16, 64 and 256, at High. Ignored by default; run with
+/// `cargo test --release -p solstice-render --test gpu -- --ignored particle_light_cost
+/// --nocapture`, and SOLSTICE_LOW_POWER=1 for the integrated GPU.
+#[test]
+#[ignore]
+fn particle_light_cost_with_many_lights() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let power = if std::env::var("SOLSTICE_LOW_POWER").is_ok() {
+        wgpu::PowerPreference::LowPower
+    } else {
+        wgpu::PowerPreference::HighPerformance
+    };
+    let Ok(gpu) = pollster::block_on(Gpu::request(&instance, None, power)) else {
+        return;
+    };
+    eprintln!("{}", gpu.adapter_info.name);
+    let effect = Effect::parse(
+        "emitter cloud\n budget 40000\n spawn burst=40000\n lifetime 1000\n shape box 24 6 24\n offset 0 3 0\n size 0.05\n render sprite soft=0",
+    )
+    .unwrap();
+    let camera = over_the_floor();
+    for n in [0usize, 16, 64, 256] {
+        let mut scene = ball_on_floor();
+        scene.lights = (0..n)
+            .map(|i| {
+                let a = i as f32 * 2.399963;
+                let r = 2.0 + 10.0 * ((i as f32 + 0.5) / n.max(1) as f32).sqrt();
+                solstice_asset::Light {
+                    position: [r * a.cos(), 1.5, r * a.sin()],
+                    range: 8.0,
+                    intensity: [2.0, 1.4, 0.8],
+                    _pad: 0,
+                }
+            })
+            .collect();
+        let settings = RendererSettings {
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        let mut stage = Stage::new(&gpu, &scene, settings, 512);
+        stage
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::IDENTITY)
+            .unwrap();
+        let mut samples = Vec::new();
+        for frame in 0..60 {
+            stage.frames(&gpu, &camera, &low_sun(), 1);
+            if frame >= 20 {
+                if let Some(times) = stage.renderer.section_times() {
+                    samples.push(times[solstice_render::profiler::section::PARTICLES]);
+                }
+            }
+        }
+        samples.sort_by(f32::total_cmp);
+        let median = samples.get(samples.len() / 2).copied().unwrap_or(f32::NAN);
+        eprintln!("{n:4} lights: particles section {median:.3} ms (40,000 lit particles)");
+    }
+}
+
+/// Local lights light particles in their range; the ball stops one from lighting a particle
+/// behind it; and lights beyond the strongest few, which are not traced, still count.
+#[test]
+fn local_lights_light_particles_and_the_scene_stops_them() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 128;
+    let camera = over_the_floor();
+    let lamp = |x: f32, y: f32, z: f32, candela: f32| solstice_asset::Light {
+        position: [x, y, z],
+        range: 9.0,
+        intensity: [candela; 3],
+        _pad: 0,
+    };
+    let lit = |lights: Vec<solstice_asset::Light>, at: &[Vec3]| {
+        let mut scene = ball_on_floor();
+        scene.lights = lights;
+        let mut stage = light_stage(&gpu, &scene, DebugView::ParticleLight, size);
+        for &p in at {
+            stage
+                .renderer
+                .particles()
+                .spawn(&lit_particle(0.35, 0.0), Mat4::from_translation(p))
+                .unwrap();
+        }
+        stage.frames(&gpu, &camera, &darkness(), 30);
+        let pixels = stage.pixels(&gpu);
+        at.iter()
+            .map(|&p| brightness(linear_at(&pixels, &camera, size, p)))
+            .collect::<Vec<_>>()
+    };
+    // A lamp at +X: one particle behind the ball from it, one as far off in the open.
+    let behind = Vec3::new(-1.8, 1.0, 0.0);
+    let open = Vec3::new(3.0, 1.0, -4.8);
+    let seen = lit(vec![lamp(3.0, 1.0, 0.0, 6.0)], &[behind, open]);
+    assert!(
+        seen[1] > 0.02,
+        "the lamp lights the open particle: {seen:?}"
+    );
+    assert!(seen[0] < seen[1] * 0.3, "the ball stops the lamp: {seen:?}");
+
+    // Three lamps the same distance from a particle give half as much again as two: the
+    // third, not traced, still counts.
+    let at = Vec3::new(4.0, 1.0, 3.0);
+    let around = |a: f32| lamp(at.x + 2.0 * a.cos(), 1.0, at.z + 2.0 * a.sin(), 1.5);
+    let two = lit(vec![around(0.0), around(2.1)], &[at])[0];
+    let three = lit(vec![around(0.0), around(2.1), around(4.2)], &[at])[0];
+    assert!(two > 0.02, "{two}");
+    assert!((three / two - 1.5).abs() < 0.15, "two {two}, three {three}");
+}

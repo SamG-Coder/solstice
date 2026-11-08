@@ -41,6 +41,9 @@ const GROUND_SHARE: f32 = 0.3;
 // illuminance; a black body's luminance, in candela per square metre, scales the same way.
 const DAYLIGHT_LUX: f32 = 100000.0;
 const LUMINOUS_EFFICACY: f32 = 683.0;
+// How many of the lights reaching a particle are traced for walls between: the strongest.
+const TRACED_LIGHTS: u32 = 2u;
+const NO_LIGHT: u32 = 0xffffffffu;
 
 // The emitter this workgroup lights, found once by its first lane.
 var<workgroup> group_emitter: u32;
@@ -190,21 +193,54 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
         l.ambient = mix(l.ambient, pair, 2.0 / (l.samples + 2.0));
         l.samples = min(l.samples + 2.0, MOST_SAMPLES);
 
-        // Local lights in range, with the GI volume to stop light through walls.
+        // Local lights in range. Tracing each through the GI volume, to stop light through
+        // walls, costs far more than the rest of the loop, so only the strongest few at this
+        // particle are traced; the rest, each fainter, count as open.
         var nearby = vec3f(0.0);
+        var strongest = array<u32, TRACED_LIGHTS>(NO_LIGHT, NO_LIGHT);
+        var strength = array<f32, TRACED_LIGHTS>(0.0, 0.0);
+        var arriving = array<vec3f, TRACED_LIGHTS>(vec3f(0.0), vec3f(0.0));
         for (var k = 0u; k < frame.light_count; k++) {
             let light = lights[k];
-            let to_light = light.position - p.position;
-            let reach = length(to_light);
+            let reach = length(light.position - p.position);
             if reach >= light.range {
                 continue;
             }
             let window = sq(clamp(1.0 - sq(sq(reach / light.range)), 0.0, 1.0));
+            let incoming_light = light.intensity * window / max(reach * reach, 0.04);
+            let level = luminance(incoming_light);
+            // Keep the strongest in order; whatever is pushed out counts as open.
+            var held = incoming_light;
+            var held_level = level;
+            var held_index = k;
+            for (var s = 0u; s < TRACED_LIGHTS; s++) {
+                if held_level > strength[s] {
+                    let index = strongest[s];
+                    let light_level = strength[s];
+                    let light_in = arriving[s];
+                    strongest[s] = held_index;
+                    strength[s] = held_level;
+                    arriving[s] = held;
+                    held_index = index;
+                    held_level = light_level;
+                    held = light_in;
+                }
+            }
+            if held_index != NO_LIGHT {
+                nearby += held;
+            }
+        }
+        for (var s = 0u; s < TRACED_LIGHTS; s++) {
+            if strongest[s] == NO_LIGHT {
+                continue;
+            }
             var open = 1.0;
             if inside {
-                open = volume_visibility(p.position, to_light / max(reach, 1.0e-4), voxel * 0.5, max(reach - voxel * 2.0, 0.0), 12u);
+                let to_light = lights[strongest[s]].position - p.position;
+                let reach = max(length(to_light), 1.0e-4);
+                open = volume_visibility(p.position, to_light / reach, voxel * 0.5, max(reach - voxel * 2.0, 0.0), 12u);
             }
-            nearby += light.intensity * window / max(reach * reach, 0.04) * open;
+            nearby += arriving[s] * open;
         }
         l.lamps = nearby / PI;
     } else {

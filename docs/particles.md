@@ -326,9 +326,30 @@ main saving over shading each fragment, and on a small sprite it looks the same.
   the volume, the sky alone.
   - This replaced the plan's sky harmonics and separate enclosure term: one estimate gives both,
     and needs no extra pass.
-- **Local lights:** each of the scene's lights in range, with the GI volume to stop light
-  through walls. The lighting pass finds lights by screen tile, which particles have no use for,
-  so they loop over the scene's lights as the voxel pass does.
+- **Local lights:** each of the scene's lights in range.
+  - **Not by screen tile.** The lighting pass's tiles cut each tile's lights to the depth range
+    of the opaque surfaces in it. A particle in front of those surfaces, such as smoke before a
+    wall, would miss lights that do reach it, so particles loop over the scene's lights instead,
+    as the voxel pass does.
+  - **Only the two strongest are traced.** Tracing a light through the GI volume, to stop it
+    shining through walls, costs far more than the rest of the loop. So only the two strongest
+    lights at each particle are traced, and the rest, each fainter, count as open.
+  - **What that costs:** the `particles` section for 40,000 particles lit every frame, at High,
+    among lights of 8 m range scattered over 12 m (the ignored test
+    `particle_light_cost_with_many_lights`), in milliseconds:
+
+    | Lights | RTX 5080 | Integrated |
+    |---|---|---|
+    | 0 | 0.07 | 4.9 |
+    | 16 | 0.09 | 5.8 |
+    | 64 | 0.10 | 5.5 |
+    | 256 | 0.16 | 7.0 |
+
+    Tracing every light in range cost 0.32 ms at 64 lights and 2.5 ms at 256 on the RTX 5080,
+    and 17 ms at 64 on the integrated GPU. The loop still visits every light, so it grows with
+    the scene's light count. A few hundred lights is comfortable; past about a thousand, lights
+    should be gathered per cell of a coarse grid in front of the camera, as Unreal's
+    translucency lighting volume does.
 - **Glow:** a black body's light at the particle's temperature, from Planck's law integrated
   against the CIE colour matching functions (Wyman, Sloan and Shirley's fit), times the
   emitter's `glow`. Its luminance in candela per square metre is scaled to the scene's units as
@@ -522,7 +543,9 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
    - Phase functions, glow by temperature with `temperature`, `cooling` and `glow`, and aerial
      perspective; `shading=lit` (the default) or `unlit`.
    - The `particle-light` debug view, number 14.
-   - Tests, each mutation-checked: 10 bugs were put back in turn, and each made a test fail.
+   - Tests, each mutation-checked: 13 bugs were put back in turn, and each made a test fail.
+     - Local lights light particles in range, the ball stops a lamp from lighting a particle
+       behind it, and lights beyond the two traced still count.
      - A particle in the ball's shadow is darker than one in the sun, in the light view and in
        the final image.
      - When the sun moves, a particle's light follows within a few frames at every quality.
