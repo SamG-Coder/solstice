@@ -25,8 +25,11 @@
 @group(0) @binding(12) var milky_way_tex: texture_2d<f32>;
 // Which lights reach each tile of the screen, from lighting/light_tiles.wgsl.
 @group(0) @binding(13) var<storage, read> light_tiles: array<u32>;
+// Each light's shadow map, from lighting/light_shadows.wgsl.
+@group(0) @binding(14) var light_shadows: texture_2d_array<f32>;
 
 #include "lighting/light_tiles_common.wgsl"
+#include "lighting/light_shadows_common.wgsl"
 
 // Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.
 // Measured leaf spectra transmit about as much as they reflect across visible light (Jacquemoud
@@ -69,7 +72,8 @@ fn contact_shadow(world: vec3f, normal: vec3f, view: vec3f, distance: f32, noise
     return 1.0;
 }
 
-fn local_light(light: Light, s: Surface, view: vec3f, world: vec3f) -> vec3f {
+fn local_light(index: u32, s: Surface, view: vec3f, world: vec3f) -> vec3f {
+    let light = lights[index];
     let to_light = light.position - world;
     let distance = length(to_light);
     if distance >= light.range {
@@ -81,15 +85,12 @@ fn local_light(light: Light, s: Surface, view: vec3f, world: vec3f) -> vec3f {
     }
     let window = sq(clamp(1.0 - sq(sq(distance / light.range)), 0.0, 1.0));
     let falloff = window / max(distance * distance, 0.04);
+    // Looked up a voxel and a half off the surface along its normal, as the trace this
+    // replaced started, where the volume's own account of the surface no longer shadows it.
     let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
     let voxel = volume_params.levels[level].w;
-    let open = volume_visibility(
-        world + s.normal * voxel * 1.5,
-        direction,
-        voxel * 0.5,
-        max(distance - voxel * 2.5, 0.0),
-        16u,
-    );
+    let from_light = world + s.normal * voxel * 1.5 - light.position;
+    let open = light_shadow(index, from_light, length(from_light), voxel);
     return shade_light(s, view, direction) * light.intensity * falloff * open;
 }
 
@@ -166,7 +167,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let tile = light_tile_base(id.xy / TILE_SIZE, size);
     let tile_lights = light_tiles[tile];
     for (var i = 0u; i < tile_lights; i++) {
-        color += local_light(lights[light_tiles[tile + 1u + i]], surface, view, world);
+        color += local_light(light_tiles[tile + 1u + i], surface, view, world);
     }
 
     // Indirect diffuse. Cavity darkens crevices the probes are too coarse to resolve.

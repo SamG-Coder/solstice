@@ -6,7 +6,9 @@ use crate::frame::{
 };
 use crate::gi::{GiVolume, ScreenGi, ScreenGiBindings, LEVEL_COUNT};
 use crate::gpu::{Gpu, Target};
-use crate::lighting::{environment_group, environment_layout, DeferredLighting, LightTiles};
+use crate::lighting::{
+    environment_group, environment_layout, DeferredLighting, LightShadows, LightTiles,
+};
 use crate::ocean::grid::PATCH_CELLS;
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::waterline::{SeaViews, Waterline};
@@ -273,6 +275,7 @@ pub struct Renderer {
     environment: wgpu::BindGroup,
     deferred: DeferredLighting,
     light_tiles: LightTiles,
+    light_shadows: LightShadows,
     post: PostProcess,
     profiler: Option<Profiler>,
     /// The open sea, if the scene has one, and an ocean waiting to be eased into, with the
@@ -475,7 +478,14 @@ impl Renderer {
         let shadows = ShadowMaps::new(gpu, &rasterizer);
         let waterline = Waterline::new(gpu);
         let environment_layout = environment_layout(gpu);
-        let volume = GiVolume::new(gpu, &scene, &aux_work, &environment_layout);
+        let light_shadows = LightShadows::new(gpu, &environment_layout, &scene);
+        let volume = GiVolume::new(
+            gpu,
+            &scene,
+            &aux_work,
+            &environment_layout,
+            &light_shadows.view,
+        );
         let mut clouds = Clouds::new(gpu, &environment_layout);
         clouds.set_enabled(settings.clouds);
         let environment = environment_group(
@@ -502,6 +512,7 @@ impl Renderer {
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
             light_tiles: LightTiles::new(gpu, &environment_layout),
+            light_shadows,
             post: PostProcess::new(gpu, output_format),
             particles: Particles::new(
                 gpu,
@@ -855,6 +866,7 @@ impl Renderer {
             &self.aux_cull_scene,
             &self.aux_work,
             &self.environment,
+            &self.light_shadows,
             SLOT_VOXEL,
             &volume_work,
             self.profiler.as_ref(),
@@ -1073,6 +1085,7 @@ impl Renderer {
             &self.scene,
             &clouds,
             &light_tiles,
+            &self.light_shadows.view,
         );
         let water = self
             .sea

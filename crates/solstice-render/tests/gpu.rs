@@ -3188,3 +3188,83 @@ fn local_lights_light_particles_and_the_scene_stops_them() {
     assert!(two > 0.02, "{two}");
     assert!((three / two - 1.5).abs() < 0.15, "two {two}, three {three}");
 }
+
+/// Local lights are shadowed through their own maps: a lamp over the floor with a ball hung
+/// between them leaves the floor under the ball dark and the floor beside it lit, and taking
+/// the ball away lights the floor under it. A map never traced would shadow the floor beside
+/// the ball too; a map never consulted would shadow nothing.
+#[test]
+fn a_lamp_is_shadowed_through_its_map() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 6.0, 9.0),
+        yaw: 0.0,
+        pitch: -0.6,
+        ..Default::default()
+    };
+    // No sun, no sky and no indirect light, with the exposure held to daylight, so only the
+    // lamp's direct light shows.
+    let night = Environment {
+        sun_illuminance: 0.0,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        daylight_illuminance: 10.0,
+        ..Default::default()
+    };
+    let lamp = Light {
+        position: [0.0, 5.0, 0.0],
+        range: 9.0,
+        intensity: [60.0; 3],
+        _pad: 0,
+    };
+    let size = 128;
+    // The volume resolves the ball at 0.2 m voxels and stops its traces most of a voxel short
+    // of a surface, so the shadow is some 2.5 m across on the floor; the lit spot stands well
+    // outside it, 42° from the lamp's vertical against the shadow's 26°.
+    let under = Vec3::ZERO;
+    let beside = Vec3::new(4.5, 0.0, 0.0);
+    let floor_at = |pixels: &[u8], world: Vec3| {
+        let (x, y) = pixel_of(&camera, size, world);
+        brightness(patch(pixels, size, x, y, 2))
+    };
+    let mut scene = ball_on_floor();
+    scene.lights = vec![lamp];
+    // The ball hangs between the lamp and the floor, a metre clear of both.
+    scene.instances[0].transform = Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
+    let with_ball = render_in(
+        &gpu,
+        &scene,
+        &camera,
+        RendererSettings::default(),
+        size,
+        &night,
+    )
+    .pixels;
+    scene.instances.remove(0);
+    let without = render_in(
+        &gpu,
+        &scene,
+        &camera,
+        RendererSettings::default(),
+        size,
+        &night,
+    )
+    .pixels;
+
+    let (shadowed, lit) = (floor_at(&with_ball, under), floor_at(&with_ball, beside));
+    let (open, lit_alone) = (floor_at(&without, under), floor_at(&without, beside));
+    assert!(
+        shadowed + 20.0 < lit,
+        "under the ball the floor is {shadowed}, beside it {lit}: no shadow"
+    );
+    assert!(
+        shadowed + 20.0 < open,
+        "under the ball the floor is {shadowed}, and {open} with the ball gone: no shadow"
+    );
+    assert!(
+        (lit - lit_alone).abs() < 8.0,
+        "beside the ball the floor is {lit} with it and {lit_alone} without: the ball shadows what it should not"
+    );
+}
