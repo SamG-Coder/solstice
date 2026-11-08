@@ -338,19 +338,58 @@ The low sun's far cascade still asks for over two million clusters; drawing them
 does not change that count. The remaining lever is a coarser level of detail for leaves at
 shadow-map distances, a cluster builder question.
 
+#### Fix 7: local lights shadowed through their own maps
+
+Every pixel traced the GI volume once per local light in range, sixteen steps each, and every
+GI voxel did the same with twenty-four: the courtyard's sixty-four torches overlap thirty deep,
+so the lighting pass cost 0.9 ms at 720p and 3.6 ms at 1440p, growing with pixels times
+overlap. Now each light has a shadow map of its own: a 64×64 octahedral map of how far its
+light reaches in every direction, traced through the same volume from the light once a frame
+(`lighting/light_shadows.wgsl`, after the volume's passes), and the lighting and voxel light
+passes look a light's shadow up with a 2×2 compare instead of tracing it. All 512 lights are
+traced each frame; the pass costs 0.04 ms, and the maps 8 MB (`r32float`, one layer per
+light).
+
+| Still camera, last frame, GPU ms | `main` | With the maps |
+|---|---|---|
+| Courtyard 1280×720, 10:00 fair: lighting / gi light | 0.94 / 0.82 | 0.35 / 0.61 (+0.04 maps) |
+| Courtyard 2560×1440, 10:00 fair | 3.55 / 0.81 | 1.24 / 0.64 |
+| Courtyard 2560×1440, 23:00 clear | 3.72 / 0.81 | 1.16 / 0.62 |
+| Hill 1280×720 (few lights in range) | 0.11 / 0.03 | 0.10 / 0.03 |
+
+What is left in the lighting pass is its shading; the per-light cost no longer depends on the
+screen. The look changes where lights are dense, by design of the user's choice: the maps
+resolve a light's shadow at 3.2° a texel and two voxels of depth, where the old trace skipped
+the first voxel and a half along the surface normal and stopped most of a voxel before any
+surface, so grazing light at the foot of a trunk or along a wall, which the old trace often
+shadowed with the surface's own voxels, now arrives, and thin foliage passes a little more
+light. Against `main`, TAA off: courtyard 26.3 dB by day and 18.9 dB at night (41% of pixels
+differ by more than 8); a 128-texel map, a smaller bias and a larger offset were all no closer,
+so the difference is the method, not the resolution. Scenes without dense lights are unchanged:
+hill 57.5 dB, beach 45.4 (floor 45.4), the cove at night 67.4. Side-by-side captures are in
+`screenshots/lm-side-by-side-*.png` on the stress branch.
+
+A GPU test hangs a ball between a lamp and the floor: the floor under the ball must be dark
+and the floor beside it lit, and lit the same without the ball. A map never traced shadows
+everything, a map never consulted shadows nothing, an inverted compare swaps the two, and no
+depth bias shadows every surface with itself: all four fail it. (The ball had to be a metre
+across and a metre clear of the lamp: the volume's 0.2 m voxels and its hit threshold inflate a
+small ball's shadow to a 40° diamond, under the old trace as much as under the maps.)
+
 ### Where things stand
 
 Fixed and in pull requests: shadow caster culling (#25, merged), cloud shadows beyond their map
 (#26, merged), the cull lists' overflow counter and capacity (#27 and #31), light tiles (#30,
-merged), movable casters culled once (#32, merged), and the cascades through the software
-rasterizer (#35, merged).
+merged), movable casters culled once (#32, merged), the cascades through the software
+rasterizer (#35, merged), and local lights shadowed through their own maps (fix 7).
 
 Found and not yet fixed, in order of how much they would give:
 
 1. Shadow cascades at full texel LOD for leaves the camera cannot resolve: with the software
    rasterizer (fix 6) a redraw is 1 to 23 ms in dense woods, worst with a low sun, and the far
    cascade still selects over two million clusters there.
-2. Local-light visibility traced per pixel per light: 7 ms at 1440p where thirty torches overlap.
+2. Local-light visibility per pixel per light: fixed by the shadow maps (fix 7), 3.6 → 1.2 ms
+   at 1440p in the courtyard; what remains there is the shading of thirty lights a pixel.
 3. Haze fixed at 0.0011 per metre: a clear day has the air of a hazy one, which long views show.
 4. The voxel light pass loops over every light per voxel; per-block lists would cut its loop
    as the tiles did the lighting pass's, though not its traces.
