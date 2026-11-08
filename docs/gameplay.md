@@ -206,14 +206,18 @@ it.
 ```text
  1. Input        gather keys, mouse, pads and touch; map them to actions
  2. Fixed steps  0 to 3 steps of 1/60 s, each one:
-      a. Events       this step's input actions and due timers, delivered to scripts
+      a. Start        the step's input is taken; timers due on it deliver their events
       b. PrePhysics   Rust systems, root motion, then script ticks for the actors that tick
       c. Physics      one Rapier step; contacts and triggers are queued
       d. PostPhysics  hits and overlaps delivered to scripts
+      e. Transforms   every entity's place in the world, keeping the step before
  3. Animation    state machines read gameplay's values; sample, blend, IK
  4. Late         the camera follows
  5. Extract      changed transforms, bone palettes, lights and environment go to the renderer
 ```
+
+As built (step 2, `crates/solstice-world`): `Game::frame` runs 2 to 4, and step 4 adds
+extraction. Steps 3 and 4 are the per-frame tick groups `Animation` and `Late`.
 
 - **Fixed steps.** Everything that decides what happens runs inside the steps, at 60 Hz from an
   accumulator: events, script ticks, Rust gameplay systems and physics. Input is gathered per
@@ -232,7 +236,13 @@ it.
   react to events: an overlap, an input action, a timer, the hour changing.
 - **Events are queued** and delivered between tick groups. A handler never runs halfway through
   another system, so the order is always the same and replays give the same result.
+  - An event sent during a fixed-step group can be read throughout the next fixed-step group,
+    and then it is gone. What PostPhysics sends is read by the next step's PrePhysics, after the
+    events of the timers due on that step.
+  - The per-frame groups can read what the last step delivered, but they send no events and set
+    no timers: they run as often as frames come, which differs from run to run.
 - **Spawning and destroying** are deferred to the end of the tick group that asks for them.
+- **Timers** count steps, not seconds, so they fire on the same step in every run.
 
 ### Where work runs
 
@@ -696,7 +706,7 @@ Each step is its own PR, with mutation-tested tests, measured costs (natively an
 clippy clean on native and wasm32, and a review by a separate AI agent. It is merged only with
 your go-ahead, and nothing is published without asking.
 
-1. **Things that move.** *In review.* The renderer API for moving instances, with `prev_world`
+1. **Things that move.** *Done.* The renderer API for moving instances, with `prev_world`
    set to the transform each was drawn with last frame; hiding instances and scaling their glow;
    the moving flag, with moving instances left out of the cached shadows, the seabed map and the
    GI voxels, and drawn into per-cascade shadow maps of their own.
@@ -709,10 +719,16 @@ your go-ahead, and nothing is published without asking.
    - Tests: a moved instance's motion vectors and shadow follow it; cached shadows of static
      geometry stay as they were; nothing static is redrawn; nothing moving is left behind in a
      cache.
-2. **The world.** `solstice-world`: entities and components on `hecs`, the transform tree, tick
-   groups, events, timers, and the fixed clock with input per step. Headless.
+2. **The world.** *In review.* `solstice-world`: entities and components on `hecs`, the
+   transform tree, tick groups, events, timers, and the fixed clock with input per step.
+   Headless.
    - Tests: tick order; event order; a recorded run replays to the same state; the clock under
      slow and uneven frames.
+   - Cost: working out every entity's place takes about 20 ns an entity a step on the web (wasm
+     with SIMD, 9800X3D), and 40 ns natively. So 9,000 entities with transforms take 0.19 ms a
+     step on the web; perhaps 0.4 ms on an integrated-GPU laptop, within the world's line of the
+     budget. Every entity with a transform is worked out every step. If scenes grow past that,
+     skipping what hasn't moved comes next.
 3. **Scripting.** `solstice-script` with Starlark: actor scripts, properties and `self.vars`,
    events, timers, the engine API table and its generated bindings, hot reload, step and memory
    caps, and errors with file and line. The benchmarks are run again in place.

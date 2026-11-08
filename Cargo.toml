@@ -13,10 +13,13 @@ solstice-builder = { path = "crates/solstice-builder" }
 solstice-import = { path = "crates/solstice-import" }
 solstice-procgen = { path = "crates/solstice-procgen" }
 solstice-render = { path = "crates/solstice-render" }
+solstice-world = { path = "crates/solstice-world" }
 # Pure Rust, MIT. The GPU compressor and its wgpu dependency are left out.
 block_compression = { version = "0.11", default-features = false, features = ["bc15", "bc7"] }
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
+# The entity store under the gameplay framework (docs/gameplay.md): small and stable.
+hecs = "0.11"
 log = "0.4"
 # Pure Rust. Compresses pages when baking and unpacks them natively.
 miniz_oxide = "0.8"

@@ -1,8 +1,8 @@
 # Gameplay benchmarks
 
-The measurements behind `docs/gameplay.md`: scripting languages, ECS crates and Rapier, natively
-and on the web. These are throwaway benchmarks, not part of the engine's workspace, and are not
-built by CI.
+The measurements behind `docs/gameplay.md`: scripting languages, ECS crates, Rapier and
+`solstice-world` itself (`b_world`), natively and on the web. These are throwaway benchmarks,
+not part of the engine's workspace, and are not built by CI.
 
 Monty 1.5 needs Rust 1.96 or newer, and the project pins 1.95, so these use 1.98. Every figure in
 the doc came from Rust 1.98, on a Ryzen 7 9800X3D under Windows 11, with Node 24.
@@ -11,7 +11,7 @@ the doc came from Rust 1.98, on a Ryzen 7 9800X3D under Windows 11, with Node 24
 
 ```bash
 cargo +1.98.0 build --release
-for b in b_base b_rhai b_starlark b_monty b_rapier b_bevy b_hecs; do ./target/release/$b; done
+for b in b_base b_rhai b_starlark b_monty b_rapier b_bevy b_hecs b_world; do ./target/release/$b; done
 ```
 
 The probes check which Python features each language accepts:
@@ -30,7 +30,7 @@ backend.
 
 ```bash
 cargo +1.98.0 build --release --target wasm32-unknown-unknown --lib
-for b in b_base b_rhai b_starlark b_monty b_rapier b_bevy b_hecs; do
+for b in b_base b_rhai b_starlark b_monty b_rapier b_bevy b_hecs b_world; do
   wasm-bindgen --target nodejs --remove-name-section --remove-producers-section \
     --out-dir js/$b target/wasm32-unknown-unknown/release/$b.wasm
   node run.js ./js/$b/$b.js
