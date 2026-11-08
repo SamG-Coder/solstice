@@ -73,26 +73,34 @@ just before the G-buffer is written.
 The sea's surface is only drawn where it is. Wetness needs to know where the water has *been*.
 One small map, held from frame to frame, remembers it.
 
-- **Texels:** 512² over 128 m around the camera, so 25 cm each, R16Float. Each holds the highest
-  water level reached at that spot recently, relative to the calm sea.
+- **Texels:** 512² over 128 m around the camera, so 25 cm each (`ocean/waterline.rs`). Each holds
+  two heights: the highest the water has stood at that spot lately, and where it stands now.
+  - They are heights in the world, not above the calm sea. When the sea falls, as a tide going
+    out, the line it reached stays behind and dries.
+  - Two Rg32Float maps take turns, one read while the other is written. Rg16Float would do, but it
+    cannot be written by a compute pass in core WebGPU.
 - **Fixed in the world.** The map wraps around rather than moving with the camera, so a remembered
   wet band stays put as the camera moves. Texels that come newly into view start out at today's
   level.
 - **Updated each frame** by a small compute pass:
   1. The water's height at that spot, from the waves, shrunk over the seabed by `shoal()` exactly
      as the surface is.
-  2. Run-up on beaches: waves rush up the slope beyond where the water itself stands, to a height
-     from Stockdon's formula, using the sea's significant wave height and the beach slope from the
-     seabed map. Without this there would be no wet strip of sand above the calm waterline.
+  2. Run-up on beaches (step 3): waves rush up the slope beyond where the water itself stands, to
+     a height from Stockdon's formula, using the sea's significant wave height and the beach slope
+     from the seabed map. Without this, the wet strip of sand above the calm waterline is only as
+     wide as the fringe.
   3. The remembered level becomes the higher of the new height and the old memory. The memory
      falls back towards the current water as it dries, with a half-life of about 30 s.
 - **Reading it in resolve,** for a surface point `p`:
   - fully wet below the remembered level;
-  - a soft fringe above it, a few centimetres high on rock and up to tens of centimetres on sand,
-    as water wicks up through the pores (scaled by porosity);
-  - drier the longer it has been since the water was there.
-- **Beyond the map** (128 m out), only the calm level and a fringe for today's waves count: no
-  memory is needed that far away.
+  - a soft fringe above it, as water wicks up through the pores: 3 cm on a surface without pores,
+    up to 20 cm on the most porous (step 3 tunes these);
+  - drier the longer it has been since the water was there, as the remembered level falls back;
+  - under the water now, by the present height: darkened, but with no film.
+- **Beyond the map** (64 m from the camera), only the calm level and the fringe count: no memory
+  is needed that far away.
+- **Cost:** about 0.02 ms on the RTX 5080 at 1280×720 (0.01 ms for the update, 0.01 ms more in
+  resolve).
 
 This covers vertical faces too: a rock or hull at a spot gets wet up to that spot's level. Points
 under the water are wet anyway, and the water pass draws over them.

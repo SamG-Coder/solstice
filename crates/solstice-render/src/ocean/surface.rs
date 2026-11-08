@@ -194,6 +194,8 @@ pub struct WaterSurface {
     groups: Option<(u64, u64, wgpu::BindGroup, wgpu::BindGroup)>,
     /// The seabed under the sea, which the waves shrink over as it shoals.
     pub seabed: SeabedMap,
+    /// Tells this surface's resources from those of any other made before it.
+    id: u64,
 }
 
 impl WaterSurface {
@@ -330,12 +332,31 @@ impl WaterSurface {
             quarter_count: 0,
             groups: None,
             seabed: SeabedMap::new(gpu, rasterizer),
+            id: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
         }
     }
 
     /// Cells across each whole patch.
     pub fn cells(&self) -> u32 {
         self.cells
+    }
+
+    /// Tells this surface's resources from those of any other made before it.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The sea's surface parameters, as `ocean/surface_params.wgsl` reads them.
+    pub fn uniform(&self) -> &wgpu::Buffer {
+        &self.uniform
+    }
+
+    /// The sampler the waves are read through.
+    pub fn wave_sampler(&self) -> &wgpu::Sampler {
+        &self.sampler
     }
 
     /// Chooses this frame's patches for a camera at `camera`, over a sea at `sea_level`. The

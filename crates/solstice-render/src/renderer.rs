@@ -9,6 +9,7 @@ use crate::gpu::{Gpu, Target};
 use crate::lighting::{environment_group, environment_layout, DeferredLighting};
 use crate::ocean::grid::PATCH_CELLS;
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
+use crate::ocean::waterline::{SeaViews, Waterline};
 use crate::ocean::{Ocean, Sea, SeaState};
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
@@ -217,6 +218,8 @@ pub struct Renderer {
     aux_raster: RasterBindings,
     rasterizer: Rasterizer,
     resolve: Resolve,
+    /// Where the sea has been, for how wet surfaces are.
+    waterline: Waterline,
     sky: Sky,
     clouds: Clouds,
     /// The lighting bind group as cloud passes see it: without the clouds they are making.
@@ -358,6 +361,7 @@ impl Renderer {
 
         let sky = Sky::new(gpu);
         let shadows = ShadowMaps::new(gpu, &rasterizer);
+        let waterline = Waterline::new(gpu);
         let environment_layout = environment_layout(gpu);
         let volume = GiVolume::new(gpu, &scene, &aux_work, &environment_layout);
         let mut clouds = Clouds::new(gpu, &environment_layout);
@@ -381,7 +385,8 @@ impl Renderer {
 
         Self {
             settings,
-            resolve: Resolve::new(gpu),
+            resolve: Resolve::new(gpu, waterline.resolve_layout()),
+            waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
             post: PostProcess::new(gpu, output_format),
@@ -586,6 +591,12 @@ impl Renderer {
         let volume_work = self
             .volume
             .prepare(gpu, &self.view_slots, SLOT_VOXEL, camera.position);
+        self.waterline.prepare(
+            gpu,
+            camera.position,
+            delta_seconds,
+            self.sea.is_some() && self.water.is_some(),
+        );
         let seabed_due = self.water.as_mut().is_some_and(|water| {
             water.seabed.prepare(
                 gpu,
@@ -650,6 +661,22 @@ impl Renderer {
                 SLOT_SEABED,
             );
         }
+        // Where the sea stands and has stood, from the waves over the seabed, before the
+        // surfaces it wets are resolved.
+        if let (Some(sea), Some(water)) = (&self.sea, &self.water) {
+            let waves = sea.waves();
+            self.waterline.record(
+                gpu,
+                &mut encoder,
+                SeaViews {
+                    key: water.id() ^ (waves.generation() << 32),
+                    surface: water.uniform(),
+                    displacement: &waves.displacement.view,
+                    sampler: water.wave_sampler(),
+                    seabed: &water.seabed.view,
+                },
+            );
+        }
 
         self.volume.record(
             &mut encoder,
@@ -701,8 +728,12 @@ impl Renderer {
             sized.hzb.record(&mut encoder);
         }
         mark(&self.profiler, &mut encoder, section::RESOLVE);
-        self.resolve
-            .record(&mut encoder, &sized.resolve, render_size);
+        self.resolve.record(
+            &mut encoder,
+            &sized.resolve,
+            self.waterline.resolve_group(),
+            render_size,
+        );
 
         // Lighting.
         mark(&self.profiler, &mut encoder, section::CLOUDS_ON_SCREEN);

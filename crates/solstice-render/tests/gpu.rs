@@ -1593,7 +1593,8 @@ fn water_darkens_porous_surfaces_but_not_metal_or_what_stands_above_it() {
         "the ball's upper half, far above the water, changed: {dry_ball} dry, {wet_ball} wet"
     );
 
-    // Metal has no pores to fill: water only films it, which leaves its colour alone.
+    // Metal has no pores to fill: water only films it, which leaves its colour alone. Its
+    // fringe is thin, so the sea comes within a centimetre of the floor to wet it.
     let metal = Material {
         base_color: [0.6, 0.55, 0.5, 1.0],
         roughness: 0.6,
@@ -1601,7 +1602,7 @@ fn water_darkens_porous_surfaces_but_not_metal_or_what_stands_above_it() {
         ..Default::default()
     };
     let dry = brightness_at(&render_albedo(&gpu, metal, None), floor.0, floor.1);
-    let wet = brightness_at(&render_albedo(&gpu, metal, Some(-0.05)), floor.0, floor.1);
+    let wet = brightness_at(&render_albedo(&gpu, metal, Some(-0.01)), floor.0, floor.1);
     assert!(
         (dry - wet).abs() < 2.0,
         "wet metal changed colour: {dry} dry, {wet} wet"
@@ -1645,5 +1646,87 @@ fn wet_ground_shines_where_dry_ground_does_not() {
     assert!(
         wet > dry * 1.3 + 10.0,
         "the wet floor's glint ({wet}) is no brighter than the dry floor's sheen ({dry})"
+    );
+}
+
+#[test]
+fn a_falling_sea_leaves_a_wet_line_that_dries() {
+    let Some(gpu) = request_gpu() else { return };
+    // The ball stands in a calm harbour. With the sea at 1.2 m its side at 0.9 m is under
+    // water; the sea then falls to 0.6 m, as a tide going out, and that side stands 30 cm
+    // clear of it, above any fringe. It stays wet from where the water was, and only after
+    // some minutes has it dried to match a ball that the sea never reached so high.
+    let size = 128;
+    let sand = Material {
+        base_color: [0.45, 0.38, 0.28, 1.0],
+        roughness: 0.95,
+        ..Default::default()
+    };
+    let mut scene = ball_on_floor();
+    scene.materials = vec![sand];
+    let scene = paginate(&scene);
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.9, 4.0),
+        ..Default::default()
+    };
+    let target = test_target(&gpu, size);
+    let view = target.create_view(&Default::default());
+    let renderer_at = |level: f32| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Albedo,
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        let mut renderer = Renderer::new(&gpu, &scene, FORMAT, settings);
+        renderer.set_ocean(Some(Ocean::by_name("murky").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+        renderer
+    };
+    let run_from = |renderer: &mut Renderer, camera: &Camera, frames: u32, seconds: f32| {
+        for _ in 0..frames {
+            renderer.render(
+                &gpu,
+                camera,
+                &Environment::default(),
+                &view,
+                (size, size),
+                seconds,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        brightness_at(&read_pixels(&gpu, &target, size), 64, 64)
+    };
+    let run = |renderer: &mut Renderer, frames: u32, seconds: f32| {
+        run_from(renderer, &camera, frames, seconds)
+    };
+
+    let mut ebbing = renderer_at(1.2);
+    run(&mut ebbing, 30, 1.0 / 60.0);
+    ebbing.set_sea_level(0.6);
+    let just_left = run(&mut ebbing, 4, 1.0 / 60.0);
+    let never_reached = run(&mut renderer_at(0.6), 34, 1.0 / 60.0);
+    assert!(
+        just_left < never_reached * 0.85,
+        "where the sea just was ({just_left}) is not wetter than where it never reached ({never_reached})"
+    );
+    // The map is fixed in the world: walking 40 m off, its window sliding with the camera, and
+    // back again, the line is where it was.
+    let away = Camera {
+        position: camera.position + Vec3::new(40.3, 0.0, -17.6),
+        ..camera
+    };
+    run_from(&mut ebbing, &away, 4, 1.0 / 60.0);
+    let back = run(&mut ebbing, 2, 1.0 / 60.0);
+    assert!(
+        (back - just_left).abs() < 3.0,
+        "the line moved with the camera: {back} on coming back, {just_left} before"
+    );
+    // Ten minutes on, twenty half-lives of drying.
+    let dried = run(&mut ebbing, 2, 300.0);
+    assert!(
+        (dried - never_reached).abs() < 3.0,
+        "after ten minutes the line is still wet: {dried}, against {never_reached} never wetted"
     );
 }
