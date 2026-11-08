@@ -1,6 +1,7 @@
 //! Shared parts of the viewer. The native window and the browser page are thin shells
 //! around [`FlyCamera`] and the renderer.
 
+pub mod bob;
 pub mod camera_path;
 #[cfg(target_arch = "wasm32")]
 mod web;

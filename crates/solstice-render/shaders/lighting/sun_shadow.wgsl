@@ -6,6 +6,9 @@
 //   var shadow_sampler: sampler_comparison;
 
 const CASCADE_COUNT: u32 = 4u;
+// The layer after the cascades holds movable instances, a quarter of it for each cascade at
+// half its resolution (shadow.rs).
+const MOVING_LAYER: i32 = 4;
 
 struct Shadows {
     view_proj: array<mat4x4f, 4>,
@@ -13,12 +16,20 @@ struct Shadows {
     splits: vec4f,
     // World size of one shadow texel per cascade.
     texel_size: vec4f,
+    // 1 for each cascade whose movable instances were drawn this frame, else 0.
+    moving: vec4f,
 }
 
 const DISK_SAMPLES: u32 = 12u;
 
-fn sample_cascade(cascade: u32, world: vec3f, normal: vec3f, angle: f32) -> f32 {
-    let texel = shadows.texel_size[cascade];
+// Twin of `moving_quarter` in shadow.rs: where a cascade's quarter starts, in UV.
+fn moving_quarter(cascade: u32) -> vec2f {
+    return vec2f(f32(cascade % 2u), f32(cascade / 2u)) * 0.5;
+}
+
+// How lit `world` is in one map: a whole layer, or a part of one starting at `origin` and
+// `scale` of it across, with texels `texel` metres across.
+fn sample_map(cascade: u32, layer: i32, origin: vec2f, scale: f32, texel: f32, world: vec3f, normal: vec3f, angle: f32) -> f32 {
     // Offset towards the surface normal, by more as the sun grazes the surface: a texel then
     // spans a long stretch of it, and the surface would otherwise shadow itself. This matters
     // most in the far cascades, whose texels are large.
@@ -33,15 +44,29 @@ fn sample_cascade(cascade: u32, world: vec3f, normal: vec3f, angle: f32) -> f32 
 
     // Penumbra sized in world units, so that it stays consistent across cascades. A rotated
     // Vogel disc turns the blocky steps of few samples into noise that TAA can resolve.
-    let filter_radius = max(0.018 / texel, 1.0) * 1.5 / f32(textureDimensions(shadow_maps).x);
+    let size = f32(textureDimensions(shadow_maps).x);
+    let filter_radius = max(0.018 / texel, 1.0) * 1.5 / size;
+    // Samples stay inside the map's own part of the layer, half a texel in from its edge.
+    let inset = 0.5 / size;
     var sum = 0.0;
     for (var i = 0u; i < DISK_SAMPLES; i++) {
         let r = sqrt((f32(i) + 0.5) / f32(DISK_SAMPLES));
         let theta = f32(i) * 2.399963 + angle;
         let offset = vec2f(cos(theta), sin(theta)) * r * filter_radius;
-        sum += textureSampleCompareLevel(shadow_maps, shadow_sampler, uv + offset, i32(cascade), clip.z);
+        let at = clamp(origin + uv * scale + offset, origin + inset, origin + scale - inset);
+        sum += textureSampleCompareLevel(shadow_maps, shadow_sampler, at, layer, clip.z);
     }
     return sum / f32(DISK_SAMPLES);
+}
+
+fn sample_cascade(cascade: u32, world: vec3f, normal: vec3f, angle: f32) -> f32 {
+    let texel = shadows.texel_size[cascade];
+    var lit = sample_map(cascade, i32(cascade), vec2f(0.0), 1.0, texel, world, normal, angle);
+    // What moves casts its shadow from its own map, with texels twice as large.
+    if shadows.moving[cascade] > 0.5 {
+        lit *= sample_map(cascade, MOVING_LAYER, moving_quarter(cascade), 0.5, texel * 2.0, world, normal, angle);
+    }
+    return lit;
 }
 
 fn sun_shadow(world: vec3f, normal: vec3f, distance: f32, noise: f32) -> f32 {

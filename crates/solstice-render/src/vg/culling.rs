@@ -36,7 +36,9 @@ pub struct PassView {
     pub eye_near: f32,
     /// How many of `receiver_planes` are in use.
     pub receiver_plane_count: u32,
-    pub _pad: [u32; 2],
+    /// Which instances the view draws: an [`InstanceFilter`].
+    pub instance_filter: u32,
+    pub _pad: u32,
     /// Further planes a cluster must lie inside: for a shadow view, the bounds of the volume
     /// whose shadows this view supplies, swept towards the light, so that casters whose shadow
     /// falls outside it are not drawn.
@@ -45,6 +47,20 @@ pub struct PassView {
     /// anywhere along the line from it away from the light.
     pub eye_light: Vec3,
     pub _pad2: f32,
+}
+
+/// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum InstanceFilter {
+    All = 0,
+    /// Only those that cannot move, for views kept from frame to frame, which would otherwise
+    /// keep a moving instance where it was.
+    Static = 1,
+    /// Only those that can move, drawn each frame over a cached view.
+    Movable = 2,
+    /// Static instances, and movable ones that stay in the GI voxels.
+    Gi = 3,
 }
 
 impl PassView {
@@ -68,7 +84,9 @@ impl PassView {
     }
 
     /// A view with no occlusion testing and no software rasterization, for orthographic
-    /// volumes such as shadow cascades. `pixels_per_unit` converts LOD error to pixels.
+    /// volumes such as shadow cascades. `pixels_per_unit` converts LOD error to pixels. These
+    /// views are kept from frame to frame, so they draw only static instances; see
+    /// [`Self::drawing`].
     pub fn orthographic(
         view_proj: Mat4,
         center: Vec3,
@@ -95,7 +113,8 @@ impl PassView {
             eye_lod_scale: 0.0,
             eye_near: 0.0,
             receiver_plane_count: 0,
-            _pad: [0; 2],
+            instance_filter: InstanceFilter::Static as u32,
+            _pad: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             _pad2: 0.0,
@@ -129,6 +148,12 @@ impl PassView {
         self.eye_light = light.normalize_or(Vec3::Y);
         self.eye_lod_scale = lod_scale;
         self.eye_near = nearest.max(1.0e-3);
+        self
+    }
+
+    /// The same view, drawing other instances.
+    pub fn drawing(mut self, filter: InstanceFilter) -> Self {
+        self.instance_filter = filter as u32;
         self
     }
 }
@@ -491,7 +516,7 @@ impl CullPipelines {
                 pass.set_pipeline(&self.seed);
                 pass.set_bind_group(0, scene_group, &offset);
                 pass.set_bind_group(1, work_group, &[]);
-                pass.dispatch_workgroups(groups_for(scene.instance_count, 64), 1, 1);
+                pass.dispatch_workgroups(groups_for(scene.gpu_instance_count, 64), 1, 1);
             }
             CullPhase::Second => {
                 pass.set_pipeline(&self.begin_second_phase);
@@ -522,11 +547,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pass_view_size_matches_the_shader_layout() {
-        // The receiver planes follow a vec3 and four scalars, so WGSL pads them to 16 bytes.
-        assert_eq!(std::mem::offset_of!(PassView, receiver_planes), 320);
-        assert_eq!(std::mem::offset_of!(PassView, eye_light), 416);
-        assert_eq!(std::mem::size_of::<PassView>(), 432);
+    fn the_pass_view_lays_out_as_its_shader_twin() {
+        crate::shaders::assert_twin!(
+            "vg/cull.wgsl",
+            "PassView",
+            PassView,
+            [
+                raster_view_proj,
+                occlusion_view,
+                planes,
+                camera_position,
+                lod_threshold,
+                viewport,
+                proj_scale,
+                hzb_size,
+                near,
+                lod_scale,
+                is_ortho,
+                phase,
+                occlusion_enabled,
+                allow_software,
+                eye_position,
+                eye_lod_scale,
+                eye_near,
+                receiver_plane_count,
+                instance_filter,
+                receiver_planes,
+                eye_light,
+            ]
+        );
+    }
+
+    #[test]
+    fn orthographic_views_draw_only_what_stands_still() {
+        let view = PassView::orthographic(Mat4::IDENTITY, Vec3::ZERO, Vec2::ONE, 1.0, 1.0);
+        assert_eq!(view.instance_filter, InstanceFilter::Static as u32);
+        let moving = view.drawing(InstanceFilter::Movable);
+        assert_eq!(moving.instance_filter, InstanceFilter::Movable as u32);
     }
 
     #[test]

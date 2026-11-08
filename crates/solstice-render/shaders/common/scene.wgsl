@@ -47,11 +47,16 @@ struct Instance {
     uv_origin: vec2f,
     uv_step: vec2f,
     root_node: u32,
-    // Material index, with INSTANCE_TWO_SIDED in the top bit so rasterizers need not look it up.
+    // Material index, with the INSTANCE_ flags in its top bits so passes need not look them up.
     material: u32,
     max_scale: f32,
     // Texture layer << 16 | (log2(uv scale) + 128) * 256, or NO_TEXTURE.
     texture_info: u32,
+    // How brightly the material's own light shines here: 1 as it is, 0 dark.
+    glow: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 struct Material {
@@ -85,11 +90,27 @@ struct VisibleCluster {
 // Twins of Material::TWO_SIDED and Material::FOLIAGE.
 const MATERIAL_TWO_SIDED: u32 = 1u;
 const MATERIAL_FOLIAGE: u32 = 2u;
-// Twin of INSTANCE_TWO_SIDED in scene.rs.
+// Twins of the INSTANCE_ flags in scene.rs.
 const INSTANCE_TWO_SIDED: u32 = 0x80000000u;
+const INSTANCE_MOVABLE: u32 = 0x40000000u;
+const INSTANCE_HIDDEN: u32 = 0x20000000u;
+const INSTANCE_STAYS_IN_GI: u32 = 0x10000000u;
+const INSTANCE_MATERIAL_MASK: u32 = 0x0fffffffu;
 
 fn instance_material(i: Instance) -> u32 {
-    return i.material & ~INSTANCE_TWO_SIDED;
+    return i.material & INSTANCE_MATERIAL_MASK;
+}
+
+fn instance_movable(i: Instance) -> bool {
+    return (i.material & INSTANCE_MOVABLE) != 0u;
+}
+
+fn instance_hidden(i: Instance) -> bool {
+    return (i.material & INSTANCE_HIDDEN) != 0u;
+}
+
+fn instance_stays_in_gi(i: Instance) -> bool {
+    return (i.material & INSTANCE_STAYS_IN_GI) != 0u;
 }
 
 fn instance_two_sided(i: Instance) -> bool {

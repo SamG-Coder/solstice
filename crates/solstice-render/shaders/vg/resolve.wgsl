@@ -265,7 +265,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let current_ndc = current_clip.xy / current_clip.w;
     let motion = (prev_ndc - current_ndc) * vec2f(0.5, -0.5);
 
-    var emissive = material.emissive;
+    var emissive = material.emissive * instance.glow;
 
     switch frame.debug_mode {
         case DEBUG_CLUSTERS: {
@@ -287,6 +287,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         }
         case DEBUG_NORMALS: {
             emissive = normal * 0.5 + vec3f(0.5);
+        }
+        case DEBUG_MOTION: {
+            // `motion` points from here to last frame's place, so this shows the way it went:
+            // a hundredth of the screen per frame is full colour.
+            emissive = vec3f(clamp(vec2f(0.5) - vec2f(motion.x, -motion.y) * 50.0, vec2f(0.0), vec2f(1.0)), 0.5);
         }
         case DEBUG_WETNESS: {
             let shade = max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);

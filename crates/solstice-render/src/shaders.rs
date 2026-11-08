@@ -170,6 +170,50 @@ pub fn module(device: &wgpu::Device, path: &str) -> wgpu::ShaderModule {
     })
 }
 
+/// How naga lays out a struct, for tests that check a Rust twin matches it byte for byte: its
+/// size, and each member's name and offset in order. `path` is an entry point that includes
+/// the struct.
+#[cfg(test)]
+pub(crate) fn struct_layout(path: &str, name: &str) -> (usize, Vec<(String, usize)>) {
+    let source = expand(path);
+    let module = naga::front::wgsl::parse_str(&source).expect("the shader parses");
+    let (_, ty) = module
+        .types
+        .iter()
+        .find(|(_, ty)| ty.name.as_deref() == Some(name))
+        .unwrap_or_else(|| panic!("{path} has no struct {name}"));
+    let naga::TypeInner::Struct { members, span } = &ty.inner else {
+        panic!("{name} is a struct");
+    };
+    let members = members
+        .iter()
+        .map(|m| (m.name.clone().unwrap_or_default(), m.offset as usize))
+        .collect();
+    (*span as usize, members)
+}
+
+/// Checks a Rust struct against its WGSL twin: the same size, and each field at the same
+/// offset as the shader member in the same place. Fields are listed in order, one per shader
+/// member. A Rust array that the shader spells out as several members is listed once for each,
+/// with the extra bytes to each: `rows, rows + 16, rows + 32`.
+#[cfg(test)]
+macro_rules! assert_twin {
+    ($path:expr, $wgsl:expr, $rust:ty, [$($field:ident $(+ $extra:literal)?),* $(,)?]) => {{
+        let (size, members) = crate::shaders::struct_layout($path, $wgsl);
+        assert_eq!(size, std::mem::size_of::<$rust>(), "size of {}", $wgsl);
+        let rust: Vec<(&str, usize)> = vec![$((
+            stringify!($field),
+            std::mem::offset_of!($rust, $field) $(+ $extra)?,
+        )),*];
+        assert_eq!(rust.len(), members.len(), "member count of {}", $wgsl);
+        for ((field, offset), (member, member_offset)) in rust.iter().zip(&members) {
+            assert_eq!(offset, member_offset, "{field} against {member} in {}", $wgsl);
+        }
+    }};
+}
+#[cfg(test)]
+pub(crate) use assert_twin;
+
 #[cfg(test)]
 mod tests {
     use super::*;
