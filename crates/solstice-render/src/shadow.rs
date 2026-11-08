@@ -118,10 +118,10 @@ pub struct ShadowWork {
 
 /// Up to this many movable instances, one cull serves every touched cascade: a traversal's
 /// fixed cost outweighs drawing a few things into quarters they fall outside of. Beyond it,
-/// drawing the whole list into every quarter would cost more than the traversals saved: two
-/// thousand bobbing instances were cheaper shared (0.46 against 0.68 ms), twenty thousand
-/// dearer (12.5 against 5.9).
-const SHARED_CULL_LIMIT: usize = 4096;
+/// drawing the whole list into every quarter costs more than the traversals saved. Measured
+/// with bobbing instances of the stress scene: 2,031 were cheaper shared (0.45 against 0.68
+/// ms), 3,615 the same either way (0.55), 13,431 far dearer shared (19 against 3).
+const SHARED_CULL_LIMIT: usize = 2048;
 
 /// Slots a [`ShadowMaps`] writes from `first_moving_slot`: one per cascade for drawing movable
 /// instances into its quarter, then one for culling them all at once.
@@ -511,9 +511,8 @@ fn moving_quarter(cascade: usize) -> [u32; 2] {
 
 /// The view that culls movable instances for every touched cascade at once: the box holding
 /// every touched cascade's box, which all share the light's orientation (`extents` gives each
-/// one's centre and radius, as [`fit_cascade`] does), with its near plane, towards the light,
-/// dropped, since a caster is clipped there by each quarter's own view anyway; and with the
-/// level of detail of the finest touched cascade, `finest_radius` across.
+/// one's centre and radius, as [`fit_cascade`] does), with the level of detail of the finest
+/// touched cascade, `finest_radius` across.
 fn moving_cull_view(
     extents: &[(Vec3, f32)],
     sun: Vec3,
@@ -537,17 +536,14 @@ fn moving_cull_view(
     let eye = from_light.transform_point3(Vec3::new(middle.x, middle.y, high.z));
     let view = Mat4::look_to_rh(eye, -sun, up);
     let projection = Mat4::orthographic_rh(-half.x, half.x, -half.y, half.y, 0.0, high.z - low.z);
-    let mut view = PassView::orthographic(
+    PassView::orthographic(
         projection * view,
         from_light.transform_point3(middle),
         Vec2::splat(MOVING_RESOLUTION as f32),
         MOVING_RESOLUTION as f32 / (2.0 * finest_radius),
         lod_threshold,
     )
-    .drawing(InstanceFilter::Movable);
-    // `frustum_planes` puts the near plane fifth. A plane with no normal passes everything.
-    view.planes[4] = Vec4::W;
-    view
+    .drawing(InstanceFilter::Movable)
 }
 
 /// The up vector of a view along the light: anything but the light's own direction.
@@ -1120,8 +1116,13 @@ mod tests {
             // Beyond every box on the side away from the light: nothing there can shadow.
             let (far_center, far_radius) = extents[CASCADE_COUNT - 1];
             assert!(!inside(&view.planes, far_center - light * far_radius * 4.0));
-            // Far towards the light, past the depth any cascade reaches: still in.
+            // Towards the light, the union reaches as far as any box and no further: casters
+            // past that would only be clipped by every quarter.
             assert!(inside(
+                &view.planes,
+                far_center + light * (DEPTH_REACH - 1.0)
+            ));
+            assert!(!inside(
                 &view.planes,
                 far_center + light * (DEPTH_REACH + far_radius * 3.0)
             ));
