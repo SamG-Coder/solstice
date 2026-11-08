@@ -251,7 +251,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let specular_scale = environment_brdf(surface.f0, roughness, n_dot_v);
     let rough_estimate = irradiance / PI;
     let traced_weight = clamp((0.65 - roughness) / 0.1, 0.0, 1.0) * clamp(reflection.a * 4.0, 0.0, 1.0);
-    let incoming = mix(rough_estimate, reflection.rgb * frame.gi_intensity, traced_weight);
+    // Texels whose sampled pixel was too rough to trace hold no light and no weight, so the
+    // accumulated light is divided by its weight rather than read as is, which would darken it.
+    let traced = reflection.rgb / max(reflection.a, 1.0e-3);
+    let incoming = mix(rough_estimate, traced * frame.gi_intensity, traced_weight);
     color += incoming * specular_scale * occlusion;
 
     color += emissive;

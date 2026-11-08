@@ -111,6 +111,18 @@ impl Gpu {
         entry_point: &str,
         layouts: &[&wgpu::BindGroupLayout],
     ) -> wgpu::ComputePipeline {
+        self.compute_pipeline_with(label, module, entry_point, layouts, &[])
+    }
+
+    /// Creates a compute pipeline, setting the shader's `override` constants by name.
+    pub fn compute_pipeline_with(
+        &self,
+        label: &str,
+        module: &wgpu::ShaderModule,
+        entry_point: &str,
+        layouts: &[&wgpu::BindGroupLayout],
+        constants: &[(&str, f64)],
+    ) -> wgpu::ComputePipeline {
         let layouts: Vec<Option<&wgpu::BindGroupLayout>> =
             layouts.iter().map(|l| Some(*l)).collect();
         let layout = self
@@ -126,7 +138,10 @@ impl Gpu {
                 layout: Some(&layout),
                 module,
                 entry_point: Some(entry_point),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants,
+                    ..Default::default()
+                },
                 cache: None,
             })
     }

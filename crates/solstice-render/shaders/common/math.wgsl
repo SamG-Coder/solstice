@@ -44,6 +44,14 @@ fn interleaved_gradient_noise(pixel: vec2f, frame: u32) -> f32 {
     return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
 }
 
+// The blend for a temporal filter tuned as `blend_at_60` at 60 frames per second. Above 60,
+// each frame contributes less, keeping the same response in time, so the same lag averages
+// more frames and noise falls. Below 60 the blend stays as tuned: keeping the lag there would
+// mean blending more of each noisy frame, so slow frames trade a longer lag for no more noise.
+fn frame_rate_blend(blend_at_60: f32, seconds: f32) -> f32 {
+    return min(1.0 - pow(1.0 - blend_at_60, seconds * 60.0), blend_at_60);
+}
+
 // R2 low-discrepancy sequence, offset by a per-pixel seed.
 fn r2_sequence(index: u32, seed: vec2f) -> vec2f {
     return fract(seed + f32(index) * vec2f(0.7548776662, 0.5698402910));

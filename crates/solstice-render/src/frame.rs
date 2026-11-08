@@ -186,7 +186,8 @@ pub struct FrameUniform {
     /// The sun's illuminance at noon, which night is measured against.
     pub daylight_illuminance: f32,
     pub star_equinox: Vec3,
-    pub _pad0: f32,
+    /// Seconds since the previous frame, which temporal filters scale their blend by.
+    pub frame_seconds: f32,
     /// Where the sun and moon are drawn: the true sun, whatever lights the scene.
     pub sun_disc: Vec3,
     pub _pad1: f32,

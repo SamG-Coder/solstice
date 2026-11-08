@@ -144,9 +144,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if all(previous_uv > vec2f(0.0)) && all(previous_uv < vec2f(1.0)) && frame.frame_index > 0u {
         let history = textureSampleLevel(reflection_history, clamp_sampler, previous_uv, 0.0);
         // Rough reflections are noisier and depend less on the view, so they keep more history.
-        let blend = mix(0.25, 0.07, clamp(roughness / MAX_TRACED_ROUGHNESS, 0.0, 1.0));
+        let blend = frame_rate_blend(mix(0.25, 0.07, clamp(roughness / MAX_TRACED_ROUGHNESS, 0.0, 1.0)), frame.frame_seconds);
         let moved = length(motion * frame.viewport);
-        result = mix(history, result, clamp(blend + moved * 0.04, blend, 0.6));
+        // The motion term and its cap are per frame, so how fast history gives way under
+        // motion still depends on the frame rate.
+        result = mix(history, result, max(blend, min(blend + moved * 0.04, 0.6)));
     }
     textureStore(output, id.xy, result);
 }
