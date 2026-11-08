@@ -710,16 +710,27 @@ mod tests {
                     (1.0 + lambda * b[2]) * (1.0 + lambda * b[3]) - lambda * lambda * a[3] * a[3];
                 let breaking = ((waves.foam_stretch - stretch) * rate).clamp(0.0, 1.0);
                 let faded = previous[cascade as usize][i][0] * kept;
-                let expected = breaking.max(faded);
-                // The stretch is worked out here from half floats; the GPU had full ones.
-                let tolerance = rate * 2.0e-3 + 1.0e-4;
-                assert!(
-                    (foam[i][0] - expected).abs() <= tolerance,
-                    "cascade {cascade}, texel {i}: {} against {expected}",
-                    foam[i][0]
-                );
-                breaking_texels += (breaking > 0.0) as usize;
-                faded_texels += (faded > breaking && faded > 0.01) as usize;
+                if stretch > waves.foam_stretch + 0.01 {
+                    // Clearly not breaking: the foam is exactly last frame's, faded. Nothing
+                    // here passes through half floats, so this holds tightly.
+                    assert!(
+                        (foam[i][0] - faded).abs() <= 1.0e-5,
+                        "cascade {cascade}, texel {i}: {} should have faded to {faded}",
+                        foam[i][0]
+                    );
+                    faded_texels += (faded > 0.01) as usize;
+                } else {
+                    // Near or past the threshold, the stretch worked out here from half floats
+                    // differs a little from the GPU's.
+                    let expected = breaking.max(faded);
+                    let tolerance = rate * 2.0e-3 + 1.0e-4;
+                    assert!(
+                        (foam[i][0] - expected).abs() <= tolerance,
+                        "cascade {cascade}, texel {i}: {} against {expected}",
+                        foam[i][0]
+                    );
+                    breaking_texels += (breaking > 0.0) as usize;
+                }
             }
         }
         assert!(breaking_texels > 0, "no crest broke");
