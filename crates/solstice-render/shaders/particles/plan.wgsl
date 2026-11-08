@@ -8,14 +8,15 @@
 @group(0) @binding(0) var<uniform> sim: SimParams;
 @group(0) @binding(1) var<storage, read> emitters: array<Emitter, MAX_EMITTERS>;
 @group(0) @binding(2) var<storage, read_write> state: array<EmitterState, MAX_EMITTERS>;
-// Dispatch arguments for spawn, then for update, then from word 8 a draw's arguments per
+// Dispatch arguments for spawn, update and light, then from word 12 a draw's arguments per
 // emitter: vertex count, instance count, first vertex, first instance.
 @group(0) @binding(3) var<storage, read_write> indirect: array<u32>;
 
-const DRAWS_FIRST: u32 = 8u;
+const DRAWS_FIRST: u32 = 12u;
 
 var<workgroup> spawn_groups: array<u32, MAX_EMITTERS>;
 var<workgroup> update_groups: array<u32, MAX_EMITTERS>;
+var<workgroup> light_groups: array<u32, MAX_EMITTERS>;
 
 @compute @workgroup_size(64)
 fn plan(@builtin(local_invocation_index) e: u32) {
@@ -72,4 +73,18 @@ fn finish(@builtin(local_invocation_index) e: u32) {
     indirect[at + 1u] = count;
     indirect[at + 2u] = 0u;
     indirect[at + 3u] = 0u;
+
+    // The light pass covers what is alive now, a workgroup at a time per emitter.
+    light_groups[e] = (count + GROUP_SIZE - 1u) / GROUP_SIZE;
+    workgroupBarrier();
+    if e == 0u {
+        var total = 0u;
+        for (var i = 0u; i < MAX_EMITTERS; i++) {
+            state[i].light_start = total;
+            total += light_groups[i];
+        }
+        indirect[6] = total;
+        indirect[7] = 1u;
+        indirect[8] = 1u;
+    }
 }

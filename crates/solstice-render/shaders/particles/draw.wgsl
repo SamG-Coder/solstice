@@ -3,10 +3,15 @@
 //
 // A sprite fades out where it nears the surface behind it, over its emitter's soft distance, so
 // it never shows a hard line where it crosses the ground or the water, and fades as it reaches
-// the camera. Unlit for now: lighting, haze and motion come in later steps.
+// the camera.
+//
+// Its light was worked out once for the whole particle by particles/light.wgsl: here it is
+// scattered towards the eye by the emitter's phase function, its glow added, and the haze
+// between it and the eye laid over it, as over everything else. Motion comes in a later step.
 
 #include "common/frame.wgsl"
 #include "particles/common.wgsl"
+#include "particles/light_common.wgsl"
 
 const CURVE_ENTRIES: u32 = 32u;
 // Each emitter's curves: its colour's entries, then its size's, four to a vector.
@@ -28,6 +33,7 @@ struct DrawParams {
 @group(1) @binding(2) var<storage, read> emitters: array<Emitter, MAX_EMITTERS>;
 @group(1) @binding(3) var<storage, read> curves: array<vec4f>;
 @group(1) @binding(4) var<uniform> draw: DrawParams;
+@group(1) @binding(5) var<storage, read> received: array<ParticleLight>;
 // The scene's depth with the water in it: reversed Z, zero where there is only sky.
 @group(2) @binding(0) var scene_depth: texture_2d<f32>;
 
@@ -35,7 +41,8 @@ struct Varyings {
     @builtin(position) clip: vec4f,
     // Where on the sprite, from -1 to 1 across it.
     @location(0) corner: vec2f,
-    // Premultiplied by nothing yet: colour times brightness, and opacity.
+    // The radiance the particle sends to the eye, through the haze, and its opacity; not yet
+    // premultiplied.
     @location(1) color: vec4f,
     // Distance along the view, and over how far to fade into the scene and towards the camera.
     @location(2) @interpolate(flat) fades: vec3f,
@@ -84,7 +91,27 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     var out: Varyings;
     out.clip = frame.view_proj * vec4f(world, 1.0);
     out.corner = corner;
-    out.color = emitter.color * curve_color(e, t);
+    let tint = emitter.color * curve_color(e, t);
+    let light = unpack_light(received[slot]);
+    // Scattered towards the eye: the sun by the phase function, the rest as it came.
+    let to_eye = normalize(frame.camera_position - p.position);
+    let sun = light.sun * phase(emitter.phase.x, dot(-frame.sun_direction, to_eye)) / PI;
+    // The ambient light already carries the scene's GI intensity, from the light pass.
+    let scattered = sun + light.ambient + light.lamps;
+    var radiance = tint.rgb;
+    if (emitter.flags & FLAG_LIT) != 0u {
+        radiance *= scattered;
+    }
+    radiance += light.glow;
+    if frame.debug_mode == DEBUG_PARTICLE_LIGHT {
+        out.color = vec4f(scattered, tint.a);
+    } else if (emitter.flags & FLAG_ADD) != 0u {
+        // An additive particle covers nothing, so the haze over what is behind it is already
+        // there: it adds only its own light, dimmed by the air.
+        out.color = vec4f(radiance * light.transmittance, tint.a);
+    } else {
+        out.color = vec4f(light.haze + radiance * light.transmittance, tint.a);
+    }
     let distance = -(frame.view * vec4f(p.position, 1.0)).z;
     out.fades = vec3f(distance, emitter.soft, max(2.0 * size, 0.2));
     return out;
