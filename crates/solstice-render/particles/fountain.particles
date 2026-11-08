@@ -8,14 +8,15 @@ emitter jet
   shape sphere 0.05
   lifetime 1.6 2.0
   velocity 0 6.5 0 cone=7 spread=0.08
-  size 0.012 0.03
+  size 0.006 0.015
   gravity
   drag 0.15
-  color 0.75 0.85 0.95 0.55
-  color life 0=1 1 1 0 0.06=1 1 1 1 0.8=1 1 1 0.8 1=1 1 1 0
+  color 0.75 0.85 0.95 1
+  color life 0=1 1 1 0 0.06=1 1 1 1 0.85=1 1 1 1 1=1 1 1 0
   size life 0=0.6 1=1.6
-  # Water scatters light mostly onward: the jet sparkles with the sun behind it.
-  render sprite soft=0.1 phase=0.7
+  # Water scatters light mostly onward: the jet sparkles with the sun behind it. Its drops are
+  # solid, so the temporal filter follows each exactly.
+  render sprite solid phase=0.7
 
 emitter mist
   budget 1500
@@ -30,4 +31,5 @@ emitter mist
   color 0.85 0.9 1 0.035
   color life 0=1 1 1 0 0.3=1 1 1 1 1=1 1 1 0
   size life 0=0.5 1=2.5
-  render sprite soft=0.5 phase=0.6
+  # Mist is sorted far to near, as smoke is.
+  render sprite sort soft=0.5 phase=0.6

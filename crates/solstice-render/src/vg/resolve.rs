@@ -28,12 +28,15 @@ pub struct GBuffer {
 impl GBuffer {
     pub fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
         let none = wgpu::TextureUsages::empty();
+        // Solid particles draw their depth and motion into these when there is no water, and
+        // tests read them back.
+        let render = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
         Self {
             albedo: Target::new(gpu, "gbuffer albedo", size, ALBEDO_FORMAT, none),
             normal: Target::new(gpu, "gbuffer normal", size, NORMAL_FORMAT, none),
             emissive: Target::new(gpu, "gbuffer emissive", size, EMISSIVE_FORMAT, none),
-            motion: Target::new(gpu, "gbuffer motion", size, MOTION_FORMAT, none),
-            depth: Target::new(gpu, "gbuffer depth", size, DEPTH_FORMAT, none),
+            motion: Target::new(gpu, "gbuffer motion", size, MOTION_FORMAT, render),
+            depth: Target::new(gpu, "gbuffer depth", size, DEPTH_FORMAT, render),
         }
     }
 }

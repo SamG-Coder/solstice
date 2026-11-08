@@ -3189,6 +3189,141 @@ fn local_lights_light_particles_and_the_scene_stops_them() {
     assert!((three / two - 1.5).abs() < 0.15, "two {two}, three {three}");
 }
 
+/// Emitters are drawn far to near, whatever order they were started in: a nearer emitter's
+/// smoke lies over a farther one's.
+#[test]
+fn nearer_emitters_draw_over_farther_ones() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let puff = |r: f32, g: f32, b: f32| {
+        Effect::parse(&format!(
+            "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 2\n color {r} {g} {b} 0.9\n render sprite soft=0 shading=unlit"
+        ))
+        .unwrap()
+    };
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let centre = |first_near: bool| {
+        let mut stage = light_stage(&gpu, &wall(0.0), DebugView::Albedo, size);
+        let near = (puff(0.0, 0.0, 1.0), Vec3::new(0.0, 0.0, -4.0));
+        let far = (puff(1.0, 0.0, 0.0), Vec3::new(0.0, 0.0, -7.0));
+        let order = if first_near { [near, far] } else { [far, near] };
+        for (effect, at) in &order {
+            stage
+                .renderer
+                .particles()
+                .spawn(effect, Mat4::from_translation(*at))
+                .unwrap();
+        }
+        stage.frames(&gpu, &camera, &darkness(), 4);
+        patch(&stage.pixels(&gpu), size, size / 2, size / 2, 0).map(srgb_to_linear)
+    };
+    for first_near in [true, false] {
+        let [r, _, b] = centre(first_near);
+        assert!(
+            b > r * 4.0,
+            "the near blue puff is on top: red {r}, blue {b}"
+        );
+    }
+}
+
+/// A small, faint particle moving fast across the view keeps its contrast under the temporal
+/// filter, as it has without it. Its neighbourhood looks much like the wall behind it, so the
+/// filter's colour clipping alone would keep the wall's history there and the particle would
+/// fade into a smear; where particles cover, the filter trusts its history less.
+#[test]
+fn moving_translucent_particles_stay_bright_under_the_temporal_filter() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 128;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let effect = Effect::parse(
+        "emitter e
+ budget 1
+ spawn burst=1
+ lifetime 1000
+ size 0.06
+ velocity 4 0 0
+ color 1 1 1 0.35
+ render sprite soft=0 shading=unlit",
+    )
+    .unwrap();
+    let frames = 12;
+    let seconds = 1.0 / 60.0;
+    let start = Vec3::new(-1.5, 0.0, -5.0);
+    let end = start + Vec3::new(4.0 * seconds * (frames as f32 - 0.5), 0.0, 0.0);
+    let contrast = |taa: bool| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Lit,
+            temporal_accumulation: taa,
+            ..Default::default()
+        };
+        let mut stage = Stage::new(&gpu, &wall(0.2), settings, size);
+        stage
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::from_translation(start))
+            .unwrap();
+        stage.frames(&gpu, &camera, &Environment::default(), frames);
+        let pixels = stage.pixels(&gpu);
+        let (x, y) = pixel_of(&camera, size, end);
+        let peak = (0..=2)
+            .flat_map(|dy| (0..=2).map(move |dx| (x + dx - 1, y + dy - 1)))
+            .map(|(x, y)| brightness(patch(&pixels, size, x, y, 0)))
+            .fold(0.0, f32::max);
+        peak - brightness(patch(&pixels, size, x, y + 12, 1))
+    };
+    let still = contrast(false);
+    let filtered = contrast(true);
+    eprintln!("contrast without the filter {still}, with it {filtered}");
+    assert!(still > 8.0, "{still}");
+    assert!(
+        filtered > still * 0.7,
+        "with the filter {filtered}, without {still}"
+    );
+}
+
+/// A solid particle hides a translucent one behind it, as any surface would.
+#[test]
+fn solid_particles_hide_what_is_behind_them() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let mut stage = light_stage(&gpu, &wall(0.0), DebugView::Albedo, size);
+    let solid = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 2\n color 1 0 0 1\n render sprite solid shading=unlit",
+    )
+    .unwrap();
+    let behind = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 3\n color 0 0 1 1\n render sprite soft=0 shading=unlit",
+    )
+    .unwrap();
+    // The translucent one is started first and is farther; either way the solid one is in front.
+    for (effect, z) in [(&behind, -8.0), (&solid, -5.0)] {
+        stage
+            .renderer
+            .particles()
+            .spawn(effect, Mat4::from_translation(Vec3::new(0.0, 0.0, z)))
+            .unwrap();
+    }
+    stage.frames(&gpu, &camera, &darkness(), 4);
+    let [r, _, b] = patch(&stage.pixels(&gpu), size, size / 2, size / 2, 0).map(srgb_to_linear);
+    assert!(r > 0.9 && b < 0.02, "red {r}, blue {b}");
+}
+
 /// Local lights are shadowed through their own maps: a lamp over the floor with a ball hung
 /// between them leaves the floor under the ball dark and the floor beside it lit, and taking
 /// the ball away lights the floor under it. A map never traced would shadow the floor beside

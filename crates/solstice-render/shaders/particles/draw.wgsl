@@ -7,7 +7,10 @@
 //
 // Its light was worked out once for the whole particle by particles/light.wgsl: here it is
 // scattered towards the eye by the emitter's phase function, its glow added, and the haze
-// between it and the eye laid over it, as over everything else. Motion comes in a later step.
+// between it and the eye laid over it, as over everything else.
+//
+// Translucent particles mark how much of each pixel they cover in the reactive mask, for the
+// temporal filter; solid ones are drawn first, by `fs_solid`, into the scene's depth and motion.
 
 #include "common/frame.wgsl"
 #include "particles/common.wgsl"
@@ -18,6 +21,8 @@ const CURVE_ENTRIES: u32 = 32u;
 const CURVE_STRIDE: u32 = 40u;
 // The overdraw view adds this per layer: dark red for one, through yellow, to white.
 const OVERDRAW_STEP: vec3f = vec3f(0.25, 0.06, 0.015);
+// How strongly the reactive mask marks a particle, for its opacity.
+const REACTIVE_GAIN: f32 = 4.0;
 
 struct DrawParams {
     // Where the emitter's alive list starts, among both lists.
@@ -46,6 +51,24 @@ struct Varyings {
     @location(1) color: vec4f,
     // Distance along the view, and over how far to fade into the scene and towards the camera.
     @location(2) @interpolate(flat) fades: vec3f,
+    // Where this point of the sprite is now, without the camera's jitter, and was last frame,
+    // for solid particles' motion.
+    @location(3) now: vec4f,
+    @location(4) before: vec4f,
+}
+
+// What a translucent particle writes: its light, premultiplied, and how much of the pixel it
+// covers, for the temporal filter to trust history less there.
+struct Translucent {
+    @location(0) color: vec4f,
+    @location(1) reactive: vec4f,
+}
+
+// What a solid particle writes, as any surface does: its light, depth and motion.
+struct Solid {
+    @location(0) color: vec4f,
+    @location(1) depth: vec4f,
+    @location(2) motion: vec4f,
 }
 
 fn curve_color(e: u32, t: f32) -> vec4f {
@@ -86,11 +109,16 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     // The camera's right and up, from the rows of the view matrix.
     let right = vec3f(frame.view[0].x, frame.view[1].x, frame.view[2].x);
     let up = vec3f(frame.view[0].y, frame.view[1].y, frame.view[2].y);
-    let world = p.position + (right * turned.x + up * turned.y) * size;
+    let offset = (right * turned.x + up * turned.y) * size;
+    let world = p.position + offset;
 
     var out: Varyings;
     out.clip = frame.view_proj * vec4f(world, 1.0);
     out.corner = corner;
+    // Last frame the particle stood at the start of its last step; the sprite turns with the
+    // camera, so its corner is taken as it is now.
+    out.now = frame.unjittered_view_proj * vec4f(world, 1.0);
+    out.before = frame.prev_view_proj * vec4f(p.previous + offset, 1.0);
     let tint = emitter.color * curve_color(e, t);
     let light = unpack_light(received[slot]);
     // Scattered towards the eye: the sun by the phase function, the rest as it came.
@@ -117,14 +145,20 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     return out;
 }
 
+// A soft round blob.
+fn blob(corner: vec2f) -> f32 {
+    return sq(max(1.0 - dot(corner, corner), 0.0));
+}
+
 @fragment
-fn fs_main(in: Varyings) -> @location(0) vec4f {
+fn fs_main(in: Varyings) -> Translucent {
+    var out: Translucent;
     if frame.debug_mode == DEBUG_PARTICLES {
-        return vec4f(OVERDRAW_STEP, 0.0);
+        out.color = vec4f(OVERDRAW_STEP, 0.0);
+        out.reactive = vec4f(0.0);
+        return out;
     }
-    // A soft round blob.
-    let r2 = dot(in.corner, in.corner);
-    let shape = sq(max(1.0 - r2, 0.0));
+    let shape = blob(in.corner);
 
     let depth = textureLoad(scene_depth, vec2i(in.clip.xy), 0).r;
     var behind = 1.0e9;
@@ -142,5 +176,30 @@ fn fs_main(in: Varyings) -> @location(0) vec4f {
     // Additive emitters cover nothing: premultiplied with no opacity, they only add light.
     let emitter = emitters[draw.emitter];
     let covers = select(alpha, 0.0, (emitter.flags & FLAG_ADD) != 0u);
-    return vec4f(in.color.rgb * alpha, covers);
+    out.color = vec4f(in.color.rgb * alpha, covers);
+    // Where it shows, the history behind it is not what is there now. Faint particles are
+    // marked as nearly as strongly as opaque ones: they are what the filter loses most easily,
+    // as their neighbourhood looks much like what is behind them.
+    out.reactive = vec4f(min(alpha * REACTIVE_GAIN, 1.0));
+    return out;
+}
+
+// A solid particle is opaque where its shape is more than half covered and absent elsewhere,
+// and writes its depth and motion there, so the temporal filter follows it exactly.
+@fragment
+fn fs_solid(in: Varyings) -> Solid {
+    if in.color.a * blob(in.corner) < 0.5 {
+        discard;
+    }
+    var out: Solid;
+    out.color = vec4f(in.color.rgb, 1.0);
+    if frame.debug_mode == DEBUG_PARTICLES {
+        out.color = vec4f(OVERDRAW_STEP, 1.0);
+    }
+    out.depth = vec4f(in.clip.z, 0.0, 0.0, 0.0);
+    // In UV units, from here to where it was last frame, as the scene's motion is.
+    let now = in.now.xy / in.now.w;
+    let before = in.before.xy / in.before.w;
+    out.motion = vec4f((before - now) * vec2f(0.5, -0.5), 0.0, 0.0);
+    return out;
 }

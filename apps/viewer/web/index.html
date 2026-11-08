@@ -42,6 +42,14 @@
   #scenes a[aria-current] { background: var(--accent); color: #1c1712; }
 
   #help { left: 12px; bottom: 12px; color: var(--muted); padding: 8px 12px; }
+
+  #play { left: 50%; bottom: 16px; transform: translateX(-50%); padding: 0; z-index: 1; }
+  #play button { background: var(--accent); color: #1c1712; border: 0; border-radius: 7px;
+    padding: 9px 22px; font: inherit; font-weight: 700; cursor: pointer; }
+  #script-log { left: 12px; right: 12px; bottom: 64px; max-width: 72ch; max-height: 30vh;
+    overflow-y: auto; padding: 8px 12px; font: 12px/1.45 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; }
+  #script-log .error { color: #ffb4a2; }
   #help b { color: var(--ink); font-weight: 600; }
 
   #overlay { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; }
@@ -151,6 +159,11 @@
   <b>Click</b> to look around, <b>WASD</b> to move, <b>Q E</b> down and up, <b>Shift</b> faster, <b>Esc</b> to release
 </aside>
 
+<!-- Offered on scenes with a game; playing loads the gameplay build of the viewer. -->
+<aside class="panel" id="play" hidden><button type="button">Play</button></aside>
+<!-- What the game's scripts log, and their errors. -->
+<aside class="panel" id="script-log" hidden aria-live="polite"></aside>
+
 <div id="overlay">
   <div>
     <div id="message">Starting…</div>
@@ -159,9 +172,19 @@
 </div>
 
 <script type="module">
-import init, { WebViewer, header_bytes, read_header } from "./pkg/solstice_viewer.js";
-
 const params = new URLSearchParams(location.search);
+// ?play loads the gameplay build, which can run a scene's game. Scenes that are only looked at
+// load the plain build, which is smaller and knows nothing of games.
+const playing = params.has("play");
+const build = playing ? "./play/solstice_viewer.js" : "./pkg/solstice_viewer.js";
+const { default: init, WebViewer, header_bytes, read_header } = await import(build).catch((error) => {
+  // Said on the page, not left at "Starting…": `fail` needs what is set up below.
+  const message = document.getElementById("message");
+  message.textContent = `Could not load the viewer (${build}): ${error.message ?? error}`;
+  message.className = "error";
+  throw error;
+});
+
 const sceneName = params.get("scene") ?? "cove";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
 // On GitHub Pages each scene is served by its own site on the same domain, so publishing one
@@ -494,6 +517,8 @@ async function main() {
       lookPitch -= e.movementY * 0.002;
     }
   });
+
+  const game = startGame(viewer);
   const axis = (positive, negative) => (keys.has(positive) ? 1 : 0) - (keys.has(negative) ? 1 : 0);
 
   new ResizeObserver(() => {
@@ -532,6 +557,7 @@ async function main() {
     previous = now;
 
     streamer.pump();
+    game?.tick();
     viewer.frame(
       delta,
       axis("KeyW", "KeyS"),
@@ -576,6 +602,123 @@ async function main() {
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
+}
+
+/// Offers Play on a scene with a game, and, in the gameplay build, runs it: passes the keys,
+/// mouse, gamepads and touch on to it, and shows what its scripts log. Returns what to call
+/// each frame, or nothing if no game runs.
+function startGame(viewer) {
+  if (!viewer.has_gameplay()) return null;
+  if (!playing) {
+    el("play").hidden = false;
+    el("play").querySelector("button").addEventListener("click", () => {
+      params.set("play", "");
+      location.search = params.toString();
+    });
+    return null;
+  }
+  const log = el("script-log");
+  const show = (lines) => {
+    for (const line of lines) {
+      const row = document.createElement("div");
+      if (line.startsWith("error: ")) row.className = "error";
+      row.textContent = line;
+      log.append(row);
+    }
+    while (log.childElementCount > 100) log.firstElementChild.remove();
+    if (lines.length) {
+      log.hidden = false;
+      log.scrollTop = log.scrollHeight;
+    }
+  };
+  try {
+    viewer.play();
+  } catch (error) {
+    show(String(error.message ?? error).split("\n").map((line) => `error: ${line}`));
+    return null;
+  }
+
+  // Keys and the mouse, while the pointer is captured.
+  const locked = () => document.pointerLockElement === canvas;
+  // Not keys typed into the page's own controls, such as the quality list.
+  const typing = (e) => e.target instanceof HTMLElement && e.target.closest("select, input, textarea, button");
+  addEventListener("keydown", (e) => { if (!e.repeat && !typing(e)) viewer.key(e.code, true); });
+  addEventListener("keyup", (e) => viewer.key(e.code, false));
+  addEventListener("blur", () => viewer.release_all());
+  const BUTTONS = ["left", "middle", "right"];
+  canvas.addEventListener("mousedown", (e) => {
+    if (locked() && BUTTONS[e.button]) viewer.mouse_button(BUTTONS[e.button], true);
+  });
+  addEventListener("mouseup", (e) => { if (BUTTONS[e.button]) viewer.mouse_button(BUTTONS[e.button], false); });
+  addEventListener("mousemove", (e) => { if (locked()) viewer.mouse_motion(e.movementX, e.movementY); });
+
+  // Touch: a stick under the left thumb, looking under the right, and quick taps.
+  const STICK_PIXELS = 60;
+  const TAP_MS = 250;
+  const touches = new Map();
+  // The stick belongs to the first thumb down on the left, until it lifts.
+  const stickTaken = () => [...touches.values()].some((touch) => touch.stick);
+  canvas.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      touches.set(t.identifier, {
+        stick: t.clientX < innerWidth / 2 && !stickTaken(),
+        x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, start: performance.now(),
+      });
+    }
+  }, { passive: false });
+  canvas.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      const touch = touches.get(t.identifier);
+      if (!touch) continue;
+      if (touch.stick) {
+        viewer.touch_stick((t.clientX - touch.x0) / STICK_PIXELS, (t.clientY - touch.y0) / STICK_PIXELS);
+      } else {
+        viewer.touch_look(t.clientX - touch.x, t.clientY - touch.y);
+      }
+      touch.x = t.clientX;
+      touch.y = t.clientY;
+    }
+  }, { passive: false });
+  const endTouch = (e) => {
+    for (const t of e.changedTouches) {
+      const touch = touches.get(t.identifier);
+      if (!touch) continue;
+      touches.delete(t.identifier);
+      if (touch.stick) viewer.touch_stick(0, 0);
+      const moved = Math.hypot(t.clientX - touch.x0, t.clientY - touch.y0);
+      if (performance.now() - touch.start < TAP_MS && moved < 10) viewer.touch_tap();
+    }
+  };
+  canvas.addEventListener("touchend", endTouch);
+  canvas.addEventListener("touchcancel", endTouch);
+
+  // Gamepads, in the standard layout, read each frame.
+  const PAD_BUTTONS = ["south", "east", "west", "north", "l1", "r1", "l2", "r2", "select",
+    "start", "l3", "r3", "up", "down", "left", "right"];
+  const PAD_AXES = ["left_x", "left_y", "right_x", "right_y"];
+  // The pad used most recently is the one read. When none is left, or another takes over,
+  // whatever the last one held is let go, so a pad unplugged mid-stride doesn't keep walking.
+  let padIndex = null;
+  const readGamepads = () => {
+    const pads = [...(navigator.getGamepads?.() ?? [])]
+      .filter((pad) => pad?.connected && pad.mapping === "standard");
+    const pad = pads.reduce((a, b) => (!a || b.timestamp > a.timestamp ? b : a), null);
+    if (padIndex !== null && pad?.index !== padIndex) {
+      PAD_BUTTONS.forEach((name) => viewer.gamepad_button(name, 0));
+      PAD_AXES.forEach((name) => viewer.gamepad_axis(name, 0));
+    }
+    padIndex = pad?.index ?? null;
+    if (!pad) return;
+    pad.buttons.forEach((b, i) => PAD_BUTTONS[i] && viewer.gamepad_button(PAD_BUTTONS[i], b.value));
+    pad.axes.forEach((v, i) => PAD_AXES[i] && viewer.gamepad_axis(PAD_AXES[i], v));
+  };
+
+  el("help").innerHTML = viewer.has_player()
+    ? "<b>Click</b> to play, <b>WASD</b> to move, the <b>mouse</b> to look, <b>E</b> to use, <b>Esc</b> to release"
+    : "Playing. <b>Click</b> to look around, <b>WASD</b> to move, <b>Esc</b> to release";
+  return { tick() { readGamepads(); show(viewer.take_messages()); } };
 }
 
 main().catch((error) => {

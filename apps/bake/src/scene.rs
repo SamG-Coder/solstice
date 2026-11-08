@@ -644,5 +644,6 @@ pub fn build_temple(quality: Quality) -> SceneAsset {
             pitch: -0.04,
         }),
         sea: None,
+        gameplay: Vec::new(),
     }
 }
