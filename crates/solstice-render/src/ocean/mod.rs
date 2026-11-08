@@ -20,6 +20,7 @@
 //! See `docs/ocean.md` for the design: [`spectrum`] says how much wave there is at each
 //! wavelength, and [`waves`] turns that into moving waves on the GPU.
 
+pub mod grid;
 pub mod sea;
 pub mod spectrum;
 pub mod waves;
