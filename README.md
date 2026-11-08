@@ -479,18 +479,6 @@ The image is not yet at Unreal's level, and these are the main reasons, roughly 
 cargo test --release
 ```
 
-To check only what a change affects, as CI does, run the checks for the crates whose files
-changed and everything that depends on them. That covers formatting, clippy, the tests (the GPU
-tests too) and, when the viewer is affected, the browser builds. Uncommitted work counts:
-
-```bash
-scripts/check-changed.sh
-```
-
-`scripts/affected.py` makes the choice: changing the renderer checks the renderer and the
-viewer, not the gameplay crates. A change outside every crate, such as `Cargo.lock`, CI or a
-build script, checks everything, and documentation checks nothing.
-
 - The key property of the DAG: every LOD cut is **watertight**, at uniform thresholds and from
   perspective viewpoints that mix levels.
 - All WGSL is validated without a GPU. Procedural meshes are checked to be closed and outward-facing.
@@ -507,6 +495,20 @@ build script, checks everything, and documentation checks nothing.
 - Shaders are also checked for operator mixes that browsers reject but native compilers accept.
 - Every built-in tree, breed of grass and kind of weather is read and written back unchanged, and
   each procedural surface is checked for seams, plausible brightness and steepness.
+
+To check only what a change affects, as CI does for pull requests, run the checks for the
+crates whose files changed and everything that depends on them. That covers formatting, clippy,
+the tests (the GPU tests too) and, when the viewer is affected, the browser builds. Uncommitted
+work counts:
+
+```bash
+scripts/check-changed.sh
+```
+
+`scripts/affected.py` makes the choice: changing the renderer checks the renderer and the
+viewer, not the gameplay crates. A change outside every crate, such as `Cargo.lock`, CI, a build
+script or a scene, checks everything, and documentation checks nothing. Every push to `main`
+checks the whole workspace, whatever the change.
 
 ## Contributing
 

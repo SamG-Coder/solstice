@@ -7,10 +7,12 @@ not the gameplay crates. A change outside every crate's folder that could affect
 (Cargo.lock, the workspace's Cargo.toml, CI, toolchain or build scripts, anything unrecognised)
 affects everything, as does an unknown base. Documentation affects nothing.
 
-    python scripts/affected.py [--base REV] [--head REV] [--github-output]
+    python scripts/affected.py [--base REV] [--head REV] [--all] [--github-output]
 
 Without --head, the working tree counts too: staged, unstaged and untracked files, so a local
 run covers what has not been committed yet. --base defaults to where HEAD left origin/main.
+--all skips the choice and affects everything. The crates and their folders are read from the
+working tree, so --head should be the checked-out revision, as it is in CI.
 
 It prints one line: `all`, `none`, or the affected crates' names separated by spaces. With
 --github-output it also writes `packages`, `all`, `any` and `web` (whether the viewer, and so
@@ -28,8 +30,8 @@ IGNORED_SUFFIXES = (".md",)
 IGNORED_PREFIXES = ("docs/",)
 IGNORED_FILES = {"LICENSE"}
 # Folders outside the workspace's crates that no workspace check reads: the benchmarks have
-# their own workspace, and scenes are baked by hand.
-UNCHECKED_PREFIXES = ("tools/", "scenes/")
+# their own workspace. (Not `scenes/`: tests include its actors and scripts.)
+UNCHECKED_PREFIXES = ("tools/",)
 WEB_PACKAGE = "viewer"
 
 
@@ -38,12 +40,13 @@ def git(*args):
 
 
 def changed_files(base, head):
-    """Files changed between `base` and `head`, or the working tree when `head` is None."""
+    """Files changed between `base` and `head`, or the working tree when `head` is None. A
+    moved file counts at both its old and its new path: the crate it left changed too."""
     if head is None:
-        files = git("diff", "--name-only", base).splitlines()
+        files = git("diff", "--name-only", "--no-renames", base).splitlines()
         files += git("ls-files", "--others", "--exclude-standard").splitlines()
     else:
-        files = git("diff", "--name-only", base, head).splitlines()
+        files = git("diff", "--name-only", "--no-renames", base, head).splitlines()
     return sorted({f.strip().replace("\\", "/") for f in files if f.strip()})
 
 
@@ -94,11 +97,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="the revision to compare against (default: merge base with origin/main)")
     parser.add_argument("--head", help="the revision to compare (default: the working tree)")
+    parser.add_argument("--all", action="store_true", help="affect everything, without looking at the change")
     parser.add_argument("--github-output", action="store_true", help="also write the result to $GITHUB_OUTPUT")
     args = parser.parse_args()
 
     base = args.base
     try:
+        if args.all:
+            raise subprocess.CalledProcessError(1, "--all")
         if base is None:
             base = git("merge-base", "HEAD", "origin/main").strip()
         elif set(base) == {"0"}:

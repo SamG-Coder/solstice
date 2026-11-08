@@ -27,22 +27,21 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      # Which crates the change affects (scripts/affected.py): those whose files changed and
-      # everything depending on them. A change outside the crates (Cargo.lock, CI, build
-      # scripts) affects everything. A pull request is checked out as its merge into the base,
-      # whose first parent is the base, so that is what it is compared against; a push to main
-      # is compared against the commit before it.
+      # Which crates a pull request affects (scripts/affected.py): those whose files changed
+      # and everything depending on them. A change outside the crates (Cargo.lock, CI, build
+      # scripts, scenes) affects everything. A pull request is checked out as its merge into the
+      # base, whose first parent is the base, so that is what it is compared against; anything
+      # that is not such a merge checks everything. A push to main always checks everything:
+      # main is where every change meets, so the whole workspace is proved there, features
+      # unified as they are in every build, whatever the selection missed.
       - name: Affected crates
         id: affected
-        env:
-          BEFORE: ${{ github.event.before }}
         run: |
-          if [[ "${{ github.event_name }}" == pull_request ]]; then
-            base=$(git rev-parse HEAD^1)
+          if [[ "${{ github.event_name }}" == pull_request ]] && git rev-parse -q --verify HEAD^2 >/dev/null; then
+            python3 scripts/affected.py --base "$(git rev-parse HEAD^1)" --head HEAD --github-output
           else
-            base="$BEFORE"
+            python3 scripts/affected.py --all --github-output
           fi
-          python3 scripts/affected.py --base "$base" --head HEAD --github-output
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test the crate selection

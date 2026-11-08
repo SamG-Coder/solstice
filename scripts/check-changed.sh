@@ -12,12 +12,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-python=$(command -v python3 || command -v python)
-if [[ "${1:-}" == "--all" ]]; then
-  result=all
-else
-  result=$("$python" scripts/affected.py "$@")
-fi
+# On Windows `python3` can be the Microsoft Store's stub, which runs nothing.
+python=python3
+"$python" --version >/dev/null 2>&1 || python=python
+result=$("$python" scripts/affected.py "$@")
 echo "affected: $result"
 
 cargo fmt --all -- --check
