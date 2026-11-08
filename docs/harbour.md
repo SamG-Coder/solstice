@@ -8,7 +8,7 @@ it will be kept up to date as each step lands.
 
 ## What makes it believable
 
-- **Real sizes.** Doors are 2.1 m high, storeys 3 m, lanes 2.6 to 3.2 m wide, and the quay stands
+- **Real sizes.** Doors are about 2.2 m high, storeys 3 m, lanes 2.6 to 3.2 m wide, and the quay stands
   1.9 m above the sea. The lighthouse's lamp is 22 m above the water.
 - **Everything has a reason to be where it is.** The town grew around a sheltered anchorage. The
   mole protects it from the west, the warehouse stands where cargo lands, and the market is one
@@ -73,7 +73,7 @@ The origin is the middle of the quay's edge, at sea level. The sea stands at hei
 | North mole | from the quay at (0, -48), curving to (-92, -65) | 100 m long, 7 m wide, reached from the quay by 8 steps | deck 3.2 m, seaward parapet to 4.4 m |
 | Lighthouse | (-92, -64) | tower 18 m, base ⌀ 7 m, top ⌀ 4.8 m, lantern 4 m | lamp 22 m |
 | Timber pier | from (0, 40) west, T-head at x -45 to -50 | 44 × 3 m, head 20 × 5 m | deck 1.58 m, two steps down from the quay |
-| Quay-front row | x 11 to 23, z -46 to 50 | 12 houses, 4.5–8 m wide, 3 storeys, eaves 9.5 m, ridge 13 m | 1.9 m |
+| Quay-front row | x 11 to 23, z -36 to 50 | 13 houses, 4.4–7.9 m wide, 2 or 3 storeys, eaves 9–10 m and ridge 12–13.4 m at 3 storeys, eaves 6.5 m and ridge 10 m at 2 | 1.9 m |
 | Market square | x 24 to 56, z -14 to 16 | 32 × 30 m | 3.0 m, falling 1:60 towards the sea |
 | Fountain | (39, 0) | basin ⌀ 5 m, column 2.4 m | |
 | Net Lane | z -30, x 11 to 120 | 3.2 m wide, climbing 1:4 by ramps and flights of steps | 2.5 to 19 m |
@@ -130,7 +130,8 @@ Everything is CC0 and fetched by script. None of it is committed.
 importer already reads them. `scenes/harbour.surfaces` lists them in `surface` lines, which
 `fetch-scans.py` reads to fetch them with their height maps. So far: `stone_wall_02` (ashlar for the
 walls), `cobblestone_floor_07` (setts on the quay), `granite_tile_04` (flags and copings) and
-`square_cobblestone` (the square). Plaster, roof tiles, planks and ground follow.
+`square_cobblestone` (the square), `white_stucco` (house walls), `clay_roof_tiles_02` (roofs) and
+`distressed_painted_planks` (doors and shutters). Ground textures follow.
 
 **Made by a new tool, because no CC0 scan exists.** Poly Haven has no period houses, no small
 boats, no lighthouse and no fountain. `apps/townkit` is a small Rust program that generates them
@@ -192,11 +193,20 @@ instances and many lights, so its targets sit above that:
 
 | | RTX 5080 | Integrated GPU (Radeon), Low |
 |---|---|---|
-| Average frame | 6 ms at 1600×900 High, 10 ms at 2560×1440 | 33 ms at 1280×720 |
-| 95th percentile | 9 ms | 45 ms |
+| Average frame | 6 ms at 1600×900 High, 10 ms at 2560×1440 | No separate limit: 41 ms at 1280×720 with the houses in |
+| 95th percentile, by day | 9 ms | 50 ms |
+| 95th percentile, with lamps and fountain | The by-day figure plus the two rows below | 55 ms |
 | Night, all lamps lit | At most 1.5 ms more | At most 4 ms more |
 | Fountain particles | 0.1 ms | 0.5 ms |
 | Physics and scripts | 0.5 ms of CPU | 2 ms of CPU on the web |
+
+The integrated GPU's limits were first 33 ms on average and 45 ms at the 95th percentile. The
+renderer's fixed passes at Low (GI flood 4.1 ms, GI light 5.8 ms, screen GI 5.3 ms and post 5.0 ms)
+take about 20 ms of every frame whatever the scene holds, and step 2's plain blocks already used
+all of the 45 ms. Textured walls alone reached 46–47 ms, and flat roofs saved only 0.5 ms, so no
+cut to the scene could get back under it without losing the houses. The limits were raised on
+2026-11-09 and the houses kept, at about 48 ms at the 95th percentile. Cutting those fixed passes at Low is separate
+renderer work, which would help every scene.
 
 | Content | Budget |
 |---|---|
@@ -207,8 +217,8 @@ instances and many lights, so its targets sit above that:
 | Local lights | About 40, each with range 12–18 m, at most 8 overlapping |
 | Collision, fetched on *Play* | At most 5 MB |
 
-If the integrated GPU overruns, the first cuts are the far house rows' roof tiles, fewer lamps, and
-half the particles. Each step measures on both GPUs.
+If the integrated GPU overruns the raised limits, the first cuts are fewer lamps and half the
+particles; roof tiles save little, about 0.5 ms for all of them. Each step measures on both GPUs.
 
 ## Collision
 
@@ -218,7 +228,8 @@ in radius and about 1.8 m tall. So the scene is built to make that easy:
 - every walkable surface is one continuous mesh with no gaps, and steps are at most 17 cm high
   (the controller allows 30 cm), with slopes under 45°;
 - doorways are at least 0.9 m wide and 2.1 m high, and lanes are far wider than the 1.2 m minimum;
-- every wall and house is a closed shape, with no thin slivers;
+- every wall is a closed shape with no thin slivers, and each house, whose mesh is an open shell,
+  gets one plain solid for collision;
 - small props (crates, barrels) are simple enough for convex hulls, and `collide=none` on a line
   marks what you walk through, such as ground cover;
 - until the sea has physics, walking off an edge would drop the player to the seabed, so the quay
@@ -274,7 +285,7 @@ Approved on 2026-11-09, all five as recommended.
 
 ## Risks
 
-- **House detail against download size.** Real tile geometry on about 60 houses is the largest cost. The
+- **House detail against download size.** Real tile geometry on about 70 houses is the largest cost. The
   roofs are instanced by plan, so a house shared by three plots costs once.
 - **The seabed map is a square around the camera.** From well above the town (over 100 m) its edge
   shows as a straight line where the water's colour changes. The flyover stays below that height.

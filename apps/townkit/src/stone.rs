@@ -73,7 +73,7 @@ pub struct HeightMap {
 
 impl HeightMap {
     /// Reads a grey, RGB or RGBA PNG of 8 or 16 bits.
-    fn load(path: &Path) -> io::Result<Self> {
+    pub fn load(path: &Path) -> io::Result<Self> {
         let failed = |e: String| {
             io::Error::other(format!(
                 "{}: {e} (run: python scripts/fetch-scans.py scenes/harbour.surfaces 2k)",
@@ -131,7 +131,7 @@ impl HeightMap {
 /// A grid of vertices, displaced along `normal_at` by the map at each point's texture coordinate.
 /// `at` takes a column and row (either may run one step over) and gives the point, its normal and
 /// its UV in metres. Viewed from outside, columns must run towards the right of rows.
-fn sheet(
+pub fn sheet(
     columns: u32,
     rows: u32,
     map: &HeightMap,

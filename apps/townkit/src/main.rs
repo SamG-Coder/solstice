@@ -1,21 +1,25 @@
 //! Generates the harbour scene's kit as glTF, because no CC0 scan exists of what it holds.
 //!
 //! ```text
-//! townkit [--output FOLDER]     # target/town by default
+//! townkit [--output FOLDER] [--without walls|roofs|details]...
 //! ```
 //!
-//! `ground.gltf` is the land and seabed, and `stone.gltf` the dressed stone, both placed whole.
+//! `ground.gltf` is the land and seabed, `stone.gltf` the dressed stone and `houses.gltf` the
+//! houses, all placed whole. The kit goes in target/town by default. `--without` leaves part of the
+//! houses out, which is how each part's cost is measured.
 //! `town.gltf` holds named parts, placed by `scenes/harbour.txt`. `docs/harbour.md` is the design.
 //! The textures come first: `python scripts/fetch-scans.py scenes/harbour.surfaces 2k`.
 
 mod geometry;
 mod gltf;
 mod ground;
+mod houses;
 mod stone;
 mod town;
 
 use gltf::{File, Plain};
 use ground::{Surface, PATCHES, SURFACES};
+use houses::Parts;
 use std::path::{Path, PathBuf};
 
 const fn plain(name: &'static str, color: [f32; 3], roughness: f32) -> Plain {
@@ -72,27 +76,42 @@ fn town_file(stonework: impl FnOnce(&mut File) -> usize) -> File {
     file
 }
 
-fn output_folder() -> Result<PathBuf, String> {
+fn parse_args() -> Result<(PathBuf, Parts), String> {
     let mut args = std::env::args().skip(1);
     let mut folder = PathBuf::from("target/town");
+    let mut parts = Parts {
+        walls: true,
+        roofs: true,
+        details: true,
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--output" => folder = args.next().ok_or("--output needs a folder")?.into(),
+            "--without" => match args.next().ok_or("--without needs a part")?.as_str() {
+                "walls" => parts.walls = false,
+                "roofs" => parts.roofs = false,
+                "details" => parts.details = false,
+                other => return Err(format!("no part of a house is called '{other}'")),
+            },
             other => return Err(format!("unknown option '{other}'")),
         }
     }
-    Ok(folder)
+    if !(parts.walls || parts.roofs || parts.details) {
+        return Err("leaving out every part of the houses would write an empty file".into());
+    }
+    Ok((folder, parts))
 }
 
-fn write_kit(folder: &Path) -> std::io::Result<()> {
+fn write_kit(folder: &Path, parts: Parts) -> std::io::Result<()> {
     ground_file().write(folder, "ground")?;
     town_file(|file| file.textured(&stone::FLAGS)).write(folder, "town")?;
-    stone::file(&folder.join("../scan"))?.write(folder, "stone")
+    stone::file(&folder.join("../scan"))?.write(folder, "stone")?;
+    houses::file(&folder.join("../scan"), parts)?.write(folder, "houses")
 }
 
 fn main() -> Result<(), String> {
-    let folder = output_folder()?;
-    write_kit(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    let (folder, parts) = parse_args()?;
+    write_kit(&folder, parts).map_err(|e| format!("{}: {e}", folder.display()))?;
     println!("wrote the kit to {}", folder.display());
     Ok(())
 }

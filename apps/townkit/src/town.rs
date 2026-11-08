@@ -306,69 +306,11 @@ fn building(m: &mut Massing, min: Vec2, max: Vec2, eaves: f32, ridge: f32, ridge
     }
 }
 
-/// A row of `houses` buildings filling a block, their ridges along the row.
-fn row(m: &mut Massing, min: Vec2, max: Vec2, houses: u32, along_z: bool) {
-    let length = if along_z {
-        max.y - min.y
-    } else {
-        max.x - min.x
-    };
-    let each = length / houses as f32;
-    for i in 0..houses {
-        // Rooflines step, as a street built house by house does.
-        let shift = [0.0, 0.5, -0.3, 0.8, 0.2, -0.5, 0.6][i as usize % 7];
-        let (start, end) = (i as f32 * each, (i + 1) as f32 * each);
-        let (a, b) = if along_z {
-            (
-                Vec2::new(min.x, min.y + start),
-                Vec2::new(max.x, min.y + end),
-            )
-        } else {
-            (
-                Vec2::new(min.x + start, min.y),
-                Vec2::new(min.x + end, max.y),
-            )
-        };
-        building(m, a, b, 9.5 + shift, 13.0 + shift, along_z);
-    }
-}
-
-/// The blocks of the town, the warehouse, chapel, wall, lighthouse, pier and ships, in plain shapes.
+/// The warehouse, chapel, wall, lighthouse and ships, in plain shapes.
 /// Each is replaced by the real thing as its step lands.
 pub fn massing() -> Massing {
     let mut m = Massing::default();
     let block = |x0: f32, z0: f32, x1: f32, z1: f32| (Vec2::new(x0, z0), Vec2::new(x1, z1));
-
-    // The quay-front row, with gaps for Net Lane, the passage up from the water stairs, and
-    // Chapel Steps.
-    for (min, max, houses) in [
-        (block(11.0, -36.0, 23.0, -31.6), 1),
-        (block(11.0, -28.4, 23.0, -11.6), 3),
-        (block(11.0, -8.4, 23.0, 23.7), 5),
-        (block(11.0, 26.3, 23.0, 50.0), 3),
-    ]
-    .map(|(b, n)| (b.0, b.1, n))
-    {
-        row(&mut m, min, max, houses, true);
-    }
-    // Round the square, north of Net Lane, south of Chapel Steps, and along Upper Street.
-    for (min, max, houses, along_z) in [
-        (block(26.0, -28.0, 56.0, -16.0), 4, false),
-        (block(26.0, 17.0, 56.0, 23.6), 4, false),
-        (block(57.0, -14.0, 68.0, 16.0), 4, true),
-        (block(38.0, -46.0, 68.0, -32.0), 4, false),
-        (block(26.0, 26.5, 68.0, 44.0), 5, false),
-        (block(72.0, -46.0, 104.0, -32.0), 4, false),
-        (block(72.0, -28.0, 84.0, 22.0), 6, true),
-        (block(92.0, -28.0, 104.0, 18.0), 6, true),
-        (block(108.0, -46.0, 120.0, -32.0), 2, true),
-        (block(108.0, -28.0, 120.0, 22.0), 6, true),
-        (block(108.0, 26.0, 120.0, 46.0), 3, true),
-    ]
-    .map(|(b, n, a)| (b.0, b.1, n, a))
-    {
-        row(&mut m, min, max, houses, along_z);
-    }
 
     let (min, max) = block(14.0, -46.0, 38.0, -36.0);
     building(&mut m, min, max, 5.5, 8.0, false);
