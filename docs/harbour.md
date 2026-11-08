@@ -206,15 +206,18 @@ half the particles. Each step measures on both GPUs.
 ## Collision
 
 Physics is gameplay step 5, and the bake will make collision from the meshes (`docs/gameplay.md`).
-So the scene is built to make that easy:
-- every walkable surface is one continuous mesh with no gaps, and steps are at most 17 cm high, so
-  the character controller climbs them;
+This is what the gameplay session proposes, provisional until its PR. The player is a capsule 0.3 m
+in radius and about 1.8 m tall. So the scene is built to make that easy:
+- every walkable surface is one continuous mesh with no gaps, and steps are at most 17 cm high
+  (the controller allows 30 cm), with slopes under 45°;
+- doorways are at least 0.9 m wide and 2.1 m high, and lanes are far wider than the 1.2 m minimum;
 - every wall and house is a closed shape, with no thin slivers;
-- small props (crates, barrels) are simple enough for convex hulls;
-- lanes and quay edges that drop to the water get a low wall, a rail or an invisible blocker. The
-  scene needs a way to name those: a collision-only box in the scene file, or `_collision` parts in
-  the kit. Which one is agreed with the gameplay session;
-- moving doors and the gate use primitive colliders in their `.actor` files.
+- small props (crates, barrels) are simple enough for convex hulls, and `collide=none` on a line
+  marks what you walk through, such as ground cover;
+- until the sea has physics, walking off an edge would drop the player to the seabed, so the quay
+  and mole edges and the beach's waterline get `blocker X Y Z SX SY SZ YAW` lines;
+- moving doors and the gate are actors with `collider box` lines. Their meshes are named parts of
+  the kit, with each part's origin at its hinge.
 
 ## Steps
 
