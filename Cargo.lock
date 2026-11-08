@@ -3626,6 +3626,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "townkit"
+version = "0.2.0"
+dependencies = [
+ "glam",
+ "png 0.17.16",
+ "solstice-import",
+ "solstice-procgen",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
