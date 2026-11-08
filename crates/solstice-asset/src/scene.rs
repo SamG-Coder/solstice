@@ -32,6 +32,15 @@ pub struct VirtualMesh {
     pub bounds_radius: f32,
     /// Triangle count of the source mesh (finest LOD only).
     pub source_triangles: u64,
+    /// For a skinned mesh, each cluster's bones. Empty for one that isn't. In a skinned mesh,
+    /// each cluster's vertices in `vertices` are followed by their skins.
+    pub cluster_bones: Vec<crate::gpu::ClusterBones>,
+}
+
+impl VirtualMesh {
+    pub fn skinned(&self) -> bool {
+        !self.cluster_bones.is_empty()
+    }
 }
 
 /// A physically based surface description.
@@ -208,6 +217,14 @@ pub struct SceneAsset {
     pub collide: Vec<crate::collision::Collide>,
     /// The ground as a grid of heights, for collision, if the scene has terrain.
     pub ground: Option<crate::collision::Heightfield>,
+    /// Every skeleton in the scene.
+    pub skeletons: Vec<crate::skeleton::Skeleton>,
+    /// The poses a scene can hold at once, each the index of its skeleton: one for each placed
+    /// character, however many meshes it is made of.
+    pub poses: Vec<u32>,
+    /// Which pose each instance follows, or [`crate::skeleton::NO_POSE`]. Instances past its end
+    /// follow none.
+    pub instance_poses: Vec<u32>,
 }
 
 impl SceneAsset {

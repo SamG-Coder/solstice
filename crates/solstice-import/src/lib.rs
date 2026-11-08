@@ -15,8 +15,12 @@ use gltf::{buffer, Document, Node, Primitive};
 use material::MaterialTable;
 use rayon::prelude::*;
 use solstice_asset::scene::Viewpoint;
+use solstice_asset::skeleton::MAX_BONES;
+use solstice_asset::{Bone, PackedSkin, Skeleton, NO_POSE};
 use solstice_asset::{Instance, Material, SceneAsset, VirtualMesh};
-use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh, Vertex};
+use solstice_builder::{
+    build_skinned_mesh, build_virtual_mesh, BuildOptions, Mesh, Sphere, Vertex,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
@@ -33,6 +37,9 @@ pub struct ImportOptions {
     pub fit_size: Option<f32>,
     /// Adds a large flat ground plane at the model's ground height (see [`ground_height`]).
     pub ground: bool,
+    /// Keeps the model's skeleton and weights, so that it can bend. The file must hold exactly
+    /// one skin, which every mesh uses. Otherwise a skinned model imports as a statue.
+    pub skinned: bool,
 }
 
 impl Default for ImportOptions {
@@ -41,6 +48,7 @@ impl Default for ImportOptions {
             texture_size: 1024,
             fit_size: None,
             ground: false,
+            skinned: false,
         }
     }
 }
@@ -81,6 +89,8 @@ impl std::error::Error for ImportError {}
 struct Placement {
     node_name: Option<String>,
     source: MeshKey,
+    /// Whether the node is bound to a skin, in which case glTF ignores where the node stands.
+    bound: bool,
     material: Option<usize>,
     transform: Mat4,
 }
@@ -106,7 +116,12 @@ pub fn import_gltf(
         )));
     }
     let (document, buffers, images) = gltf::import(path).map_err(ImportError::Gltf)?;
-    let mut warnings = document_warnings(&document);
+    let mut warnings = document_warnings(&document, options.skinned);
+    let rig = if options.skinned {
+        Some(read_rig(&document, &buffers)?)
+    } else {
+        None
+    };
 
     let mut placements = Vec::new();
     let mut bounds = Bounds::default();
@@ -138,14 +153,24 @@ pub fn import_gltf(
     let mut parts: HashMap<String, Vec<Instance>> = HashMap::new();
     for placement in &placements {
         let material = materials.slot(&document, placement.material, &mut warnings);
-        let mesh = *mesh_slots.entry(placement.source).or_insert_with(|| {
-            keys.push(placement.source);
+        // A skinned mesh is drawn as its skeleton says: glTF ignores where its node stands.
+        let skinned = options.skinned && placement.bound;
+        let source = MeshKey {
+            mirrored: placement.source.mirrored && !skinned,
+            ..placement.source
+        };
+        let mesh = *mesh_slots.entry(source).or_insert_with(|| {
+            keys.push(source);
             keys.len() as u32 - 1
         });
         instances.push(Instance {
             mesh,
             material,
-            transform: root * placement.transform,
+            transform: if skinned {
+                root
+            } else {
+                root * placement.transform
+            },
         });
         if let Some(name) = &placement.node_name {
             parts.entry(name.clone()).or_default().push(Instance {
@@ -157,20 +182,33 @@ pub fn import_gltf(
     }
 
     let build_options = BuildOptions::default();
-    let mut meshes: Vec<VirtualMesh> = keys
+    let read = keys
         .par_iter()
-        .map(|key| {
+        .map(|key| -> Result<_, ImportError> {
             let primitive = document
                 .meshes()
                 .nth(key.mesh)
                 .and_then(|mesh| mesh.primitives().nth(key.primitive))
                 .expect("keys come from walking this document");
-            build_virtual_mesh(
-                &read_primitive(&primitive, &buffers, key.mirrored),
-                &build_options,
-            )
+            let mesh = read_primitive(&primitive, &buffers, key.mirrored);
+            let skins = rig
+                .as_ref()
+                .map(|rig| read_skins(&primitive, &buffers, rig))
+                .transpose()?;
+            Ok((mesh, skins))
+        })
+        .collect::<Result<Vec<_>, ImportError>>()?;
+    let mut meshes: Vec<VirtualMesh> = read
+        .par_iter()
+        .map(|(mesh, skins)| match skins {
+            Some(skins) => build_skinned_mesh(mesh, skins, &build_options),
+            None => build_virtual_mesh(mesh, &build_options),
         })
         .collect();
+    let skeleton = rig.map(|mut rig| {
+        measure_influences(&mut rig.skeleton, &read);
+        rig.skeleton
+    });
 
     let (mut material_list, textures) = materials.finish();
     if options.ground {
@@ -195,6 +233,22 @@ pub fn import_gltf(
         meshes.push(build_virtual_mesh(&ground_plane(extent), &build_options));
     }
 
+    let poses = usize::from(skeleton.is_some());
+    let instance_poses = if poses > 0 {
+        instances
+            .iter()
+            .map(|i| {
+                if meshes[i.mesh as usize].skinned() {
+                    0
+                } else {
+                    NO_POSE
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(Imported {
         scene: SceneAsset {
             meshes,
@@ -209,6 +263,9 @@ pub fn import_gltf(
             gameplay: Vec::new(),
             collide: Vec::new(),
             ground: None,
+            skeletons: skeleton.into_iter().collect(),
+            poses: vec![0; poses],
+            instance_poses,
         },
         parts,
         warnings,
@@ -247,6 +304,24 @@ pub fn append_model(
         "all textures in a scene must be the same size"
     );
     let mesh_base = target.meshes.len() as u32;
+    // Each placement of a skinned model is a character of its own, with its own pose.
+    let skeleton_base = target.skeletons.len() as u32;
+    let bends = !source.skeletons.is_empty();
+    let skinned: Vec<bool> = source.meshes.iter().map(VirtualMesh::skinned).collect();
+    target.skeletons.extend(source.skeletons);
+    let new_pose = |poses: &mut Vec<u32>| -> Option<u32> {
+        bends.then(|| {
+            poses.push(skeleton_base);
+            poses.len() as u32 - 1
+        })
+    };
+    let follow = |instance: &Instance, pose: Option<u32>, poses: &mut Vec<u32>, at: usize| {
+        let Some(pose) = pose.filter(|_| skinned[instance.mesh as usize]) else {
+            return;
+        };
+        poses.resize(at, NO_POSE);
+        poses.push(pose);
+    };
     let material_base = target.materials.len() as u32;
     let layer_base = target.textures.len() as i32;
 
@@ -270,7 +345,14 @@ pub fn append_model(
     let mut ranges = Vec::with_capacity(placements.whole.len() + placements.parts.len());
     for placement in &placements.whole {
         let first = target.instances.len() as u32;
+        let pose = new_pose(&mut target.poses);
         for instance in &source.instances {
+            follow(
+                instance,
+                pose,
+                &mut target.instance_poses,
+                target.instances.len(),
+            );
             target
                 .instances
                 .push(rebase(instance, *placement * instance.transform));
@@ -284,7 +366,14 @@ pub fn append_model(
             .find(|(candidate, _)| *candidate == name || candidate.ends_with(&suffix))
             .ok_or_else(|| format!("no part named '{name}'"))?;
         let first = target.instances.len() as u32;
+        let pose = new_pose(&mut target.poses);
         for instance in found.1 {
+            follow(
+                instance,
+                pose,
+                &mut target.instance_poses,
+                target.instances.len(),
+            );
             target
                 .instances
                 .push(rebase(instance, *placement * instance.transform));
@@ -294,12 +383,12 @@ pub fn append_model(
     Ok(ranges)
 }
 
-fn document_warnings(document: &Document) -> Vec<String> {
+fn document_warnings(document: &Document, skinned: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     if document.animations().next().is_some() {
         warnings.push("animations are ignored: the model is imported in its rest pose".to_string());
     }
-    if document.skins().next().is_some() {
+    if document.skins().next().is_some() && !skinned {
         warnings.push("skinning is ignored: skinned meshes are imported unposed".to_string());
     }
     if document
@@ -345,6 +434,7 @@ fn walk(
             bounds.add_box(Vec3::from(box_.min), Vec3::from(box_.max), transform);
             placements.push(Placement {
                 node_name: node.name().map(str::to_string),
+                bound: node.skin().is_some(),
                 source: MeshKey {
                     mesh: mesh.index(),
                     primitive: primitive.index(),
@@ -357,6 +447,176 @@ fn walk(
     }
     for child in node.children() {
         walk(&child, transform, placements, bounds, warnings);
+    }
+}
+
+/// A skeleton read from a file, and what the file's joint numbers become.
+struct Rig {
+    skeleton: Skeleton,
+    numbers: Vec<u8>,
+}
+
+/// Reads the one skin of a file that is to bend, with its bones renumbered so that parents come
+/// before children.
+fn read_rig(document: &Document, buffers: &[buffer::Data]) -> Result<Rig, ImportError> {
+    let invalid = |reason: String| ImportError::InvalidOptions(reason);
+    let skins: Vec<_> = document.skins().collect();
+    let [skin] = skins.as_slice() else {
+        return Err(invalid(format!(
+            "a model that bends has one skin, not {}",
+            skins.len()
+        )));
+    };
+    let joints: Vec<Node<'_>> = skin.joints().collect();
+    if joints.len() > MAX_BONES {
+        return Err(invalid(format!(
+            "the skin has {} bones, more than the {MAX_BONES} the engine takes",
+            joints.len()
+        )));
+    }
+    let reader = skin.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+    let inverse_binds: Vec<Mat4> = reader
+        .read_inverse_bind_matrices()
+        .ok_or_else(|| invalid("the skin has no inverse bind matrices".to_owned()))?
+        .map(|m| Mat4::from_cols_array_2d(&m))
+        .collect();
+    if inverse_binds.len() != joints.len() {
+        return Err(invalid(
+            "the skin doesn't have one inverse bind matrix per bone".to_owned(),
+        ));
+    }
+
+    let mut parent_node = vec![None; document.nodes().len()];
+    for node in document.nodes() {
+        for child in node.children() {
+            parent_node[child.index()] = Some(node.index());
+        }
+    }
+    let local: Vec<Mat4> = document
+        .nodes()
+        .map(|n| Mat4::from_cols_array_2d(&n.transform().matrix()))
+        .collect();
+    let world_of = |mut node: usize| {
+        let mut world = local[node];
+        while let Some(up) = parent_node[node] {
+            world = local[up] * world;
+            node = up;
+        }
+        world
+    };
+    let joint_of_node: HashMap<usize, usize> = joints
+        .iter()
+        .enumerate()
+        .map(|(joint, node)| (node.index(), joint))
+        .collect();
+    let parent_joint = |joint: usize| {
+        let mut node = joints[joint].index();
+        while let Some(up) = parent_node[node] {
+            if let Some(&found) = joint_of_node.get(&up) {
+                return Some(found);
+            }
+            node = up;
+        }
+        None
+    };
+    let depth = |mut joint: usize| {
+        let mut depth = 0u32;
+        while let Some(up) = parent_joint(joint) {
+            depth += 1;
+            joint = up;
+        }
+        depth
+    };
+
+    // Parents first: a bone is always deeper than the bone it hangs from.
+    let mut order: Vec<usize> = (0..joints.len()).collect();
+    order.sort_by_key(|&joint| depth(joint));
+    let mut numbers = vec![0u8; joints.len()];
+    for (number, &joint) in order.iter().enumerate() {
+        numbers[joint] = number as u8;
+    }
+
+    let mut bones = Vec::with_capacity(joints.len());
+    for &joint in &order {
+        let world = world_of(joints[joint].index());
+        let parent = parent_joint(joint);
+        let local = match parent {
+            Some(up) => world_of(joints[up].index()).inverse() * world,
+            None => world,
+        };
+        let (scale, rotation, translation) = local.to_scale_rotation_translation();
+        if !scale.abs_diff_eq(Vec3::ONE, 1.0e-3) {
+            return Err(invalid(format!(
+                "bone `{}` is scaled by {scale}: apply the scale before exporting",
+                joints[joint].name().unwrap_or("(unnamed)")
+            )));
+        }
+        bones.push(Bone {
+            name: joints[joint].name().unwrap_or("").to_owned(),
+            parent: parent.map(|up| u32::from(numbers[up])),
+            translation,
+            rotation,
+            inverse_bind: inverse_binds[joint],
+            center: Vec3::ZERO,
+            radius: 0.0,
+        });
+    }
+    Ok(Rig {
+        skeleton: Skeleton { bones },
+        numbers,
+    })
+}
+
+/// Reads the weights of a primitive that bends, with its joints as the rig numbers them.
+fn read_skins(
+    primitive: &Primitive<'_>,
+    buffers: &[buffer::Data],
+    rig: &Rig,
+) -> Result<Vec<PackedSkin>, ImportError> {
+    let reader = primitive.reader(|b| Some(&buffers[b.index()].0));
+    let (Some(joints), Some(weights)) = (reader.read_joints(0), reader.read_weights(0)) else {
+        return Err(ImportError::InvalidOptions(
+            "a mesh of a model that bends has no bone weights".to_owned(),
+        ));
+    };
+    joints
+        .into_u16()
+        .zip(weights.into_f32())
+        .map(|(joints, weights)| {
+            let mut numbers = [0u8; 4];
+            for (slot, (&joint, &weight)) in joints.iter().zip(&weights).enumerate() {
+                if weight > 0.0 {
+                    numbers[slot] = *rig.numbers.get(usize::from(joint)).ok_or_else(|| {
+                        ImportError::InvalidOptions(format!(
+                            "a vertex is weighted to bone {joint}, which the skin doesn't have"
+                        ))
+                    })?;
+                }
+            }
+            Ok(PackedSkin::new(numbers, weights))
+        })
+        .collect()
+}
+
+/// Works out the sphere around all that each bone moves, which says how far a pose carries it.
+fn measure_influences(skeleton: &mut Skeleton, meshes: &[(Mesh, Option<Vec<PackedSkin>>)]) {
+    let mut points: Vec<Vec<Vec3>> = vec![Vec::new(); skeleton.bones.len()];
+    for (mesh, skins) in meshes {
+        let Some(skins) = skins else {
+            continue;
+        };
+        for (vertex, skin) in mesh.vertices.iter().zip(skins) {
+            for bone in skin.bones() {
+                points[usize::from(bone)].push(vertex.position);
+            }
+        }
+    }
+    for (bone, points) in skeleton.bones.iter_mut().zip(&points) {
+        if !points.is_empty() {
+            let sphere = Sphere::from_points(points.iter().copied());
+            bone.center = sphere.center;
+            bone.radius = sphere.radius;
+        }
     }
 }
 

@@ -109,6 +109,13 @@ impl Character {
     /// Writes it, and checks it against `roles`.
     fn check(&self, roles: Option<&str>) -> CharacterReport {
         let folder = Folder::new();
+        let path = self.write(&folder);
+        let roles = roles.map(|r| Roles::parse(r).unwrap());
+        check_character(&path, roles.as_ref()).unwrap()
+    }
+
+    /// Writes it into `folder`, and says where.
+    fn write(&self, folder: &Folder) -> PathBuf {
         let mut bin = Vec::new();
         let mut views = Vec::new();
         let mut add = |bytes: Vec<u8>| {
@@ -253,9 +260,111 @@ impl Character {
         std::fs::write(folder.0.join("c.bin"), &bin).unwrap();
         let path = folder.0.join("c.gltf");
         std::fs::write(&path, json).unwrap();
-        let roles = roles.map(|r| Roles::parse(r).unwrap());
-        check_character(&path, roles.as_ref()).unwrap()
+        path
     }
+}
+
+fn import_skinned(character: &Character) -> Result<crate::Imported, crate::ImportError> {
+    let folder = Folder::new();
+    let path = character.write(&folder);
+    crate::import_gltf(
+        path,
+        &crate::ImportOptions {
+            texture_size: 4,
+            skinned: true,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn importing_a_skin_keeps_its_bones_and_weights() {
+    let imported = import_skinned(&Character::default()).unwrap();
+    let scene = &imported.scene;
+    assert_eq!(scene.skeletons.len(), 1);
+    let bones = &scene.skeletons[0].bones;
+    assert_eq!(
+        bones.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+        ["Root", "pelvis", "spine"]
+    );
+    assert_eq!(bones[0].parent, None);
+    assert_eq!(bones[2].parent, Some(1));
+    assert_eq!(scene.poses, [0]);
+    assert_eq!(scene.instance_poses, [0]);
+
+    let mesh = &scene.meshes[0];
+    assert!(mesh.skinned());
+    let cluster = mesh.clusters[0];
+    assert_eq!(cluster.vertex_count(), 4);
+    let skins: Vec<solstice_asset::PackedSkin> = mesh.vertices
+        [cluster.vertex_offset as usize + 4..cluster.vertex_offset as usize + 6]
+        .iter()
+        .flat_map(|record| bytemuck::cast::<_, [solstice_asset::PackedSkin; 2]>(*record))
+        .collect();
+    // Vertices may be listed in any order, but each of the file's four skins must be there.
+    for (joints, weights) in Character::default().weights {
+        let wanted = solstice_asset::PackedSkin::new(joints.map(|j| j as u8), weights);
+        assert!(skins.contains(&wanted), "{wanted:?} missing from {skins:?}");
+    }
+    assert_eq!(&mesh.cluster_bones[0][..3], &[1, 2, 2]);
+    // No weight reaches the root, so it moves nothing.
+    assert_eq!(bones[0].radius, 0.0);
+    assert!(bones[2].radius > 0.5, "{}", bones[2].radius);
+}
+
+#[test]
+fn without_being_asked_a_skin_imports_as_a_statue() {
+    let folder = Folder::new();
+    let path = Character::default().write(&folder);
+    let imported = crate::import_gltf(
+        path,
+        &crate::ImportOptions {
+            texture_size: 4,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(imported.scene.skeletons.is_empty());
+    assert!(!imported.scene.meshes[0].skinned());
+    assert!(imported
+        .warnings
+        .iter()
+        .any(|w| w.contains("skinning is ignored")));
+}
+
+#[test]
+fn a_skin_must_be_there_to_keep() {
+    let none = Character {
+        skins: 0,
+        skinned: false,
+        ..Default::default()
+    };
+    assert!(import_skinned(&none).is_err());
+    let unweighted = Character {
+        weighted: false,
+        ..Default::default()
+    };
+    assert!(import_skinned(&unweighted).is_err());
+}
+
+#[test]
+fn placing_a_skinned_model_twice_gives_two_poses() {
+    let mut scene = solstice_asset::SceneAsset {
+        texture_size: 4,
+        ..Default::default()
+    };
+    let imported = import_skinned(&Character::default()).unwrap();
+    let placements = crate::ModelPlacements {
+        whole: vec![
+            glam::Mat4::IDENTITY,
+            glam::Mat4::from_translation(glam::Vec3::X),
+        ],
+        parts: Vec::new(),
+    };
+    crate::append_model(&mut scene, imported, &placements).unwrap();
+    assert_eq!(scene.skeletons.len(), 1);
+    assert_eq!(scene.poses, [0, 0]);
+    assert_eq!(scene.instance_poses, [0, 1]);
 }
 
 const ROLES: &str = "root Root\npelvis pelvis\nspine spine\n";

@@ -15,15 +15,16 @@
 //! little-endian, and loading is one bounds-checked copy per array.
 
 use crate::collision::{encode_shape, Collision, CollisionIndex, HeightfieldEntry, ShapeEntry};
-use crate::gpu::{PackedCluster, PackedNode};
+use crate::gpu::{ClusterBones, PackedCluster, PackedNode};
 use crate::paged::{
     upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
 };
 use crate::scene::{
     GameFile, Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint,
 };
+use crate::skeleton::{Bone, Skeleton, MAX_BONES, NO_POSE};
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use std::fmt;
 
 const MAGIC: [u8; 8] = *b"SOLSTICE";
@@ -37,6 +38,10 @@ const SEA_TAG: [u8; 4] = *b"SEA ";
 const GAME_TAG: [u8; 4] = *b"GAME";
 /// The optional section listing the scene's collision shapes, whose data is in the data area.
 const COLLISION_TAG: [u8; 4] = *b"COLL";
+/// The optional section holding a scene's skins and skeletons, written only if it has any.
+const SKIN_TAG: [u8; 4] = *b"SKIN";
+/// In a skin section's mesh list: a mesh that isn't skinned.
+const NO_BONE_LISTS: i32 = i32::MIN;
 
 /// Why a scene file could not be decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +55,7 @@ pub enum DecodeError {
     BadSea,
     BadGameplay,
     BadCollision,
+    BadSkin,
 }
 
 impl fmt::Display for DecodeError {
@@ -71,6 +77,7 @@ impl fmt::Display for DecodeError {
             Self::BadSea => write!(f, "the sea's description is not text"),
             Self::BadGameplay => write!(f, "the scene's gameplay files are malformed"),
             Self::BadCollision => write!(f, "the scene's collision shapes are malformed"),
+            Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
         }
     }
 }
@@ -239,7 +246,120 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     if let Some(index) = &scene.collision {
         w.section(COLLISION_TAG, &encode_collision_index(index));
     }
+    if !scene.skeletons.is_empty() {
+        w.section(SKIN_TAG, &encode_skin(scene));
+    }
     w.finish()
+}
+
+/// A scene's skins: the bone lists, each mesh's way into them, the skeletons, and who follows what.
+fn encode_skin(scene: &PagedScene) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.slice(&scene.cluster_bones);
+    let lists: Vec<i32> = scene
+        .meshes
+        .iter()
+        .map(|mesh| mesh.bone_lists.unwrap_or(NO_BONE_LISTS))
+        .collect();
+    w.slice(&lists);
+    w.pod(&(scene.skeletons.len() as u32));
+    for skeleton in &scene.skeletons {
+        w.pod(&(skeleton.bones.len() as u32));
+        for bone in &skeleton.bones {
+            w.slice(bone.name.as_bytes());
+            w.pod(&bone.parent.unwrap_or(u32::MAX));
+            w.pod(&bone.translation.to_array());
+            w.pod(&bone.rotation.to_array());
+            w.pod(&bone.inverse_bind.to_cols_array());
+            w.pod(&bone.center.to_array());
+            w.pod(&bone.radius);
+        }
+    }
+    w.slice(&scene.poses);
+    w.slice(&scene.instance_poses);
+    w.finish()
+}
+
+/// What [`encode_skin`] writes: the bone lists, each mesh's way into them, the skeletons, the
+/// poses, and which pose each instance follows.
+struct SkinSection {
+    cluster_bones: Vec<ClusterBones>,
+    lists: Vec<i32>,
+    skeletons: Vec<Skeleton>,
+    poses: Vec<u32>,
+    instance_poses: Vec<u32>,
+}
+
+fn decode_skin(bytes: &[u8]) -> Result<SkinSection, DecodeError> {
+    let mut r = Reader { bytes };
+    let cluster_bones: Vec<ClusterBones> = r.slice().map_err(|_| DecodeError::BadSkin)?;
+    let lists: Vec<i32> = r.slice().map_err(|_| DecodeError::BadSkin)?;
+    let count: u32 = r.pod().map_err(|_| DecodeError::BadSkin)?;
+    let mut skeletons = Vec::new();
+    for _ in 0..count {
+        let bone_count: u32 = r.pod().map_err(|_| DecodeError::BadSkin)?;
+        if bone_count as usize > MAX_BONES {
+            return Err(DecodeError::BadSkin);
+        }
+        let mut bones = Vec::new();
+        for _ in 0..bone_count {
+            let name: Vec<u8> = r.slice().map_err(|_| DecodeError::BadSkin)?;
+            let parent: u32 = r.pod().map_err(|_| DecodeError::BadSkin)?;
+            let translation: [f32; 3] = r.pod().map_err(|_| DecodeError::BadSkin)?;
+            let rotation: [f32; 4] = r.pod().map_err(|_| DecodeError::BadSkin)?;
+            let inverse_bind: [f32; 16] = r.pod().map_err(|_| DecodeError::BadSkin)?;
+            let center: [f32; 3] = r.pod().map_err(|_| DecodeError::BadSkin)?;
+            let radius: f32 = r.pod().map_err(|_| DecodeError::BadSkin)?;
+            bones.push(Bone {
+                name: String::from_utf8(name).map_err(|_| DecodeError::BadSkin)?,
+                parent: (parent != u32::MAX).then_some(parent),
+                translation: Vec3::from_array(translation),
+                rotation: Quat::from_array(rotation),
+                inverse_bind: Mat4::from_cols_array(&inverse_bind),
+                center: Vec3::from_array(center),
+                radius,
+            });
+        }
+        let skeleton = Skeleton { bones };
+        if !skeleton.is_well_formed() {
+            return Err(DecodeError::BadSkin);
+        }
+        skeletons.push(skeleton);
+    }
+    let poses: Vec<u32> = r.slice().map_err(|_| DecodeError::BadSkin)?;
+    let instance_poses: Vec<u32> = r.slice().map_err(|_| DecodeError::BadSkin)?;
+    if !r.bytes.is_empty() {
+        return Err(DecodeError::BadSkin);
+    }
+    Ok(SkinSection {
+        cluster_bones,
+        lists,
+        skeletons,
+        poses,
+        instance_poses,
+    })
+}
+
+/// Checks everything a skin section's numbers point at, which the renderer would index blindly.
+fn skin_is_consistent(scene: &PagedScene) -> bool {
+    let poses_ok = scene
+        .poses
+        .iter()
+        .all(|&skeleton| (skeleton as usize) < scene.skeletons.len());
+    let instances_ok = scene.instance_poses.len() <= scene.instances.len()
+        && scene
+            .instance_poses
+            .iter()
+            .all(|&pose| pose == NO_POSE || (pose as usize) < scene.poses.len());
+    // Shaders load a bone list by adding these to a cluster's number. Out of range, a load reads
+    // zeros rather than anything else, so this only refuses numbers that cannot be right.
+    let clusters = scene.clusters.len() as i64;
+    let lists = scene.cluster_bones.len() as i64;
+    let lists_ok = scene.meshes.iter().all(|mesh| {
+        mesh.bone_lists
+            .is_none_or(|delta| i64::from(delta) + clusters >= 0 && i64::from(delta) <= lists)
+    });
+    poses_ok && instances_ok && lists_ok
 }
 
 /// Writes a scene's collision shapes into the data area, each deflated on its own so that it
@@ -375,6 +495,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             quant_step: mesh.quant_step,
             uv_origin: mesh.uv_origin,
             uv_step: mesh.uv_step,
+            bone_lists: None,
         })
         .collect();
     let raw_instances: Vec<RawInstance> = r.slice()?;
@@ -431,6 +552,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let mut sea = None;
     let mut gameplay = Vec::new();
     let mut collision = None;
+    let mut skin = None;
     while !r.bytes.is_empty() {
         let tag: [u8; 4] = r.pod()?;
         let contents: Vec<u8> = r.slice()?;
@@ -446,8 +568,28 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             gameplay = decode_gameplay(&contents)?;
         } else if tag == COLLISION_TAG {
             collision = Some(decode_collision_index(&contents)?);
+        } else if tag == SKIN_TAG {
+            skin = Some(decode_skin(&contents)?);
         }
     }
+    let mut meshes = meshes;
+    let (cluster_bones, skeletons, poses, instance_poses) = match skin {
+        None => Default::default(),
+        Some(skin) => {
+            if skin.lists.len() != meshes.len() {
+                return Err(DecodeError::BadSkin);
+            }
+            for (mesh, list) in meshes.iter_mut().zip(skin.lists) {
+                mesh.bone_lists = (list != NO_BONE_LISTS).then_some(list);
+            }
+            (
+                skin.cluster_bones,
+                skin.skeletons,
+                skin.poses,
+                skin.instance_poses,
+            )
+        }
+    };
 
     if let Some(index) = &collision {
         index.validate(instances.len(), data_offset)?;
@@ -477,9 +619,16 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         base_textures,
         upper_mip_offsets,
         data_offset,
+        cluster_bones,
+        skeletons,
+        poses,
+        instance_poses,
     };
     if !tables_are_consistent(&scene) {
         return Err(DecodeError::BadPages);
+    }
+    if !skin_is_consistent(&scene) {
+        return Err(DecodeError::BadSkin);
     }
     Ok(scene)
 }
@@ -1244,6 +1393,78 @@ mod tests {
         assert_eq!(
             decode(&bytes[..bytes.len() - 1]).unwrap_err(),
             DecodeError::Truncated
+        );
+    }
+
+    fn skinned_scene() -> LoadedScene {
+        let bone = Bone {
+            name: "pelvis".to_owned(),
+            parent: None,
+            translation: Vec3::new(0.0, 1.0, 0.0),
+            rotation: Quat::from_rotation_y(0.3),
+            inverse_bind: Mat4::from_translation(Vec3::new(0.0, -1.0, 0.0)),
+            center: Vec3::ONE,
+            radius: 0.5,
+        };
+        LoadedScene {
+            scene: PagedScene {
+                meshes: vec![MeshInfo {
+                    bone_lists: Some(0),
+                    ..Default::default()
+                }],
+                cluster_bones: vec![[3; 16]],
+                skeletons: vec![Skeleton { bones: vec![bone] }],
+                poses: vec![0],
+                instance_poses: vec![0],
+                instances: vec![Instance {
+                    mesh: 0,
+                    material: 0,
+                    transform: Mat4::IDENTITY,
+                }],
+                materials: vec![Material::default()],
+                clusters: vec![Default::default()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_scene_with_skins_comes_back_as_it_went_in() {
+        let scene = skinned_scene();
+        let read = decode(&encode(&scene)).unwrap().scene;
+        assert_eq!(read.cluster_bones, scene.scene.cluster_bones);
+        assert_eq!(read.skeletons, scene.scene.skeletons);
+        assert_eq!(read.poses, [0]);
+        assert_eq!(read.instance_poses, [0]);
+        assert_eq!(read.meshes[0].bone_lists, Some(0));
+    }
+
+    #[test]
+    fn a_scene_without_skins_has_no_section_for_them() {
+        let mut scene = skinned_scene();
+        scene.scene.skeletons.clear();
+        let read = decode(&encode(&scene)).unwrap().scene;
+        assert!(read.cluster_bones.is_empty());
+        assert_eq!(read.meshes[0].bone_lists, None);
+    }
+
+    #[test]
+    fn numbers_a_skin_cannot_mean_are_refused() {
+        let mut bad_pose = skinned_scene();
+        bad_pose.scene.poses = vec![4];
+        assert_eq!(decode(&encode(&bad_pose)).err(), Some(DecodeError::BadSkin));
+        let mut bad_instance = skinned_scene();
+        bad_instance.scene.instance_poses = vec![9];
+        assert_eq!(
+            decode(&encode(&bad_instance)).err(),
+            Some(DecodeError::BadSkin)
+        );
+        let mut bad_bones = skinned_scene();
+        bad_bones.scene.skeletons[0].bones[0].parent = Some(0);
+        assert_eq!(
+            decode(&encode(&bad_bones)).err(),
+            Some(DecodeError::BadSkin)
         );
     }
 

@@ -10,12 +10,15 @@ pub mod file;
 pub mod gpu;
 pub mod paged;
 pub mod scene;
+pub mod skeleton;
+
+pub use skeleton::{Bone, Skeleton, NO_POSE};
 
 pub use collision::{
     Collide, Collision, CollisionIndex, CollisionShape, Heightfield, MAX_COORDINATE,
     MAX_HULL_POINTS, NO_SHAPE,
 };
-pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedVertex};
+pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedSkin, PackedVertex};
 pub use paged::{LoadedScene, PagedScene};
 pub use scene::{
     GameFile, Instance, Light, Material, SceneAsset, Sea, TextureEncoding, TextureLayer, Viewpoint,

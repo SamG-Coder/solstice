@@ -31,7 +31,7 @@ mod thin;
 mod paging;
 
 pub use bounds::Sphere;
-pub use dag::{build_virtual_mesh, BuildOptions};
+pub use dag::{build_skinned_mesh, build_virtual_mesh, BuildOptions};
 pub use mesh::{Mesh, Vertex};
 pub use paging::paginate;
 pub use texture::{compress_textures, masked_mip_chain, mip_chain, move_alpha_threshold};

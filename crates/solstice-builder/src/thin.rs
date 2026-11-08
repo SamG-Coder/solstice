@@ -97,6 +97,8 @@ pub struct Thinned {
     /// The surviving pieces. A corner whose position is `NEW_POSITION | i` uses `positions[i]`.
     pub triangles: Vec<Triangle>,
     pub positions: Vec<Vec3>,
+    /// The existing position each of `positions` was moved from, so that it can keep its skin.
+    pub sources: Vec<u32>,
     /// Furthest any surviving vertex moved, in world units.
     pub error: f32,
 }
@@ -159,6 +161,7 @@ pub fn thin(
     let mut out = Thinned {
         triangles: Vec::with_capacity(kept_triangles),
         positions: Vec::new(),
+        sources: Vec::new(),
         error: 0.0,
     };
     for &index in &kept {
@@ -199,6 +202,7 @@ pub fn thin(
             out.error = out.error.max(to.distance(p) as f32);
             moved.insert(v, NEW_POSITION | out.positions.len() as u32);
             out.positions.push(to.as_vec3());
+            out.sources.push(v);
         }
         for &t in piece {
             out.triangles
