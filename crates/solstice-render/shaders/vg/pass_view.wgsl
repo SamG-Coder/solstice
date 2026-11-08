@@ -22,7 +22,20 @@ struct PassView {
     occlusion_enabled: u32,
     // 0: hardware only. 1: small clusters go to software. 2: every cluster does.
     allow_software: u32,
+    // Which instances the view draws: one of the INSTANCES_ constants.
+    instance_filter: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
+
+// Twins of `InstanceFilter` in vg/culling.rs.
+const INSTANCES_ALL: u32 = 0u;
+// Views kept from frame to frame leave out what may move, or they would keep it where it was.
+const INSTANCES_STATIC: u32 = 1u;
+const INSTANCES_MOVABLE: u32 = 2u;
+// The GI voxels: static instances, and movable ones that stay in them.
+const INSTANCES_GI: u32 = 3u;
 
 // Written by the cull passes. Atomic view of `CullStateRead`.
 struct CullState {

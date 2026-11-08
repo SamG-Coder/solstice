@@ -16,7 +16,9 @@ mod hzb;
 mod raster;
 mod resolve;
 
-pub use culling::{CullPhase, CullPipelines, CullStats, CullWork, PassView, ViewSlots};
+pub use culling::{
+    CullPhase, CullPipelines, CullStats, CullWork, InstanceFilter, PassView, ViewSlots,
+};
 pub use hzb::Hzb;
 pub use raster::{RasterBindings, Rasterizer, VisibilityBuffer};
 pub use resolve::{GBuffer, Resolve, ResolveBindings};

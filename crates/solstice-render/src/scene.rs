@@ -5,6 +5,7 @@
 //! live in a fixed pool of page slots filled by [`crate::streaming`].
 
 use crate::gpu::Gpu;
+use crate::motion::InstanceTable;
 use crate::streaming::textures::TierPlan;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
@@ -23,19 +24,95 @@ pub struct GpuInstance {
     uv_origin: Vec2,
     uv_step: Vec2,
     root_node: u32,
+    /// Material index, with the `INSTANCE_` flags in its top bits.
     material: u32,
     max_scale: f32,
     texture_info: u32,
+    /// How brightly the material's own light shines here: 1 as it is, 0 dark.
+    glow: f32,
+    _pad: [f32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<GpuInstance>() == 192);
+const _: () = assert!(std::mem::size_of::<GpuInstance>() == 208);
 
-/// Marks [`GpuInstance::material`] as two-sided. Twin of the same constant in `common/scene.wgsl`.
-const INSTANCE_TWO_SIDED: u32 = 1 << 31;
+// Flags in `GpuInstance::material`, twins of the same constants in `common/scene.wgsl`.
+/// Drawn from both sides.
+pub(crate) const INSTANCE_TWO_SIDED: u32 = 1 << 31;
+/// May move: drawn afresh every frame, and left out of the views that are kept from frame to
+/// frame (shadow cascades, the seabed map, GI voxels), which would otherwise keep it where it
+/// was.
+pub(crate) const INSTANCE_MOVABLE: u32 = 1 << 30;
+/// Not drawn at all.
+pub(crate) const INSTANCE_HIDDEN: u32 = 1 << 29;
+/// Movable, but kept in the GI voxels where it stood when they were last drawn: for things
+/// that move only a little, such as a ship at anchor, whose light and shade would be missed.
+/// The bits below it hold the material's index.
+pub(crate) const INSTANCE_STAYS_IN_GI: u32 = 1 << 28;
+
+impl GpuInstance {
+    /// Places the instance at `world`. Where it was drawn last stays as `prev_world`.
+    pub(crate) fn set_world(&mut self, world: Mat4) {
+        let linear = Mat3::from_mat4(world);
+        self.world = affine_rows(world);
+        self.normal = affine_rows(Mat4::from_mat3(linear.inverse().transpose()));
+        self.max_scale = max_scale(linear);
+    }
+
+    /// Makes this frame's place last frame's too, so the instance shows no motion.
+    pub(crate) fn settle(&mut self) {
+        self.prev_world = self.world;
+    }
+
+    pub(crate) fn has_flag(&self, flag: u32) -> bool {
+        self.material & flag != 0
+    }
+
+    pub(crate) fn set_flag(&mut self, flag: u32, on: bool) {
+        if on {
+            self.material |= flag;
+        } else {
+            self.material &= !flag;
+        }
+    }
+
+    pub(crate) fn glow(&self) -> f32 {
+        self.glow
+    }
+
+    pub(crate) fn set_glow(&mut self, glow: f32) {
+        self.glow = glow;
+    }
+
+    pub(crate) fn max_scale(&self) -> f32 {
+        self.max_scale
+    }
+
+    /// The transform the instance is drawn with this frame, and the one it was drawn with last.
+    pub(crate) fn worlds(&self) -> (Mat4, Mat4) {
+        (
+            from_affine_rows(self.world),
+            from_affine_rows(self.prev_world),
+        )
+    }
+}
+
+/// The largest scale along any axis of `linear`.
+fn max_scale(linear: Mat3) -> f32 {
+    linear
+        .x_axis
+        .length()
+        .max(linear.y_axis.length())
+        .max(linear.z_axis.length())
+}
 
 /// Stores the top three rows of an affine matrix.
 fn affine_rows(m: Mat4) -> [Vec4; 3] {
     [m.row(0), m.row(1), m.row(2)]
+}
+
+/// Inverse of [`affine_rows`].
+fn from_affine_rows(rows: [Vec4; 3]) -> Mat4 {
+    Mat4::from_cols(rows[0], rows[1], rows[2], Vec4::W).transpose()
 }
 
 /// A scene on the GPU. Everything but the page pool is fully resident.
@@ -54,6 +131,8 @@ pub struct GpuScene {
     pub texture_summary: String,
     pub material_sampler: wgpu::Sampler,
     pub instance_count: u32,
+    /// The CPU's copy of `instances`, and what has changed in it.
+    pub instance_table: InstanceTable,
     pub light_count: u32,
     /// Longest root-to-leaf path over all meshes, which sets the traversal dispatch count.
     pub max_hierarchy_depth: u32,
@@ -73,7 +152,7 @@ impl GpuScene {
         upper_textures: Option<&[TextureLayer]>,
         plan: Option<TierPlan>,
     ) -> Self {
-        let instances = gpu_instances(scene);
+        let (instances, gpu_index) = gpu_instances(scene);
         let materials = starting_materials(scene);
         let (textures, texture_summary) = upload_textures(gpu, scene, upper_textures, plan);
 
@@ -105,11 +184,27 @@ impl GpuScene {
             texture_summary,
             material_sampler,
             instance_count: instances.len() as u32,
+            instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
             light_count: scene.lights.len() as u32,
             max_hierarchy_depth: scene.hierarchy_depth,
             source_triangles: scene.source_triangles,
             unique_triangles: scene.unique_triangles,
         }
+    }
+
+    /// Applies this frame's changes to instances and uploads them. Returns whether anything the
+    /// cached views draw has changed, so that they must be drawn again.
+    pub fn update_instances(&mut self, gpu: &Gpu) -> bool {
+        let changes = self.instance_table.advance();
+        for range in &changes.ranges {
+            let offset = (range.start * std::mem::size_of::<GpuInstance>()) as u64;
+            gpu.queue.write_buffer(
+                &self.instances,
+                offset,
+                bytemuck::cast_slice(self.instance_table.gpu_data(range.clone())),
+            );
+        }
+        changes.cached_views_changed
     }
 }
 
@@ -138,22 +233,21 @@ fn texture_info(material: Option<&Material>) -> u32 {
     }
 }
 
-/// Builds the GPU's view of each instance. Instances of meshes with no geometry are left out.
-fn gpu_instances(scene: &PagedScene) -> Vec<GpuInstance> {
+/// Builds the GPU's view of each instance, and where each of the scene's instances went in it.
+/// Instances of meshes with no geometry are left out.
+fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
     let mut out = Vec::with_capacity(scene.instances.len());
+    let mut index = Vec::with_capacity(scene.instances.len());
     for instance in &scene.instances {
         let mesh = &scene.meshes[instance.mesh as usize];
         let Some(root_node) = mesh.root_node else {
+            index.push(None);
             continue;
         };
+        index.push(Some(out.len() as u32));
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());
-        let max_scale = linear
-            .x_axis
-            .length()
-            .max(linear.y_axis.length())
-            .max(linear.z_axis.length());
         out.push(GpuInstance {
             world: affine_rows(world),
             prev_world: affine_rows(world),
@@ -173,11 +267,27 @@ fn gpu_instances(scene: &PagedScene) -> Vec<GpuInstance> {
                 } else {
                     0
                 },
-            max_scale,
+            max_scale: max_scale(linear),
             texture_info: texture_info(scene.materials.get(instance.material as usize)),
+            glow: 1.0,
+            _pad: [0.0; 3],
         });
     }
-    out
+    (out, index)
+}
+
+/// The object-space bounding sphere of each GPU instance's mesh, in the order
+/// [`gpu_instances`] makes them.
+fn instance_spheres(scene: &PagedScene) -> Vec<(Vec3, f32)> {
+    scene
+        .instances
+        .iter()
+        .filter_map(|instance| scene.meshes[instance.mesh as usize].root_node)
+        .map(|root| {
+            let node = &scene.nodes[root as usize];
+            (Vec3::from_array(node.center), node.radius)
+        })
+        .collect()
 }
 
 /// The largest edge kept when textures must be unpacked, because the GPU can't sample BC.
@@ -536,6 +646,48 @@ fn unpack_blocks<const TEXEL_BYTES: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_instance_lays_out_as_its_shader_twin() {
+        crate::shaders::assert_twin!(
+            "vg/cull.wgsl",
+            "Instance",
+            GpuInstance,
+            [
+                world,
+                world + 16,
+                world + 32,
+                prev_world,
+                prev_world + 16,
+                prev_world + 32,
+                normal,
+                normal + 16,
+                normal + 32,
+                quant_origin,
+                quant_step,
+                uv_origin,
+                uv_step,
+                root_node,
+                material,
+                max_scale,
+                texture_info,
+                glow,
+                _pad,
+                _pad + 4,
+                _pad + 8,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_transform_comes_back_as_it_went_in() {
+        let world = Mat4::from_scale_rotation_translation(
+            Vec3::new(1.0, 2.0, 3.0),
+            glam::Quat::from_rotation_y(0.7),
+            Vec3::new(4.0, -5.0, 6.0),
+        );
+        assert!(from_affine_rows(affine_rows(world)).abs_diff_eq(world, 1.0e-6));
+    }
 
     /// A BC5 block whose two channels are constant: both endpoints equal, all indices zero.
     fn flat_bc5_block(red: u8, green: u8) -> [u8; 16] {

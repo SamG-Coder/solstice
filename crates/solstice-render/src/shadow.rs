@@ -1,21 +1,32 @@
 //! Cascaded sun shadow maps, drawn through the same cluster culling as the main view.
 //!
-//! Shadow maps are the most expensive pass on small GPUs, and the scene is static, so a
-//! cascade is only redrawn when its view changes. Views move in coarse steps to make that
-//! rare: each cascade covers slightly more than it must, so it can stay put while the
-//! camera moves. When several cascades are stale, the far ones take turns.
+//! Shadow maps are the most expensive pass on small GPUs, and most of a scene stands still, so
+//! a cascade holds only static instances and is only redrawn when its view changes. Views move
+//! in coarse steps to make that rare: each cascade covers slightly more than it must, so it can
+//! stay put while the camera moves. When several cascades are stale, the far ones take turns.
+//!
+//! Movable instances are drawn every frame into a map of their own, through the same view as
+//! the cascade they fall in, and shading takes the darker of the two. The four cascades share
+//! one more layer of the array for this, a quarter each, at half their resolution: a moving
+//! thing's shadow is a little softer, but it costs one layer rather than four, and no new
+//! binding. Shaders that sample the shadows are already at WebGPU's limit of 16 textures. A
+//! cascade with nothing movable in it draws nothing, and is not sampled twice.
 
 use crate::frame::Camera;
 use crate::gpu::{Gpu, LayoutBuilder};
 use crate::scene::GpuScene;
 use crate::vg::{
-    CullPhase, CullPipelines, CullWork, PassView, RasterBindings, Rasterizer, ViewSlots,
+    CullPhase, CullPipelines, CullWork, InstanceFilter, PassView, RasterBindings, Rasterizer,
+    ViewSlots,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 pub const CASCADE_COUNT: usize = 4;
 const RESOLUTION: u32 = 2048;
+/// Each cascade's quarter of the layer for movable instances, the last layer of the array.
+const MOVING_RESOLUTION: u32 = RESOLUTION / 2;
+const MOVING_LAYER: u32 = CASCADE_COUNT as u32;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Far end of each cascade, in metres from the camera.
 const SPLITS: [f32; CASCADE_COUNT] = [12.0, 38.0, 120.0, 420.0];
@@ -35,6 +46,16 @@ struct ShadowUniform {
     view_proj: [Mat4; CASCADE_COUNT],
     splits: Vec4,
     texel_size: Vec4,
+    /// 1 for each cascade whose movable instances were drawn this frame, else 0.
+    moving: Vec4,
+}
+
+/// What [`ShadowMaps::record`] draws this frame.
+pub struct ShadowWork {
+    /// Cascades whose static contents are redrawn.
+    pub due: [bool; CASCADE_COUNT],
+    /// Cascades with movable instances to draw.
+    pub moving: [bool; CASCADE_COUNT],
 }
 
 /// Shadow map resources and passes.
@@ -43,10 +64,14 @@ pub struct ShadowMaps {
     pub comparison_sampler: wgpu::Sampler,
     pub uniform: wgpu::Buffer,
     layer_views: Vec<wgpu::TextureView>,
+    /// The layer movable instances are drawn into.
+    moving_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
     data: ShadowUniform,
     /// What each cascade last drew, to tell when it has gone stale.
     drawn: [Option<(Mat4, f32)>; CASCADE_COUNT],
+    /// The centre and radius of each cascade's view as last drawn.
+    extents: [(Vec3, f32); CASCADE_COUNT],
     next_far_cascade: usize,
     /// Cascades that must redraw because the geometry on the GPU has improved.
     outdated: [bool; CASCADE_COUNT],
@@ -59,7 +84,7 @@ impl ShadowMaps {
             size: wgpu::Extent3d {
                 width: RESOLUTION,
                 height: RESOLUTION,
-                depth_or_array_layers: CASCADE_COUNT as u32,
+                depth_or_array_layers: CASCADE_COUNT as u32 + 1,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -68,16 +93,16 @@ impl ShadowMaps {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let layer_views = (0..CASCADE_COUNT as u32)
-            .map(|layer| {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: layer,
-                    array_layer_count: Some(1),
-                    ..Default::default()
-                })
+        let layer_view = |layer| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
             })
-            .collect();
+        };
+        let layer_views = (0..CASCADE_COUNT as u32).map(layer_view).collect();
+        let moving_view = layer_view(MOVING_LAYER);
         let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -136,13 +161,16 @@ impl ShadowMaps {
             }),
             uniform: gpu.uniform_buffer("shadow", std::mem::size_of::<ShadowUniform>() as u64),
             layer_views,
+            moving_view,
             pipeline,
             data: ShadowUniform {
                 view_proj: [Mat4::IDENTITY; CASCADE_COUNT],
                 splits: Vec4::from_array(SPLITS),
                 texel_size: Vec4::ONE,
+                moving: Vec4::ZERO,
             },
             drawn: [None; CASCADE_COUNT],
+            extents: [(Vec3::ZERO, 1.0); CASCADE_COUNT],
             next_far_cascade: 1,
             outdated: [false; CASCADE_COUNT],
         }
@@ -154,18 +182,21 @@ impl ShadowMaps {
     }
 
     /// Finds the stale cascades and writes the views of those to redraw to slots from
-    /// `first_slot`. Returns which cascades are due.
+    /// `first_slot`. Then finds the cascades that `moving`, the bounding spheres of movable
+    /// instances, fall in, and writes their views to slots from `first_moving_slot`.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         gpu: &Gpu,
         slots: &ViewSlots,
         first_slot: u32,
+        first_moving_slot: u32,
         camera: &Camera,
         aspect: f32,
         sun_direction: Vec3,
         lod_threshold: f32,
-    ) -> [bool; CASCADE_COUNT] {
+        moving: &[(Vec3, f32)],
+    ) -> ShadowWork {
         let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] = std::array::from_fn(|cascade| {
             let near = if cascade == 0 {
                 camera.near
@@ -185,6 +216,7 @@ impl ShadowMaps {
             self.outdated[cascade] = false;
             let (view_proj, center, radius) = fits[cascade];
             self.drawn[cascade] = Some((view_proj, lod_threshold));
+            self.extents[cascade] = (center, radius);
             self.data.view_proj[cascade] = view_proj;
             self.data.texel_size[cascade] = 2.0 * radius / RESOLUTION as f32;
             let view = PassView::orthographic(
@@ -196,12 +228,40 @@ impl ShadowMaps {
             );
             slots.write(gpu, first_slot + cascade as u32, &view);
         }
+
+        // Movable instances go through each cascade's view as it stands, drawn this frame or
+        // before, so that the two maps line up.
+        let moving_due: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
+            let (center, radius) = self.extents[cascade];
+            let view_proj = self.data.view_proj[cascade];
+            let touched = self.drawn[cascade].is_some()
+                && moving
+                    .iter()
+                    .any(|&sphere| cascade_touches(view_proj, radius, sphere));
+            if touched {
+                let view = PassView::orthographic(
+                    view_proj,
+                    center,
+                    Vec2::splat(MOVING_RESOLUTION as f32),
+                    MOVING_RESOLUTION as f32 / (2.0 * radius),
+                    lod_threshold,
+                )
+                .drawing(InstanceFilter::Movable);
+                slots.write(gpu, first_moving_slot + cascade as u32, &view);
+            }
+            touched
+        });
+        self.data.moving = Vec4::from_array(moving_due.map(|m| f32::from(u8::from(m))));
+
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.data));
-        due
+        ShadowWork {
+            due,
+            moving: moving_due,
+        }
     }
 
-    /// Culls and draws the cascades marked in `due`.
+    /// Culls and draws what `shadow_work` says is due: stale cascades, then movable instances.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
@@ -212,9 +272,10 @@ impl ShadowMaps {
         work: &CullWork,
         raster: &RasterBindings,
         first_slot: u32,
-        due: &[bool; CASCADE_COUNT],
+        first_moving_slot: u32,
+        shadow_work: &ShadowWork,
     ) {
-        for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
+        for cascade in (0..CASCADE_COUNT).filter(|&c| shadow_work.due[c]) {
             let slot = first_slot + cascade as u32;
             cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
 
@@ -235,12 +296,63 @@ impl ShadowMaps {
             pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
         }
+
+        let mut cleared = false;
+        for cascade in (0..CASCADE_COUNT).filter(|&c| shadow_work.moving[c]) {
+            let slot = first_moving_slot + cascade as u32;
+            cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("moving shadows"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.moving_view,
+                    depth_ops: Some(wgpu::Operations {
+                        // The whole layer is cleared once a frame, before its first quarter.
+                        load: if cleared {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(1.0)
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            cleared = true;
+            let [x, y] = moving_quarter(cascade);
+            let size = MOVING_RESOLUTION as f32;
+            pass.set_viewport(x as f32 * size, y as f32 * size, size, size, 0.0, 1.0);
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
+            pass.draw_indirect(work.args(), CullWork::draw_args_offset());
+        }
     }
 
     /// Layout entries for sampling the maps: uniform, depth array, comparison sampler.
     pub fn add_to_layout(builder: LayoutBuilder) -> LayoutBuilder {
         builder.uniform().depth_texture_array().sampler_comparison()
     }
+}
+
+/// Which quarter of the movable layer a cascade has, as column and row. Twin of
+/// `moving_quarter` in `lighting/sun_shadow.wgsl`.
+fn moving_quarter(cascade: usize) -> [u32; 2] {
+    [cascade as u32 % 2, cascade as u32 / 2]
+}
+
+/// Whether a sphere could cast a shadow into a cascade drawn through `view_proj`, an
+/// orthographic view `radius` across each way from its centre, with depth reaching back
+/// [`DEPTH_REACH`] towards the sun.
+fn cascade_touches(view_proj: Mat4, radius: f32, (center, sphere_radius): (Vec3, f32)) -> bool {
+    let clip = view_proj.project_point3(center);
+    let across = sphere_radius / radius;
+    let deep = sphere_radius / (DEPTH_REACH + radius * 2.0);
+    clip.x.abs() <= 1.0 + across
+        && clip.y.abs() <= 1.0 + across
+        && clip.z >= -deep
+        && clip.z <= 1.0 + deep
 }
 
 /// Picks what to redraw. Anything never drawn goes now, since it has no usable contents.
@@ -367,6 +479,48 @@ mod tests {
             unchanged >= 40,
             "only {unchanged} of 50 small moves kept the cascade"
         );
+    }
+
+    #[test]
+    fn a_cascade_is_touched_by_what_stands_in_it_and_not_by_what_stands_aside() {
+        let camera = test_camera();
+        let (view_proj, center, radius) = fit_cascade(&camera, 1.5, sun(), 5.0, 30.0);
+        assert!(cascade_touches(view_proj, radius, (center, 0.5)));
+        // The light's own sideways axis, which runs along the cascade's x.
+        let across = (-sun()).cross(Vec3::Y).normalize();
+        // Out to one side, beyond the cascade's edge by more than its own radius.
+        let aside = center + across * radius * 1.5;
+        assert!(!cascade_touches(view_proj, radius, (aside, 1.0)));
+        // As far out, but large enough to reach in.
+        assert!(cascade_touches(view_proj, radius, (aside, radius * 0.6)));
+        // Up towards the sun, a caster can be far beyond the cascade and still shade it.
+        assert!(cascade_touches(
+            view_proj,
+            radius,
+            (center + sun() * 500.0, 1.0)
+        ));
+        // Behind the cascade, away from the sun, it can't.
+        assert!(!cascade_touches(
+            view_proj,
+            radius,
+            (center - sun() * (radius * 2.0 + 5.0), 1.0)
+        ));
+    }
+
+    #[test]
+    fn the_uniform_lays_out_as_its_shader_twin() {
+        crate::shaders::assert_twin!(
+            "lighting/deferred.wgsl",
+            "Shadows",
+            ShadowUniform,
+            [view_proj, splits, texel_size, moving]
+        );
+    }
+
+    #[test]
+    fn each_cascade_has_its_own_quarter() {
+        let quarters: Vec<_> = (0..CASCADE_COUNT).map(moving_quarter).collect();
+        assert_eq!(quarters, vec![[0, 0], [1, 0], [0, 1], [1, 1]]);
     }
 
     #[test]

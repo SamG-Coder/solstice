@@ -208,7 +208,7 @@ fn voxelize_cluster_triangle(item: u32, t: u32) {
         let data = VoxelData(
             pack4x8unorm(vec4f(albedo, 1.0)),
             pack2x16snorm(oct_encode(face / face_length)),
-            encode_emissive(material.emissive),
+            encode_emissive(material.emissive * instance.glow),
         );
         voxelize_triangle(
             (world0 - params.origin) * inv_voxel,

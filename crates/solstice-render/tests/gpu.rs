@@ -1809,3 +1809,306 @@ fn waves_wet_the_faces_they_break_against() {
         "the side the waves break against is dry: {washed}, against {dry} with no sea near"
     );
 }
+
+/// A red ball, instance 0, standing on a white floor, instance 1.
+fn red_ball_on_floor() -> SceneAsset {
+    let mut scene = ball_on_floor();
+    scene.materials.push(Material {
+        base_color: [0.9, 0.08, 0.06, 1.0],
+        ..Default::default()
+    });
+    scene.instances[0].material = 1;
+    scene
+}
+
+/// A renderer drawing into a test target, frame by frame, between which a test can change the
+/// scene. It fails on any validation error.
+struct Stage {
+    renderer: Renderer,
+    target: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: u32,
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl Stage {
+    fn new(gpu: &Gpu, scene: &SceneAsset, settings: RendererSettings, size: u32) -> Self {
+        let errors: Arc<Mutex<Vec<String>>> = Default::default();
+        let sink = errors.clone();
+        gpu.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                sink.lock().unwrap().push(error.to_string());
+            }));
+        let target = test_target(gpu, size);
+        let view = target.create_view(&Default::default());
+        Self {
+            renderer: Renderer::new(gpu, &paginate(scene), FORMAT, settings),
+            target,
+            view,
+            size,
+            errors,
+        }
+    }
+
+    fn frames(&mut self, gpu: &Gpu, camera: &Camera, environment: &Environment, count: u32) {
+        for _ in 0..count {
+            self.renderer.render(
+                gpu,
+                camera,
+                environment,
+                &self.view,
+                (self.size, self.size),
+                1.0 / 60.0,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+    }
+
+    fn pixels(&self, gpu: &Gpu) -> Vec<u8> {
+        let pixels = read_pixels(gpu, &self.target, self.size);
+        let errors = self.errors.lock().unwrap();
+        assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+        pixels
+    }
+}
+
+/// The pixel a point in the world lands on, seen by `camera` in a square image.
+fn pixel_of(camera: &Camera, size: u32, world: Vec3) -> (u32, u32) {
+    let ndc = (camera.projection(1.0) * camera.view()).project_point3(world);
+    let x = ((ndc.x * 0.5 + 0.5) * size as f32) as u32;
+    let y = ((0.5 - ndc.y * 0.5) * size as f32) as u32;
+    (x.min(size - 1), y.min(size - 1))
+}
+
+/// Looking down at the floor around the origin from above and in front.
+fn over_the_floor() -> Camera {
+    Camera {
+        position: Vec3::new(1.5, 11.0, 11.0),
+        pitch: -std::f32::consts::FRAC_PI_4,
+        ..Default::default()
+    }
+}
+
+/// A sun 45 degrees up in the +X direction, so a ball's shadow falls on the floor to its -X
+/// side: centred 1 m from its foot, from 2.4 m to 0.6 m beyond it, as seen from above.
+fn low_sun() -> Environment {
+    Environment {
+        sun_direction: Vec3::new(1.0, 1.0, 0.0).normalize(),
+        ..Default::default()
+    }
+}
+
+fn place(x: f32) -> Mat4 {
+    Mat4::from_translation(Vec3::new(x, 1.0, 0.0))
+}
+
+#[test]
+fn a_moved_ball_is_drawn_where_it_went_with_its_shadow_and_none_is_left_behind() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 192;
+    let camera = over_the_floor();
+    let sun = low_sun();
+    let mut stage = Stage::new(
+        &gpu,
+        &red_ball_on_floor(),
+        RendererSettings::default(),
+        size,
+    );
+
+    // Brightness of the floor in a ball's shadow, if the ball were at x, against open floor.
+    let shade_at = |pixels: &[u8], x: f32| {
+        let (px, py) = pixel_of(&camera, size, Vec3::new(x - 1.6, 0.0, 0.0));
+        let (ox, oy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
+        brightness(patch(pixels, size, px, py, 1)) / brightness(patch(pixels, size, ox, oy, 2))
+    };
+    let red_at = |pixels: &[u8], x: f32| {
+        let (px, py) = pixel_of(&camera, size, Vec3::new(x, 1.0, 0.0));
+        let [r, g, _] = patch(pixels, size, px, py, 1);
+        r > 2.0 * g
+    };
+
+    stage.frames(&gpu, &camera, &sun, 30);
+    let pixels = stage.pixels(&gpu);
+    assert!(red_at(&pixels, 0.0), "the ball isn't where it stands");
+    assert!(
+        shade_at(&pixels, 0.0) < 0.6,
+        "the standing ball casts no shadow"
+    );
+
+    for (from, to) in [(0.0, 3.0), (3.0, 6.0)] {
+        assert!(stage.renderer.move_instance(0, place(to)));
+        stage.frames(&gpu, &camera, &sun, 30);
+        let pixels = stage.pixels(&gpu);
+        assert!(red_at(&pixels, to), "the ball isn't drawn at {to}");
+        assert!(!red_at(&pixels, from), "the ball is still drawn at {from}");
+        let (new, old) = (shade_at(&pixels, to), shade_at(&pixels, from));
+        assert!(
+            new < 0.6,
+            "the ball moved to {to} casts no shadow there: {new}"
+        );
+        assert!(old > 0.85, "a shadow is left behind at {from}: {old}");
+    }
+}
+
+#[test]
+fn moving_things_show_their_motion_and_stop_showing_it_when_they_stop() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 128;
+    let camera = over_the_floor();
+    let settings = RendererSettings {
+        debug_view: DebugView::Motion,
+        ..Default::default()
+    };
+    let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    let environment = low_sun();
+
+    // Red over green, at the ball's centre and on the floor beside it.
+    let colours = |pixels: &[u8], x: f32| {
+        let (bx, by) = pixel_of(&camera, size, Vec3::new(x, 1.0, 0.0));
+        let (fx, fy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
+        (
+            patch(pixels, size, bx, by, 1),
+            patch(pixels, size, fx, fy, 1),
+        )
+    };
+
+    stage.frames(&gpu, &camera, &environment, 4);
+    let mut x = 0.0;
+    for _ in 0..6 {
+        x += 0.1;
+        stage.renderer.move_instance(0, place(x));
+        stage.frames(&gpu, &camera, &environment, 1);
+    }
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        ball[0] > floor[0] + 30.0,
+        "the ball moving right shows no motion to the right: {ball:?} against {floor:?}"
+    );
+    assert!(
+        (ball[1] - floor[1]).abs() < 15.0,
+        "the ball moving across the screen shows motion up or down: {ball:?} against {floor:?}"
+    );
+
+    // Still from here on: the frame after it stops, its motion must be gone.
+    stage.frames(&gpu, &camera, &environment, 2);
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        (ball[0] - floor[0]).abs() < 10.0,
+        "the ball still shows motion after it stopped: {ball:?} against {floor:?}"
+    );
+}
+
+#[test]
+fn a_hidden_ball_is_not_drawn_and_casts_no_shadow() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 128;
+    let camera = over_the_floor();
+    let sun = low_sun();
+    let mut stage = Stage::new(
+        &gpu,
+        &red_ball_on_floor(),
+        RendererSettings::default(),
+        size,
+    );
+    stage.frames(&gpu, &camera, &sun, 4);
+    // Hidden while static, then shown and hidden again while movable: both paths.
+    for movable in [false, true] {
+        assert!(stage.renderer.set_instance_movable(0, movable));
+        assert!(stage.renderer.set_instance_hidden(0, true));
+        stage.frames(&gpu, &camera, &sun, 30);
+        let pixels = stage.pixels(&gpu);
+        let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
+        let [r, g, _] = patch(&pixels, size, bx, by, 1);
+        assert!(
+            r < g * 1.3,
+            "the hidden ball is drawn, movable {movable}: {r} {g}"
+        );
+        let (sx, sy) = pixel_of(&camera, size, Vec3::new(-1.6, 0.0, 0.0));
+        let (ox, oy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
+        let shade = brightness(patch(&pixels, size, sx, sy, 1))
+            / brightness(patch(&pixels, size, ox, oy, 2));
+        assert!(
+            shade > 0.85,
+            "the hidden ball casts a shadow, movable {movable}: {shade}"
+        );
+        assert!(stage.renderer.set_instance_hidden(0, false));
+    }
+}
+
+#[test]
+fn a_lamp_put_out_stops_glowing() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 96;
+    let mut scene = red_ball_on_floor();
+    // Far brighter than the sunlit floor.
+    scene.materials[1].emissive = [60.0, 45.0, 15.0];
+    let camera = over_the_floor();
+    let sun = low_sun();
+    let mut stage = Stage::new(&gpu, &scene, RendererSettings::default(), size);
+    let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
+    let green_at = |pixels: &[u8]| patch(pixels, size, bx, by, 1)[1];
+    stage.frames(&gpu, &camera, &sun, 20);
+    let lit = green_at(&stage.pixels(&gpu));
+    assert!(stage.renderer.set_instance_glow(0, 0.0));
+    stage.frames(&gpu, &camera, &sun, 20);
+    let out = green_at(&stage.pixels(&gpu));
+    // Unlit, the red ball has little green; glowing, the lamp's yellow light has plenty.
+    assert!(lit > 150.0, "the lamp doesn't glow: {lit}");
+    assert!(
+        out < lit * 0.5,
+        "the lamp put out still glows: {out} against {lit}"
+    );
+}
+
+#[test]
+fn instances_without_geometry_are_refused() {
+    let Some(gpu) = request_gpu() else { return };
+    let mut scene = red_ball_on_floor();
+    // A third instance of a mesh with nothing in it.
+    scene.meshes.push(build_virtual_mesh(
+        &Mesh::default(),
+        &BuildOptions::default(),
+    ));
+    scene.instances.push(instance(2, Mat4::IDENTITY));
+    let renderer = &mut Stage::new(&gpu, &scene, RendererSettings::default(), 16).renderer;
+    assert_eq!(renderer.instance_count(), 3);
+    assert!(!renderer.move_instance(2, Mat4::IDENTITY));
+    assert!(!renderer.move_instance(3, Mat4::IDENTITY));
+    assert!(renderer.move_instance(1, Mat4::IDENTITY));
+    // The ball's mesh is bounded by its clusters' spheres, so its bounds are near the unit
+    // sphere around (0, 1, 0), and hold it.
+    let (center, radius) = renderer.instance_bounds(0).unwrap();
+    assert!(center.distance(Vec3::Y) < 0.3 && radius >= 1.0 - center.distance(Vec3::Y));
+}
+
+#[test]
+fn a_movable_ball_is_in_the_gi_voxels_only_if_it_stays_in_them() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 96;
+    let camera = over_the_floor();
+    let settings = RendererSettings {
+        debug_view: DebugView::Voxels,
+        ..Default::default()
+    };
+    let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
+    // How red the voxels look where the ball stands.
+    let redness = |stays: bool| {
+        let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+        stage.renderer.set_instance_movable(0, true);
+        stage.renderer.set_instance_stays_in_gi(0, stays);
+        stage.frames(&gpu, &camera, &low_sun(), 12);
+        let [r, g, _] = patch(&stage.pixels(&gpu), size, bx, by, 1);
+        r / g.max(1.0)
+    };
+    let (kept, left_out) = (redness(true), redness(false));
+    assert!(
+        kept > 2.0,
+        "the ball that stays in GI isn't in the voxels: {kept}"
+    );
+    assert!(
+        left_out < 1.3,
+        "the movable ball is in the voxels: {left_out}"
+    );
+}

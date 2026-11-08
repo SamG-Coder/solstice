@@ -26,6 +26,23 @@ pub struct PassView {
     pub phase: u32,
     pub occlusion_enabled: u32,
     pub allow_software: u32,
+    /// Which instances the view draws: an [`InstanceFilter`].
+    pub instance_filter: u32,
+    pub _pad: [u32; 3],
+}
+
+/// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum InstanceFilter {
+    All = 0,
+    /// Only those that cannot move, for views kept from frame to frame, which would otherwise
+    /// keep a moving instance where it was.
+    Static = 1,
+    /// Only those that can move, drawn each frame over a cached view.
+    Movable = 2,
+    /// Static instances, and movable ones that stay in the GI voxels.
+    Gi = 3,
 }
 
 impl PassView {
@@ -49,7 +66,9 @@ impl PassView {
     }
 
     /// A view with no occlusion testing and no software rasterization, for orthographic
-    /// volumes such as shadow cascades. `pixels_per_unit` converts LOD error to pixels.
+    /// volumes such as shadow cascades. `pixels_per_unit` converts LOD error to pixels. These
+    /// views are kept from frame to frame, so they draw only static instances; see
+    /// [`Self::drawing`].
     pub fn orthographic(
         view_proj: Mat4,
         center: Vec3,
@@ -72,7 +91,15 @@ impl PassView {
             phase: 0,
             occlusion_enabled: 0,
             allow_software: 0,
+            instance_filter: InstanceFilter::Static as u32,
+            _pad: [0; 3],
         }
+    }
+
+    /// The same view, drawing other instances.
+    pub fn drawing(mut self, filter: InstanceFilter) -> Self {
+        self.instance_filter = filter as u32;
+        self
     }
 }
 
@@ -458,8 +485,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pass_view_size_matches_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<PassView>(), 288);
+    fn the_pass_view_lays_out_as_its_shader_twin() {
+        crate::shaders::assert_twin!(
+            "vg/cull.wgsl",
+            "PassView",
+            PassView,
+            [
+                raster_view_proj,
+                occlusion_view,
+                planes,
+                camera_position,
+                lod_threshold,
+                viewport,
+                proj_scale,
+                hzb_size,
+                near,
+                lod_scale,
+                is_ortho,
+                phase,
+                occlusion_enabled,
+                allow_software,
+                instance_filter,
+                _pad,
+                _pad + 4,
+                _pad + 8,
+            ]
+        );
+    }
+
+    #[test]
+    fn orthographic_views_draw_only_what_stands_still() {
+        let view = PassView::orthographic(Mat4::IDENTITY, Vec3::ZERO, Vec2::ONE, 1.0, 1.0);
+        assert_eq!(view.instance_filter, InstanceFilter::Static as u32);
+        let moving = view.drawing(InstanceFilter::Movable);
+        assert_eq!(moving.instance_filter, InstanceFilter::Movable as u32);
     }
 
     #[test]

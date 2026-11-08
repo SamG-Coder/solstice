@@ -24,6 +24,7 @@ mod native {
         Camera, DebugView, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
         StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
+    use solstice_viewer::bob::Bobbing;
     use solstice_viewer::{
         default_environment, initial_camera, parse_time, CameraInput, DayClock, FlyCamera,
     };
@@ -193,6 +194,17 @@ mod native {
         /// their own bring both.
         ocean: Option<Ocean>,
         sea_level: Option<f32>,
+        /// Instances to rock as if afloat: those centred within a radius of a point across the
+        /// ground, as x, z, radius, the height they rock about, and how far they rock.
+        bob: Option<[f32; 5]>,
+    }
+
+    /// Makes the instances `--bob` names movable, ready to rock.
+    fn bobbing(options: &Options, renderer: &mut Renderer) -> Option<Bobbing> {
+        let [x, z, radius, height, amplitude] = options.bob?;
+        let bobbing = Bobbing::around(renderer, [x, z], radius, height, amplitude);
+        log::info!("{} instances bob around ({x}, {z})", bobbing.len());
+        Some(bobbing)
     }
 
     /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
@@ -225,6 +237,7 @@ mod native {
             ocean: None,
             sea_level: None,
             clock: None,
+            bob: None,
         };
         // The time of day, built up from its options and made at the end.
         let (mut time, mut day_seconds, mut latitude) = (None, 0.0, None);
@@ -324,6 +337,15 @@ mod native {
                             Weather::parse(&text).map_err(|e| format!("{name}: {e}"))?
                         }
                     };
+                }
+                "--bob" => {
+                    let v = floats(&value()?)?;
+                    options.bob = Some(match v[..] {
+                        [x, z, radius] => [x, z, radius, 0.0, 1.0],
+                        [x, z, radius, height] => [x, z, radius, height, 1.0],
+                        [x, z, radius, height, amplitude] => [x, z, radius, height, amplitude],
+                        _ => return Err("--bob expects x,z,radius[,height[,amplitude]]".into()),
+                    });
                 }
                 "--stream" => options.stream = true,
                 "--geometry-budget-mb" => {
@@ -448,6 +470,7 @@ mod native {
         let start = Instant::now();
         let (mut renderer, mut reader) = scene.renderer(&gpu, CAPTURE_FORMAT, options);
         log::info!("renderer created in {:.2}s", start.elapsed().as_secs_f32());
+        let mut bob = bobbing(options, &mut renderer);
 
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
@@ -481,6 +504,9 @@ mod native {
                 reader.pump(&mut renderer);
             }
             let environment = light(&mut clock, options.environment, 1.0 / 60.0);
+            if let Some(bob) = &mut bob {
+                bob.advance(&mut renderer, 1.0 / 60.0);
+            }
             renderer.render(&gpu, &camera, &environment, &view, options.size, 1.0 / 60.0);
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             if frame > 10 {
@@ -903,6 +929,7 @@ mod native {
         renderer: Renderer,
         reader: Option<PageReader>,
         camera: FlyCamera,
+        bob: Option<Bobbing>,
         last_frame: Instant,
         title_timer: f32,
         frames_since_title: u32,
@@ -947,8 +974,10 @@ mod native {
             config.present_mode = wgpu::PresentMode::AutoVsync;
             surface.configure(&gpu.device, &config);
 
-            let (renderer, reader) = self.scene.renderer(&gpu, config.format, &self.options);
+            let (mut renderer, reader) = self.scene.renderer(&gpu, config.format, &self.options);
+            let bob = bobbing(&self.options, &mut renderer);
             Ok(WindowState {
+                bob,
                 reader,
                 window,
                 surface,
@@ -990,6 +1019,9 @@ mod native {
             let delta = (now - state.last_frame).as_secs_f32();
             state.last_frame = now;
             let environment = light(clock, fixed, delta);
+            if let Some(bob) = &mut state.bob {
+                bob.advance(&mut state.renderer, delta);
+            }
             state.camera.update(
                 &CameraInput {
                     forward,

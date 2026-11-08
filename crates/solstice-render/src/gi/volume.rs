@@ -4,7 +4,7 @@ use crate::gpu::{groups_for, Gpu, LayoutBuilder};
 use crate::profiler::{section, Profiler};
 use crate::scene::GpuScene;
 use crate::shaders;
-use crate::vg::{CullPhase, CullPipelines, CullWork, PassView, ViewSlots};
+use crate::vg::{CullPhase, CullPipelines, CullWork, InstanceFilter, PassView, ViewSlots};
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec2, Vec3, Vec4};
 
@@ -749,7 +749,8 @@ fn write_level_view(
         1.0 / voxel_size,
         // Half a voxel of geometric error is invisible at this resolution.
         0.5,
-    );
+    )
+    .drawing(InstanceFilter::Gi);
     pass_view.allow_software = 2;
     slots.write(gpu, slot, &pass_view);
 }

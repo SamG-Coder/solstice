@@ -18,8 +18,8 @@ use crate::shadow::{ShadowMaps, CASCADE_COUNT};
 use crate::sky::Sky;
 use crate::streaming::{choose_tiers, StreamRequest, Streamer, StreamingStats};
 use crate::vg::{
-    CullPhase, CullPipelines, CullWork, GBuffer, Hzb, PassView, RasterBindings, Rasterizer,
-    Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
+    CullPhase, CullPipelines, CullWork, GBuffer, Hzb, InstanceFilter, PassView, RasterBindings,
+    Rasterizer, Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
 };
 use glam::{Mat4, Vec2, Vec3};
 use solstice_asset::paged::{PagedScene, PAGE_BYTES};
@@ -45,7 +45,8 @@ const SLOT_MAIN_SECOND: u32 = 1;
 const SLOT_SHADOW: u32 = 2;
 const SLOT_VOXEL: u32 = SLOT_SHADOW + CASCADE_COUNT as u32;
 const SLOT_SEABED: u32 = SLOT_VOXEL + LEVEL_COUNT as u32;
-const SLOT_COUNT: u32 = SLOT_SEABED + 1;
+const SLOT_MOVING_SHADOW: u32 = SLOT_SEABED + 1;
+const SLOT_COUNT: u32 = SLOT_MOVING_SHADOW + CASCADE_COUNT as u32;
 
 /// A named balance between image quality and GPU cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -319,6 +320,58 @@ impl Renderer {
         self.sea_level = level;
     }
 
+    /// How many instances the scene has. Instances are named by their index in the scene file,
+    /// from 0 to this.
+    pub fn instance_count(&self) -> u32 {
+        self.scene.instance_table.len() as u32
+    }
+
+    /// Moves an instance to `world` from the next frame on. An instance that moves becomes
+    /// movable, as [`Self::set_instance_movable`] makes it, if it was not already. Returns false,
+    /// and does nothing, for an instance that has no geometry or does not exist.
+    pub fn move_instance(&mut self, instance: u32, world: Mat4) -> bool {
+        self.scene.instance_table.set_transform(instance, world)
+    }
+
+    /// Makes an instance movable, or static again. A movable instance is drawn afresh every
+    /// frame, with its shadow drawn separately, and so costs more; a static one is drawn into
+    /// views kept from frame to frame. Either change redraws those views once. Set an instance
+    /// movable before it starts moving, for example when a scene loads, to have that happen at
+    /// a quiet moment.
+    pub fn set_instance_movable(&mut self, instance: u32, movable: bool) -> bool {
+        self.scene.instance_table.set_movable(instance, movable)
+    }
+
+    /// Keeps a movable instance in the GI voxels, where it stood when they were last drawn, or
+    /// leaves it out (the default). Movable instances are left out because the voxels are kept
+    /// from frame to frame, and would hold them where they were. Something that moves only a
+    /// little, such as a ship riding at anchor, is better kept in: its shade and the light it
+    /// bounces, and its reflection in the water, would otherwise be missing.
+    pub fn set_instance_stays_in_gi(&mut self, instance: u32, stays: bool) -> bool {
+        self.scene.instance_table.set_stays_in_gi(instance, stays)
+    }
+
+    /// Hides an instance, or shows it again.
+    pub fn set_instance_hidden(&mut self, instance: u32, hidden: bool) -> bool {
+        self.scene.instance_table.set_hidden(instance, hidden)
+    }
+
+    /// Scales how brightly an instance's material glows, as a lamp is lit or put out: 1 as the
+    /// material says, 0 dark.
+    pub fn set_instance_glow(&mut self, instance: u32, glow: f32) -> bool {
+        self.scene.instance_table.set_glow(instance, glow)
+    }
+
+    /// Where an instance will be drawn next frame.
+    pub fn instance_transform(&self, instance: u32) -> Option<Mat4> {
+        self.scene.instance_table.transform(instance)
+    }
+
+    /// An instance's bounding sphere in the world, as its centre and radius.
+    pub fn instance_bounds(&self, instance: u32) -> Option<(Vec3, f32)> {
+        self.scene.instance_table.world_sphere(instance)
+    }
+
     fn from_parts(
         gpu: &Gpu,
         scene: GpuScene,
@@ -565,9 +618,11 @@ impl Renderer {
         self.time += delta_seconds;
         self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
 
-        // Everything below draws what's installed from here on.
+        // Everything below draws what's installed from here on, with instances where they are
+        // this frame.
         self.streamer.update(gpu, &self.scene);
-        if self.streamer.should_refresh_cached_views() {
+        let instances_changed = self.scene.update_instances(gpu);
+        if self.streamer.should_refresh_cached_views() || instances_changed {
             self.shadows.mark_stale();
             self.volume.mark_stale();
             if let Some(water) = &mut self.water {
@@ -579,14 +634,16 @@ impl Renderer {
         let parity = (self.frame_index & 1) as usize;
 
         self.write_frame_data(gpu, camera, environment, render_size);
-        let due_cascades = self.shadows.prepare(
+        let shadow_work = self.shadows.prepare(
             gpu,
             &self.view_slots,
             SLOT_SHADOW,
+            SLOT_MOVING_SHADOW,
             camera,
             aspect,
             environment.sun_direction,
             self.settings.shadow_lod_threshold,
+            &self.scene.instance_table.moving_spheres(),
         );
         let volume_work = self
             .volume
@@ -647,7 +704,8 @@ impl Renderer {
             &self.aux_work,
             &self.aux_raster,
             SLOT_SHADOW,
-            &due_cascades,
+            SLOT_MOVING_SHADOW,
+            &shadow_work,
         );
 
         if let Some(water) = self.water.as_ref().filter(|_| seabed_due) {
@@ -1002,6 +1060,8 @@ impl Renderer {
             phase,
             occlusion_enabled: u32::from(occlusion_enabled),
             allow_software: 1,
+            instance_filter: InstanceFilter::All as u32,
+            _pad: [0; 3],
         };
         self.view_slots.write(
             gpu,

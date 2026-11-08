@@ -191,10 +191,31 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     atomicAdd(&state.triangle_count, cluster_triangle_count(cluster));
 }
 
-// Queues every instance's hierarchy root.
+// Whether this view draws an instance at all.
+fn view_draws(instance: Instance) -> bool {
+    if instance_hidden(instance) {
+        return false;
+    }
+    switch view.instance_filter {
+        case INSTANCES_STATIC: {
+            return !instance_movable(instance);
+        }
+        case INSTANCES_MOVABLE: {
+            return instance_movable(instance);
+        }
+        case INSTANCES_GI: {
+            return !instance_movable(instance) || instance_stays_in_gi(instance);
+        }
+        default: {
+            return true;
+        }
+    }
+}
+
+// Queues the hierarchy root of every instance the view draws.
 @compute @workgroup_size(64)
 fn seed(@builtin(global_invocation_id) id: vec3u) {
-    if id.x < arrayLength(&instances) {
+    if id.x < arrayLength(&instances) && view_draws(instances[id.x]) {
         push_queue(QueueEntry(id.x, instances[id.x].root_node));
     }
 }
