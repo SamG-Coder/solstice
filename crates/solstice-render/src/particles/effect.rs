@@ -103,6 +103,37 @@ pub enum Shading {
     Unlit,
 }
 
+/// What particles collide with: any of these, as bits of [`Collide::against`].
+pub const COLLIDE_DEPTH: u32 = 1;
+pub const COLLIDE_FIELD: u32 = 2;
+pub const COLLIDE_WATER: u32 = 4;
+
+/// What a particle does when it hits something.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Response {
+    /// Rebounds, losing speed into the surface by its restitution and along it by friction.
+    #[default]
+    Bounce,
+    /// Stays where it hit for the rest of its life: snow settling.
+    Stick,
+    /// Dies: a raindrop that has landed.
+    Kill,
+}
+
+/// How an emitter's particles collide, if they do.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Collide {
+    /// What they hit: `COLLIDE_` bits.
+    pub against: u32,
+    pub response: Response,
+    /// The share of speed into the surface kept on a bounce, `0..1`.
+    pub restitution: Value,
+    /// The share of speed along the surface lost on a bounce, `0..1`.
+    pub friction: Value,
+    /// An event each hit sends, which emitters spawning on it hear.
+    pub event: Option<String>,
+}
+
 /// Where a moving effect keeps its emitter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Follow {
@@ -199,6 +230,22 @@ pub struct Emitter {
     pub cooling: Value,
     /// How much of a black body's light it gives at its temperature, `0..1`: its emissivity.
     pub glow: Value,
+    /// How strongly the wind and other moving air carry it, as a share of the weather's wind
+    /// near the ground. The air pulls a particle by its drag, so without drag it does nothing.
+    pub wind: Value,
+    /// Swirling air, from the curl of a noise field, so it neither bunches particles up nor
+    /// thins them out: its speed in m/s, its eddies' size in metres, and how fast they change.
+    pub curl: [Value; 3],
+    /// Hot particles rise: their lift as a share of gravity, times how much hotter than the air
+    /// they are, as a fraction of their temperature.
+    pub buoyancy: Value,
+    /// Acceleration towards the effect's origin, in m/s².
+    pub attract: Value,
+    /// Air turning about the effect's up axis, in radians per second.
+    pub vortex: Value,
+    pub collide: Option<Collide>,
+    /// An event this emitter spawns on, and how many particles each hit spawns.
+    pub on_event: Option<(String, Value)>,
     /// Downward acceleration in m/s².
     pub gravity: Value,
     /// Linear drag: the share of its velocity relative to still air a particle loses, per
@@ -237,6 +284,17 @@ impl Emitter {
             temperature: [Value::constant(0.0); 2],
             cooling: Value::constant(0.0),
             glow: Value::constant(1.0),
+            wind: Value::constant(0.0),
+            curl: [
+                Value::constant(0.0),
+                Value::constant(4.0),
+                Value::constant(0.2),
+            ],
+            buoyancy: Value::constant(0.0),
+            attract: Value::constant(0.0),
+            vortex: Value::constant(0.0),
+            collide: None,
+            on_event: None,
             gravity: Value::constant(0.0),
             drag: Value::constant(0.0),
             color_life: Curve::constant([1.0; 4]),
@@ -294,6 +352,22 @@ impl Effect {
             };
             let at = |e: String| format!("line {}: {e}", index + 1);
             effect.line(keyword, rest).map_err(at)?;
+        }
+        // Every event sent is heard by some emitter of the effect.
+        for emitter in &effect.emitters {
+            let Some(event) = emitter.collide.as_ref().and_then(|c| c.event.as_ref()) else {
+                continue;
+            };
+            let heard = effect
+                .emitters
+                .iter()
+                .any(|e| e.on_event.as_ref().is_some_and(|(name, _)| name == event));
+            if !heard {
+                return Err(format!(
+                    "emitter {} sends event {event}, but no emitter spawns on it",
+                    emitter.name
+                ));
+            }
         }
         for emitter in &effect.emitters {
             if emitter.sort && emitter.budget > MAX_SORTED {
@@ -547,9 +621,24 @@ fn module(
             };
         }
         "spawn" => {
-            words.only(keyword, &["rate", "burst", "every"])?;
+            words.only(keyword, &["rate", "burst", "every", "event", "count"])?;
             if !plain.is_empty() {
-                return Err("spawn takes rate=, burst= and every=".into());
+                return Err("spawn takes rate=, burst=, every=, and event= with count=".into());
+            }
+            if let Some(v) = words.option("event") {
+                let [name] = v else {
+                    return Err("event takes a name".into());
+                };
+                if !is_name(name) {
+                    return Err(format!("{name:?} is not a valid event name"));
+                }
+                let count = match words.option("count") {
+                    Some(c) => single(c, params, "count")?,
+                    None => Value::constant(1.0),
+                };
+                emitter.on_event = Some(((*name).to_owned(), count));
+            } else if words.option("count").is_some() {
+                return Err("count= goes with event=".into());
             }
             if let Some(v) = words.option("rate") {
                 emitter.rate = single(v, params, "rate")?;
@@ -651,6 +740,73 @@ fn module(
                 [] => Value::constant(STANDARD_GRAVITY),
                 _ => single(plain, params, "gravity")?,
             };
+        }
+        "wind" => {
+            no_options(words)?;
+            emitter.wind = single(plain, params, "wind")?;
+        }
+        "curl" => {
+            words.only(keyword, &["scale", "change"])?;
+            emitter.curl[0] = single(plain, params, "curl")?;
+            if let Some(v) = words.option("scale") {
+                emitter.curl[1] = single(v, params, "scale")?;
+            }
+            if let Some(v) = words.option("change") {
+                emitter.curl[2] = single(v, params, "change")?;
+            }
+        }
+        "buoyancy" => {
+            no_options(words)?;
+            emitter.buoyancy = single(plain, params, "buoyancy")?;
+        }
+        "attract" => {
+            no_options(words)?;
+            emitter.attract = single(plain, params, "attract")?;
+        }
+        "vortex" => {
+            no_options(words)?;
+            emitter.vortex = single(plain, params, "vortex")?;
+        }
+        "collide" => {
+            words.only(keyword, &["restitution", "friction", "event"])?;
+            let mut collide = Collide {
+                against: 0,
+                response: Response::Bounce,
+                restitution: Value::constant(0.4),
+                friction: Value::constant(0.2),
+                event: None,
+            };
+            for word in plain {
+                match *word {
+                    "depth" => collide.against |= COLLIDE_DEPTH,
+                    "field" => collide.against |= COLLIDE_FIELD,
+                    "water" => collide.against |= COLLIDE_WATER,
+                    "bounce" => collide.response = Response::Bounce,
+                    "stick" => collide.response = Response::Stick,
+                    "kill" => collide.response = Response::Kill,
+                    _ => {
+                        return Err(format!(
+                            "collide takes depth, field or water, then bounce, stick or kill, not {word:?}"
+                        ))
+                    }
+                }
+            }
+            if collide.against == 0 {
+                return Err("collide needs something to hit: depth, field or water".into());
+            }
+            if let Some(v) = words.option("restitution") {
+                collide.restitution = single(v, params, "restitution")?;
+            }
+            if let Some(v) = words.option("friction") {
+                collide.friction = single(v, params, "friction")?;
+            }
+            if let Some(v) = words.option("event") {
+                let [name] = v else {
+                    return Err("event takes a name".into());
+                };
+                collide.event = Some((*name).to_owned());
+            }
+            emitter.collide = Some(collide);
         }
         "drag" => {
             no_options(words)?;
@@ -781,6 +937,47 @@ mod tests {
     }
 
     #[test]
+    fn forces_and_collisions_read_back() {
+        let effect = Effect::parse(
+            "
+            param gust 2
+            emitter drops
+              wind 0.5*gust
+              curl 1.5 scale=3 change=0.4
+              buoyancy 0.8
+              attract 2
+              vortex 0.5
+              collide depth water kill event=splash
+            emitter splash
+              spawn event=splash count=4
+              collide field stick restitution=0.2 friction=0.9
+            ",
+        )
+        .unwrap();
+        let params = [2.0];
+        let drops = &effect.emitters[0];
+        assert_eq!(drops.wind.eval(&params), 1.0);
+        assert_eq!(drops.curl.map(|v| v.eval(&params)), [1.5, 3.0, 0.4]);
+        assert_eq!(drops.buoyancy.eval(&params), 0.8);
+        assert_eq!(drops.attract.eval(&params), 2.0);
+        assert_eq!(drops.vortex.eval(&params), 0.5);
+        let collide = drops.collide.as_ref().unwrap();
+        assert_eq!(collide.against, COLLIDE_DEPTH | COLLIDE_WATER);
+        assert_eq!(collide.response, Response::Kill);
+        assert_eq!(collide.event.as_deref(), Some("splash"));
+        let splash = &effect.emitters[1];
+        let (name, count) = splash.on_event.as_ref().unwrap();
+        assert_eq!((name.as_str(), count.eval(&params)), ("splash", 4.0));
+        let collide = splash.collide.as_ref().unwrap();
+        assert_eq!(
+            (collide.against, collide.response),
+            (COLLIDE_FIELD, Response::Stick)
+        );
+        assert_eq!(collide.restitution.eval(&params), 0.2);
+        assert_eq!(collide.friction.eval(&params), 0.9);
+    }
+
+    #[test]
     fn parameters_drive_values_as_they_change() {
         let effect = Effect::parse(SMOKE).unwrap();
         let rate = effect.emitters[0].rate;
@@ -825,6 +1022,11 @@ mod tests {
             assert!(error.starts_with(expected), "{text:?} gave {error:?}");
         }
         assert!(Effect::parse("# nothing\n").is_err());
+        // An event someone sends must be heard.
+        let error = Effect::parse("emitter rain\n collide water kill event=splash").unwrap_err();
+        assert!(error.contains("no emitter spawns on it"), "{error}");
+        let error = Effect::parse("emitter e\n collide bounce").unwrap_err();
+        assert!(error.contains("needs something to hit"), "{error}");
         // Sorting is done in one workgroup's memory, which bounds the budget.
         let error = Effect::parse("emitter smoke\n budget 5000\n render sprite sort").unwrap_err();
         assert!(error.contains("at most 4096"), "{error}");

@@ -28,14 +28,20 @@ fn plan(@builtin(local_invocation_index) e: u32) {
     if (emitter.flags & FLAG_LIVE) != 0u {
         // New particles take slots from the top of the free list, as many as it holds.
         let free = atomicLoad(&state[e].free_count);
-        spawn = min(emitter.spawn_request, free);
-        state[e].dropped += emitter.spawn_request - spawn;
+        // Last frame's events, which this emitter spawns from first.
+        let events_in = min(atomicLoad(&state[e].event_count), EVENT_CAPACITY);
+        state[e].events_in = events_in;
+        let wanted = emitter.spawn_request + events_in * emitter.event_spawn;
+        spawn = min(wanted, free);
+        state[e].dropped += wanted - spawn;
         state[e].spawn_first = free - spawn;
         atomicStore(&state[e].free_count, free - spawn);
         state[e].spawn_index = state[e].spawned;
         state[e].spawned += spawn;
         update = atomicLoad(&state[e].alive[read]);
     }
+    // This frame's hits count afresh, after the spawn has read last frame's.
+    atomicStore(&state[e].event_count, 0u);
     state[e].spawn_count = spawn;
     state[e].update_count = update;
     atomicStore(&state[e].alive[written], 0u);

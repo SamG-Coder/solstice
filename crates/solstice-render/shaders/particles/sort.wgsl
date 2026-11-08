@@ -15,6 +15,7 @@
 @group(0) @binding(3) var<storage, read_write> particles: array<Particle>;
 @group(0) @binding(4) var<storage, read_write> free_list: array<u32>;
 @group(0) @binding(5) var<storage, read_write> alive: array<u32>;
+@group(0) @binding(6) var<storage, read_write> events: array<Event>;
 
 const MOST_SORTED: u32 = 4096u;
 const SORT_LANES: u32 = 256u;

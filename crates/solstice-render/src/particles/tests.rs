@@ -72,7 +72,15 @@ impl Rig {
             }),
         };
         let environment = crate::lighting::environment_layout(&gpu);
-        let particles = Particles::new(&gpu, &frame, capacity, &environment, inputs);
+        let waterline = crate::ocean::waterline::Waterline::new(&gpu);
+        let particles = Particles::new(
+            &gpu,
+            &frame,
+            capacity,
+            &environment,
+            waterline.resolve_layout(),
+            inputs,
+        );
         Some(Self {
             gpu,
             particles,
@@ -275,6 +283,76 @@ fn gpu_trajectories_match_the_reference() {
     let mean_height = emitter.particles.iter().map(|p| p.position[1]).sum::<f32>() / 1500.0;
     assert!(mean_height > 4.0, "{mean_height}");
     eprintln!("worst position error {worst} m");
+}
+
+/// Under every force at once, wind, curl noise, a vortex, attraction and buoyancy, each particle
+/// the GPU moved is where the CPU reference puts it.
+#[test]
+fn forced_trajectories_match_the_reference() {
+    let Some(mut rig) = Rig::new(4096) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter smoke
+          budget 600
+          spawn burst=500
+          shape box 4 1 4
+          offset 0 2 0
+          lifetime 30
+          velocity 0 1 0 cone=40 spread=0.3
+          gravity
+          drag 1.5
+          wind 1
+          curl 2 scale=3 change=0.5
+          vortex 0.6
+          attract 1
+          buoyancy 0.5
+          temperature 600 900
+          cooling 0.3
+        ",
+    )
+    .unwrap();
+    rig.particles.set_air([5.0, -2.0], -1.0);
+    rig.particles
+        .spawn(&effect, Mat4::from_translation(Vec3::new(3.0, 0.0, -2.0)))
+        .unwrap();
+    let mut time = 0.0;
+    let mut ends = Vec::new();
+    for seconds in UNEVEN {
+        rig.frame(seconds);
+        time += seconds;
+        ends.push((seconds, time));
+    }
+    let [emitter] = rig.emitters().try_into().ok().unwrap();
+    assert_eq!(emitter.particles.len(), 500);
+    let air = |time: f32| reference::Air {
+        time,
+        wind: [5.0, -2.0],
+        floor: -1.0,
+    };
+    let mut worst: f32 = 0.0;
+    for p in &emitter.particles {
+        let mut expected = spawn(&emitter.record, p.index);
+        let (first, first_end) = ends[0];
+        reference::step_in(
+            &mut expected,
+            &emitter.record,
+            spawn_elapsed(p.index, 500, first),
+            &air(first_end),
+        );
+        for &(seconds, end) in &ends[1..] {
+            reference::step_in(&mut expected, &emitter.record, seconds, &air(end));
+        }
+        let error = (Vec3::from(p.position) - Vec3::from(expected.position)).length();
+        worst = worst.max(error);
+        assert!(error < 2.0e-3, "particle {} is {error} m off", p.index);
+    }
+    // They really were pushed about: the wind is taking them east, at over a metre a second
+    // already.
+    let mean_east = emitter.particles.iter().map(|p| p.velocity[0]).sum::<f32>() / 500.0;
+    assert!(mean_east > 1.0, "{mean_east}");
+    eprintln!("worst position error under forces {worst} m");
 }
 
 /// Splitting the same span of time differently gives the same particles.
@@ -665,6 +743,13 @@ fn shader_records_match_their_rust_twins() {
             scale,
             temperature_glow,
             phase,
+            wind_curl,
+            buoyancy_attract_vortex,
+            restitution_friction,
+            collide_against,
+            response,
+            event_target,
+            event_spawn,
         ]
     );
     twin!(
@@ -679,7 +764,8 @@ fn shader_records_match_their_rust_twins() {
             size,
             index,
             rotation,
-            temperature
+            temperature,
+            flags
         ]
     );
     twin!(
@@ -697,6 +783,8 @@ fn shader_records_match_their_rust_twins() {
             spawn_start,
             update_start,
             light_start,
+            event_count,
+            events_in,
         ]
     );
     twin!(
@@ -1247,4 +1335,310 @@ fn the_reactive_mask_clears_when_particles_stop() {
         0,
         "the mask is clear once nothing is drawn"
     );
+}
+
+/// A renderer over a floor of `size` metres at height `floor`, optionally with a sea at
+/// `sea_level`, seen from above and in front, for collision tests.
+struct Ground {
+    gpu: Gpu,
+    renderer: crate::Renderer,
+    view: wgpu::TextureView,
+    camera: Camera,
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl Ground {
+    fn new(floor: f32, sea_level: Option<f32>) -> Option<Self> {
+        use solstice_builder::{build_virtual_mesh, paginate, BuildOptions, Mesh, Vertex};
+        let gpu = request_gpu()?;
+        let errors: Arc<Mutex<Vec<String>>> = Default::default();
+        let sink = errors.clone();
+        gpu.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                sink.lock().unwrap().push(error.to_string());
+            }));
+        let mut ground = Mesh::default();
+        for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            ground.vertices.push(Vertex {
+                position: Vec3::new(x * 40.0, floor, z * 40.0),
+                normal: Vec3::Y,
+                uv: glam::Vec2::new(x, z),
+            });
+        }
+        ground.indices = vec![0, 2, 1, 0, 3, 2];
+        let scene = solstice_asset::SceneAsset {
+            meshes: vec![build_virtual_mesh(&ground, &BuildOptions::default())],
+            materials: vec![solstice_asset::Material {
+                base_color: [0.5, 0.5, 0.5, 1.0],
+                flags: solstice_asset::Material::TWO_SIDED,
+                ..Default::default()
+            }],
+            instances: vec![solstice_asset::Instance {
+                mesh: 0,
+                material: 0,
+                transform: Mat4::IDENTITY,
+            }],
+            ..Default::default()
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let settings = crate::RendererSettings {
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        let mut renderer = crate::Renderer::new(&gpu, &paginate(&scene), format, settings);
+        if let Some(level) = sea_level {
+            renderer.set_ocean(Some(crate::Ocean::by_name("coastal").unwrap()), 0.0);
+            renderer.set_sea_level(level);
+        }
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test target"),
+            size: wgpu::Extent3d {
+                width: 128,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        // Above and in front of the origin, looking down at it.
+        let camera = Camera {
+            position: Vec3::new(0.0, floor + 9.0, 9.0),
+            pitch: -std::f32::consts::FRAC_PI_4,
+            ..Default::default()
+        };
+        Some(Self {
+            gpu,
+            renderer,
+            view,
+            camera,
+            errors,
+        })
+    }
+
+    fn frame(&mut self) {
+        self.renderer.render(
+            &self.gpu,
+            &self.camera,
+            &crate::Environment::default(),
+            &self.view,
+            (128, 128),
+            1.0 / 60.0,
+        );
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let errors = self.errors.lock().unwrap();
+        assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    }
+
+    fn read<T: bytemuck::Pod>(&self, buffer: &wgpu::Buffer) -> Vec<T> {
+        let size = buffer.size();
+        let staging = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("collision readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        self.gpu.queue.submit([encoder.finish()]);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let data = staging.slice(..).get_mapped_range().unwrap();
+        bytemuck::pod_collect_to_vec(&data)
+    }
+
+    /// Each live emitter's state and live particles, in slot order.
+    fn emitters(&mut self) -> Vec<(EmitterState, Vec<Particle>)> {
+        let particles = self.renderer.particles();
+        let (state, alive, pool, emitters) = (
+            particles.pool.state.clone(),
+            particles.pool.alive.clone(),
+            particles.pool.particles.clone(),
+            particles.pool.emitters.clone(),
+        );
+        let (capacity, parity, slots) =
+            (particles.pool.capacity, particles.parity, particles.slots);
+        let records: Vec<EmitterRecord> = self.read(&emitters);
+        let states: Vec<EmitterState> = self.read(&state);
+        let lists: Vec<u32> = self.read(&alive);
+        let pool: Vec<Particle> = self.read(&pool);
+        (0..MAX_EMITTERS)
+            .filter(|&s| slots[s])
+            .map(|s| {
+                let start = (parity * capacity + records[s].base) as usize;
+                let count = states[s].alive[parity as usize] as usize;
+                let live = lists[start..start + count]
+                    .iter()
+                    .map(|&slot| pool[slot as usize])
+                    .filter(|p| !reference::is_dead(p))
+                    .collect();
+                (states[s], live)
+            })
+            .collect()
+    }
+}
+
+/// Particles thrown at a floor in view never fall through it, whether they find it by the depth
+/// drawn this frame or by the GI volume's distance field. (Depth alone is blind off screen.)
+#[test]
+fn particles_never_fall_through_the_floor() {
+    for against in ["depth", "field"] {
+        let Some(mut ground) = Ground::new(0.0, None) else {
+            return;
+        };
+        let effect = Effect::parse(&format!(
+            "emitter e\n budget 400\n spawn burst=300\n lifetime 100\n shape box 3 1 3\n offset 0 3 -2\n velocity 0 -2 0 cone=20\n size 0.05\n gravity\n collide {against} bounce restitution=0.3"
+        ))
+        .unwrap();
+        ground
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::IDENTITY)
+            .unwrap();
+        let mut lowest = f32::MAX;
+        for frame in 0..150 {
+            ground.frame();
+            if frame % 10 == 9 {
+                let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+                assert_eq!(live.len(), 300);
+                lowest = live.iter().map(|p| p.position[1]).fold(lowest, f32::min);
+            }
+        }
+        // The field finds the floor to within its voxels, 0.2 m near the camera.
+        let allowed = if against == "field" { -0.2 } else { -0.05 };
+        assert!(lowest > allowed, "{against}: a particle reached {lowest} m");
+    }
+}
+
+/// A particle dropped on the floor rebounds to its restitution squared of the height it fell.
+#[test]
+fn bounces_keep_the_energy_their_restitution_allows() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 100\n size 0.04\n gravity\n collide depth bounce restitution=0.5 friction=0",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0)))
+        .unwrap();
+    let mut heights = Vec::new();
+    for _ in 0..90 {
+        ground.frame();
+        let [(_, live)] = ground.emitters().try_into().ok().unwrap();
+        heights.push(live[0].position[1]);
+    }
+    // After it first comes down, the highest it climbs again.
+    let landed = heights.iter().position(|&y| y < 0.1).expect("it lands");
+    let rebound = heights[landed..].iter().copied().fold(f32::MIN, f32::max);
+    let fall = 2.0 - 0.02;
+    assert!(
+        (rebound - 0.02 - fall * 0.25).abs() < 0.08,
+        "rebounded to {rebound} m from {fall} m"
+    );
+}
+
+/// Drops falling on the sea die where they meet it, each sending its splash: the splash
+/// emitter spawns its count for every drop that hit.
+#[test]
+fn drops_landing_on_the_sea_splash() {
+    let Some(mut ground) = Ground::new(-12.0, Some(0.0)) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter drops
+          budget 200
+          spawn burst=200
+          lifetime 100
+          shape box 4 0.2 4
+          offset 0 3 0
+          size 0.02
+          gravity
+          collide water kill event=splash
+        emitter splash
+          budget 1200
+          spawn event=splash count=3
+          lifetime 100
+          velocity 0 1 0 cone=30
+          size 0.01
+        ",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    let mut deepest = f32::MAX;
+    for _ in 0..90 {
+        ground.frame();
+        let emitters = ground.emitters();
+        deepest = emitters[0]
+            .1
+            .iter()
+            .map(|p| p.position[1])
+            .fold(deepest, f32::min);
+    }
+    let emitters = ground.emitters();
+    let (drops, splash) = (&emitters[0], &emitters[1]);
+    assert!(drops.1.is_empty(), "{} drops still falling", drops.1.len());
+    // No living drop ever went more than a step's fall below the waves.
+    assert!(deepest > -1.0, "a drop reached {deepest} m");
+    assert_eq!(
+        splash.0.spawned,
+        3 * 200,
+        "three splash particles for each drop"
+    );
+    assert_eq!(splash.0.dropped, 0);
+}
+
+/// Sticking particles stay where they landed.
+#[test]
+fn sticking_particles_stay_put() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter flakes\n budget 200\n spawn burst=150\n lifetime 100\n shape box 5 1 5\n offset 0 2 0\n size 0.03\n gravity 3\n collide depth field stick",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..90 {
+        ground.frame();
+    }
+    let [(_, before)] = ground.emitters().try_into().ok().unwrap();
+    assert!(before
+        .iter()
+        .all(|p| p.flags & reference::PARTICLE_STUCK != 0));
+    for _ in 0..20 {
+        ground.frame();
+    }
+    let [(_, after)] = ground.emitters().try_into().ok().unwrap();
+    let place = |ps: &[Particle]| -> HashMap<u32, [f32; 3]> {
+        ps.iter().map(|p| (p.index, p.position)).collect()
+    };
+    assert_eq!(place(&before), place(&after));
+    assert!(after
+        .iter()
+        .all(|p| p.position[1] > -0.25 && p.position[1] < 0.3));
 }
