@@ -30,10 +30,20 @@ struct PassView {
     // Further planes a cluster must lie inside, and how many of them are in use: for a shadow
     // view, the bounds of what it shadows, open towards the light.
     receiver_plane_count: u32,
+    // Which instances the view draws: one of the INSTANCES_ constants.
+    instance_filter: u32,
     receiver_planes: array<vec4f, 6>,
     // Towards the light, for a shadow view.
     eye_light: vec3f,
 }
+
+// Twins of `InstanceFilter` in vg/culling.rs.
+const INSTANCES_ALL: u32 = 0u;
+// Views kept from frame to frame leave out what may move, or they would keep it where it was.
+const INSTANCES_STATIC: u32 = 1u;
+const INSTANCES_MOVABLE: u32 = 2u;
+// The GI voxels: static instances, and movable ones that stay in them.
+const INSTANCES_GI: u32 = 3u;
 
 // Written by the cull passes. Atomic view of `CullStateRead`.
 struct CullState {
@@ -46,8 +56,11 @@ struct CullState {
     sw_base: u32,
     hw_base: u32,
     triangle_count: atomic<u32>,
-    _pad0: u32,
-    _pad1: u32,
+    // Queue entries and clusters that found no room in their lists, and so were lost. Nonzero
+    // means the lists are too small for this view, and the image or shadow has holes.
+    dropped: atomic<u32>,
+    // Entries of the visible list claimed so far, from both ends together.
+    reserved: atomic<u32>,
     _pad2: u32,
 }
 
@@ -62,7 +75,7 @@ struct CullStateRead {
     sw_base: u32,
     hw_base: u32,
     triangle_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    dropped: u32,
+    reserved: u32,
     _pad2: u32,
 }

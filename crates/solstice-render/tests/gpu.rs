@@ -6,7 +6,7 @@ use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
+    Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
     StreamRequest, StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
@@ -1900,4 +1900,685 @@ fn waves_wet_the_faces_they_break_against() {
         washed < dry * 0.85,
         "the side the waves break against is dry: {washed}, against {dry} with no sea near"
     );
+}
+
+/// A red ball, instance 0, standing on a white floor, instance 1.
+fn red_ball_on_floor() -> SceneAsset {
+    let mut scene = ball_on_floor();
+    scene.materials.push(Material {
+        base_color: [0.9, 0.08, 0.06, 1.0],
+        ..Default::default()
+    });
+    scene.instances[0].material = 1;
+    scene
+}
+
+/// A renderer drawing into a test target, frame by frame, between which a test can change the
+/// scene. It fails on any validation error.
+struct Stage {
+    renderer: Renderer,
+    target: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: u32,
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl Stage {
+    fn new(gpu: &Gpu, scene: &SceneAsset, settings: RendererSettings, size: u32) -> Self {
+        let errors: Arc<Mutex<Vec<String>>> = Default::default();
+        let sink = errors.clone();
+        gpu.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                sink.lock().unwrap().push(error.to_string());
+            }));
+        let target = test_target(gpu, size);
+        let view = target.create_view(&Default::default());
+        Self {
+            renderer: Renderer::new(gpu, &paginate(scene), FORMAT, settings),
+            target,
+            view,
+            size,
+            errors,
+        }
+    }
+
+    fn frames(&mut self, gpu: &Gpu, camera: &Camera, environment: &Environment, count: u32) {
+        for _ in 0..count {
+            self.renderer.render(
+                gpu,
+                camera,
+                environment,
+                &self.view,
+                (self.size, self.size),
+                1.0 / 60.0,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+    }
+
+    fn pixels(&self, gpu: &Gpu) -> Vec<u8> {
+        let pixels = read_pixels(gpu, &self.target, self.size);
+        let errors = self.errors.lock().unwrap();
+        assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+        pixels
+    }
+}
+
+/// The pixel a point in the world lands on, seen by `camera` in a square image.
+fn pixel_of(camera: &Camera, size: u32, world: Vec3) -> (u32, u32) {
+    let ndc = (camera.projection(1.0) * camera.view()).project_point3(world);
+    let x = ((ndc.x * 0.5 + 0.5) * size as f32) as u32;
+    let y = ((0.5 - ndc.y * 0.5) * size as f32) as u32;
+    (x.min(size - 1), y.min(size - 1))
+}
+
+/// Looking down at the floor around the origin from above and in front.
+fn over_the_floor() -> Camera {
+    Camera {
+        position: Vec3::new(1.5, 11.0, 11.0),
+        pitch: -std::f32::consts::FRAC_PI_4,
+        ..Default::default()
+    }
+}
+
+/// A sun 45 degrees up in the +X direction, so a ball's shadow falls on the floor to its -X
+/// side: centred 1 m from its foot, from 2.4 m to 0.6 m beyond it, as seen from above.
+fn low_sun() -> Environment {
+    Environment {
+        sun_direction: Vec3::new(1.0, 1.0, 0.0).normalize(),
+        ..Default::default()
+    }
+}
+
+/// The ball at `x` along the floor, `scale` times its size, standing on the floor.
+fn place_scaled(x: f32, scale: f32) -> Mat4 {
+    Mat4::from_scale_rotation_translation(
+        Vec3::splat(scale),
+        glam::Quat::IDENTITY,
+        Vec3::new(x, scale, 0.0),
+    )
+}
+
+fn place(x: f32) -> Mat4 {
+    place_scaled(x, 1.0)
+}
+
+/// Settings for tests that look at a frame or two after a change: no temporal accumulation,
+/// which would blend old frames in and hide a late change.
+fn untemporal() -> RendererSettings {
+    RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    }
+}
+
+/// The ball and the light on the floor its shadow falls on, seen by a camera `scale` times as
+/// far away as [`over_the_floor`], with the ball `scale` times as large.
+struct ShadowProbe {
+    camera: Camera,
+    size: u32,
+    scale: f32,
+}
+
+impl ShadowProbe {
+    fn new(scale: f32, size: u32) -> Self {
+        let mut camera = over_the_floor();
+        camera.position *= scale;
+        Self {
+            camera,
+            size,
+            scale,
+        }
+    }
+
+    /// Light on the floor where the shadow of a ball at `x` falls, against open floor.
+    fn shade(&self, pixels: &[u8], x: f32) -> f32 {
+        let at = |p: Vec3| {
+            let (px, py) = pixel_of(&self.camera, self.size, p * self.scale);
+            brightness(patch(pixels, self.size, px, py, 1))
+        };
+        at(Vec3::new(x - 1.6, 0.0, 0.0)) / at(Vec3::new(-4.0, 0.0, 3.0))
+    }
+
+    /// Whether the ball is drawn at `x`.
+    fn red(&self, pixels: &[u8], x: f32) -> bool {
+        let (px, py) = pixel_of(&self.camera, self.size, Vec3::new(x, 1.0, 0.0) * self.scale);
+        let [r, g, _] = patch(pixels, self.size, px, py, 1);
+        r > 2.0 * g
+    }
+}
+
+/// Moves a ball twice, `scale` times as large and seen from `scale` times as far, and checks
+/// that it is drawn where it went with its shadow, and that no shadow is left behind.
+fn check_moving_shadows(scale: f32) {
+    let Some(gpu) = request_gpu() else { return };
+    let probe = ShadowProbe::new(scale, 192);
+    let sun = low_sun();
+    let mut scene = red_ball_on_floor();
+    scene.instances[0].transform = place_scaled(0.0, scale);
+    let mut stage = Stage::new(&gpu, &scene, untemporal(), probe.size);
+
+    stage.frames(&gpu, &probe.camera, &sun, 8);
+    let pixels = stage.pixels(&gpu);
+    assert!(probe.red(&pixels, 0.0), "the ball isn't where it stands");
+    assert!(
+        probe.shade(&pixels, 0.0) < 0.6,
+        "the standing ball casts no shadow"
+    );
+
+    for (from, to) in [(0.0, 3.0), (3.0, 6.0)] {
+        assert!(stage
+            .renderer
+            .move_instance(0, place_scaled(to * scale, scale)));
+        // Two frames: the first draws the move, and by the second every cached cascade must
+        // have caught up, not just the near one.
+        stage.frames(&gpu, &probe.camera, &sun, 2);
+        let pixels = stage.pixels(&gpu);
+        assert!(probe.red(&pixels, to), "the ball isn't drawn at {to}");
+        assert!(
+            !probe.red(&pixels, from),
+            "the ball is still drawn at {from}"
+        );
+        let (new, old) = (probe.shade(&pixels, to), probe.shade(&pixels, from));
+        assert!(
+            new < 0.6,
+            "the ball moved to {to} casts no shadow there: {new}"
+        );
+        assert!(old > 0.85, "a shadow is left behind at {from}: {old}");
+    }
+
+    // Static again where it stands: its shadow comes back from the cached cascades, at once.
+    assert!(stage.renderer.set_instance_movable(0, false));
+    stage.frames(&gpu, &probe.camera, &sun, 2);
+    let shade = probe.shade(&stage.pixels(&gpu), 6.0);
+    assert!(
+        shade < 0.6,
+        "the ball made static again lost its shadow: {shade}"
+    );
+}
+
+/// The near cascades, about 15 m away.
+#[test]
+fn a_moved_ball_is_drawn_where_it_went_with_its_shadow_and_none_is_left_behind() {
+    check_moving_shadows(1.0);
+}
+
+/// The same, six times as large and far: about 90 m away, in the far cascades, which have the
+/// lower row of the movable layer.
+#[test]
+fn a_distant_moved_ball_casts_its_shadow_from_the_far_cascades() {
+    check_moving_shadows(6.0);
+}
+
+#[test]
+fn moving_things_show_their_motion_and_stop_showing_it_when_they_stop() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 128;
+    let camera = over_the_floor();
+    let settings = RendererSettings {
+        debug_view: DebugView::Motion,
+        ..untemporal()
+    };
+    let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    let environment = low_sun();
+
+    // Red over green, at the ball's centre and on the floor beside it.
+    let colours = |pixels: &[u8], x: f32| {
+        let (bx, by) = pixel_of(&camera, size, Vec3::new(x, 1.0, 0.0));
+        let (fx, fy) = pixel_of(&camera, size, Vec3::new(-4.0, 0.0, 3.0));
+        (
+            patch(pixels, size, bx, by, 1),
+            patch(pixels, size, fx, fy, 1),
+        )
+    };
+
+    stage.frames(&gpu, &camera, &environment, 4);
+    let mut x = 0.0;
+    for _ in 0..6 {
+        x += 0.1;
+        stage.renderer.move_instance(0, place(x));
+        stage.frames(&gpu, &camera, &environment, 1);
+    }
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        ball[0] > floor[0] + 30.0,
+        "the ball moving right shows no motion to the right: {ball:?} against {floor:?}"
+    );
+    assert!(
+        (ball[1] - floor[1]).abs() < 15.0,
+        "the ball moving across the screen shows motion up or down: {ball:?} against {floor:?}"
+    );
+
+    // Still from here on: the very next frame must show no motion.
+    stage.frames(&gpu, &camera, &environment, 1);
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        (ball[0] - floor[0]).abs() < 10.0,
+        "the ball still shows motion after it stopped: {ball:?} against {floor:?}"
+    );
+
+    // A jump shows no motion at all, even a long one.
+    x += 2.0;
+    stage.renderer.place_instance(0, place(x));
+    stage.frames(&gpu, &camera, &environment, 1);
+    let (ball, floor) = colours(&stage.pixels(&gpu), x);
+    assert!(
+        (ball[0] - floor[0]).abs() < 10.0,
+        "the ball that jumped shows motion: {ball:?} against {floor:?}"
+    );
+}
+
+#[test]
+fn a_hidden_ball_is_not_drawn_and_casts_no_shadow() {
+    let Some(gpu) = request_gpu() else { return };
+    let probe = ShadowProbe::new(1.0, 128);
+    let sun = low_sun();
+    let mut stage = Stage::new(&gpu, &red_ball_on_floor(), untemporal(), probe.size);
+    stage.frames(&gpu, &probe.camera, &sun, 6);
+    // Hidden while static, then while movable, after the movable layer has drawn it.
+    for movable in [false, true] {
+        assert!(stage.renderer.set_instance_movable(0, movable));
+        stage.frames(&gpu, &probe.camera, &sun, 3);
+        assert!(
+            probe.shade(&stage.pixels(&gpu), 0.0) < 0.6,
+            "no shadow, movable {movable}"
+        );
+        assert!(stage.renderer.set_instance_hidden(0, true));
+        stage.frames(&gpu, &probe.camera, &sun, 2);
+        let pixels = stage.pixels(&gpu);
+        assert!(
+            !probe.red(&pixels, 0.0),
+            "the hidden ball is drawn, movable {movable}"
+        );
+        let shade = probe.shade(&pixels, 0.0);
+        assert!(
+            shade > 0.85,
+            "the hidden ball casts a shadow, movable {movable}: {shade}"
+        );
+        assert!(stage.renderer.set_instance_hidden(0, false));
+    }
+}
+
+#[test]
+fn a_lamp_put_out_stops_glowing() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 96;
+    let mut scene = red_ball_on_floor();
+    // Far brighter than the sunlit floor.
+    scene.materials[1].emissive = [60.0, 45.0, 15.0];
+    let camera = over_the_floor();
+    let sun = low_sun();
+    let mut stage = Stage::new(&gpu, &scene, RendererSettings::default(), size);
+    let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
+    let green_at = |pixels: &[u8]| patch(pixels, size, bx, by, 1)[1];
+    stage.frames(&gpu, &camera, &sun, 20);
+    let lit = green_at(&stage.pixels(&gpu));
+    assert!(stage.renderer.set_instance_glow(0, 0.0));
+    stage.frames(&gpu, &camera, &sun, 20);
+    let out = green_at(&stage.pixels(&gpu));
+    // Unlit, the red ball has little green; glowing, the lamp's yellow light has plenty.
+    assert!(lit > 150.0, "the lamp doesn't glow: {lit}");
+    assert!(
+        out < lit * 0.5,
+        "the lamp put out still glows: {out} against {lit}"
+    );
+}
+
+#[test]
+fn instances_without_geometry_are_refused() {
+    let Some(gpu) = request_gpu() else { return };
+    let mut scene = red_ball_on_floor();
+    // A third instance of a mesh with nothing in it.
+    scene.meshes.push(build_virtual_mesh(
+        &Mesh::default(),
+        &BuildOptions::default(),
+    ));
+    scene.instances.push(instance(2, Mat4::IDENTITY));
+    let renderer = &mut Stage::new(&gpu, &scene, RendererSettings::default(), 16).renderer;
+    assert_eq!(renderer.instance_count(), 3);
+    assert!(!renderer.move_instance(2, Mat4::IDENTITY));
+    assert!(!renderer.move_instance(3, Mat4::IDENTITY));
+    assert!(renderer.move_instance(1, Mat4::IDENTITY));
+    // The ball's mesh is bounded by its clusters' spheres, so its bounds are near the unit
+    // sphere around (0, 1, 0), and hold it.
+    let (center, radius) = renderer.instance_bounds(0).unwrap();
+    assert!(center.distance(Vec3::Y) < 0.3 && radius >= 1.0 - center.distance(Vec3::Y));
+}
+
+#[test]
+fn a_movable_ball_is_in_the_gi_voxels_only_if_it_stays_in_them() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 96;
+    let camera = over_the_floor();
+    let settings = RendererSettings {
+        debug_view: DebugView::Voxels,
+        ..Default::default()
+    };
+    let (bx, by) = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
+    // How red the voxels look where the ball stands.
+    let redness = |stage: &Stage| {
+        let [r, g, _] = patch(&stage.pixels(&gpu), size, bx, by, 1);
+        r / g.max(1.0)
+    };
+    let mut stage = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    stage.renderer.set_instance_movable(0, true);
+    stage.renderer.set_instance_stays_in_gi(0, true);
+    stage.frames(&gpu, &camera, &low_sun(), 12);
+    let kept = redness(&stage);
+    assert!(
+        kept > 2.0,
+        "the ball that stays in GI isn't in the voxels: {kept}"
+    );
+
+    // Hidden, it must leave the voxels too, once they have been rebuilt.
+    stage.renderer.set_instance_hidden(0, true);
+    stage.frames(&gpu, &camera, &low_sun(), 40);
+    let hidden = redness(&stage);
+    assert!(
+        hidden < 1.3,
+        "the hidden ball is still in the voxels: {hidden}"
+    );
+
+    // Shown again, but left out of GI.
+    stage.renderer.set_instance_hidden(0, false);
+    stage.renderer.set_instance_stays_in_gi(0, false);
+    stage.frames(&gpu, &camera, &low_sun(), 40);
+    let left_out = redness(&stage);
+    assert!(
+        left_out < 1.3,
+        "the movable ball is in the voxels: {left_out}"
+    );
+}
+
+/// A wall of grey `albedo`, glowing as brightly, facing the camera 10 m in front of it along -Z.
+fn wall(albedo: f32) -> SceneAsset {
+    let mut wall = Mesh::default();
+    for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        wall.vertices.push(Vertex {
+            position: Vec3::new(x * 60.0, y * 60.0, -10.0),
+            normal: Vec3::Z,
+            uv: Vec2::new(x, y),
+        });
+    }
+    wall.indices = vec![0, 1, 2, 0, 2, 3];
+    SceneAsset {
+        meshes: vec![build_virtual_mesh(&wall, &BuildOptions::default())],
+        materials: vec![Material {
+            base_color: [albedo, albedo, albedo, 1.0],
+            // It glows as bright as it is pale, so views that light it show it in the dark.
+            emissive: [albedo; 3],
+            flags: Material::TWO_SIDED,
+            ..Default::default()
+        }],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    }
+}
+
+/// `count` still white particles of radius 3 m in one place, fading over `soft` metres: large
+/// enough on screen that the resolve filter does not soften their middles.
+fn still_particles(count: u32, soft: f32) -> Effect {
+    Effect::parse(&format!(
+        "emitter e\n budget {count}\n spawn burst={count}\n lifetime 1000\n size 3\n color 1 1 1 1\n render sprite soft={soft}"
+    ))
+    .unwrap()
+}
+
+/// Renders a wall of `albedo` with the particles of `effect`, if any, at `at`, in a debug view
+/// that shows the scene's colour as it is, with no exposure or history, and reads back the image.
+#[allow(clippy::too_many_arguments)]
+fn render_particles(
+    gpu: &Gpu,
+    albedo: f32,
+    effect: Option<&Effect>,
+    at: Vec3,
+    debug: DebugView,
+    sea_level: Option<f32>,
+    size: u32,
+) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let settings = RendererSettings {
+        debug_view: debug,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(gpu, &paginate(&wall(albedo)), FORMAT, settings);
+    if let Some(level) = sea_level {
+        renderer.set_ocean(Some(Ocean::by_name("coastal").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+    }
+    if let Some(effect) = effect {
+        renderer
+            .particles()
+            .spawn(effect, Mat4::from_translation(at))
+            .expect("room for the effect");
+    }
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+    for _ in 0..4 {
+        renderer.render(gpu, &camera, &darkness(), &view, (size, size), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, size);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    pixels
+}
+
+fn srgb_to_linear(byte: f32) -> f32 {
+    let c = byte / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// A particle fades by how far it stands in front of the surface behind it, over its soft
+/// distance: nearly gone just in front of the wall, a quarter at a quarter of the distance, whole
+/// beyond it, and hidden behind it.
+#[test]
+fn particles_fade_softly_into_the_surface_behind_them() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let centre = |z: f32, soft: f32| {
+        let pixels = render_particles(
+            &gpu,
+            0.0,
+            Some(&still_particles(1, soft)),
+            Vec3::new(0.0, 0.0, z),
+            DebugView::Albedo,
+            None,
+            size,
+        );
+        srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0])
+    };
+    let (touching, quarter, clear) = (centre(-9.97, 1.0), centre(-9.75, 1.0), centre(-8.0, 1.0));
+    assert!(touching < 0.06, "touching the wall: {touching}");
+    assert!(
+        (quarter - 0.25).abs() < 0.05,
+        "a quarter of the way out: {quarter}"
+    );
+    assert!(clear > 0.95, "well clear of it: {clear}");
+    // Without a fade, just in front of the wall it shows whole, and behind it the depth test
+    // alone hides it.
+    assert!(centre(-9.97, 0.0) > 0.95);
+    assert_eq!(centre(-10.5, 0.0), 0.0, "behind the wall");
+}
+
+/// The overdraw view counts layers of particles: more layers, hotter.
+#[test]
+fn the_overdraw_view_counts_layers() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let red = |count| {
+        let pixels = render_particles(
+            &gpu,
+            0.0,
+            Some(&still_particles(count, 0.0)),
+            Vec3::new(0.0, 0.0, -9.0),
+            DebugView::Particles,
+            None,
+            size,
+        );
+        // Away from the sprite there is nothing at all.
+        assert_eq!(brightness(patch(&pixels, size, 2, 2, 1)), 0.0);
+        srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0])
+    };
+    let (one, two) = (red(1), red(2));
+    assert!((one - 0.25).abs() < 0.02, "{one}");
+    assert!((two - 0.5).abs() < 0.03, "{two}");
+}
+
+/// Over the sea, particles are drawn into the colour post reads, the water's, so they show.
+#[test]
+fn particles_show_over_the_sea() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let pixels = render_particles(
+        &gpu,
+        0.0,
+        Some(&still_particles(1, 0.0)),
+        Vec3::new(0.0, 0.0, -5.0),
+        DebugView::Particles,
+        Some(-1.0),
+        size,
+    );
+    let one = srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0]);
+    assert!((one - 0.25).abs() < 0.02, "{one}");
+}
+
+/// The fountain runs at every quality, in the lit view, with no GPU errors, and its particles
+/// are counted, fewer on lower qualities.
+#[test]
+fn the_fountain_runs_at_every_quality() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let mut alive = Vec::new();
+    for quality in [Quality::Low, Quality::Medium, Quality::High] {
+        let errors: Arc<Mutex<Vec<String>>> = Default::default();
+        let sink = errors.clone();
+        gpu.device
+            .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+                sink.lock().unwrap().push(error.to_string());
+            }));
+        let mut settings = RendererSettings::default();
+        settings.apply_quality(quality);
+        let mut renderer = Renderer::new(&gpu, &paginate(&ball_on_floor()), FORMAT, settings);
+        let fountain = renderer
+            .particles()
+            .spawn(
+                &Effect::by_name("fountain").unwrap(),
+                Mat4::from_translation(Vec3::new(0.0, 0.0, -4.0)),
+            )
+            .unwrap();
+        assert!(renderer.particles().set(fountain, "strength", 0.5));
+        let target = test_target(&gpu, 64);
+        let view = target.create_view(&Default::default());
+        let camera = Camera {
+            position: Vec3::new(0.0, 1.5, 4.0),
+            ..Default::default()
+        };
+        for _ in 0..40 {
+            renderer.render(
+                &gpu,
+                &camera,
+                &Environment::default(),
+                &view,
+                (64, 64),
+                1.0 / 60.0,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        let stats = renderer.stats().particles;
+        assert_eq!(stats.emitters, 2);
+        assert!(stats.alive > 50, "{quality:?}: {stats:?}");
+        assert_eq!(stats.dropped, 0);
+        alive.push(stats.alive);
+        let errors = errors.lock().unwrap();
+        assert!(errors.is_empty(), "{quality:?}: {}", errors.join("\n"));
+    }
+    assert!(alive[0] < alive[1] && alive[1] < alive[2], "{alive:?}");
+}
+
+/// Additive particles add their light and hide nothing; alpha ones cover what is behind.
+#[test]
+fn additive_particles_add_light_and_alpha_particles_cover() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let centre = |blend: &str, z: f32| {
+        let effect = Effect::parse(&format!(
+            "emitter e
+ budget 1
+ spawn burst=1
+ lifetime 1000
+ size 3
+ color 0.25 0.25 0.25 1
+ render sprite soft=0 blend={blend}"
+        ))
+        .unwrap();
+        let pixels = render_particles(
+            &gpu,
+            0.5,
+            Some(&effect),
+            Vec3::new(0.0, 0.0, z),
+            DebugView::Albedo,
+            None,
+            size,
+        );
+        srgb_to_linear(patch(&pixels, size, size / 2, size / 2, 0)[0])
+    };
+    // Behind the wall, the wall alone.
+    let wall = centre("alpha", -11.0);
+    let covered = centre("alpha", -8.0);
+    let added = centre("add", -8.0);
+    assert!(wall > 0.3, "{wall}");
+    assert!((covered - 0.25).abs() < 0.03, "covered: {covered}");
+    assert!(
+        (added - (wall + 0.25)).abs() < 0.04,
+        "added: {added} over {wall}"
+    );
+}
+
+/// With nothing running, the overdraw view is black rather than the scene.
+#[test]
+fn the_overdraw_view_is_black_with_no_particles() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let pixels = render_particles(
+        &gpu,
+        0.8,
+        None,
+        Vec3::ZERO,
+        DebugView::Particles,
+        None,
+        size,
+    );
+    assert_eq!(brightness(patch(&pixels, size, size / 2, size / 2, 4)), 0.0);
 }

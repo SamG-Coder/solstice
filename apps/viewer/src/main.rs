@@ -21,9 +21,10 @@ mod native {
     use solstice_asset::scene::Viewpoint;
     use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
+        Camera, DebugView, Effect, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
         StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
+    use solstice_viewer::bob::Bobbing;
     use solstice_viewer::{
         default_environment, initial_camera, parse_time, CameraInput, DayClock, FlyCamera,
     };
@@ -158,6 +159,7 @@ mod native {
             if let Some(level) = options.sea_level {
                 renderer.set_sea_level(level);
             }
+            spawn_effects(&mut renderer, options);
             (renderer, reader)
         }
     }
@@ -193,6 +195,28 @@ mod native {
         /// their own bring both.
         ocean: Option<Ocean>,
         sea_level: Option<f32>,
+        /// Particle effects to run, by name or file, and where.
+        effects: Vec<(Effect, Vec3)>,
+        /// Instances to rock as if afloat: those centred within a radius of a point across the
+        /// ground, as x, z, radius, the height they rock about, and how far they rock.
+        bob: Option<[f32; 5]>,
+    }
+
+    /// Starts the effects the options name.
+    fn spawn_effects(renderer: &mut Renderer, options: &Options) {
+        for (effect, at) in &options.effects {
+            renderer
+                .particles()
+                .spawn(effect, glam::Mat4::from_translation(*at));
+        }
+    }
+
+    /// Makes the instances `--bob` names movable, ready to rock.
+    fn bobbing(options: &Options, renderer: &mut Renderer) -> Option<Bobbing> {
+        let [x, z, radius, height, amplitude] = options.bob?;
+        let bobbing = Bobbing::around(renderer, [x, z], radius, height, amplitude);
+        log::info!("{} instances bob around ({x}, {z})", bobbing.len());
+        Some(bobbing)
     }
 
     /// The light for the next frame, `seconds` after the last: the clock's, moving on, or the
@@ -225,6 +249,8 @@ mod native {
             ocean: None,
             sea_level: None,
             clock: None,
+            effects: Vec::new(),
+            bob: None,
         };
         // The time of day, built up from its options and made at the end.
         let (mut time, mut day_seconds, mut latitude) = (None, 0.0, None);
@@ -305,6 +331,34 @@ mod native {
                         }
                     });
                 }
+                "--effect" => {
+                    // NAME or FILE, then optionally @x,y,z for where it stands.
+                    let text = value()?;
+                    let (name, at) = match text.split_once('@') {
+                        Some((name, at)) => {
+                            let at = floats(at)?;
+                            let [x, y, z] = at[..] else {
+                                return Err("--effect expects NAME@x,y,z".into());
+                            };
+                            (name.to_owned(), Vec3::new(x, y, z))
+                        }
+                        None => (text, Vec3::ZERO),
+                    };
+                    let effect = match Effect::by_name(&name) {
+                        Some(effect) => effect,
+                        None => {
+                            let text = std::fs::read_to_string(&name).map_err(|e| {
+                                let names: Vec<_> = Effect::names().collect();
+                                format!(
+                                    "--effect: {name} is neither {} nor a file: {e}",
+                                    names.join(", ")
+                                )
+                            })?;
+                            Effect::parse(&text).map_err(|e| format!("{name}: {e}"))?
+                        }
+                    };
+                    options.effects.push((effect, at));
+                }
                 "--sea-level" => {
                     options.sea_level =
                         Some(value()?.parse().map_err(|e| format!("--sea-level: {e}"))?);
@@ -324,6 +378,15 @@ mod native {
                             Weather::parse(&text).map_err(|e| format!("{name}: {e}"))?
                         }
                     };
+                }
+                "--bob" => {
+                    let v = floats(&value()?)?;
+                    options.bob = Some(match v[..] {
+                        [x, z, radius] => [x, z, radius, 0.0, 1.0],
+                        [x, z, radius, height] => [x, z, radius, height, 1.0],
+                        [x, z, radius, height, amplitude] => [x, z, radius, height, amplitude],
+                        _ => return Err("--bob expects x,z,radius[,height[,amplitude]]".into()),
+                    });
                 }
                 "--stream" => options.stream = true,
                 "--geometry-budget-mb" => {
@@ -448,6 +511,7 @@ mod native {
         let start = Instant::now();
         let (mut renderer, mut reader) = scene.renderer(&gpu, CAPTURE_FORMAT, options);
         log::info!("renderer created in {:.2}s", start.elapsed().as_secs_f32());
+        let mut bob = bobbing(options, &mut renderer);
 
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
@@ -481,6 +545,9 @@ mod native {
                 reader.pump(&mut renderer);
             }
             let environment = light(&mut clock, options.environment, 1.0 / 60.0);
+            if let Some(bob) = &mut bob {
+                bob.advance(&mut renderer, 1.0 / 60.0);
+            }
             renderer.render(&gpu, &camera, &environment, &view, options.size, 1.0 / 60.0);
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             if frame > 10 {
@@ -526,10 +593,28 @@ mod native {
             stats.unique_triangles,
             stats.instances,
         );
+        if stats.particles.emitters > 0 {
+            let particles = stats.particles;
+            println!(
+                "particles: {} alive in {} emitters, {} of {} slots reserved, {} spawned, {} dropped",
+                particles.alive,
+                particles.emitters,
+                particles.reserved,
+                particles.capacity,
+                particles.spawned,
+                particles.dropped,
+            );
+        }
         println!(
             "last shadow cascade: {} clusters, {} triangles",
             stats.shadow_clusters, stats.shadow_triangles
         );
+        if stats.dropped > 0 || stats.shadow_dropped > 0 {
+            println!(
+                "WARNING: the cull lists overflowed: {} dropped in the main view, {} in the last shadow cascade redrawn",
+                stats.dropped, stats.shadow_dropped
+            );
+        }
 
         if let Some(times) = renderer.section_times() {
             let parts: Vec<String> = solstice_render::profiler::SECTIONS
@@ -639,6 +724,7 @@ mod native {
         if let Some(level) = options.sea_level {
             renderer.set_sea_level(level);
         }
+        spawn_effects(&mut renderer, options);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),
             size: wgpu::Extent3d {
@@ -661,6 +747,7 @@ mod native {
         let mut previous_grid: Option<Vec<f32>> = None;
         let mut changes: Vec<(f32, GridChange)> = Vec::new();
         let mut clock = options.clock;
+        let (mut dropped, mut shadow_dropped) = (0, 0);
         for frame in 0..=frames {
             let time = frame as f32 * STEP;
             let start = Instant::now();
@@ -676,7 +763,10 @@ mod native {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             let elapsed = start.elapsed().as_secs_f32() * 1000.0;
             let sections = renderer.section_times().unwrap_or_default();
-            records.push((time, elapsed, renderer.stats().triangles, sections));
+            let stats = renderer.stats();
+            records.push((time, elapsed, stats.triangles, sections));
+            dropped = dropped.max(stats.dropped);
+            shadow_dropped = shadow_dropped.max(stats.shadow_dropped);
             if options.stability {
                 let pixels = read_pixels(&gpu, &target, options.size)?;
                 let grid = luma_grid(&pixels, options.size);
@@ -743,6 +833,11 @@ mod native {
             report_stability(&changes);
         }
 
+        if dropped > 0 || shadow_dropped > 0 {
+            println!(
+                "WARNING: the cull lists overflowed: up to {dropped} dropped in the main view, {shadow_dropped} in the last shadow cascade redrawn each frame"
+            );
+        }
         let errors = errors.lock().expect("error sink");
         if errors.is_empty() {
             println!("no GPU errors");
@@ -907,6 +1002,7 @@ mod native {
         renderer: Renderer,
         reader: Option<PageReader>,
         camera: FlyCamera,
+        bob: Option<Bobbing>,
         last_frame: Instant,
         title_timer: f32,
         frames_since_title: u32,
@@ -951,8 +1047,10 @@ mod native {
             config.present_mode = wgpu::PresentMode::AutoVsync;
             surface.configure(&gpu.device, &config);
 
-            let (renderer, reader) = self.scene.renderer(&gpu, config.format, &self.options);
+            let (mut renderer, reader) = self.scene.renderer(&gpu, config.format, &self.options);
+            let bob = bobbing(&self.options, &mut renderer);
             Ok(WindowState {
+                bob,
                 reader,
                 window,
                 surface,
@@ -994,6 +1092,9 @@ mod native {
             let delta = (now - state.last_frame).as_secs_f32();
             state.last_frame = now;
             let environment = light(clock, fixed, delta);
+            if let Some(bob) = &mut state.bob {
+                bob.advance(&mut state.renderer, delta);
+            }
             state.camera.update(
                 &CameraInput {
                     forward,

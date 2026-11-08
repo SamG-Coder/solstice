@@ -596,9 +596,19 @@ rasterizers, the visibility buffer and resolve. They do not get a separate path.
     cascades' cache, the seabed map and GI voxelisation) skips flagged instances, so none of them
     keeps a ghost of something at its old place.
   - *Shadows.* The cached cascades keep only static geometry. Moving instances are drawn each
-    frame into a small depth map of their own for each cascade they touch, and the shadow test
-    takes the nearer of the two. Nothing is copied: copying all four 2048² cascades each frame
-    would move about 128 MB, too much for integrated GPUs.
+    frame into a map of their own for each cascade they touch, and shading multiplies the light
+    the two let through. Nothing is copied: copying all four 2048² cascades each frame would move
+    about 128 MB, too much for integrated GPUs.
+    - As built (step 1): the four moving maps share one more layer of the cascades' array, a
+      quarter each, at half their resolution. The shaders that sample shadows already use
+      WebGPU's limit of 16 textures, so a new texture was not an option, and one layer costs
+      16 MiB rather than four layers' 64 MiB.
+    - A cascade with nothing movable in it draws nothing more and is sampled once, as before.
+    - The layer costs 16 MiB even in a scene with nothing movable: an array's layers can't be
+      added later without making it again.
+    - Cost: 0.45 ms on the RTX 5080 with the cove's ship moving in all four cascades, nearly all
+      of it one culling pass per cascade. Culling once for all four is left to the stress-test
+      work.
   - *GI voxels.* Moving things are left out at first. They receive GI and appear in screen-space
     GI, but don't occlude or bounce light in the voxels.
   - *Wetness.* The water-line map draws no geometry, and needs nothing. But its wetness belongs
@@ -686,13 +696,16 @@ Each step is its own PR, with mutation-tested tests, measured costs (natively an
 clippy clean on native and wasm32, and a review by a separate AI agent. It is merged only with
 your go-ahead, and nothing is published without asking.
 
-1. **Things that move.** The renderer API for moving instances, with `prev_world` set to the
-   transform each was drawn with last frame; hiding instances and scaling their glow; the moving
-   flag, with moving instances left out of the cached shadows, the seabed map and the GI voxels,
-   and drawn into per-cascade shadow maps of their own.
-   - Demo: the cove's ship bobs at anchor, driven by plain Rust for now. Its hull then leaves the
-     GI voxels, so the step checks that the cove's indirect light doesn't visibly change. If it
-     does, a bobbing ship keeps a voxel copy at its mean position.
+1. **Things that move.** *In review.* The renderer API for moving instances, with `prev_world`
+   set to the transform each was drawn with last frame; hiding instances and scaling their glow;
+   the moving flag, with moving instances left out of the cached shadows, the seabed map and the
+   GI voxels, and drawn into per-cascade shadow maps of their own.
+   - Demo: the cove's ship bobs at anchor, driven by plain Rust for now (`viewer --bob`).
+   - Checked, and decided: with its hull out of the GI voxels, the water around the ship stopped
+     reflecting it, and the image moved by 4.5 levels in 255 on average. So an instance can now
+     *stay in GI* while movable, held where it stood when the voxels were last drawn: right for
+     things that move only a little, such as a ship at anchor. With it, the difference from a
+     static ship is 0.4 levels in 255. The demo uses it; a character walking about would not.
    - Tests: a moved instance's motion vectors and shadow follow it; cached shadows of static
      geometry stay as they were; nothing static is redrawn; nothing moving is left behind in a
      cache.

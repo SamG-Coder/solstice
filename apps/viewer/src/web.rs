@@ -6,8 +6,8 @@ use crate::{initial_camera, CameraInput, DayClock, FlyCamera, DEFAULT_DAY_SECOND
 use glam::Vec3;
 use solstice_asset::file;
 use solstice_render::{
-    DebugView, Gpu, Observation, Quality, Renderer, RendererSettings, StreamingBudget, TimeOfDay,
-    Weather,
+    DebugView, Effect, Gpu, Observation, Quality, Renderer, RendererSettings, StreamingBudget,
+    TimeOfDay, Weather,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -365,6 +365,21 @@ impl WebViewer {
     /// How the scene's textures are held on the GPU.
     pub fn texture_summary(&self) -> String {
         self.renderer.texture_summary().to_owned()
+    }
+
+    /// Starts a built-in particle effect by name, standing at (x, y, z). Returns false if there
+    /// is no such effect or no room for it.
+    pub fn spawn_effect(&mut self, name: &str, x: f32, y: f32, z: f32) -> bool {
+        let Some(effect) = Effect::by_name(name) else {
+            return false;
+        };
+        let at = glam::Mat4::from_translation(Vec3::new(x, y, z));
+        self.renderer.particles().spawn(&effect, at).is_some()
+    }
+
+    /// Particles alive, from a recent frame.
+    pub fn particles_alive(&self) -> u32 {
+        self.renderer.stats().particles.alive
     }
 
     pub fn gpu_error_count(&self) -> u32 {
