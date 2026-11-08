@@ -786,9 +786,11 @@ def on_hour(self, hour):
 - **Input** (`.input` files, or built-in actions). An action's value is the sum of its
   controls, times their scales.
   - Buttons and sticks add up to between -1 and 1.
-  - Movement (the mouse, and dragging on the screen) is in pixels a second. That keeps
-    `self.yaw += input("turn") * dt` right however the frames and steps fall.
-  - Sticks have a dead zone.
+  - Movement (the mouse, and dragging on the screen) is in pixels a second. It builds up until
+    a step uses it, over the time since the step before. So `self.yaw += input("turn") * dt`
+    turns as far at 144 frames a second, where most frames run no step, as at 60. Looking up
+    and down follows it every frame.
+  - Sticks have a dead zone, and press their action pushed either way.
   - A tap presses its action without holding it.
 - **Play mode** (`Play`) runs the frame, then says which instances moved and where the
   player's eye is.
@@ -798,12 +800,18 @@ def on_hour(self, hour):
 - **Viewers.**
   - Natively, `viewer SCENE --play` plays the scene, with keys and the mouse. It reloads
     scripts from `--scripts DIR` (by default `scenes`) when they change, checking twice a
-    second. `--play --capture` runs a game headless, with no input.
+    second. `--play --capture` runs a game headless, pressing whatever `--press ACTION@FRAME`
+    names.
   - On the web, the plain build offers *Play* on scenes with a game, which reloads the page
     with the gameplay build. That build reads keys, the mouse, standard-layout gamepads and
     touch: a stick under the left thumb, looking under the right, and taps. It shows what
     scripts log, and their errors, in a panel.
   - Gamepads natively are left for later: they need a crate of their own (`gilrs`).
+  - With actors but no player, the keys both fly the camera and reach the game.
+  - Keys typed into the page's own controls don't reach the game.
+- **Left for later.** An actor's instances are movable from the start, so a gate that seldom
+  moves still has its own shadow pass and leaves the GI voxels. Making them movable only once
+  they move, or keeping them in GI, waits until a scene has enough actors for it to matter.
 - **Maths.** Starlark has no maths module, so the engine gives `sin`, `cos`, `atan2` and
   `sqrt`.
 - **Until physics,** the player walks at a fixed height, through walls.

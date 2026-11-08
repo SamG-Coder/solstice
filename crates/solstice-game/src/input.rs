@@ -255,7 +255,8 @@ impl Devices {
     fn set(&mut self, device: Device, control: &str, value: f32) {
         let key = (device, control.to_owned());
         let before = self.values.get(&key).copied().unwrap_or(0.0);
-        if value >= 0.5 && before < 0.5 {
+        // Either way: a stick pushed to -1 presses an action bound to it with a scale of -1.
+        if value.abs() >= 0.5 && before.abs() < 0.5 {
             self.pressed.insert(key.clone());
         }
         if value == 0.0 {
@@ -324,9 +325,14 @@ impl Devices {
         self.pressed.clear();
     }
 
-    /// Ends a frame: movement and presses start again from nothing; what is held stays held.
+    /// Ends a frame: presses start again from nothing; what is held stays held, and movement
+    /// builds up until [`Devices::clear_movement`].
     pub fn end_frame(&mut self) {
         self.pressed.clear();
+    }
+
+    /// Forgets the movement so far, once a step has used it.
+    pub fn clear_movement(&mut self) {
         self.values
             .retain(|(device, control), _| !device.is_movement(control));
     }
@@ -390,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn movement_is_in_pixels_a_second_and_starts_again_each_frame() {
+    fn movement_is_in_pixels_a_second_and_starts_again_once_used() {
         let map = InputMap::parse("turn mouse x -0.5\nturn gamepad right_x 2\n").unwrap();
         let mut devices = Devices::new();
         devices.mouse_motion(10.0, 0.0);
@@ -399,7 +405,7 @@ mod tests {
         let input = map.actions(&devices, 0.5);
         // 30 pixels in half a second, times -0.5, plus the stick's 2 (limited to 1).
         assert_eq!(input.value("turn"), 30.0 / 0.5 * -0.5 + 1.0);
-        devices.end_frame();
+        devices.clear_movement();
         assert_eq!(map.actions(&devices, 0.5).value("turn"), 1.0);
         // A frame of no time moves nothing, rather than dividing by zero.
         devices.mouse_motion(5.0, 0.0);
@@ -416,6 +422,22 @@ mod tests {
         assert_eq!(map.actions(&devices, 0.1).value("right"), -1.0);
         devices.gamepad_axis("left_x", 0.575);
         assert!((map.actions(&devices, 0.1).value("right") - 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn a_stick_pushed_either_way_presses() {
+        // Up on the left stick is -1, and forward's binding to it has a scale of -1.
+        let map = InputMap::default();
+        let mut devices = Devices::new();
+        devices.gamepad_axis("left_y", -1.0);
+        let input = map.actions(&devices, 0.1);
+        assert!(input.pressed("forward") && input.held("forward"));
+        devices.end_frame();
+        devices.gamepad_axis("left_y", -0.9);
+        assert!(
+            !map.actions(&devices, 0.1).pressed("forward"),
+            "still held, not pressed again"
+        );
     }
 
     #[test]

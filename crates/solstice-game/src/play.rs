@@ -12,7 +12,7 @@ use crate::scene::{SceneGame, GAME_FILE};
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use solstice_asset::GameFile;
 use solstice_script::{Script, ScriptHost};
-use solstice_world::{Entity, Game, GlobalTransform, Input, Name, Schedule, Transform, World};
+use solstice_world::{Entity, Game, GlobalTransform, Name, Schedule, Transform, World};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -60,7 +60,12 @@ pub struct Play {
     drawn: Vec<Drawn>,
     player: Option<Player>,
     map: InputMap,
+    /// How far the camera looks up, as of the last step.
     pitch: f32,
+    /// Seconds since the last step, over which the devices' movement has built up.
+    unstepped: f64,
+    /// Actions to press in the next frame, from [`Play::press`].
+    presses: Vec<String>,
     scripts: Vec<String>,
     messages: VecDeque<Message>,
 }
@@ -198,6 +203,8 @@ impl Play {
             player,
             map,
             pitch: 0.0,
+            unstepped: 0.0,
+            presses: Vec::new(),
             scripts,
             messages: VecDeque::new(),
         })
@@ -220,31 +227,38 @@ impl Play {
         self.player.is_some()
     }
 
+    /// Presses an action in the next frame, whatever the devices do: for scripted runs.
+    pub fn press(&mut self, action: &str) {
+        self.presses.push(action.to_owned());
+    }
+
     /// Runs a frame `seconds` long, with the devices as they are. `place` is told where to draw
     /// each instance that moved. Returns where the player's camera is, if there is a player.
+    ///
+    /// Movement (the mouse, dragging) builds up in `devices` until a step uses it, and is
+    /// given to that step as a rate over the time since the step before. So none is lost in
+    /// frames that run no step, as at 144 Hz, and none is counted twice. Looking up and down
+    /// follows the movement every frame, for a camera that never lags the mouse.
     pub fn frame(
         &mut self,
         seconds: f64,
-        devices: &Devices,
+        devices: &mut Devices,
         mut place: impl FnMut(u32, Mat4),
     ) -> Option<View> {
-        let input = self.map.actions(devices, seconds as f32);
-        self.frame_with(seconds, &input, &mut place)
-    }
-
-    /// Each action's value this frame, from the devices, by the scene's input actions.
-    pub fn actions(&self, devices: &Devices, seconds: f32) -> Input {
-        self.map.actions(devices, seconds)
-    }
-
-    /// [`Play::frame`], with actions already worked out.
-    pub fn frame_with(
-        &mut self,
-        seconds: f64,
-        input: &Input,
-        mut place: impl FnMut(u32, Mat4),
-    ) -> Option<View> {
-        let steps = self.game.frame(seconds, input);
+        self.unstepped += seconds;
+        let mut input = self.map.actions(devices, self.unstepped as f32);
+        for action in self.presses.drain(..) {
+            input.press(&action);
+        }
+        let steps = self.game.frame(seconds, &input);
+        devices.end_frame();
+        let pitch = (self.pitch + input.value("look_up") * self.unstepped as f32)
+            .clamp(-MAX_PITCH, MAX_PITCH);
+        if steps.steps > 0 {
+            devices.clear_movement();
+            self.unstepped = 0.0;
+            self.pitch = pitch;
+        }
         self.gather_messages();
         let entities = &self.game.world.entities;
         for drawn in &mut self.drawn {
@@ -267,12 +281,10 @@ impl Play {
             .ok()?
             .interpolated(steps.alpha);
         let (_, rotation, translation) = world.to_scale_rotation_translation();
-        self.pitch =
-            (self.pitch + input.value("look_up") * seconds as f32).clamp(-MAX_PITCH, MAX_PITCH);
         Some(View {
             position: translation + rotation * player.eye,
             yaw: rotation.to_euler(EulerRot::YXZ).0,
-            pitch: self.pitch,
+            pitch,
         })
     }
 

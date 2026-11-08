@@ -12,8 +12,6 @@ pub struct PlayMode {
     pub play: Play,
     /// What the input devices are doing, filled in from the window's events.
     pub devices: Devices,
-    /// Actions to press in the next frame whatever the devices do, for scripted captures.
-    pub presses: Vec<String>,
 }
 
 impl PlayMode {
@@ -27,7 +25,6 @@ impl PlayMode {
         Ok(Self {
             play,
             devices: Devices::new(),
-            presses: Vec::new(),
         })
     }
 
@@ -39,16 +36,11 @@ impl PlayMode {
         camera: &mut Camera,
         seconds: f32,
     ) -> Vec<Message> {
-        let mut input = self.play.actions(&self.devices, seconds);
-        for action in self.presses.drain(..) {
-            input.press(&action);
-        }
         let view = self
             .play
-            .frame_with(f64::from(seconds), &input, |id, world| {
+            .frame(f64::from(seconds), &mut self.devices, |id, world| {
                 renderer.move_instance(id, world);
             });
-        self.devices.end_frame();
         if let Some(view) = view {
             camera.position = view.position;
             camera.yaw = view.yaw;

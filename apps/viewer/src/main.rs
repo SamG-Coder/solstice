@@ -682,7 +682,7 @@ mod native {
             if let Some(play) = &mut play {
                 for (action, at) in &options.presses {
                     if *at == frame {
-                        play.presses.push(action.clone());
+                        play.play.press(action);
                     }
                 }
                 log_messages(play.frame(&mut renderer, &mut camera, 1.0 / 60.0));

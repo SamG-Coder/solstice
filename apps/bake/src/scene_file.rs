@@ -370,6 +370,8 @@ struct Gameplay {
     files: Vec<GameFile>,
     /// For each actor with a mesh: which actor, which model, and which of its whole placements.
     meshes: Vec<(usize, PathBuf, usize)>,
+    /// Whether an actor has a camera already: only one can.
+    has_player: bool,
 }
 
 impl Gameplay {
@@ -395,9 +397,25 @@ impl Gameplay {
         base: &Path,
         mut line: ActorLine,
     ) -> Result<Option<(String, f32)>, String> {
+        if line.instances.is_some() {
+            return Err("`instances` is worked out by the bake, not written by hand".to_owned());
+        }
         line.file = resolve(GAME_FILE, &line.file);
         let actor = ActorFile::parse(self.read(base, &line.file)?)
             .map_err(|e| format!("{}: {e}", line.file))?;
+        // Each of these would stop the game starting, so they stop the bake instead.
+        if actor.script.is_none() && !line.settings.is_empty() {
+            return Err(format!("{} has no script, so no properties", line.file));
+        }
+        if actor.camera.is_some() {
+            if self.has_player {
+                return Err(format!(
+                    "{} has a camera, and another actor already does: only one can",
+                    line.file
+                ));
+            }
+            self.has_player = true;
+        }
         for (name, value) in &line.settings {
             let property = actor
                 .property(name)
@@ -848,7 +866,7 @@ mod tests {
         // One step in, before the script has turned it far.
         play.frame(
             1.0 / 60.0 * 1.001,
-            &solstice_game::Devices::new(),
+            &mut solstice_game::Devices::new(),
             |id, at| placed.push((id, at)),
         );
         assert_eq!(placed.len(), 4);
@@ -874,7 +892,7 @@ mod tests {
 
     #[test]
     fn gameplay_mistakes_are_found_while_baking() {
-        let cases: [(&[u8], &str); 5] = [
+        let cases: [(&[u8], &str); 8] = [
             (
                 b"actor gate.actor 0 0 0 0 colour=red\n",
                 "has no property `colour`",
@@ -883,18 +901,36 @@ mod tests {
             (b"actor nowhere.actor 0 0 0 0\n", "nowhere.actor"),
             (b"actor broken.actor 0 0 0 0\n", "broken.star:2"),
             (b"input bad.input\n", "bad.input: line 1"),
+            (
+                b"actor rock.actor 0 0 0 0 size=2\n",
+                "has no script, so no properties",
+            ),
+            (
+                b"actor eye.actor 0 0 0 0\nactor eye.actor 1 0 0 0\n",
+                "only one can",
+            ),
+            (
+                b"actor gate.actor 0 0 0 0 instances=0+5\n",
+                "worked out by the bake",
+            ),
         ];
         for (scene, part) in cases {
             let folder = Folder::with(&[
                 ("scene.txt", scene),
-                ("gate.actor", b"name gate\nproperty locked bool false\n"),
+                (
+                    "gate.actor",
+                    b"name gate\nscript gate.star\nproperty locked bool false\n",
+                ),
+                ("gate.star", b"def on_begin(self):\n    pass\n"),
+                ("rock.actor", b"name rock\n"),
+                ("eye.actor", b"name eye\ncamera 0 1 0\n"),
                 ("broken.actor", b"name broken\nscript broken.star\n"),
                 ("broken.star", b"def on_tick(self, dt):\n    x = = 1\n"),
                 ("bad.input", b"jump\n"),
             ]);
             let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
             assert!(error.contains(part), "{error}");
-            assert!(error.contains("scene.txt:1:"), "{error}");
+            assert!(error.contains("scene.txt:"), "{error}");
         }
     }
 

@@ -34,7 +34,7 @@ pub fn bench() -> String {
             let mut moved = 0;
             let ms = best(3, || {
                 for _ in 0..frames {
-                    play.frame(1.0 / 60.0, &devices, |_, _| moved += 1);
+                    play.frame(1.0 / 60.0, &mut devices, |_, _| moved += 1);
                 }
             }) / frames as f64;
             assert!(play.take_messages().is_empty());

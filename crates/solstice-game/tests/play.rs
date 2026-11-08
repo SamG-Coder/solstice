@@ -61,20 +61,20 @@ fn a_placed_actor_moves_its_instances_when_its_script_moves_it() {
 
     // Standing still, it is drawn where the bake put it, once, and then left alone.
     let mut placed = HashMap::new();
-    let devices = Devices::new();
-    play.frame(STEP_SECONDS * 1.5, &devices, |id, at| {
+    let mut devices = Devices::new();
+    play.frame(STEP_SECONDS * 1.5, &mut devices, |id, at| {
         placed.insert(id, at);
     });
     assert!(close(placed[&2], baked(2).unwrap()) && close(placed[&3], baked(3).unwrap()));
     let mut again = 0;
-    play.frame(STEP_SECONDS, &devices, |_, _| again += 1);
+    play.frame(STEP_SECONDS, &mut devices, |_, _| again += 1);
     assert_eq!(again, 0, "nothing moved, so nothing is redrawn");
 
     // Pressed, it turns by its placement's `swing`, about its own origin.
     let mut devices = Devices::new();
     devices.key("KeyE", true);
     // Two whole steps, so the frame ends on a step and nothing is between two.
-    play.frame(STEP_SECONDS * 2.0, &devices, |id, at| {
+    play.frame(STEP_SECONDS * 2.0, &mut devices, |id, at| {
         placed.insert(id, at);
     });
     let turned = Mat4::from_rotation_translation(
@@ -136,14 +136,14 @@ fn seen(play: &Play, key: &str) -> Option<ScriptValue> {
 }
 
 /// Runs one frame of a game that records each action it sees.
-fn recorded(devices: &Devices) -> Play {
+fn recorded(mut devices: Devices) -> Play {
     let scene = files(&[
         (GAME_FILE, "actor recorder.actor 0 0 0 0\n"),
         ("recorder.actor", "name recorder\nscript recorder.star\n"),
         ("recorder.star", RECORDER),
     ]);
     let mut play = Play::load(&scene, baked).unwrap();
-    play.frame(STEP_SECONDS * 1.01, devices, |_, _| {});
+    play.frame(STEP_SECONDS * 1.01, &mut devices, |_, _| {});
     let messages = play.take_messages();
     assert!(messages.is_empty(), "{messages:?}");
     play
@@ -156,14 +156,14 @@ fn an_action_reaches_a_script_from_each_kind_of_input() {
 
     let mut keys = Devices::new();
     keys.key("KeyW", true);
-    let play = recorded(&keys);
+    let play = recorded(keys);
     assert_eq!(seen(&play, "forward"), float(1.0));
     assert_eq!(seen(&play, "forward_pressed"), yes);
 
     let mut mouse = Devices::new();
     mouse.mouse_button("left", true);
     mouse.mouse_motion(-12.0, 0.0);
-    let play = recorded(&mouse);
+    let play = recorded(mouse);
     assert_eq!(seen(&play, "interact_pressed"), yes);
     let turn = match seen(&play, "turn") {
         Some(ScriptValue::Float(t)) => t,
@@ -176,14 +176,14 @@ fn an_action_reaches_a_script_from_each_kind_of_input() {
     let mut pad = Devices::new();
     pad.gamepad_axis("left_y", -1.0);
     pad.gamepad_button("south", 1.0);
-    let play = recorded(&pad);
+    let play = recorded(pad);
     assert_eq!(seen(&play, "forward"), float(1.0));
     assert_eq!(seen(&play, "jump"), float(1.0));
 
     let mut touch = Devices::new();
     touch.touch_stick(0.0, -0.5);
     touch.touch_tap();
-    let play = recorded(&touch);
+    let play = recorded(touch);
     assert_eq!(seen(&play, "forward"), float(0.5));
     assert_eq!(seen(&play, "interact_pressed"), yes);
     assert_eq!(
@@ -208,7 +208,7 @@ fn a_scene_can_bring_its_own_input_actions() {
     let mut devices = Devices::new();
     devices.key("KeyJ", true);
     devices.key("KeyW", true);
-    play.frame(STEP_SECONDS * 1.01, &devices, |_, _| {});
+    play.frame(STEP_SECONDS * 1.01, &mut devices, |_, _| {});
     assert_eq!(seen(&play, "jump"), Some(ScriptValue::Float(1.0)));
     assert_eq!(seen(&play, "forward"), None, "only its own actions");
 }
@@ -237,8 +237,7 @@ fn the_player_camera_follows_the_player_and_looks_up_and_down() {
     devices.mouse_motion(0.0, -100.0);
     let mut view = None;
     for _ in 0..60 {
-        view = play.frame(STEP_SECONDS, &devices, |_, _| {});
-        devices.end_frame();
+        view = play.frame(STEP_SECONDS, &mut devices, |_, _| {});
     }
     let view = view.unwrap();
     // A second at 3 m/s along -Z, from (1, 0, 2), with the eye 1.6 m up.
@@ -257,7 +256,7 @@ fn the_player_camera_follows_the_player_and_looks_up_and_down() {
     ]);
     let mut play = Play::load(&scene, baked).unwrap();
     let view = play
-        .frame(STEP_SECONDS, &Devices::new(), |_, _| {})
+        .frame(STEP_SECONDS, &mut Devices::new(), |_, _| {})
         .unwrap();
     assert!(
         view.position.abs_diff_eq(Vec3::new(-0.5, 1.6, 0.0), 1.0e-5),
@@ -334,7 +333,7 @@ fn scripts_reload_while_playing_and_report_what_they_log() {
         ("talk.star", "def on_begin(self):\n    log(\"hello\")\n"),
     ]);
     let mut play = Play::load(&scene, baked).unwrap();
-    play.frame(STEP_SECONDS * 1.01, &Devices::new(), |_, _| {});
+    play.frame(STEP_SECONDS * 1.01, &mut Devices::new(), |_, _| {});
     let messages = play.take_messages();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].text, "talker: hello");
@@ -342,7 +341,7 @@ fn scripts_reload_while_playing_and_report_what_they_log() {
 
     let error = play.reload("talk.star", "def on_tick(self, dt):\n    fail(\"no\")\n");
     assert!(error.is_ok());
-    play.frame(STEP_SECONDS, &Devices::new(), |_, _| {});
+    play.frame(STEP_SECONDS, &mut Devices::new(), |_, _| {});
     let messages = play.take_messages();
     assert!(messages[0].error);
     assert!(
@@ -351,4 +350,139 @@ fn scripts_reload_while_playing_and_report_what_they_log() {
         messages[0]
     );
     assert!(play.reload("talk.star", "def on_tick(self dt):\n").is_err());
+}
+
+#[test]
+fn the_mouse_turns_as_far_however_fast_the_frames_come() {
+    // The same 300 pixels of mouse, spread over a second at 60, 144 and 37 frames a second,
+    // turns the player by the same amount: none is lost in frames with no step.
+    let turned = |rate: f64| {
+        let scene = files(&[
+            (GAME_FILE, "actor player.actor 0 0 0 0\n"),
+            (
+                "player.actor",
+                "name player\nscript walker.star\ncamera 0 1.6 0\n",
+            ),
+            ("walker.star", WALKER),
+        ]);
+        let mut play = Play::load(&scene, baked).unwrap();
+        let mut devices = Devices::new();
+        let frames = rate.round() as u32;
+        let mut view = None;
+        for _ in 0..frames {
+            devices.mouse_motion(-300.0 / frames as f32, 30.0 / frames as f32);
+            view = play.frame(1.0 / rate, &mut devices, |_, _| {});
+        }
+        // Let the last movement reach a step.
+        view = play.frame(STEP_SECONDS, &mut devices, |_, _| {}).or(view);
+        view.unwrap()
+    };
+    let at_60 = turned(60.0);
+    // 300 pixels at 0.002 radians each; 30 down, looking down 0.06.
+    assert!((at_60.yaw - 0.6).abs() < 1.0e-3, "{at_60:?}");
+    assert!((at_60.pitch + 0.06).abs() < 1.0e-4, "{at_60:?}");
+    for rate in [144.0, 37.0] {
+        let view = turned(rate);
+        assert!((view.yaw - at_60.yaw).abs() < 1.0e-3, "{rate} Hz: {view:?}");
+        assert!(
+            (view.pitch - at_60.pitch).abs() < 1.0e-4,
+            "{rate} Hz: {view:?}"
+        );
+    }
+}
+
+#[test]
+fn a_quarter_turn_looks_along_minus_x_as_the_renderers_camera_does() {
+    let scene = files(&[
+        (GAME_FILE, "actor cove/player.actor 0 0 0 90\n"),
+        (
+            "cove/player.actor",
+            include_str!("../../../scenes/cove/player.actor"),
+        ),
+        (
+            "cove/player.star",
+            include_str!("../../../scenes/cove/player.star"),
+        ),
+    ]);
+    let mut play = Play::load(&scene, baked).unwrap();
+    let mut devices = Devices::new();
+    devices.key("KeyW", true);
+    // Two steps' walk, at 1.6 m/s.
+    let view = play.frame(STEP_SECONDS * 2.0, &mut devices, |_, _| {});
+    let view = view.unwrap();
+    // The renderer's camera looks along (-sin yaw, 0, -cos yaw): -X at a quarter turn, and
+    // walking forward goes that way.
+    assert!(
+        (view.yaw - std::f32::consts::FRAC_PI_2).abs() < 1.0e-5,
+        "{view:?}"
+    );
+    // Drawn between the last two steps, and a frame ending just on a step is drawn at the one
+    // before it: one step's walk.
+    let walked = 1.6 * STEP_SECONDS as f32;
+    assert!(
+        view.position
+            .abs_diff_eq(Vec3::new(-walked, 1.65, 0.0), 1.0e-4),
+        "{view:?}"
+    );
+}
+
+#[test]
+fn in_the_cove_the_player_walks_to_the_gate_and_opens_it() {
+    // The cove's own actors and scripts, as the bake carries them.
+    let scene = files(&[
+        (
+            GAME_FILE,
+            "actor cove/gate.actor 20.7 0 0 90 instances=0+1\nactor cove/player.actor 30 0 0 90\n",
+        ),
+        (
+            "cove/gate.actor",
+            include_str!("../../../scenes/cove/gate.actor"),
+        ),
+        (
+            "cove/gate.star",
+            include_str!("../../../scenes/cove/gate.star"),
+        ),
+        (
+            "cove/player.actor",
+            include_str!("../../../scenes/cove/player.actor"),
+        ),
+        (
+            "cove/player.star",
+            include_str!("../../../scenes/cove/player.star"),
+        ),
+    ]);
+    let gate_at = |_: u32| Some(Mat4::from_translation(Vec3::new(20.7, 0.0, 0.0)));
+    let mut play = Play::load(&scene, gate_at).unwrap();
+    let gate_y = std::cell::Cell::new(0.0);
+    let frame = |play: &mut Play, devices: &mut Devices| {
+        play.frame(STEP_SECONDS, devices, |_, at| gate_y.set(at.w_axis.y));
+    };
+    // Too far to reach: pressing E does nothing.
+    let mut devices = Devices::new();
+    devices.key("KeyE", true);
+    frame(&mut play, &mut devices);
+    devices.key("KeyE", false);
+    for _ in 0..30 {
+        frame(&mut play, &mut devices);
+    }
+    assert_eq!(gate_y.get(), 0.0);
+    // Walk towards it for 4 seconds, at 1.6 m/s: from 9.3 m to 2.9 m away.
+    devices.key("KeyW", true);
+    for _ in 0..240 {
+        frame(&mut play, &mut devices);
+    }
+    devices.key("KeyW", false);
+    devices.key("KeyE", true);
+    frame(&mut play, &mut devices);
+    devices.key("KeyE", false);
+    for _ in 0..300 {
+        frame(&mut play, &mut devices);
+    }
+    let messages: Vec<String> = play.take_messages().into_iter().map(|m| m.text).collect();
+    assert_eq!(messages, ["gate: The gate rises."]);
+    assert!(
+        (gate_y.get() - 3.2).abs() < 1.0e-4,
+        "the gate rose to {}",
+        gate_y.get()
+    );
 }

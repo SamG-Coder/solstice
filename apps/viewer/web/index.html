@@ -176,8 +176,14 @@ const params = new URLSearchParams(location.search);
 // ?play loads the gameplay build, which can run a scene's game. Scenes that are only looked at
 // load the plain build, which is smaller and knows nothing of games.
 const playing = params.has("play");
-const { default: init, WebViewer, header_bytes, read_header } =
-  await import(playing ? "./play/solstice_viewer.js" : "./pkg/solstice_viewer.js");
+const build = playing ? "./play/solstice_viewer.js" : "./pkg/solstice_viewer.js";
+const { default: init, WebViewer, header_bytes, read_header } = await import(build).catch((error) => {
+  // Said on the page, not left at "Starting…": `fail` needs what is set up below.
+  const message = document.getElementById("message");
+  message.textContent = `Could not load the viewer (${build}): ${error.message ?? error}`;
+  message.className = "error";
+  throw error;
+});
 
 const sceneName = params.get("scene") ?? "cove";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
@@ -634,7 +640,9 @@ function startGame(viewer) {
 
   // Keys and the mouse, while the pointer is captured.
   const locked = () => document.pointerLockElement === canvas;
-  addEventListener("keydown", (e) => { if (!e.repeat) viewer.key(e.code, true); });
+  // Not keys typed into the page's own controls, such as the quality list.
+  const typing = (e) => e.target instanceof HTMLElement && e.target.closest("select, input, textarea, button");
+  addEventListener("keydown", (e) => { if (!e.repeat && !typing(e)) viewer.key(e.code, true); });
   addEventListener("keyup", (e) => viewer.key(e.code, false));
   addEventListener("blur", () => viewer.release_all());
   const BUTTONS = ["left", "middle", "right"];
@@ -648,11 +656,13 @@ function startGame(viewer) {
   const STICK_PIXELS = 60;
   const TAP_MS = 250;
   const touches = new Map();
+  // The stick belongs to the first thumb down on the left, until it lifts.
+  const stickTaken = () => [...touches.values()].some((touch) => touch.stick);
   canvas.addEventListener("touchstart", (e) => {
     e.preventDefault();
     for (const t of e.changedTouches) {
       touches.set(t.identifier, {
-        stick: t.clientX < innerWidth / 2,
+        stick: t.clientX < innerWidth / 2 && !stickTaken(),
         x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, start: performance.now(),
       });
     }
@@ -688,13 +698,21 @@ function startGame(viewer) {
   const PAD_BUTTONS = ["south", "east", "west", "north", "l1", "r1", "l2", "r2", "select",
     "start", "l3", "r3", "up", "down", "left", "right"];
   const PAD_AXES = ["left_x", "left_y", "right_x", "right_y"];
+  // The pad used most recently is the one read. When none is left, or another takes over,
+  // whatever the last one held is let go, so a pad unplugged mid-stride doesn't keep walking.
+  let padIndex = null;
   const readGamepads = () => {
-    for (const pad of navigator.getGamepads?.() ?? []) {
-      if (!pad || pad.mapping !== "standard") continue;
-      pad.buttons.forEach((b, i) => PAD_BUTTONS[i] && viewer.gamepad_button(PAD_BUTTONS[i], b.value));
-      pad.axes.forEach((v, i) => PAD_AXES[i] && viewer.gamepad_axis(PAD_AXES[i], v));
-      break;
+    const pads = [...(navigator.getGamepads?.() ?? [])]
+      .filter((pad) => pad?.connected && pad.mapping === "standard");
+    const pad = pads.reduce((a, b) => (!a || b.timestamp > a.timestamp ? b : a), null);
+    if (padIndex !== null && pad?.index !== padIndex) {
+      PAD_BUTTONS.forEach((name) => viewer.gamepad_button(name, 0));
+      PAD_AXES.forEach((name) => viewer.gamepad_axis(name, 0));
     }
+    padIndex = pad?.index ?? null;
+    if (!pad) return;
+    pad.buttons.forEach((b, i) => PAD_BUTTONS[i] && viewer.gamepad_button(PAD_BUTTONS[i], b.value));
+    pad.axes.forEach((v, i) => PAD_AXES[i] && viewer.gamepad_axis(PAD_AXES[i], v));
   };
 
   el("help").innerHTML = viewer.has_player()

@@ -230,6 +230,12 @@ impl WebViewer {
         if let Some(play) = &mut self.play {
             let messages = play.frame(&mut self.renderer, &mut self.camera.camera, delta_seconds);
             self.messages.extend(messages);
+            // Kept for the page to take; a page that never does still holds only the newest.
+            let excess = self
+                .messages
+                .len()
+                .saturating_sub(solstice_game::play::MAX_MESSAGES);
+            self.messages.drain(..excess);
         }
         let texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
