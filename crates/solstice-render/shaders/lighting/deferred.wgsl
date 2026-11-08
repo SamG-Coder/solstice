@@ -33,7 +33,6 @@ struct Shadows {
 // The Milky Way over the celestial sphere, worked out once by sky/milky_way_bake.wgsl.
 @group(0) @binding(12) var milky_way_tex: texture_2d<f32>;
 
-
 const DISK_SAMPLES: u32 = 12u;
 
 // Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.

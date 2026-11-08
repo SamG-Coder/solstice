@@ -145,6 +145,14 @@ fn reaches(origin: Vec2, size: f32, camera: Vec3, sea_level: f32, radius: f32) -
 /// Where vertex `(x, z)` of `patch`'s grid lies on the calm sea, in metres, after blending
 /// towards the coarser grid by its distance from `camera`.
 pub fn vertex_position(patch: &Patch, x: u32, z: u32, camera: Vec3, sea_level: f32) -> Vec2 {
+    vertex(patch, x, z, camera, sea_level).0
+}
+
+/// Vertex `(x, z)` of `patch`: where it lies on the calm sea, and the spacing whose detail its
+/// waves are read at. That spacing blends to the coarser grid's along with the position, so
+/// where two levels meet, both read the waves at the same place and the same level of detail,
+/// and their heights agree.
+pub fn vertex(patch: &Patch, x: u32, z: u32, camera: Vec3, sea_level: f32) -> (Vec2, f32) {
     let spacing = patch.spacing();
     let grid = Vec2::new(x as f32, z as f32);
     let unmorphed = patch.origin + grid * spacing;
@@ -153,7 +161,8 @@ pub fn vertex_position(patch: &Patch, x: u32, z: u32, camera: Vec3, sea_level: f
     let morph = ((distance - start) / (end - start)).clamp(0.0, 1.0);
     // Odd vertices slide onto their even neighbours, so the grid becomes the coarser one's.
     let odd = grid - (grid * 0.5).floor() * 2.0;
-    patch.origin + (grid - odd * morph) * spacing
+    let position = patch.origin + (grid - odd * morph) * spacing;
+    (position, spacing * (1.0 + morph))
 }
 
 #[cfg(test)]
@@ -228,8 +237,9 @@ mod tests {
     fn neighbouring_patches_share_every_edge_point() {
         // Wherever two patches touch, each point of one's edge, blended as the vertex shader
         // blends it, lies on the other's edge as it is drawn: between two of its points, on the
-        // straight line the rasterizer draws. Equal heights follow, since heights are read at
-        // the same place.
+        // straight line the rasterizer draws. And where a point of each meets, both read the
+        // waves at the same level of detail, so their heights agree too: the same place alone
+        // is not enough, as a finer mip holds different heights.
         for (camera, cells) in cameras()
             .into_iter()
             .flat_map(|c| [(c, PATCH_CELLS), (c, PATCH_CELLS / 2)])
@@ -258,12 +268,12 @@ mod tests {
                         if a_from.max(b_from) >= a_to.min(b_to) {
                             continue;
                         }
-                        let edge = |p: &Patch, at_far_side: bool| -> Vec<Vec2> {
+                        let edge = |p: &Patch, at_far_side: bool| -> Vec<(Vec2, f32)> {
                             (0..=p.cells)
                                 .map(|i| {
                                     let fixed = if at_far_side { p.cells } else { 0 };
                                     let (x, z) = if axis == 0 { (fixed, i) } else { (i, fixed) };
-                                    vertex_position(p, x, z, camera, 0.0)
+                                    vertex(p, x, z, camera, 0.0)
                                 })
                                 .collect()
                         };
@@ -271,14 +281,14 @@ mod tests {
                         let b_far = (b.origin[axis] + b.size - b_side).abs() < 1.0e-3;
                         let fine = edge(a, a_far);
                         let coarse = edge(b, b_far);
-                        for point in fine {
+                        for (point, detail) in fine {
                             let t = point[along];
                             if t < b_from - 1.0e-3 || t > b_to + 1.0e-3 {
                                 continue;
                             }
                             // The coarse edge's segment around t, and the point on it.
                             let on_coarse = coarse.windows(2).find_map(|w| {
-                                let (p, q) = (w[0][along], w[1][along]);
+                                let (p, q) = (w[0].0[along], w[1].0[along]);
                                 let (lo, hi) = (p.min(q), p.max(q));
                                 (t >= lo - 1.0e-4 && t <= hi + 1.0e-4).then_some(())
                             });
@@ -291,12 +301,17 @@ mod tests {
                             // any it has that the coarse side lacks must sit on the coarse
                             // side's points once blended.
                             if a.spacing() < b.spacing() {
-                                let matched = coarse
-                                    .iter()
-                                    .any(|c| (c[along] - t).abs() < 1.0e-3 * b.spacing().max(1.0));
+                                let matched = coarse.iter().find(|c| {
+                                    (c.0[along] - t).abs() < 1.0e-3 * b.spacing().max(1.0)
+                                });
+                                let Some((_, coarse_detail)) = matched else {
+                                    panic!(
+                                        "{camera}: {point} of {a:?} is not blended onto a vertex of {b:?}"
+                                    );
+                                };
                                 assert!(
-                                    matched,
-                                    "{camera}: {point} of {a:?} is not blended onto a vertex of {b:?}"
+                                    (detail / coarse_detail - 1.0).abs() < 1.0e-3,
+                                    "{camera}: at {point}, {a:?} reads waves at {detail} m detail and {b:?} at {coarse_detail} m"
                                 );
                             }
                         }

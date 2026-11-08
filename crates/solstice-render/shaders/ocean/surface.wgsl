@@ -44,8 +44,9 @@ fn vs_main(
     for (var cascade = 0u; cascade < 3u; cascade++) {
         let tile = surface.sizes[cascade];
         // The level whose texels are as far apart as the vertices: smaller waves would only
-        // alias between them.
-        let level_of_detail = max(log2(spacing / (tile / surface.grid.x)), 0.0);
+        // alias between them. The spacing blends to the coarser grid's with the position, so
+        // where levels meet both read the same heights (grid.rs, `vertex`).
+        let level_of_detail = max(log2(spacing * (1.0 + morph) / (tile / surface.grid.x)), 0.0);
         offset += textureSampleLevel(displacement, wave_sampler, calm / tile, cascade, level_of_detail).xyz;
     }
     let choppiness = surface.grid.y;

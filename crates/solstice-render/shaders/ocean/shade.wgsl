@@ -18,13 +18,14 @@
 // The water layer: its depth, and where its water lay on the calm sea.
 @group(0) @binding(3) var water_depth: texture_depth_2d;
 @group(0) @binding(4) var water_calm: texture_2d<f32>;
-// The waves' slopes and stretch, per cascade.
+// The waves' slopes and stretch, and their displacement (its shear in w), per cascade.
 @group(0) @binding(5) var derivatives: texture_2d_array<f32>;
-@group(0) @binding(6) var wave_sampler: sampler;
-@group(0) @binding(7) var<uniform> surface: SurfaceParams;
-@group(0) @binding(8) var out_color: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(9) var out_depth: texture_storage_2d<r32float, write>;
-@group(0) @binding(10) var out_motion: texture_storage_2d<rg32float, write>;
+@group(0) @binding(6) var displacement: texture_2d_array<f32>;
+@group(0) @binding(7) var wave_sampler: sampler;
+@group(0) @binding(8) var<uniform> surface: SurfaceParams;
+@group(0) @binding(9) var out_color: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(10) var out_depth: texture_storage_2d<r32float, write>;
+@group(0) @binding(11) var out_motion: texture_storage_2d<rg32float, write>;
 
 const DEBUG_OCEAN: u32 = 10u;
 // Water's reflectance looking straight down: from its index of refraction, 1.33.
@@ -37,15 +38,22 @@ const WATER_ROUGHNESS: f32 = 0.08;
 // `footprint` metres.
 fn wave_normal(calm: vec2f, footprint: f32) -> vec3f {
     var d = vec4f(0.0);
+    var shear = 0.0;
     for (var cascade = 0u; cascade < 3u; cascade++) {
         let tile = surface.sizes[cascade];
         let level = max(log2(footprint / (tile / surface.grid.x)), 0.0);
         d += textureSampleLevel(derivatives, wave_sampler, calm / tile, cascade, level);
+        shear += textureSampleLevel(displacement, wave_sampler, calm / tile, cascade, level).w;
     }
-    // Slopes of the displaced surface: the horizontal displacement stretches or squeezes them.
+    // The displaced surface's tangents along x and z, with the horizontal displacement's
+    // stretch and shear (∂Dz/∂x = ∂Dx/∂z), and their cross product. Where a crest folds over,
+    // the surface turns back on itself; it is held upright rather than flipped.
     let choppiness = surface.grid.y;
-    let slope = vec2f(d.x / (1.0 + choppiness * d.z), d.y / (1.0 + choppiness * d.w));
-    return normalize(vec3f(-slope.x, 1.0, -slope.y));
+    let along_x = vec3f(1.0 + choppiness * d.z, d.x, choppiness * shear);
+    let along_z = vec3f(choppiness * shear, d.y, 1.0 + choppiness * d.w);
+    var normal = cross(along_z, along_x);
+    normal.y = max(normal.y, 0.05);
+    return normalize(normal);
 }
 
 @compute @workgroup_size(8, 8)
@@ -58,8 +66,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let behind = textureLoad(lit, pixel, 0);
     let scene_depth = textureLoad(opaque_depth, pixel, 0).r;
     let water = textureLoad(water_depth, pixel, 0);
-    // Reversed depth: nearer is larger. No water here, or something stands in front of it.
-    if water <= scene_depth {
+    // Reversed depth: nearer is larger. No water here, or something stands in front of it; or a
+    // debug view of the opaque scene, which water would hide.
+    let other_view = frame.debug_mode != DEBUG_NONE && frame.debug_mode != DEBUG_OCEAN;
+    if water <= scene_depth || other_view {
         textureStore(out_color, pixel, behind);
         textureStore(out_depth, pixel, vec4f(scene_depth, 0.0, 0.0, 0.0));
         textureStore(out_motion, pixel, textureLoad(opaque_motion, pixel, 0));

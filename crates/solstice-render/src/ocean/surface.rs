@@ -258,6 +258,7 @@ impl WaterSurface {
             .depth_texture()
             .texture_unfilterable()
             .texture_array()
+            .texture_array()
             .sampler()
             .uniform()
             .storage_texture(COLOR_FORMAT)
@@ -395,6 +396,7 @@ impl WaterSurface {
                     tex(&targets.depth),
                     tex(&targets.calm.view),
                     tex(&waves.derivatives.view),
+                    tex(&waves.displacement.view),
                     wgpu::BindingResource::Sampler(&self.sampler),
                     self.uniform.as_entire_binding(),
                     tex(&targets.color.view),

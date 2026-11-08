@@ -1297,6 +1297,8 @@ fn render_sea(
     let mut settings = RendererSettings::default();
     settings.apply_quality(quality);
     settings.debug_view = debug;
+    // Temporal accumulation would average thin cracks away, hiding what these tests look for.
+    settings.temporal_accumulation = false;
     let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
     renderer.set_ocean(Some(Ocean::by_name(ocean).unwrap()), 0.0);
     renderer.set_sea_level(sea_level);
@@ -1349,12 +1351,13 @@ fn the_sea_covers_everything_below_the_horizon() {
     // pixel below the horizon shows sea, so the surface has no cracks or holes, whatever the
     // patches' sizes and however far they reach. The ball stands near the origin, so these
     // look away from it.
-    let size = 128;
-    for (quality, position, pitch) in [
-        (Quality::High, Vec3::new(30.0, 6.5, 0.0), -0.15),
-        (Quality::High, Vec3::new(40.0, 30.0, 3.0), -0.5),
-        (Quality::Low, Vec3::new(5_000.0, 11.0, -3_000.0), -0.1),
-        (Quality::Medium, Vec3::new(60.0, 400.0, 0.0), -1.2),
+    for (size, quality, position, pitch) in [
+        (128, Quality::High, Vec3::new(30.0, 6.5, 0.0), -0.15),
+        (128, Quality::High, Vec3::new(40.0, 30.0, 3.0), -0.5),
+        (128, Quality::Low, Vec3::new(5_000.0, 11.0, -3_000.0), -0.1),
+        (128, Quality::Medium, Vec3::new(60.0, 400.0, 0.0), -1.2),
+        // Finely, looking along the water where many levels meet within the view.
+        (384, Quality::High, Vec3::new(12.0, 8.0, -5.0), -0.08),
     ] {
         let camera = Camera {
             position,
