@@ -96,6 +96,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     // Scattered towards the eye: the sun by the phase function, the rest as it came.
     let to_eye = normalize(frame.camera_position - p.position);
     let sun = light.sun * phase(emitter.phase.x, dot(-frame.sun_direction, to_eye)) / PI;
+    // The ambient light already carries the scene's GI intensity, from the light pass.
     let scattered = sun + light.ambient + light.lamps;
     var radiance = tint.rgb;
     if (emitter.flags & FLAG_LIT) != 0u {
@@ -104,6 +105,10 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     radiance += light.glow;
     if frame.debug_mode == DEBUG_PARTICLE_LIGHT {
         out.color = vec4f(scattered, tint.a);
+    } else if (emitter.flags & FLAG_ADD) != 0u {
+        // An additive particle covers nothing, so the haze over what is behind it is already
+        // there: it adds only its own light, dimmed by the air.
+        out.color = vec4f(radiance * light.transmittance, tint.a);
     } else {
         out.color = vec4f(light.haze + radiance * light.transmittance, tint.a);
     }

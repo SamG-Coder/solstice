@@ -632,12 +632,24 @@ fn shader_records_match_their_rust_twins() {
             flags,
             soft,
             scale,
+            temperature_glow,
+            phase,
         ]
     );
     twin!(
         "Particle",
         Particle,
-        [position, age, velocity, lifetime, previous, size, index, rotation,]
+        [
+            position,
+            age,
+            velocity,
+            lifetime,
+            previous,
+            size,
+            index,
+            rotation,
+            temperature
+        ]
     );
     twin!(
         "EmitterState",
@@ -653,6 +665,7 @@ fn shader_records_match_their_rust_twins() {
             update_count,
             spawn_start,
             update_start,
+            light_start,
         ]
     );
     twin!(
@@ -675,4 +688,111 @@ fn ranges_split_and_join() {
     assert_eq!(ranges, vec![(0, 60)]);
     release(&mut ranges, c.0, c.1);
     assert_eq!(ranges, vec![(0, 100)]);
+}
+
+/// Runs the light record's packing and the black body from `particles/light_common.wgsl` on the
+/// GPU: each input's colour (xyz) through RGB9E5 and back, and the luminance of a black body at
+/// its w kelvin.
+fn run_light_common(gpu: &Gpu, inputs: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    let source = crate::shaders::expand("particles/light_common.wgsl")
+        + "
+@group(0) @binding(0) var<storage, read> inputs: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> outputs: array<vec4f>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+    if id.x >= arrayLength(&inputs) {
+        return;
+    }
+    let v = inputs[id.x];
+    outputs[id.x] = vec4f(unpack_rgb9e5(pack_rgb9e5(v.xyz)), black_body_xyz(v.w).y);
+}
+";
+    let module = gpu
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("light common test"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+    let layout = LayoutBuilder::new()
+        .storage_read()
+        .storage_write()
+        .build(gpu, "light common test");
+    let pipeline = gpu.compute_pipeline("light common test", &module, "main", &[&layout]);
+    let input = gpu.storage_buffer_init("inputs", inputs);
+    let bytes = std::mem::size_of_val(inputs) as u64;
+    let output = gpu.storage_buffer("outputs", bytes, wgpu::BufferUsages::COPY_SRC);
+    let group = gpu.bind_group(
+        "light common test",
+        &layout,
+        &[input.as_entire_binding(), output.as_entire_binding()],
+    );
+    let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("light common readback"),
+        size: bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &group, &[]);
+        pass.dispatch_workgroups((inputs.len() as u32).div_ceil(64), 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
+    gpu.queue.submit([encoder.finish()]);
+    staging
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    let data = staging.slice(..).get_mapped_range().unwrap();
+    bytemuck::pod_collect_to_vec(&data)
+}
+
+/// RGB9E5 keeps every channel to within a step of its largest, holds zero and tiny values, and
+/// clips at its maximum; and a black body at the freezing point of platinum, 2,042 K, has the
+/// luminance that once defined the candela, 60 cd/cm².
+#[test]
+fn light_packing_and_black_bodies_hold_their_values() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let mut inputs = vec![
+        [0.0, 0.0, 0.0, 2042.0],
+        [1.0, 1.0, 1.0, 0.0],
+        [0.5, 0.25, 0.125, 0.0],
+        [1.0e-6, 1.0e-3, 1.0, 0.0],
+        [3.0e-7, 0.0, 0.0, 0.0],
+        [65408.0, 2.0, 0.0, 0.0],
+        [90000.0, 1.0, 1.0, 0.0],
+        [0.333, 7.77, 1234.5, 0.0],
+    ];
+    for i in 0..200u32 {
+        let r = |k| reference::hash_to_unit(i * 4 + k);
+        let scale = 2.0f32.powf(r(3) * 40.0 - 24.0);
+        inputs.push([r(0) * scale, r(1) * scale, r(2) * scale, 0.0]);
+    }
+    let outputs = run_light_common(&gpu, &inputs);
+    for (input, output) in inputs.iter().zip(&outputs) {
+        let wanted = [input[0], input[1], input[2]].map(|c| c.clamp(0.0, 65408.0));
+        let largest = wanted.iter().copied().fold(0.0, f32::max);
+        // Half a step of the shared exponent, at most 1/512 of the largest channel.
+        let tolerance = largest / 512.0 + 1.0e-7;
+        for c in 0..3 {
+            assert!(
+                (output[c] - wanted[c]).abs() <= tolerance,
+                "{input:?} came back as {output:?}"
+            );
+        }
+    }
+    assert_eq!(&outputs[0][..3], &[0.0; 3]);
+    assert_eq!(outputs[6][0], 65408.0, "beyond the maximum, it clips to it");
+    let platinum = outputs[0][3];
+    assert!(
+        (platinum / 600_000.0 - 1.0).abs() < 0.03,
+        "a black body at 2,042 K: {platinum} cd/m²"
+    );
 }

@@ -345,6 +345,10 @@ main saving over shading each fragment, and on a small sprite it looks the same.
     | 64 | 0.10 | 5.5 |
     | 256 | 0.16 | 7.0 |
 
+    The trade-off: a third light behind a wall counts as open, and as a particle moves, two
+    lights can trade places. A light traced as blocked can then show as open, so light can leak
+    or flicker by walls in rooms with three or more lamps near each other.
+
     Tracing every light in range cost 0.32 ms at 64 lights and 2.5 ms at 256 on the RTX 5080,
     and 17 ms at 64 on the integrated GPU. The loop still visits every light, so it grows with
     the scene's light count. A few hundred lights is comfortable; past about a thousand, lights
@@ -367,6 +371,16 @@ main saving over shading each fragment, and on a small sprite it looks the same.
   afresh once every 2 and 4 frames, a workgroup at a time, so that those not due sit idle. In
   between it keeps the light it had. New particles head their emitter's list, so they share the
   workgroups lit in their first frame. The ambient rays take 16, 12 and 8 steps.
+  - A particle's place in the list moves as others are born and die, so each records the frame
+    it was last lit. One that has waited a full turn is lit whatever its workgroup: none waits
+    longer than 2 or 4 frames.
+  - Ambient light is stored with random rounding, so slow changes average out rather than
+    stall on RGB9E5's precision.
+  - The scene's GI intensity scales it, as it scales surfaces' indirect light.
+  - A slice given to a new emitter has its light cleared, so no particle can take the light its
+    slot's last owner had.
+- **Additive particles** cover nothing, so the haze over what is behind them is already there:
+  they add only their own light, dimmed by the air between.
 
 **Soft particles.** Each fragment fades by its distance to the scene's depth over the emitter's
 `soft` distance, so smoke never shows a hard line where it crosses the ground or the water. It
@@ -543,7 +557,15 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
    - Phase functions, glow by temperature with `temperature`, `cooling` and `glow`, and aerial
      perspective; `shading=lit` (the default) or `unlit`.
    - The `particle-light` debug view, number 14.
-   - Tests, each mutation-checked: 13 bugs were put back in turn, and each made a test fail.
+   - Tests, each mutation-checked: 19 bugs were put back in turn, and each made a test fail.
+     - RGB9E5 holds every channel to within a step of its largest, and a black body at 2,042 K,
+       the freezing point of platinum, has the luminance that once defined the candela,
+       60 cd/cm², to within 3%.
+     - A black additive particle in the haze leaves the wall behind it as it was.
+     - An effect started in a just-ended effect's slice shows none of its glow, even at Low.
+     - While an emitter keeps spawning, Medium and Low bring all of a cloud into a newly risen
+       sun within six frames, as High does.
+     - With GI turned off, a particle in shadow is dark.
      - Local lights light particles in range, the ball stops a lamp from lighting a particle
        behind it, and lights beyond the two traced still count.
      - A particle in the ball's shadow is darker than one in the sun, in the light view and in
@@ -560,11 +582,11 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
 
    | Case | RTX 5080, High | Integrated, Low |
    |---|---|---|
-   | The fountain, close | 0.05, 0.03 ms | 0.15, 0.20 ms |
-   | 100,000 lit drops (35,000 on Low) | 0.17, 0.06 ms | 1.76, 0.53 ms |
+   | The fountain, close | 0.06, 0.03 ms | 0.18, 0.20 ms |
+   | 100,000 lit drops (35,000 on Low) | 0.17, 0.06 ms | 2.0, 0.52 ms |
 
    On the integrated GPU, lighting every particle every frame cost 4.4 ms for the 35,000 drops;
-   lit once in four frames it is 1.8 ms. Of what remains, about 0.7 ms is simulation and
+   lit once in four frames, with overdue particles lit too, it is 2.0 ms. Of what remains, about 0.7 ms is simulation and
    bookkeeping, and the rest is mostly the two GI traces and the 12-tap shadow. That is over the
    budget for heavy rain on Low. Rain's drops are small and fast, so step 5 should give them a
    cheaper light, such as the sky and the sun's shadow without GI traces.

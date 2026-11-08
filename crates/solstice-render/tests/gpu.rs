@@ -2649,6 +2649,23 @@ fn a_particle_in_shadow_is_darker_than_one_in_the_sun() {
             "{view:?}: the shaded particle still has the sky: {dark}"
         );
     }
+
+    // With GI turned off, as surfaces lose their indirect light, the shaded particle loses
+    // all it had: in shadow, nothing is left.
+    let mut stage = light_stage(&gpu, &ball_on_floor(), DebugView::ParticleLight, size);
+    stage
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::from_translation(shaded))
+        .unwrap();
+    let no_gi = Environment {
+        sun_illuminance: 1.0,
+        gi_intensity: 0.0,
+        ..low_sun()
+    };
+    stage.frames(&gpu, &camera, &no_gi, 12);
+    let left = brightness(linear_at(&stage.pixels(&gpu), &camera, size, shaded));
+    assert!(left < 0.005, "without GI, the shaded particle keeps {left}");
 }
 
 /// When the sun moves, a particle's light follows within a few frames at every quality, however
@@ -2769,16 +2786,141 @@ fn distant_particles_fade_into_the_haze_as_surfaces_do() {
         .particles()
         .spawn(&effect, Mat4::from_translation(at))
         .unwrap();
+    // To its right, a black additive particle: it adds no light, and so must add no haze
+    // either, as the haze over the wall behind it is already there.
+    let black = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 60\n color 0 0 0 1\n render sprite soft=0 shading=unlit blend=add",
+    )
+    .unwrap();
+    let right = Vec3::new(200.0, 0.0, -595.0);
+    stage
+        .renderer
+        .particles()
+        .spawn(&black, Mat4::from_translation(right))
+        .unwrap();
     stage.frames(&gpu, &camera, &Environment::default(), 8);
     let pixels = stage.pixels(&gpu);
     let particle = brightness(patch(&pixels, size, size / 2, size / 2, 0));
     let surface = brightness(patch(&pixels, size, 6, size / 2, 0));
+    let (rx, ry) = pixel_of(&camera, size, right);
+    let added = brightness(patch(&pixels, size, rx, ry, 0));
     assert!(surface > 10.0, "the wall shows: {surface}");
     // Within a few levels: the two are seen in slightly different directions through the air.
     assert!(
         (particle - surface).abs() <= 5.0,
         "particle {particle} against the wall beside it {surface}"
     );
+    assert!(
+        (added - surface).abs() <= 5.0,
+        "a black additive particle {added} against the wall {surface}"
+    );
+}
+
+/// An effect started in the slice of one that has just ended starts with no light of its own:
+/// none of the old effect's glow shows on its particles, even at Low, where particles are lit
+/// only every few frames.
+#[test]
+fn a_reused_slice_keeps_no_light_from_its_last_effect() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 64;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let mut settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    settings.apply_quality(Quality::Low);
+    settings.render_scale = 1.0;
+    let mut stage = Stage::new(&gpu, &wall(0.0), settings, size);
+    let cloud = |temperature: f32| {
+        Effect::parse(&format!(
+            "emitter e\n budget 64\n spawn burst=64\n lifetime 1000\n shape sphere 0.3\n size 0.5\n color 0 0 0 1\n temperature {temperature}\n render sprite soft=0 shading=unlit"
+        ))
+        .unwrap()
+    };
+    let at = Mat4::from_translation(Vec3::new(0.0, 0.0, -6.0));
+    let night = Environment {
+        sun_illuminance: 0.0,
+        sky_intensity: 0.0,
+        daylight_illuminance: 10.0,
+        ..Default::default()
+    };
+    let hot = stage
+        .renderer
+        .particles()
+        .spawn(&cloud(2400.0), at)
+        .unwrap();
+    stage.frames(&gpu, &camera, &night, 10);
+    let glowing = brightness(patch(&stage.pixels(&gpu), size, size / 2, size / 2, 1));
+    assert!(glowing > 100.0, "the hot cloud glows: {glowing}");
+    stage.renderer.particles().kill(hot);
+    stage.renderer.particles().spawn(&cloud(0.0), at).unwrap();
+    for frame in 0..4 {
+        stage.frames(&gpu, &camera, &night, 1);
+        let seen = brightness(patch(&stage.pixels(&gpu), size, size / 2, size / 2, 1));
+        assert!(seen < 3.0, "frame {frame} of the cold cloud glows: {seen}");
+    }
+}
+
+/// While an emitter keeps spawning, and so its particles' places in its list keep moving, the
+/// Medium and Low qualities, which light each particle only every few frames, still bring all
+/// of a cloud's particles into a newly risen sun within a few frames, as High does.
+#[test]
+fn particles_relit_in_turns_are_never_left_out() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let size = 128;
+    let camera = over_the_floor();
+    // A burst in the ball's shadow, then a steady stream of 64 a frame, which shifts every
+    // particle's place in the list by a workgroup each frame.
+    let effect = Effect::parse(
+        "emitter e\n budget 6000\n spawn burst=1500 rate=3840\n lifetime 1000\n shape box 0.6 0.6 0.6\n offset -1.4 0.4 0\n size 0.05\n color 1 1 1 1\n render sprite soft=0 phase=0",
+    )
+    .unwrap();
+    let mut seen = Vec::new();
+    for quality in [Quality::High, Quality::Medium, Quality::Low] {
+        let mut settings = RendererSettings {
+            debug_view: DebugView::ParticleLight,
+            temporal_accumulation: false,
+            ..Default::default()
+        };
+        settings.apply_quality(quality);
+        settings.render_scale = 1.0;
+        settings.particle_detail = 1.0;
+        let mut stage = Stage::new(&gpu, &ball_on_floor(), settings, size);
+        stage
+            .renderer
+            .particles()
+            .spawn(&effect, Mat4::IDENTITY)
+            .unwrap();
+        let shaded = Environment {
+            sun_illuminance: 1.0,
+            ..low_sun()
+        };
+        let open = Environment {
+            sun_direction: Vec3::new(-1.0, 1.0, 0.0).normalize(),
+            ..shaded
+        };
+        stage.frames(&gpu, &camera, &shaded, 6);
+        // Six frames: every particle is due by then at Low, where one in four is lit a frame;
+        // left to chance, about a sixth would not be.
+        stage.frames(&gpu, &camera, &open, 6);
+        let (x, y) = pixel_of(&camera, size, Vec3::new(-1.4, 0.4, 0.0));
+        seen.push(brightness(
+            patch(&stage.pixels(&gpu), size, x, y, 3).map(srgb_to_linear),
+        ));
+    }
+    let [high, medium, low] = seen[..] else {
+        unreachable!()
+    };
+    assert!(high > 0.05, "{seen:?}");
+    assert!(medium > high * 0.98, "Medium against High: {seen:?}");
+    assert!(low > high * 0.98, "Low against High: {seen:?}");
 }
 
 /// Beside a sunlit red ball, a particle's light turns red, from light the GI volume has bounced

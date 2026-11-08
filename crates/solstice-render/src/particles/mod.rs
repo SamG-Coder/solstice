@@ -737,6 +737,13 @@ impl Particles {
                 (slot * CURVE_STRIDE * 16) as u64,
                 bytemuck::cast_slice(&baked_curves(desc)),
             );
+            // Light left by the slice's last owner must not pass for a new particle's: the
+            // new emitter counts its particles from zero again, into the same slots.
+            queue.write_buffer(
+                &self.pool.light,
+                u64::from(emitter.base) * LIGHT_BYTES,
+                &vec![0u8; (u64::from(emitter.budget) * LIGHT_BYTES) as usize],
+            );
         }
         queue.write_buffer(&self.pool.emitters, 0, bytemuck::cast_slice(&records));
         queue.write_buffer(&self.pool.draws, 0, &draws);
@@ -964,7 +971,7 @@ impl Pool {
         let light = gpu.storage_buffer(
             "particle light",
             cap * LIGHT_BYTES,
-            wgpu::BufferUsages::COPY_SRC,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         );
         let sim = gpu.uniform_buffer("particle sim", std::mem::size_of::<SimUniform>() as u64);
         let draws = gpu.uniform_buffer("particle draws", MAX_EMITTERS as u64 * DRAW_STRIDE);
@@ -1158,7 +1165,7 @@ fn emitter_record(
     if desc.shading == Shading::Lit {
         flags |= FLAG_LIT;
     }
-    if hot_high.max(hot_low) > 0.0 {
+    if hot_high.max(hot_low) > 0.0 && v(&desc.glow) > 0.0 {
         flags |= FLAG_GLOW;
     }
     if surface {

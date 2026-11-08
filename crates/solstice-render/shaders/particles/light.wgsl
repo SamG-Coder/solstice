@@ -40,7 +40,6 @@ const GROUND_SHARE: f32 = 0.3;
 // Sunlit ground in full daylight takes about 100,000 lux, which the scene calls the daylight
 // illuminance; a black body's luminance, in candela per square metre, scales the same way.
 const DAYLIGHT_LUX: f32 = 100000.0;
-const LUMINOUS_EFFICACY: f32 = 683.0;
 // How many of the lights reaching a particle are traced for walls between: the strongest.
 const TRACED_LIGHTS: u32 = 2u;
 const NO_LIGHT: u32 = 0xffffffffu;
@@ -60,44 +59,7 @@ fn incoming(origin: vec3f, direction: vec3f, inside: bool, voxel: f32) -> vec3f 
     return select(sky, sky * GROUND_SHARE, direction.y < 0.0);
 }
 
-// Wyman, Sloan and Shirley's fit of the CIE 1931 colour matching functions (JCGT 2013).
-fn lobe(x: f32, mean: f32, below: f32, above: f32) -> f32 {
-    let t = (x - mean) / select(above, below, x < mean);
-    return exp(-0.5 * t * t);
-}
-
-fn cie_xyz(nm: f32) -> vec3f {
-    return vec3f(
-        1.056 * lobe(nm, 599.8, 37.9, 31.0) + 0.362 * lobe(nm, 442.0, 16.0, 26.7)
-            - 0.065 * lobe(nm, 501.1, 20.4, 26.2),
-        0.821 * lobe(nm, 568.8, 46.9, 40.5) + 0.286 * lobe(nm, 530.9, 16.3, 31.1),
-        1.217 * lobe(nm, 437.0, 11.8, 36.0) + 0.681 * lobe(nm, 459.0, 26.0, 13.8),
-    );
-}
-
-// The linear Rec. 709 radiance of a black body at `kelvin`, in candela per square metre for
-// its luminance: Planck's law integrated against the colour matching functions.
-fn black_body(kelvin: f32) -> vec3f {
-    if kelvin < 500.0 {
-        return vec3f(0.0);
-    }
-    var xyz = vec3f(0.0);
-    let step_nm = 20.0;
-    for (var nm = 390.0; nm < 790.0; nm += step_nm) {
-        let metres = nm * 1.0e-9;
-        // 2hc² / λ⁵ / (exp(hc / λkT) - 1), in W / (m² sr m), times the band's width in metres.
-        let exponent = 0.0143877735 / (metres * kelvin);
-        let radiance = 1.191042972e-16 / (pow(metres, 5.0) * (exp(min(exponent, 80.0)) - 1.0));
-        xyz += cie_xyz(nm) * radiance * step_nm * 1.0e-9;
-    }
-    xyz *= LUMINOUS_EFFICACY;
-    let rgb = vec3f(
-        3.2406 * xyz.x - 1.5372 * xyz.y - 0.4986 * xyz.z,
-        -0.9689 * xyz.x + 1.8758 * xyz.y + 0.0415 * xyz.z,
-        0.0557 * xyz.x - 0.2040 * xyz.y + 1.0570 * xyz.z,
-    );
-    return max(rgb, vec3f(0.0));
-}
+// The black body's light comes from particles/light_common.wgsl.
 
 // The open sky's average radiance over every direction, with the ground below as a share of
 // the horizon: where a new particle's ambient light starts, before it has samples of its own.
@@ -146,16 +108,21 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
     let fresh = l.index != p.index || l.samples <= 0.0;
     // Between turns a particle keeps the light it had; a new one is lit at once. Turns go by
     // whole workgroups, so that those not due sit idle rather than wait on one lane that is.
-    // New particles head each list, so they share workgroups too.
+    // New particles head each list, so they share workgroups too. A particle's place in the
+    // list moves as particles are born and die, so one that has missed its turn for as long as
+    // a turn lasts is lit anyway: none waits longer than that.
     let turn = group.x - state[e].light_start + frame.frame_index;
-    if !fresh && turn % sim.light_interval != 0u {
+    let overdue = frame.frame_index - l.lit_frame >= sim.light_interval;
+    if !fresh && !overdue && turn % sim.light_interval != 0u {
         return;
     }
     if fresh {
         l.index = p.index;
-        l.ambient = open_sky();
+        l.ambient = open_sky() * frame.gi_intensity;
         l.samples = 2.0;
     }
+    l.lit_frame = frame.frame_index;
+    l.dither = particle_random(p.index, frame.frame_index, 2u);
     let to_camera = frame.camera_position - p.position;
     let distance = max(length(to_camera), 1.0e-4);
     let view = to_camera / distance;
@@ -188,8 +155,9 @@ fn main(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) la
         let z = 2.0 * u.x - 1.0;
         let ring = sqrt(max(1.0 - z * z, 0.0));
         let direction = vec3f(ring * cos(TAU * u.y), z, ring * sin(TAU * u.y));
+        // Indirect light, which the scene's GI intensity scales as it does for surfaces.
         let pair = 0.5 * (incoming(p.position, direction, inside, voxel)
-            + incoming(p.position, -direction, inside, voxel));
+            + incoming(p.position, -direction, inside, voxel)) * frame.gi_intensity;
         l.ambient = mix(l.ambient, pair, 2.0 / (l.samples + 2.0));
         l.samples = min(l.samples + 2.0, MOST_SAMPLES);
 
