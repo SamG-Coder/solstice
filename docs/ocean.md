@@ -1,0 +1,248 @@
+# Ocean: design
+
+A design for open water: waves that move with the weather, water that shows what lies beneath
+it, and a surface that takes part in everything else the renderer does. To be built slowly, one
+measured step at a time.
+
+## Goals
+
+- **Real.** Waves follow a measured ocean spectrum, driven by the wind. Light reflects and
+  refracts as it does at a water surface, and water absorbs and scatters with depth.
+  - A calm morning is a glassy mirror with a long swell.
+  - A storm is a heaving grey sea streaked with whitecaps.
+  - Shallows over sand are clear and turquoise.
+- **Fast.** At most about 0.8 ms at 1080p on a desktop GPU and 1.5 ms on integrated graphics,
+  with quality tiers. Each step is measured, not guessed.
+- **Dynamic.** Every property can change at any time and eases into the new value, as the weather
+  does: wind speed and direction, swell, water colour and clarity, foam, and choppiness.
+- **Part of the whole system.** The ocean must work with everything else in the renderer:
+  - It answers to the weather and the time of day.
+  - It takes the sun's and clouds' shadows, and reflects the scene, sky, clouds, moon and stars.
+  - It lights the scene through GI, fades into the haze, and meets the sky at the horizon without
+    a seam.
+  - It holds steady under temporal anti-aliasing.
+
+Not in the first version:
+- an underwater camera;
+- wakes and objects disturbing the water;
+- floating objects;
+- rivers and lakes with currents.
+
+The design leaves room for each.
+
+## What there is today
+
+The bake's `water` command adds two flat planes: a 4 km one that borrows the sand's ripples as
+waves, and an 80 km one beyond it. They go through the visibility buffer like any other mesh, so
+the water is opaque. It has no idea of the seabed below it, and it never moves.
+
+## References
+
+- Tessendorf, *Simulating Ocean Water* (2001): waves as a sum of many sinusoids, from a spectrum,
+  summed by FFT, with horizontal displacement for sharp crests.
+- Hasselmann et al. (1973), the JONSWAP spectrum, and Horvath, *Empirical Directional Wave Spectra
+  for Computer Graphics* (DigiPro 2015): wind and fetch, directional spreading, and swell.
+- Bruneton, Neyret and Holzschuch, *Real-time Realistic Ocean Lighting using Seamless Transitions
+  from Geometry to BRDF* (2010): waves too small to see become surface roughness, so distant water
+  neither shimmers nor turns too dark, and glitter spreads correctly towards the horizon.
+- Unreal Engine's Single Layer Water shading model. Water is shaded after the opaque scene, over
+  what lies behind it, with absorption and scattering by depth.
+- *The Technical Art of Sea of Thieves* (GDC 2018) and Atlas's interactive water (GDC 2019):
+  foam, light through wave crests, and how a game ocean holds up in motion.
+
+## Data and API
+
+Like trees, grass and weather, an ocean is a short text file, so it can be changed without
+touching code:
+
+```text
+# crates/solstice-render/ocean/clear.ocean
+name clear
+absorption 0.45 0.07 0.04    # per metre, red is absorbed fastest
+scattering 0.002 0.006 0.007 # per metre: blue-green glow from within
+turbidity 0.0                # 0 clear, 1 murky
+foam 1.0                     # how readily whitecaps form
+choppiness 0.85              # how sharp crests are
+swell 0.6 11 250             # height (m), period (s), from (degrees)
+```
+
+- The **wind** comes from the weather. The weather's wind is at cloud height, and is brought down
+  to 10 m with the usual log profile. When the weather changes, the sea follows over minutes, not
+  seconds, as a real sea builds and calms.
+- **Presets:**
+  - *clear*: tropical shallows;
+  - *coastal*: the default, for the cove;
+  - *ocean*: deep Atlantic;
+  - *murky*: a harbour.
+- **Scenes:** a scene asset records its sea level and ocean preset. The bake's `water` command
+  becomes `ocean HEIGHT PRESET` and stops adding meshes.
+- **Library:**
+
+  ```rust
+  renderer.set_ocean(Ocean::by_name("ocean").unwrap(), 60.0);
+  ```
+
+  This is eased over 60 seconds, as with `set_weather`. `Ocean` is public, with every field
+  documented.
+- **Viewers:**
+  - The web page gets **Sea**, which by default follows the weather.
+  - **Extras** gets sliders for wave height and water clarity.
+  - The native viewer gets `--ocean NAME`.
+
+## Waves
+
+**Spectrum.** JONSWAP for the wind sea, with fetch, and directional spreading after Horvath, plus
+a narrow swell spectrum from its own direction. The wind sea and the swell can come from different
+directions, as at a real coast. Calm water then keeps a long swell, and a storm's waves run with
+the wind.
+
+**Cascades.** Three tiles, about 500 m, 85 m and 13 m across. Their ratios are irrational, so no
+repeat lines up, and each carries only the wavelengths the others don't, so none is counted twice.
+
+| Tier | Resolution per cascade |
+|---|---|
+| High | 256² |
+| Medium | 256² |
+| Low | 128² |
+
+**Per frame, on the GPU:**
+1. Advance each wave's phase by the deep-water dispersion relation, ω² = gk.
+2. Run an inverse FFT, Stockham, in workgroup memory: one dispatch per axis per cascade, six in
+   all. Four complex channels are packed per cascade:
+   - height and the two horizontal displacements;
+   - the slope and Jacobian terms for normals and foam.
+
+   That is 8 KB of the 16 KB WebGPU allows.
+3. Write each cascade into a mipmapped texture array:
+   - displacement;
+   - normal derivatives;
+   - the Jacobian;
+   - persistent foam, which grows where waves fold and fades over seconds.
+
+The initial spectrum is only rebuilt when the wind or ocean changes, at a low rate while easing.
+Phases are kept within one period per frequency, so precision does not decay over a long session.
+
+**Filtering.** Every texture is mipmapped. Wave slopes finer than a pixel's footprint are added
+to the surface's roughness from the spectrum's own slope variance (Bruneton 2010). This removes
+shimmer and aliasing at distance, and keeps the far sea's brightness and the sun's glitter path
+correct all the way to the horizon.
+
+## Geometry
+
+**The grid.** A camera-centred grid of concentric rings, each twice as coarse as the last. Each
+ring is snapped to its own texel grid, so waves don't swim as the camera moves, and blends into
+the next so there is no popping. That is about 100,000 triangles in all, out to around 10 km.
+Beyond that, displacement is too small to see, and the surface is a flat plane carried to the
+true horizon, shaded exactly as the near water.
+
+**The water layer.** The grid is drawn by the hardware rasterizer into its own layer:
+- a depth target, so waves hide each other correctly;
+- one attribute target holding the undisplaced position, from which everything else is looked up.
+
+The opaque scene is untouched. The visibility buffer, G-buffer and lighting run as now, and the
+seabed, rocks and the ship's hull are lit as usual, under water or not.
+
+## Shading: the water pass
+
+A compute pass after deferred lighting and before post. On each pixel where the water is nearer
+than the opaque scene, it works as follows.
+
+1. **Surface.** It samples the cascades at the right mip for the pixel's footprint, for the normal,
+   foam and Jacobian, and turns unresolved slope variance into roughness.
+2. **Reflection.** Fresnel for water (n = 1.33) weights a reflected ray, which goes in turn:
+   1. through screen space, against the opaque scene, reusing the existing hierarchical trace;
+   2. through the GI volume;
+   3. to the sky, clouds included, with the sun's and moon's glitter from their discs.
+
+   The ray stays above the horizon, so sea and sky meet without a seam, as they already do.
+3. **Direct light.** GGX specular from the sun or moon at the wave's roughness, taking:
+   - the cascaded sun shadows at the water's surface;
+   - contact shadows;
+   - the clouds' shadows.
+
+   The shadow code moves from `deferred.wgsl` into a shared include for this.
+4. **Through the water.** It refracts the view ray and reads the lit scene behind it. A depth test
+   stops it from picking up things in front of the water. The water's depth along that ray then
+   sets:
+   - how much of the seabed's light survives, by Beer-Lambert absorption;
+   - how much light the water scatters itself, lit by the sky and by sun refracted into it.
+
+   Shallows come out clear and turquoise, and deep water dark blue-green. Only one layer of water
+   is shaded, as in Unreal.
+5. **Light through wave crests.** Light scatters forward through the thin top of a wave towards the
+   viewer, when the sun is behind it. This is single scattering, from the wave's height above the
+   mean and the angle between sun and view.
+6. **Foam.**
+   - Whitecaps form where waves fold (Jacobian below one) and persist as they fade.
+   - Shore foam forms where the water is shallow.
+   - Foam is a rough, white diffuse layer, lit by the sun with its shadows and by the GI volume's
+     light.
+7. **Haze.** The same aerial perspective as the rest of the scene, from one shared function.
+8. **Outputs.**
+   - The composited colour, into the HDR image, so exposure, bloom and tone mapping see it.
+   - Its depth and motion into the G-buffer, so TAA, haze and everything after treat the water as
+     the surface.
+   - Motion vectors follow the moving waves, from last frame's displacement, so waves don't ghost
+     under TAA.
+
+On the Low tier, the reflection trace runs at half resolution and is upsampled by depth and
+normal.
+
+## How it joins everything else
+
+| System | With the ocean |
+|---|---|
+| Weather | Wind drives the spectrum, storms raise whitecaps, and the sea builds and calms over minutes. Later, rain roughens and rings the surface (the wetness work). |
+| Time of day | The sun's glitter path, the moon's at night, and sunset and twilight colours in reflection. |
+| Clouds | Reflected, and their shadows dim the sea and its glitter. |
+| Shadows | Cliffs, the fort and the ship shade the water. |
+| GI | A flat water surface at sea level is voxelized, so light bounces off the sea onto cliffs and hulls, and rays from the scene that hit the sea see its colour. |
+| Reflections | Rays from the scene reaching the sea see water; the water's own reflections see the scene. |
+| Haze and horizon | One aerial perspective, and below-horizon views beyond the scene shaded as distant sea, not a fixed colour. |
+| TAA and post | True depth and motion vectors; the sun's glints go into bloom. |
+| Debug views | Water only, each wave cascade, foam, and water depth. |
+
+## Steps
+
+Each step is its own pull request, with renders, before-and-after measurements and tests, and none
+starts until the last is right. Steps 1 and 2 touch nothing in lighting, so they can begin while the
+lighting flicker investigation finishes.
+
+1. **Waves.** Spectrum, cascades and FFT, shown in a debug view. Tests:
+   - The FFT matches a direct sum.
+   - The height variance matches the spectrum's integral.
+   - The significant wave height matches measured seas: about 2 m for a fully developed sea at
+     10 m/s.
+   - Cost is measured per tier.
+2. **Surface.** The grid, the water layer and the bake's `ocean` command, replacing the planes;
+   the cove is rebaked. Simple shading at first. Tests:
+   - no cracks;
+   - no popping or swimming as the camera moves;
+   - the water meets the land correctly.
+3. **Water shading.** Reflection, refraction, absorption and scattering, sun and moon specular with
+   shadows, filtering to roughness, and the horizon. Compared against photographs, one condition at
+   a time: calm, choppy, storm, shallows, sunset, night.
+4. **Foam and light through crests.**
+5. **The whole system.** GI water surface, motion vectors, weather coupling and easing, presets,
+   viewer controls and debug views.
+6. **README, screenshots and GPU tests.** The tests check:
+   - no seam at the horizon;
+   - a storm sea is rougher and whiter than a calm one;
+   - shallows are brighter than deep water;
+   - the sea holds steady under a still camera.
+
+Wetness follows as its own design: rain darkening and glossing surfaces, puddles, the wet band
+along the shore, and rain on the sea.
+
+## Risks
+
+- **Moving water and TAA.** Fast normals can ghost or smear. Motion vectors from the waves are the
+  first defence; if that is not enough, the water pass marks itself so TAA trusts history less.
+- **Precision.** Wave phases in f32 over long sessions, which is why they are kept within one
+  period, and depth precision far out on the plane, under reversed-Z.
+- **WebGPU limits.**
+  - The water pass writes three storage textures (colour, depth and motion), within the 5 the
+    renderer already requires.
+  - The FFT uses 8 KB of workgroup memory.
+- **Shared code.** The water pass reuses the reflection and shadow code that the flicker
+  investigation may change, so step 3 waits for its findings.
