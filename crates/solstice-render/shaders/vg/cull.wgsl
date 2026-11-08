@@ -88,7 +88,15 @@ fn emit_cluster(instance: u32, cluster: u32, software: bool) {
 // children, monotonic up the DAG.
 fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
     if view.is_ortho != 0u {
-        return error * view.lod_scale;
+        var pixels = error * view.lod_scale;
+        // Drawn for a camera: error that camera cannot see is not worth drawing here either.
+        // Its nearest point to the camera keeps this conservative and monotonic up the DAG, as
+        // below; the view's own measure already is, so the smaller of the two is as well.
+        if view.eye_lod_scale > 0.0 {
+            let distance = max(length(center - view.eye_position) - radius, view.eye_near);
+            pixels = min(pixels, error * view.eye_lod_scale / distance);
+        }
+        return pixels;
     }
     let distance = max(length(center - view.camera_position) - radius, view.near);
     return error * view.lod_scale / distance;
@@ -97,6 +105,12 @@ fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
 fn in_frustum(center: vec3f, radius: f32) -> bool {
     for (var i = 0u; i < 6u; i++) {
         let p = view.planes[i];
+        if dot(p.xyz, center) + p.w < -radius {
+            return false;
+        }
+    }
+    for (var i = 0u; i < view.receiver_plane_count; i++) {
+        let p = view.receiver_planes[i];
         if dot(p.xyz, center) + p.w < -radius {
             return false;
         }
