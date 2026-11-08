@@ -122,7 +122,8 @@ fn field_contact(x: vec3f, level: u32, distance: f32, remembered: vec3f) -> Cont
 // On the two finest levels the sliding particle's path is still marched for any other surface
 // ahead of it, offset three voxels from the one it slides on, so that what is found is
 // something else, with a clean normal: nearer the surface the field is too blurred in a
-// corner to tell the two apart. What stands lower than that offset isn't seen.
+// corner to tell the two apart. What stands lower than that offset, or sticks out from a wall
+// less than it, isn't seen.
 fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Contact {
     let path = end - start;
     let length_of_path = length(path);

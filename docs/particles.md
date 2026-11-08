@@ -486,7 +486,7 @@ picks the ones it needs, as `collide depth field water` then `bounce`, `stick` o
     by a ledge it has slid off, nothing holds it up.
   - On the two finest levels its path, offset three voxels from the surface, is
     still marched for another surface ahead, so a wall stops it and anything lower than that
-    doesn't. On coarser levels it isn't.
+    doesn't, nor a ledge sticking out from a wall by less than that. On coarser levels it isn't.
   - One within reach that remembers nothing was born there. It is trusted when the gradient points
     up, off a floor; otherwise it is left alone until it has come out of reach, and what it meets
     after that counts. So a particle born under the field's ridge, within half a voxel of a floor,
@@ -732,7 +732,9 @@ Each step is its own PR off `main`, and none starts until the last is merged. Ea
        gusts; curl noise, buoyancy, attract and vortex.
      - Collision against depth, the distance field and the water, with bounce, stick and kill.
      - Events between emitters.
-     - Tests, each mutation-checked: 35 bugs were put back in turn, and each made a test fail.
+     - Tests, each mutation-checked: 33 bugs were put back in turn, and each made a test fail. No test reaches two other paths:
+       a wall merely beside a particle not holding it up, and a corner's blur not being taken for
+       the surface.
        - Under every force at once, the GPU's particles are where the CPU reference puts them,
          to within 0.1 mm (2 µm measured).
        - Curl noise has no divergence, and the noise's gradient matches finite differences.

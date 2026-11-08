@@ -1768,8 +1768,8 @@ fn particles_born_near_a_surface_still_hit_the_next() {
     assert!(live.is_empty(), "{} went through the floor", live.len());
 }
 
-/// A particle that remembers a floor, up beside a wall, isn't held up by the wall: it falls back
-/// to the floor. (The wall is low enough for the search ahead, above it, not to find it.)
+/// A particle thrown up beside a wall comes back down to the floor, rather than staying up there
+/// or going through it.
 #[test]
 fn a_neighbouring_surface_holds_nothing_up() {
     let Some(mut ground) = Ground::with_wall_of_height(1.5, 0.9) else {
@@ -1813,6 +1813,12 @@ fn a_neighbouring_surface_holds_nothing_up() {
         .map(|p| p.position[1])
         .fold(f32::MIN, f32::max);
     assert!(highest < 0.35, "a particle hung at {highest} m");
+    let lowest = emitters[1]
+        .1
+        .iter()
+        .map(|p| p.position[1])
+        .fold(f32::MAX, f32::min);
+    assert!(lowest > -0.25, "a particle fell to {lowest} m");
 }
 
 /// One that hops off the floor, still within reach and under the field's ridge, remembers which
@@ -1923,11 +1929,12 @@ fn slow_sliding_particles_do_not_jump_to_a_wall() {
         ground.frame();
     }
     let settled = ground.emitters()[1].0.spawned;
-    assert!(settled <= 20, "{settled} hits to land");
+    assert!((10..=20).contains(&settled), "{settled} hits to land");
     for _ in 0..30 {
         ground.frame();
     }
     let emitters = ground.emitters();
+    assert_eq!(emitters[0].1.len(), 10);
     assert_eq!(emitters[1].0.spawned, settled, "hits while sliding");
     // A tenth of a metre a second for 80 frames, from 1.05.
     let furthest = emitters[0]
