@@ -88,7 +88,20 @@ fn emit_cluster(instance: u32, cluster: u32, software: bool) {
 // children, monotonic up the DAG.
 fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
     if view.is_ortho != 0u {
-        return error * view.lod_scale;
+        var pixels = error * view.lod_scale;
+        // Drawn for a camera: error that camera cannot see is not worth drawing here either.
+        // A caster's error shows where its shadow lands, anywhere along the line from it away
+        // from the light, so the camera's distance to that line bounds how near the error can
+        // be seen. A parent's line sweeps a volume holding its children's, so this stays
+        // monotonic up the DAG, as the view's own measure is; the smaller of the two is too.
+        if view.eye_lod_scale > 0.0 {
+            let to_eye = view.eye_position - center;
+            let along = max(dot(to_eye, -view.eye_light), 0.0);
+            let nearest = sqrt(max(dot(to_eye, to_eye) - along * along, 0.0));
+            let distance = max(nearest - radius, view.eye_near);
+            pixels = min(pixels, error * view.eye_lod_scale / distance);
+        }
+        return pixels;
     }
     let distance = max(length(center - view.camera_position) - radius, view.near);
     return error * view.lod_scale / distance;
@@ -97,6 +110,12 @@ fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
 fn in_frustum(center: vec3f, radius: f32) -> bool {
     for (var i = 0u; i < 6u; i++) {
         let p = view.planes[i];
+        if dot(p.xyz, center) + p.w < -radius {
+            return false;
+        }
+    }
+    for (var i = 0u; i < view.receiver_plane_count; i++) {
+        let p = view.receiver_planes[i];
         if dot(p.xyz, center) + p.w < -radius {
             return false;
         }
