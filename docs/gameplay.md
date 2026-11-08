@@ -293,9 +293,9 @@ What each one means:
   of work, as Godot and Epic (Verse) both found. Compiling to wasm has a second problem: the
   browser can run wasm, but the native build would need a wasm runtime such as Wasmtime as well.
 
-### The recommendation: Starlark
+### The choice: Starlark
 
-**Starlark, through `starlark-rust`.**
+**Starlark, through `starlark-rust`.** Chosen on 8 November 2026, from the measurements above.
 - It is Python to read and write: `def`, indentation, lists, dicts, comprehensions, `if`, `for`.
 - It is the fastest at the crossings a game makes all the time.
 - It is fully sandboxed, can be stopped, and has types and an editor language server.
