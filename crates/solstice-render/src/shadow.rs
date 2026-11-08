@@ -37,12 +37,16 @@ const ROTATION_MARGIN: f32 = 0.1;
 
 /// How far the shadow lookup reaches from the receiver it is for, in metres, for a cascade
 /// with texels `texel` across, as `lighting/sun_shadow.wgsl` samples: an offset along the
-/// normal of 1.2 + 0.8 × a slope of up to 8 texels, then a filter disc 1.5 texels across, and
-/// a texel of bilinear comparison. The disc is held to 1.8 cm at least, which in the nearest
-/// cascade is more than a texel.
+/// normal of 1.2 + 0.8 × a slope of up to 8 texels, then a filter disc of radius 1.5 texels,
+/// and the diagonal of the 2×2 bilinear comparison. The disc's radius is held to 1.8 cm at
+/// least, which in the nearest cascade is more than a texel. Receivers themselves are found
+/// through a jittered projection, which reaches up to half a pixel past the slice: at 720p
+/// and 420 m, 0.34 m, which `JITTER_REACH` covers at any distance the cascades span.
 fn lookup_reach(texel: f32) -> f32 {
-    texel * (7.6 + 1.5 * (0.018 / texel).max(1.0) + 1.0)
+    texel * (7.6 + 1.5 * (0.018 / texel).max(1.0) + std::f32::consts::SQRT_2) + JITTER_REACH
 }
+/// Half a pixel at the far end of the last cascade, at 720p, in metres.
+const JITTER_REACH: f32 = 0.35;
 
 /// What a cascade was drawn with, to tell when it has gone stale.
 #[derive(Clone, Copy, PartialEq)]
@@ -769,8 +773,8 @@ mod tests {
     fn the_lookup_reach_grows_with_the_texel_but_never_falls_below_the_filter_floor() {
         // Far cascades: about ten texels. The nearest, with 1.5 cm texels, keeps the 1.8 cm
         // disc, so more than ten.
-        assert!((lookup_reach(0.5) / 0.5 - 10.1).abs() < 1.0e-4);
-        assert!(lookup_reach(0.015) / 0.015 > 10.3);
+        assert!(((lookup_reach(0.5) - JITTER_REACH) / 0.5 - 10.514).abs() < 1.0e-3);
+        assert!((lookup_reach(0.015) - JITTER_REACH) / 0.015 > 10.7);
         assert!(lookup_reach(0.2) > lookup_reach(0.1));
     }
 

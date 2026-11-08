@@ -125,7 +125,8 @@ impl PassView {
     /// nothing this view draws is seen nearer than `nearest` from that camera.
     pub fn seen_from(mut self, eye: Vec3, light: Vec3, lod_scale: f32, nearest: f32) -> Self {
         self.eye_position = eye;
-        self.eye_light = light;
+        // The distance to the shadow's line needs a unit direction.
+        self.eye_light = light.normalize_or(Vec3::Y);
         self.eye_lod_scale = lod_scale;
         self.eye_near = nearest.max(1.0e-3);
         self
