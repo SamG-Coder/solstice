@@ -7,7 +7,12 @@
 //! bake --gallery [--texture-size N] [--output FILE]
 //! bake --forest [--texture-size N] [--output FILE]
 //! bake --plants [--species FILE.species]... [--grass FILE.grass]... [--texture-size N] [--output FILE]
+//! bake --check-character CHARACTER.glb [--roles RIG.roles]
 //! ```
+//!
+//! `--check-character` bakes nothing: it checks a rigged character as the export tool wrote it
+//! (`tools/blender/solstice_export.py`), prints what it holds and what is wrong with it, and
+//! fails if anything is.
 //!
 //! `--plants` grows every built-in species and breed of grass, then each species and grass file
 //! given, so either can be edited and looked at without touching code.
@@ -46,6 +51,9 @@ struct Options {
     species: Vec<PathBuf>,
     /// Grass files to add to the row of grass.
     grass: Vec<PathBuf>,
+    /// A character to check, and its rig's role file.
+    check_character: Option<PathBuf>,
+    roles: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -62,6 +70,8 @@ fn parse_args() -> Result<Options, String> {
         plants: false,
         species: Vec::new(),
         grass: Vec::new(),
+        check_character: None,
+        roles: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -77,6 +87,8 @@ fn parse_args() -> Result<Options, String> {
             }
             "--output" => options.output = PathBuf::from(value()?),
             "--scene" => options.scene_file = Some(PathBuf::from(value()?)),
+            "--check-character" => options.check_character = Some(PathBuf::from(value()?)),
+            "--roles" => options.roles = Some(PathBuf::from(value()?)),
             "--gltf" => options.gltf = Some(PathBuf::from(value()?)),
             "--fit" => {
                 let metres = value()?.parse().map_err(|e| format!("--fit: {e}"))?;
@@ -142,8 +154,31 @@ fn load_scene(options: &Options) -> Result<SceneAsset, String> {
     Ok(imported.scene)
 }
 
+/// Checks a character file, and fails if anything is wrong with it.
+fn check_character(path: &std::path::Path, roles: Option<&PathBuf>) -> Result<(), String> {
+    use solstice_import::character::{check_character, Roles};
+    let roles = match roles {
+        Some(file) => {
+            let text =
+                std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+            Some(Roles::parse(&text).map_err(|e| format!("{}: {e}", file.display()))?)
+        }
+        None => None,
+    };
+    let report = check_character(path, roles.as_ref())?;
+    println!("{}: {}", path.display(), report.summary());
+    if report.problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{} is not ready for the engine", path.display()))
+    }
+}
+
 fn main() -> Result<(), String> {
     let options = parse_args()?;
+    if let Some(path) = &options.check_character {
+        return check_character(path, options.roles.as_ref());
+    }
     let start = Instant::now();
     let mut scene = load_scene(&options)?;
     if !options.raw_textures {
