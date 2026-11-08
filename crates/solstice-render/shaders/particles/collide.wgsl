@@ -115,12 +115,13 @@ fn field_contact(x: vec3f, level: u32, distance: f32, remembered: vec3f) -> Cont
 // reach, and can only be trusted when the gradient points up, off a floor: anywhere else it may
 // be under the field's ridge, where the gradient points the wrong way. Then it is left alone
 // until it has come out of reach, and what it meets after that counts. (So a particle born under
-// the ridge of a floor and moving down passes through it. Particles spawned by an event remember
-// the surface they were born on.)
+// the ridge of a floor and moving down passes through it, and one born between a ceiling and
+// its ridge is taken to be on a floor there. Particles spawned by an event remember the surface
+// they were born on.)
 //
 // On the two finest levels the sliding particle's path is still marched for any other surface
-// ahead of it, offset three voxels from the one it slides on, across its motion, so that what is
-// found is something else, with a clean normal: nearer the surface the field is too blurred in a
+// ahead of it, offset three voxels from the one it slides on, so that what is found is
+// something else, with a clean normal: nearer the surface the field is too blurred in a
 // corner to tell the two apart. What stands lower than that offset isn't seen.
 fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Contact {
     let path = end - start;
@@ -147,11 +148,8 @@ fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Co
         if distance < reach {
             let contact = field_contact(x, level, distance, remembered);
             if step == 0u {
-                if !contact.hit {
-                    return no_contact();
-                }
                 var side = remembered;
-                if dot(side, side) == 0.0 && contact.normal.y > OFF_A_FLOOR {
+                if contact.hit && dot(side, side) == 0.0 && contact.normal.y > OFF_A_FLOOR {
                     side = contact.normal;
                 }
                 if dot(side, side) == 0.0 {
@@ -165,9 +163,8 @@ fn against_field(start: vec3f, end: vec3f, radius: f32, remembered: vec3f) -> Co
                     if level > FINEST_LEVEL_SEARCHED {
                         break;
                     }
-                    let across = resting_on - direction * dot(resting_on, direction);
-                    let away_from_path = select(resting_on, normalize(across), length(across) > 1.0e-3);
-                    offset = away_from_path * voxel * 3.0;
+                    // Along the side known, not the gradient, which a corner tilts.
+                    offset = side * voxel * 3.0;
                 }
             } else if !unsure && contact.hit && abs(dot(contact.normal, resting_on)) < SAME_SURFACE {
                 // On the surface's own plane, at the particle's path rather than the offset one.

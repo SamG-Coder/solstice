@@ -1354,10 +1354,14 @@ impl Ground {
 
     /// The floor at height 0 with a wall across it at `x`, 6 m high.
     fn with_wall(x: f32) -> Option<Self> {
-        Self::build(0.0, None, Some(x))
+        Self::with_wall_of_height(x, 6.0)
     }
 
-    fn build(floor: f32, sea_level: Option<f32>, wall: Option<f32>) -> Option<Self> {
+    fn with_wall_of_height(x: f32, height: f32) -> Option<Self> {
+        Self::build(0.0, None, Some((x, height)))
+    }
+
+    fn build(floor: f32, sea_level: Option<f32>, wall: Option<(f32, f32)>) -> Option<Self> {
         use solstice_builder::{build_virtual_mesh, paginate, BuildOptions, Mesh, Vertex};
         let gpu = request_gpu()?;
         let errors: Arc<Mutex<Vec<String>>> = Default::default();
@@ -1375,8 +1379,8 @@ impl Ground {
             });
         }
         ground.indices = vec![0, 2, 1, 0, 3, 2];
-        if let Some(x) = wall {
-            for (y, z) in [(0.0, -40.0), (0.0, 40.0), (6.0, 40.0), (6.0, -40.0)] {
+        if let Some((x, height)) = wall {
+            for (y, z) in [(0.0, -40.0), (0.0, 40.0), (height, 40.0), (height, -40.0)] {
                 ground.vertices.push(Vertex {
                     position: Vec3::new(x, y, z),
                     normal: -Vec3::X,
@@ -1765,10 +1769,10 @@ fn particles_born_near_a_surface_still_hit_the_next() {
 }
 
 /// A particle that remembers a floor, up beside a wall, isn't held up by the wall: it falls back
-/// to the floor.
+/// to the floor. (The wall is low enough for the search ahead, above it, not to find it.)
 #[test]
 fn a_neighbouring_surface_holds_nothing_up() {
-    let Some(mut ground) = Ground::with_wall(1.5) else {
+    let Some(mut ground) = Ground::with_wall_of_height(1.5, 0.9) else {
         return;
     };
     let effect = Effect::parse(
@@ -1811,6 +1815,53 @@ fn a_neighbouring_surface_holds_nothing_up() {
     assert!(highest < 0.35, "a particle hung at {highest} m");
 }
 
+/// One that hops off the floor, still within reach and under the field's ridge, remembers which
+/// side it was on when it comes back down.
+#[test]
+fn hopping_particles_remember_their_side() {
+    let Some(mut ground) = Ground::new(0.0, None) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter drops
+          budget 20
+          spawn burst=20
+          lifetime 100
+          shape box 2 0 2
+          offset 0 1 -1
+          size 0.01
+          gravity
+          collide depth kill event=hit
+        emitter child
+          budget 40
+          spawn event=hit count=1
+          lifetime 100
+          velocity 0 0.3 0
+          size 0.02
+          gravity
+          collide field bounce restitution=0
+        ",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..90 {
+        ground.frame();
+    }
+    let emitters = ground.emitters();
+    assert_eq!(emitters[1].1.len(), 20);
+    let lowest = emitters[1]
+        .1
+        .iter()
+        .map(|p| p.position[1])
+        .fold(f32::MAX, f32::min);
+    assert!(lowest > -0.25, "a particle fell to {lowest} m");
+}
+
 /// A particle born just above a floor and falling, where the field's gradient is up, lands.
 #[test]
 fn falling_from_just_above_a_floor_lands() {
@@ -1836,6 +1887,57 @@ fn falling_from_just_above_a_floor_lands() {
     assert!(lowest > -0.2, "a particle fell to {lowest} m");
 }
 
+/// A slow particle sliding towards a wall stays where its speed takes it, rather than being
+/// taken to a wall that the search ahead of it found.
+#[test]
+fn slow_sliding_particles_do_not_jump_to_a_wall() {
+    let Some(mut ground) = Ground::with_wall(1.5) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "
+        emitter e
+          budget 20
+          spawn burst=10
+          lifetime 100
+          shape box 0.02 0.02 0.2
+          offset 1.05 0.3 0
+          velocity 0.1 0 0
+          size 0.04
+          gravity
+          collide field bounce restitution=0 friction=0 event=hit
+        emitter child
+          budget 400
+          spawn event=hit count=1
+          lifetime 100
+          size 0.01
+        ",
+    )
+    .unwrap();
+    ground
+        .renderer
+        .particles()
+        .spawn(&effect, Mat4::IDENTITY)
+        .unwrap();
+    for _ in 0..50 {
+        ground.frame();
+    }
+    let settled = ground.emitters()[1].0.spawned;
+    assert!(settled <= 20, "{settled} hits to land");
+    for _ in 0..30 {
+        ground.frame();
+    }
+    let emitters = ground.emitters();
+    assert_eq!(emitters[1].0.spawned, settled, "hits while sliding");
+    // A tenth of a metre a second for 80 frames, from 1.05.
+    let furthest = emitters[0]
+        .1
+        .iter()
+        .map(|p| p.position[0])
+        .fold(f32::MIN, f32::max);
+    assert!(furthest < 1.3, "a particle jumped to x = {furthest}");
+}
+
 /// A particle sliding along the floor still finds a wall in its way.
 #[test]
 fn sliding_particles_stop_at_a_wall() {
@@ -1859,7 +1961,7 @@ fn sliding_particles_stop_at_a_wall() {
     let furthest = live.iter().map(|p| p.position[0]).fold(f32::MIN, f32::max);
     // Sliding on at 12 m/s would have taken them to x = 9. The field finds the wall to a voxel.
     assert!(furthest < 1.9, "a particle reached x = {furthest}");
-    assert!(furthest > 0.5, "they never got there: {furthest}");
+    assert!(furthest > 1.0, "they stopped short: {furthest}");
 }
 
 /// Hits past what an emitter takes in a frame are counted as dropped, not lost unseen.
