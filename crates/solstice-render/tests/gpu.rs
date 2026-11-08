@@ -1,7 +1,7 @@
 //! End-to-end tests on a real GPU. They pass trivially, with a note, if none is available.
 
 use glam::{Mat4, Vec2, Vec3};
-use solstice_asset::{Instance, LoadedScene, Material, SceneAsset, TextureLayer};
+use solstice_asset::{Instance, Light, LoadedScene, Material, SceneAsset, TextureLayer};
 use solstice_builder::{
     build_virtual_mesh, compress_textures, mip_chain, paginate, BuildOptions, Mesh, Vertex,
 };
@@ -132,13 +132,26 @@ struct Run {
     software_clusters: u32,
 }
 
-/// Renders a few frames, fails on any validation error, and reads back the result.
+/// Renders a few frames in darkness, fails on any validation error, and reads back the result.
 fn render(
     gpu: &Gpu,
     scene: &SceneAsset,
     camera: &Camera,
     settings: RendererSettings,
     size: u32,
+) -> Run {
+    render_in(gpu, scene, camera, settings, size, &darkness())
+}
+
+/// Renders a few frames under `environment`, fails on any validation error, and reads back
+/// the result.
+fn render_in(
+    gpu: &Gpu,
+    scene: &SceneAsset,
+    camera: &Camera,
+    settings: RendererSettings,
+    size: u32,
+    environment: &Environment,
 ) -> Run {
     let errors: Arc<Mutex<Vec<String>>> = Default::default();
     let sink = errors.clone();
@@ -153,7 +166,7 @@ fn render(
 
     // Enough frames for the depth history to exist and the stats readback to cycle.
     for _ in 0..8 {
-        renderer.render(gpu, camera, &darkness(), &view, (size, size), 1.0 / 60.0);
+        renderer.render(gpu, camera, environment, &view, (size, size), 1.0 / 60.0);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
@@ -948,6 +961,84 @@ fn compressed_scene_without_textures_renders() {
     };
     let run = render(&gpu, &scene, &camera, RendererSettings::default(), 64);
     assert!(run.clusters > 0);
+}
+
+/// Lights reach only the tiles of the screen their range meets, and the lighting loops over
+/// those alone. A lamp over the ball lights it; six hundred lamps far off to the side change
+/// nothing; and without the lamp the ball stays dark, as there is no sun or sky here.
+#[test]
+fn tiled_lights_reach_what_is_in_their_range_and_nothing_else() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 8.0),
+        yaw: 0.0,
+        pitch: -0.1,
+        ..Default::default()
+    };
+    // No sun, no sky and no indirect light, with the exposure held to daylight, so only the
+    // lamps' direct light shows: the GI volume lights the ball from the lamps too, by its own
+    // loop over them, and would hide a tile that left one out.
+    let night = Environment {
+        sun_illuminance: 0.0,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        daylight_illuminance: 10.0,
+        ..Default::default()
+    };
+    let lamp = |x: f32, z: f32| Light {
+        position: [x, 3.0, z],
+        range: 6.0,
+        intensity: [40.0; 3],
+        _pad: 0,
+    };
+    let near = lamp(1.5, 1.5);
+    // A field of lamps 200 m off to the side, in range of nothing on screen.
+    let far: Vec<Light> = (0..600)
+        .map(|i| {
+            lamp(
+                200.0 + (i % 30) as f32 * 5.0,
+                -200.0 + (i / 30) as f32 * 5.0,
+            )
+        })
+        .collect();
+    let size = 128;
+    let render_lights = |lights: Vec<Light>| {
+        let mut scene = ball_on_floor();
+        scene.lights = lights;
+        render_in(
+            &gpu,
+            &scene,
+            &camera,
+            RendererSettings::default(),
+            size,
+            &night,
+        )
+        .pixels
+    };
+    let dark = render_lights(Vec::new());
+    let lit = render_lights(vec![near]);
+    // The near lamp comes last, so a tile that listed the wrong index would pick a far one.
+    let crowded = render_lights([far, vec![near]].concat());
+
+    let ball = |pixels: &[u8]| brightness(patch(pixels, size, size / 2, size / 2, 6));
+    assert!(
+        ball(&lit) > ball(&dark) + 20.0,
+        "the lamp lights the ball: {} lit, {} dark",
+        ball(&lit),
+        ball(&dark)
+    );
+    let difference: f32 = lit
+        .iter()
+        .zip(&crowded)
+        .map(|(&a, &b)| (f32::from(a) - f32::from(b)).abs())
+        .sum::<f32>()
+        / lit.len() as f32;
+    assert!(
+        difference < 1.0,
+        "far lamps changed the picture by {difference} per channel on average"
+    );
 }
 
 /// A white ball on a wide floor, lit by the sun from +X, for judging how clouds light a scene.

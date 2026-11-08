@@ -6,7 +6,7 @@ use crate::frame::{
 };
 use crate::gi::{GiVolume, ScreenGi, ScreenGiBindings, LEVEL_COUNT};
 use crate::gpu::{Gpu, Target};
-use crate::lighting::{environment_group, environment_layout, DeferredLighting};
+use crate::lighting::{environment_group, environment_layout, DeferredLighting, LightTiles};
 use crate::ocean::grid::PATCH_CELLS;
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::waterline::{SeaViews, Waterline};
@@ -199,6 +199,9 @@ struct SizedResources {
     screen_gi: ScreenGiBindings,
     clouds: CloudBindings,
     deferred: [wgpu::BindGroup; 2],
+    /// The bindings of the pass that lists which lights reach each tile of the screen; the
+    /// list itself is held by these and the deferred bind groups.
+    light_tiles_group: wgpu::BindGroup,
     post: PostBindings,
     hdr: Target,
     /// Where the water pass draws, when there is a sea.
@@ -238,6 +241,7 @@ pub struct Renderer {
     screen_gi: ScreenGi,
     environment: wgpu::BindGroup,
     deferred: DeferredLighting,
+    light_tiles: LightTiles,
     post: PostProcess,
     profiler: Option<Profiler>,
     /// The open sea, if the scene has one, and an ocean waiting to be eased into, with the
@@ -398,6 +402,7 @@ impl Renderer {
             waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
+            light_tiles: LightTiles::new(gpu, &environment_layout),
             post: PostProcess::new(gpu, output_format),
             profiler: Profiler::new(gpu),
             scene,
@@ -764,6 +769,14 @@ impl Renderer {
         self.screen_gi
             .record(&mut encoder, &sized.screen_gi, &self.environment, parity);
         mark(&self.profiler, &mut encoder, section::LIGHTING);
+        if self.scene.light_count > 0 {
+            self.light_tiles.record(
+                &mut encoder,
+                &sized.light_tiles_group,
+                &self.environment,
+                render_size,
+            );
+        }
         self.deferred.record(
             &mut encoder,
             &sized.deferred[parity],
@@ -883,6 +896,10 @@ impl Renderer {
             [&history[1].view, &history[0].view],
         );
         let clouds = self.clouds.bindings(gpu, render_size, &gbuffer.depth.view);
+        let light_tiles = LightTiles::buffer(gpu, render_size);
+        let light_tiles_group =
+            self.light_tiles
+                .bind_group(gpu, &gbuffer.depth.view, &self.scene, &light_tiles);
         let deferred = self.deferred.bind_groups(
             gpu,
             &gbuffer,
@@ -891,6 +908,7 @@ impl Renderer {
             &self.shadows,
             &self.scene,
             &clouds,
+            &light_tiles,
         );
         let water = self
             .sea
@@ -929,6 +947,7 @@ impl Renderer {
             screen_gi,
             clouds,
             deferred,
+            light_tiles_group,
             post,
             hdr,
             water,

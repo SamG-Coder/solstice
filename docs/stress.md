@@ -185,3 +185,33 @@ as the main view's per pixel, over four and a half times the pixels. Fewer, larg
 far shadow casters would need a coarser LOD than the texel for foliage, which is a design
 question for the cluster builder's thinning, not a cull bug.
 
+#### Fix 4: lights reach tiles, not every pixel
+
+The lighting pass looped over every light in the scene for every pixel, 512 distance tests a
+pixel here, before tracing visibility for the few in range. A compute pass now finds, per
+16×16 tile of the screen, the lights whose range meets the tile's frustum (its four edge planes
+through the camera, cut to the depth range the tile holds), and lists up to 127 of them; the
+lighting pass loops over the tile's list. With no lights in the scene the pass is skipped and
+the lists, zero from creation, say so.
+
+| View, round 2 | Lighting before | After |
+|---|---|---|
+| Hill (512 lights in view, few in range) | 0.74 ms | 0.10 ms |
+| Beach | 0.97 ms | 0.12 ms |
+| Courtyard, day (64 torches 14 m apart) | 1.72 ms | 0.87 ms |
+| Courtyard, 22:00 | 1.69 ms | 1.09 ms |
+
+Images are unchanged within noise (TAA off; hill 58.3 dB, beach 46.8, courtyard 41.8 against
+floors of 58, 46.5 and 40.7). What remains in the courtyard is the torches themselves: each pixel
+there lies within range of some thirty, and each costs a 16-step visibility trace through the GI
+volume. That is the content's cost, and a cheaper visibility (a shadow cache per light, or fewer
+steps for near lights) would be the next step if it mattered. The voxel light pass still loops
+over every light per voxel (0.8 ms in the courtyard); the same list idea per 8³ block of each
+clipmap level would cut its loop, but not its traces.
+
+A GPU test renders a ball under one lamp and six hundred lamps 200 m away, with sun, sky and
+indirect light off so that only direct light shows, and checks that the lamp lights the ball and
+the far lamps change nothing; the near lamp comes last in the list so that a tile holding the
+wrong index would pick a far one. Four mutations fail it: no light listed, planes shrunk by the
+range, the depth range shrunk, and the lighting pass reading the list's position as the index.
+
