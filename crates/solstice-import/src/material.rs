@@ -364,7 +364,12 @@ fn sample_weighted(image: &ImageData, u: f32, v: f32, size: u32, by_alpha: bool)
         for tx in 0..taps {
             let du = (tx as f32 + 0.5) / taps as f32 - 0.5;
             let dv = (ty as f32 + 0.5) / taps as f32 - 0.5;
-            let texel = bilinear(image, u + du / size as f32, v + dv / size as f32);
+            let (tap_u, tap_v) = (u + du / size as f32, v + dv / size as f32);
+            let texel = if by_alpha {
+                bilinear_by_alpha(image, tap_u, tap_v)
+            } else {
+                bilinear(image, tap_u, tap_v)
+            };
             let weight = if by_alpha { texel[3] } else { 1.0 };
             for channel in 0..3 {
                 colour[channel] += texel[channel] * weight;
@@ -396,6 +401,37 @@ fn bilinear(image: &ImageData, u: f32, v: f32) -> [f32; 4] {
         let bottom = c[channel] + (d[channel] - c[channel]) * fx;
         top + (bottom - top) * fy
     })
+}
+
+/// [`bilinear`] with colour averaged by alpha as well, so a hole's colour doesn't reach a mask's
+/// edge. Alpha is filtered as usual.
+fn bilinear_by_alpha(image: &ImageData, u: f32, v: f32) -> [f32; 4] {
+    let x = u * image.width as f32 - 0.5;
+    let y = v * image.height as f32 - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let corners = [
+        (0, 0, (1.0 - fx) * (1.0 - fy)),
+        (1, 0, fx * (1.0 - fy)),
+        (0, 1, (1.0 - fx) * fy),
+        (1, 1, fx * fy),
+    ];
+    let mut colour = [0.0f32; 3];
+    let (mut colour_weight, mut alpha) = (0.0, 0.0);
+    for (dx, dy, weight) in corners {
+        let texel = texel(image, x0 as i64 + dx, y0 as i64 + dy);
+        alpha += texel[3] * weight;
+        colour_weight += texel[3] * weight;
+        for channel in 0..3 {
+            colour[channel] += texel[channel] * texel[3] * weight;
+        }
+    }
+    let [r, g, b] = if colour_weight > 0.0 {
+        colour.map(|value| value / colour_weight)
+    } else {
+        [0.0; 3]
+    };
+    [r, g, b, alpha]
 }
 
 /// One texel as RGBA in `0.0..=255.0`, whatever the source format.

@@ -569,6 +569,21 @@ fn shrinking_a_mask_keeps_the_colour_of_its_strands() {
 }
 
 #[test]
+fn enlarging_a_mask_keeps_the_colour_of_its_strands() {
+    // A column of strand and a column of black hole, read three quarters of the way to the hole's
+    // side of the strand: mostly solid, so it passes, and it must not be darkened.
+    let image = ImageData {
+        pixels: [[200, 100, 50, 255, 0, 0, 0, 0]; 2].concat(),
+        format: Format::R8G8B8A8,
+        width: 2,
+        height: 2,
+    };
+    let texel = material::sample_masked(&image, 0.375, 0.5, 4);
+    assert!(texel[3] > 128, "{texel:?}");
+    assert!(texel[0] > 190, "{texel:?}");
+}
+
+#[test]
 fn an_occlusion_map_on_a_masked_material_is_reported_and_left_out() {
     let dir = TempDir::new();
     let material = textured(
