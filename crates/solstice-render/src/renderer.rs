@@ -7,6 +7,8 @@ use crate::frame::{
 use crate::gi::{GiVolume, ScreenGi, ScreenGiBindings, LEVEL_COUNT};
 use crate::gpu::{Gpu, Target};
 use crate::lighting::{environment_group, environment_layout, DeferredLighting};
+use crate::ocean::grid::PATCH_CELLS;
+use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::{Ocean, Sea, SeaState};
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
@@ -86,6 +88,8 @@ pub struct RendererSettings {
     /// Rays each GI probe traces on a side: one of `PROBE_RAY_OPTIONS`. More rays mean less
     /// boiling in indirect light, for more tracing.
     pub probe_rays: u32,
+    /// Cells across each of the sea surface's patches: a multiple of four.
+    pub ocean_patch_cells: u32,
 }
 
 impl Default for RendererSettings {
@@ -99,6 +103,7 @@ impl Default for RendererSettings {
             clouds: true,
             ocean_resolution: 256,
             probe_rays: 8,
+            ocean_patch_cells: PATCH_CELLS,
         }
     }
 }
@@ -117,6 +122,11 @@ impl RendererSettings {
         };
         self.ocean_resolution = if quality == Quality::Low { 128 } else { 256 };
         self.probe_rays = if quality == Quality::Low { 6 } else { 8 };
+        self.ocean_patch_cells = if quality == Quality::Low {
+            PATCH_CELLS / 2
+        } else {
+            PATCH_CELLS
+        };
     }
 }
 
@@ -171,7 +181,7 @@ struct SizedResources {
     render_size: (u32, u32),
     visibility: VisibilityBuffer,
     hzb: Hzb,
-    _gbuffer: GBuffer,
+    gbuffer: GBuffer,
     cull_scene: wgpu::BindGroup,
     raster: RasterBindings,
     resolve: ResolveBindings,
@@ -179,7 +189,9 @@ struct SizedResources {
     clouds: CloudBindings,
     deferred: [wgpu::BindGroup; 2],
     post: PostBindings,
-    _hdr: Target,
+    hdr: Target,
+    /// Where the water pass draws, when there is a sea.
+    water: Option<WaterTargets>,
 }
 
 /// Previous-frame camera state, for reprojection and occlusion culling.
@@ -219,6 +231,12 @@ pub struct Renderer {
     /// seconds to take. The sea is made on the next frame, which has the GPU to hand.
     sea: Option<Sea>,
     ocean_request: Option<(Option<Ocean>, f32)>,
+    /// The calm sea's level, from the scene.
+    sea_level: f32,
+    /// Draws and shades the sea's surface, when there is a sea.
+    water: Option<WaterSurface>,
+    /// The layout of the lighting bind group, for passes made after the renderer.
+    environment_layout: wgpu::BindGroupLayout,
     sized: Option<SizedResources>,
     history: Option<History>,
     frame_index: u32,
@@ -249,7 +267,7 @@ impl Renderer {
             streamer.install_now(gpu, &scene, page, loaded.page(page));
         }
         streamer.flush(gpu, &scene);
-        Self::from_parts(gpu, scene, streamer, output_format, settings)
+        Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&loaded.scene.sea)
     }
 
     /// Creates a renderer that starts with only a scene's pinned pages and smallest textures,
@@ -274,7 +292,27 @@ impl Renderer {
             streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
         }
         streamer.flush(gpu, &scene);
-        Self::from_parts(gpu, scene, streamer, output_format, settings)
+        Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&paged.sea)
+    }
+
+    /// Gives the renderer the scene's sea, if it has one.
+    fn with_sea(mut self, sea: &Option<solstice_asset::Sea>) -> Self {
+        if let Some(sea) = sea {
+            self.sea_level = sea.level;
+            let ocean =
+                Ocean::by_name(sea.ocean.trim()).map_or_else(|| Ocean::parse(&sea.ocean), Ok);
+            let ocean = ocean.unwrap_or_else(|error| {
+                log::warn!("the scene's ocean is unreadable ({error}); using coastal water");
+                Ocean::default()
+            });
+            self.ocean_request = Some((Some(ocean), 0.0));
+        }
+        self
+    }
+
+    /// Sets the calm sea's level, in metres.
+    pub fn set_sea_level(&mut self, level: f32) {
+        self.sea_level = level;
     }
 
     fn from_parts(
@@ -365,6 +403,9 @@ impl Renderer {
             environment,
             sea: None,
             ocean_request: None,
+            sea_level: 0.0,
+            water: None,
+            environment_layout,
             sized: None,
             history: None,
             frame_index: 0,
@@ -493,6 +534,22 @@ impl Renderer {
             ((output_size.0 as f32 * scale) as u32).max(16),
             ((output_size.1 as f32 * scale) as u32).max(16),
         );
+        // The sea first: whether there is one decides what the frame's textures are.
+        if let Some((ocean, seconds)) = self.ocean_request.take() {
+            match (ocean, &mut self.sea) {
+                (None, _) => self.sea = None,
+                (Some(ocean), Some(sea)) => sea.set_ocean(ocean, seconds),
+                (Some(ocean), None) => {
+                    self.sea = Some(Sea::new(gpu, ocean, self.settings.ocean_resolution))
+                }
+            }
+        }
+        let cells = self.settings.ocean_patch_cells;
+        if self.sea.is_none() {
+            self.water = None;
+        } else if self.water.as_ref().is_none_or(|w| w.cells() != cells) {
+            self.water = Some(WaterSurface::new(gpu, &self.environment_layout, cells));
+        }
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
         self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
@@ -544,15 +601,6 @@ impl Renderer {
             .record_lighting(&mut encoder, &self.cloud_environment);
 
         // The sea's waves, raised by the weather's wind.
-        if let Some((ocean, seconds)) = self.ocean_request.take() {
-            match (ocean, &mut self.sea) {
-                (None, _) => self.sea = None,
-                (Some(ocean), Some(sea)) => sea.set_ocean(ocean, seconds),
-                (Some(ocean), None) => {
-                    self.sea = Some(Sea::new(gpu, ocean, self.settings.ocean_resolution))
-                }
-            }
-        }
         mark(&self.profiler, &mut encoder, section::OCEAN);
         if let Some(sea) = &mut self.sea {
             let weather = self.clouds.weather();
@@ -641,6 +689,32 @@ impl Renderer {
             render_size,
         );
 
+        // The sea's surface, over the lit scene.
+        mark(&self.profiler, &mut encoder, section::WATER);
+        if let (Some(sea), Some(water), Some(targets)) = (&self.sea, &mut self.water, &sized.water)
+        {
+            water.prepare(
+                gpu,
+                camera.position,
+                self.sea_level,
+                &sea.ocean(),
+                sea.waves(),
+            );
+            water.record(
+                gpu,
+                &mut encoder,
+                &self.frame_uniform,
+                &self.environment,
+                sea.waves(),
+                targets,
+                SceneViews {
+                    lit: &sized.hdr.view,
+                    depth: &sized.gbuffer.depth.view,
+                    motion: &sized.gbuffer.motion.view,
+                },
+            );
+        }
+
         // From the lit scene to the display.
         mark(&self.profiler, &mut encoder, section::POST);
         let debug = self.settings.debug_view;
@@ -681,6 +755,7 @@ impl Renderer {
             s.render_size == render_size
                 && s.output_size == output_size
                 && s.screen_gi.probe_rays() == self.settings.probe_rays
+                && s.water.is_some() == self.sea.is_some()
         });
         if unchanged {
             return;
@@ -730,11 +805,24 @@ impl Renderer {
             &self.scene,
             &clouds,
         );
+        let water = self
+            .sea
+            .is_some()
+            .then(|| WaterTargets::new(gpu, render_size));
+        let (scene_color, scene_depth, scene_motion) = match &water {
+            Some(water) => (
+                &water.color.view,
+                &water.scene_depth.view,
+                &water.motion.view,
+            ),
+            None => (&hdr.view, &gbuffer.depth.view, &gbuffer.motion.view),
+        };
         let post = self.post.bindings(
             gpu,
             &self.frame_uniform,
-            &gbuffer,
-            &hdr.view,
+            scene_color,
+            scene_depth,
+            scene_motion,
             history,
             render_size,
             output_size,
@@ -747,7 +835,7 @@ impl Renderer {
             render_size,
             visibility,
             hzb,
-            _gbuffer: gbuffer,
+            gbuffer,
             cull_scene,
             raster,
             resolve,
@@ -755,7 +843,8 @@ impl Renderer {
             clouds,
             deferred,
             post,
-            _hdr: hdr,
+            hdr,
+            water,
         });
     }
 

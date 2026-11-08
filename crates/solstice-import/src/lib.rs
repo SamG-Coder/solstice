@@ -204,6 +204,7 @@ pub fn import_gltf(
             texture_encoding: Default::default(),
             textures,
             viewpoint: Some(frame_bounds(&world_bounds)),
+            sea: None,
         },
         parts,
         warnings,

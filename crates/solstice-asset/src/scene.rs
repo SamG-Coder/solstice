@@ -164,6 +164,16 @@ pub struct Viewpoint {
     pub pitch: f32,
 }
 
+/// An open sea around a scene: where its surface lies, and what its water is like.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Sea {
+    /// Height of the calm surface, in metres.
+    pub level: f32,
+    /// The name of a built-in ocean, such as `coastal`, or a whole ocean in its text form, as
+    /// `solstice_render::Ocean::parse` reads it, so a scene can carry an ocean of its own.
+    pub ocean: String,
+}
+
 /// A complete, self-contained scene.
 #[derive(Clone, Debug, Default)]
 pub struct SceneAsset {
@@ -176,6 +186,7 @@ pub struct SceneAsset {
     pub texture_encoding: TextureEncoding,
     pub textures: Vec<TextureLayer>,
     pub viewpoint: Option<Viewpoint>,
+    pub sea: Option<Sea>,
 }
 
 impl SceneAsset {

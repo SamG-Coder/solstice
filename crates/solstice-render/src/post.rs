@@ -2,7 +2,6 @@
 
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
 use crate::shaders;
-use crate::vg::GBuffer;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
@@ -262,8 +261,9 @@ impl PostProcess {
         &self,
         gpu: &Gpu,
         frame_uniform: &wgpu::Buffer,
-        gbuffer: &GBuffer,
         hdr: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        motion: &wgpu::TextureView,
         history: [Target; 2],
         render_size: (u32, u32),
         output_size: (u32, u32),
@@ -278,8 +278,8 @@ impl PostProcess {
                 &[
                     frame_uniform.as_entire_binding(),
                     tex(hdr),
-                    tex(&gbuffer.depth.view),
-                    tex(&gbuffer.motion.view),
+                    tex(depth),
+                    tex(motion),
                     tex(&history[1 - parity].view),
                     sampler.clone(),
                     tex(&history[parity].view),

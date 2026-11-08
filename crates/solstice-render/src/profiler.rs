@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 18] = [
+pub const SECTIONS: [&str; 19] = [
     "sky",
     "clouds",
     "ocean",
@@ -28,6 +28,7 @@ pub const SECTIONS: [&str; 18] = [
     "clouds on screen",
     "screen gi",
     "lighting",
+    "water",
     "post",
 ];
 /// Indices into [`SECTIONS`], for the marks that begin each one.
@@ -52,8 +53,10 @@ pub mod section {
     pub const CLOUDS_ON_SCREEN: usize = 14;
     pub const SCREEN_GI: usize = 15;
     pub const LIGHTING: usize = 16;
-    pub const POST: usize = 17;
-    pub const END: usize = 18;
+    /// The sea's surface, drawn and shaded.
+    pub const WATER: usize = 17;
+    pub const POST: usize = 18;
+    pub const END: usize = 19;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;

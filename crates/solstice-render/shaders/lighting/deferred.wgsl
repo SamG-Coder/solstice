@@ -33,9 +33,6 @@ struct Shadows {
 // The Milky Way over the celestial sphere, worked out once by sky/milky_way_bake.wgsl.
 @group(0) @binding(12) var milky_way_tex: texture_2d<f32>;
 
-// Distance over which distant objects dissolve into the air, as extinction per metre.
-const HAZE: f32 = 0.0011;
-
 const DISK_SAMPLES: u32 = 12u;
 
 // Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.
@@ -259,27 +256,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     color += emissive;
 
-    // Aerial perspective: distant objects fade towards the sky colour behind them.
-    let transmittance = exp(-distance * HAZE);
-    // How far into the haze this is: nearby haze glows with light from all around, but over a
-    // long path the air takes the colour of the sky at the horizon behind the object.
-    let far = sq(1.0 - transmittance);
-    // Sampled above the horizon and partly desaturated: the air between here and a distant
-    // object scatters light from all around, not only the long path to the horizon line.
-    let haze_direction = normalize(vec3f(-view.x, max(-view.y, 0.2), -view.z));
-    // Haze is the air's own glow, so it comes from the clear sky, not the clouds in it. Where
-    // clouds shade the air between here and the surface, less sunlight scatters into it.
-    let shade = mix(0.35, 1.0, cloud_shadow((world + frame.camera_position) * 0.5));
-    let haze_sky = clear_sky_radiance(haze_direction) * shade;
-    var haze_color = mix(vec3f(luminance(haze_sky)), haze_sky, 0.55);
-    // That direction can land on the glow around the sun even when looking down at nearby ground,
-    // whose radiance is so high that this small share of it shows as smoke across shadows. So the
-    // haze is limited relative to the open sky on the side away from the sun.
-    let away_from_sun = normalize(vec3f(-frame.sun_direction.x, 0.2, -frame.sun_direction.z));
-    let haze_limit = luminance(clear_sky_radiance(away_from_sun)) * shade * 2.0;
-    haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
-    haze_color = mix(haze_color, clear_sky_radiance(toward_horizon(-view)) * shade, far);
-    color = mix(haze_color, color, transmittance);
+    color = aerial_perspective(color, world, view, distance);
 
     switch frame.debug_mode {
         case DEBUG_DIFFUSE_GI: {

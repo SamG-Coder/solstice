@@ -11,6 +11,10 @@ use super::Ocean;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
 use crate::shaders;
 use bytemuck::{Pod, Zeroable};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Numbers each set of wave textures, so that what binds them knows when they are replaced.
+static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub const CASCADES: u32 = 3;
 
@@ -49,11 +53,29 @@ struct OceanUniform {
 /// A texture array with one layer per cascade.
 pub struct CascadeTexture {
     pub texture: wgpu::Texture,
+    /// Every level, for sampling.
     pub view: wgpu::TextureView,
+    /// Each level alone, for writing.
+    pub levels: Vec<wgpu::TextureView>,
 }
 
 impl CascadeTexture {
     fn new(gpu: &Gpu, label: &str, size: u32, format: wgpu::TextureFormat) -> Self {
+        Self::with_levels(gpu, label, size, format, 1)
+    }
+
+    /// One with a full mip chain, down to a single texel.
+    fn mipmapped(gpu: &Gpu, label: &str, size: u32, format: wgpu::TextureFormat) -> Self {
+        Self::with_levels(gpu, label, size, format, size.ilog2() + 1)
+    }
+
+    fn with_levels(
+        gpu: &Gpu,
+        label: &str,
+        size: u32,
+        format: wgpu::TextureFormat,
+        levels: u32,
+    ) -> Self {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -61,7 +83,7 @@ impl CascadeTexture {
                 height: size,
                 depth_or_array_layers: CASCADES,
             },
-            mip_level_count: 1,
+            mip_level_count: levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
@@ -74,7 +96,21 @@ impl CascadeTexture {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        Self { texture, view }
+        let levels = (0..levels)
+            .map(|level| {
+                texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        Self {
+            texture,
+            view,
+            levels,
+        }
     }
 }
 
@@ -95,6 +131,8 @@ pub struct OceanWaves {
     evolve: (wgpu::ComputePipeline, wgpu::BindGroup),
     rows: (wgpu::ComputePipeline, wgpu::BindGroup),
     columns: (wgpu::ComputePipeline, [wgpu::BindGroup; 2]),
+    /// Builds each mip level of the displacement and slopes from the one above.
+    mips: (wgpu::ComputePipeline, Vec<wgpu::BindGroup>),
     /// The sea state the amplitudes were last drawn from, and how long ago.
     built: Option<SeaState>,
     since_build: f32,
@@ -105,6 +143,7 @@ pub struct OceanWaves {
     seed: u32,
     frame: usize,
     uniform_data: OceanUniform,
+    generation: u64,
     /// The stretch below which the surface breaks into foam.
     pub(crate) foam_stretch: f32,
 }
@@ -140,8 +179,8 @@ impl OceanWaves {
             CascadeTexture::new(gpu, "ocean rows a", size, SPECTRUM_FORMAT),
             CascadeTexture::new(gpu, "ocean rows b", size, SPECTRUM_FORMAT),
         ];
-        let displacement = CascadeTexture::new(gpu, "ocean displacement", size, WAVE_FORMAT);
-        let derivatives = CascadeTexture::new(gpu, "ocean derivatives", size, WAVE_FORMAT);
+        let displacement = CascadeTexture::mipmapped(gpu, "ocean displacement", size, WAVE_FORMAT);
+        let derivatives = CascadeTexture::mipmapped(gpu, "ocean derivatives", size, WAVE_FORMAT);
         let foam = [
             CascadeTexture::new(gpu, "ocean foam 0", size, FOAM_FORMAT),
             CascadeTexture::new(gpu, "ocean foam 1", size, FOAM_FORMAT),
@@ -149,6 +188,9 @@ impl OceanWaves {
         let uniform = gpu.uniform_buffer("ocean", std::mem::size_of::<OceanUniform>() as u64);
         fn tex(t: &CascadeTexture) -> wgpu::BindingResource<'_> {
             wgpu::BindingResource::TextureView(&t.view)
+        }
+        fn level(t: &CascadeTexture, level: usize) -> wgpu::BindingResource<'_> {
+            wgpu::BindingResource::TextureView(&t.levels[level])
         }
 
         let layout = LayoutBuilder::new()
@@ -238,8 +280,8 @@ impl OceanWaves {
                     tex(&rows_out[0]),
                     tex(&rows_out[1]),
                     tex(&foam[read]),
-                    tex(&displacement),
-                    tex(&derivatives),
+                    level(&displacement, 0),
+                    level(&derivatives, 0),
                     tex(&foam[1 - read]),
                 ],
             )
@@ -254,6 +296,35 @@ impl OceanWaves {
             [columns_group(0), columns_group(1)],
         );
 
+        let layout = LayoutBuilder::new()
+            .texture_array()
+            .texture_array()
+            .storage_texture_array(WAVE_FORMAT)
+            .storage_texture_array(WAVE_FORMAT)
+            .build(gpu, "ocean mips");
+        let mips = (
+            gpu.compute_pipeline(
+                "ocean mips",
+                &shaders::module(&gpu.device, "ocean/mips.wgsl"),
+                "main",
+                &[&layout],
+            ),
+            (1..displacement.levels.len())
+                .map(|l| {
+                    gpu.bind_group(
+                        "ocean mips",
+                        &layout,
+                        &[
+                            level(&displacement, l - 1),
+                            level(&derivatives, l - 1),
+                            level(&displacement, l),
+                            level(&derivatives, l),
+                        ],
+                    )
+                })
+                .collect(),
+        );
+
         let [first, second] = band_limits();
         Self {
             size,
@@ -266,6 +337,7 @@ impl OceanWaves {
             evolve,
             rows,
             columns,
+            mips,
             built: None,
             since_build: 0.0,
             pending_build: false,
@@ -273,6 +345,7 @@ impl OceanWaves {
             seed: 0x5eed,
             frame: 0,
             foam_stretch: FOAM_STRETCH,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             uniform_data: OceanUniform {
                 sizes: [CASCADE_SIZES[0], CASCADE_SIZES[1], CASCADE_SIZES[2], 0.0],
                 bands: [first, second, 0.0, 0.0],
@@ -290,6 +363,11 @@ impl OceanWaves {
     /// Texels across each cascade's tile.
     pub fn size(&self) -> u32 {
         self.size
+    }
+
+    /// Different for every set of wave textures ever made, so bind groups know when to remake.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// How far through the sea's repeat it is, 0..1.
@@ -326,6 +404,13 @@ impl OceanWaves {
         pass.set_pipeline(&self.columns.0);
         pass.set_bind_group(0, &self.columns.1[self.frame % 2], &[]);
         pass.dispatch_workgroups(self.size, CASCADES, 1);
+        // Each level from the one above, down to a single texel.
+        pass.set_pipeline(&self.mips.0);
+        for (level, group) in self.mips.1.iter().enumerate() {
+            let texels = groups_for((self.size >> (level + 1)).max(1), 8);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(texels, texels, CASCADES);
+        }
         self.frame += 1;
     }
 
@@ -427,6 +512,17 @@ mod tests {
 
     /// Every texel of one cascade's layer, as four floats whatever the format.
     fn read_layer(gpu: &Gpu, texture: &CascadeTexture, size: u32, layer: u32) -> Vec<[f32; 4]> {
+        read_level(gpu, texture, size, layer, 0)
+    }
+
+    /// Every texel of one level of one cascade's layer; `size` is the level's own.
+    fn read_level(
+        gpu: &Gpu,
+        texture: &CascadeTexture,
+        size: u32,
+        layer: u32,
+        mip_level: u32,
+    ) -> Vec<[f32; 4]> {
         let format = texture.texture.format();
         let texel_bytes = format.block_copy_size(None).unwrap();
         let row_bytes = (size * texel_bytes).div_ceil(256) * 256;
@@ -440,7 +536,7 @@ mod tests {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture.texture,
-                mip_level: 0,
+                mip_level,
                 origin: wgpu::Origin3d {
                     x: 0,
                     y: 0,
@@ -661,6 +757,37 @@ mod tests {
                 (variance / energy - 1.0).abs() < 0.01,
                 "{size}², cascade {cascade}: variance {variance} against energy {energy}"
             );
+        }
+    }
+
+    #[test]
+    fn each_mip_level_is_the_mean_of_the_one_above() {
+        let Some(gpu) = request_gpu() else { return };
+        let size = 128;
+        let waves = run(&gpu, size, 5.0);
+        for texture in [&waves.displacement, &waves.derivatives] {
+            assert_eq!(texture.levels.len(), 8);
+            for cascade in 0..CASCADES {
+                for level in [1, 4, 7] {
+                    let above = read_level(&gpu, texture, size >> (level - 1), cascade, level - 1);
+                    let here = read_level(&gpu, texture, size >> level, cascade, level);
+                    let width = (size >> level) as usize;
+                    for z in 0..width {
+                        for x in 0..width {
+                            let at =
+                                |dx: usize, dz: usize| above[(2 * z + dz) * 2 * width + 2 * x + dx];
+                            for (c, found) in here[z * width + x].iter().copied().enumerate() {
+                                let mean =
+                                    (at(0, 0)[c] + at(1, 0)[c] + at(0, 1)[c] + at(1, 1)[c]) / 4.0;
+                                assert!(
+                                    (found - mean).abs() <= mean.abs() * 2.0e-3 + 1.0e-4,
+                                    "level {level}, cascade {cascade}, ({x}, {z}), channel {c}: {found} against {mean}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

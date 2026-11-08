@@ -238,11 +238,46 @@ lighting flicker investigation finishes.
    About 0.03 ms a frame at 256² on an RTX 5080, and 0.02 ms at 128². A picture test draws calm,
    fresh and gale seas for review. The on-screen debug view comes with step 2, which gives the
    waves a surface to show on.
-2. **Surface.** The grid, the water layer and the bake's `ocean` command, replacing the planes;
-   the cove is rebaked. Simple shading at first. Tests:
+2. **Surface.** *Done.* The grid, the water layer and the bake's `ocean` command, replacing the
+   planes; the cove is rebaked. Simple shading at first. Tests:
    - no cracks;
    - no popping or swimming as the camera moves;
    - the water meets the land correctly.
+
+   How, decided from the code:
+   - **Scene files.** The manifest gains optional tagged sections after its fixed part: a
+     four-byte tag, a length, then the contents. The first is the sea: its level, and the
+     ocean's own text, so a scene can carry an ocean of its own.
+     - Readers skip tags they don't know, and older readers never look past the fixed part, so
+       files stay readable both ways with no change of version.
+     - The temple and forest keep working unbaked; only the cove is rebaked.
+   - **Wave mips.** Each frame, the displacement and slope textures get their mip chains, so
+     geometry and pixels far away sample waves as large as they can show, not alias smaller ones.
+   - **The grid.** Concentric rings were the first plan. But a ring snapped to its own spacing
+     no longer lines up with the ring inside it, by up to a cell, and filling that takes
+     per-frame trim strips. Strugar's CDLOD (2010) avoids this:
+     - A quadtree of patches fixed in the world, finer near the camera, chosen each frame by
+       distance. Vertices never slide over the waves.
+     - Each vertex blends onto the coarser grid by its own distance, so neighbouring levels meet
+       exactly, with no cracks and no popping.
+     - Fourteen levels, from 4 m patches with 12.5 cm cells to 32 km, out to ±48 km.
+     - Patches are 32 cells across, 16 on Low. That is under 700,000 triangles at the surface
+       on desktop GPUs, and under 180,000 on Low.
+
+     Tests check the tiling, that every shared edge holds the same points (and that an unsafe
+     range would crack), and that vertices stay put as the camera moves.
+   - **The water layer.** The grid is drawn by the hardware rasterizer into its own depth target,
+     with the undisplaced position of each pixel's water in a colour target.
+   - **The water pass.** A compute pass after deferred lighting. Where the water is nearer than
+     the opaque scene, it shades it: Fresnel reflection of the sky, sun specular, deep-water
+     colour, and the same haze as everything else. It writes the result into a new HDR target,
+     which post then reads, and the water's depth and motion into the G-buffer. Opaque light
+     stays untouched in the old HDR target, ready for refraction in step 3.
+   - **Debug view.** "Ocean": the water's normals, so the waves, cracks and coverage can be
+     checked on screen and by tests. GPU tests check that every pixel below the horizon is sea,
+     from low, high and distant cameras at every quality, and that what stands out of the water
+     is not covered by it.
+   - **Cost**, on an RTX 5080 at 1280×720: waves 0.05 ms, surface and water pass 0.06 ms.
 3. **Water shading.** Reflection, refraction, absorption and scattering, sun and moon specular with
    shadows, filtering to roughness, and the horizon. Compared against photographs, one condition at
    a time: calm, choppy, storm, shallows, sunset, night.
