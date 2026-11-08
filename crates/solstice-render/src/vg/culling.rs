@@ -479,7 +479,7 @@ pub struct CullPipelines {
 }
 
 impl CullPipelines {
-    pub fn new(gpu: &Gpu) -> Self {
+    pub fn new(gpu: &Gpu, skinned: bool) -> Self {
         let scene_layout = LayoutBuilder::new()
             .uniform_dynamic()
             .storage_read()
@@ -501,7 +501,7 @@ impl CullPipelines {
             .storage_write()
             .build(gpu, "cull control");
 
-        let cull = shaders::module(&gpu.device, "vg/cull.wgsl");
+        let cull = shaders::module_for(&gpu.device, "vg/cull.wgsl", skinned);
         let control = shaders::module(&gpu.device, "vg/cull_control.wgsl");
         let cull_layouts = [&scene_layout, &work_layout];
         Self {

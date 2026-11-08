@@ -13,6 +13,7 @@ use crate::motion::InstanceTable;
 use glam::{Mat3, Mat4, Vec3, Vec4};
 use solstice_asset::paged::PagedScene;
 use solstice_asset::{Skeleton, NO_POSE};
+use std::ops::Range;
 
 /// `Instance.bones` of an instance that isn't skinned. Twin of `NO_BONES` in `common/skin.wgsl`.
 pub const NO_BONES: u32 = u32::MAX;
@@ -95,9 +96,8 @@ impl GpuSkins {
             })
             .collect();
         for (number, (&pose, slot)) in scene.instance_poses.iter().zip(gpu_index).enumerate() {
-            let bends = scene.instances[number..]
-                .first()
-                .is_some_and(|i| scene.meshes[i.mesh as usize].bone_lists.is_some());
+            let mesh = scene.instances[number].mesh as usize;
+            let bends = scene.meshes[mesh].bone_lists.is_some();
             if let (true, true, Some(i)) = (bends, pose != NO_POSE, slot) {
                 poses[pose as usize].instances.push(*i);
             }
@@ -168,15 +168,10 @@ impl GpuSkins {
     /// Applies this frame's poses, lets last frame's catch up, and uploads what changed. Sets each
     /// changed pose's instances' LOD margins.
     pub fn update(&mut self, gpu: &Gpu, instances: &mut InstanceTable) {
-        let mut rows: Option<std::ops::Range<u32>> = None;
-        let mut touch = |rows_of_pose: std::ops::Range<u32>| {
-            rows = Some(rows.as_ref().map_or(rows_of_pose.clone(), |r| {
-                r.start.min(rows_of_pose.start)..r.end.max(rows_of_pose.end)
-            }));
-        };
+        let mut touched = Vec::new();
         for pose in std::mem::take(&mut self.moved_last_frame) {
             self.settle(pose);
-            touch(self.rows_of(pose));
+            touched.push(self.rows_of(pose));
         }
         // A stable sort keeps each pose's entries in the order given, so the last of each run is
         // the one that counts.
@@ -198,17 +193,16 @@ impl GpuSkins {
             } else {
                 self.moved_last_frame.push(entry.pose);
             }
-            touch(self.rows_of(entry.pose));
+            touched.push(self.rows_of(entry.pose));
         }
-        if let Some(rows) = rows {
+        for rows in merged_rows(touched) {
             self.upload(gpu, rows);
         }
     }
 
     /// The rows of one frame's matrices a pose's bones lie on.
-    fn rows_of(&self, pose: u32) -> std::ops::Range<u32> {
-        let texels = self.range(pose);
-        texels.start as u32 / BONE_TEXTURE_WIDTH..(texels.end as u32).div_ceil(BONE_TEXTURE_WIDTH)
+    fn rows_of(&self, pose: u32) -> Range<u32> {
+        rows_of_texels(self.range(pose))
     }
 
     /// Makes last frame's matrices for a pose the same as this frame's, so that it shows no motion.
@@ -277,6 +271,25 @@ impl GpuSkins {
     }
 }
 
+/// The rows of the bone texture a run of texels lies on.
+fn rows_of_texels(texels: Range<usize>) -> Range<u32> {
+    texels.start as u32 / BONE_TEXTURE_WIDTH..(texels.end as u32).div_ceil(BONE_TEXTURE_WIDTH)
+}
+
+/// Sorts runs of rows and joins those that touch, dropping empty ones, to upload each once.
+fn merged_rows(mut rows: Vec<Range<u32>>) -> Vec<Range<u32>> {
+    rows.retain(|r| !r.is_empty());
+    rows.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<u32>> = Vec::with_capacity(rows.len());
+    for run in rows {
+        match merged.last_mut() {
+            Some(last) if run.start <= last.end => last.end = last.end.max(run.end),
+            _ => merged.push(run),
+        }
+    }
+    merged
+}
+
 /// How far a skinning matrix carries anything inside the sphere at `center`: how far the centre
 /// moves, plus how far the turn moves a point at the sphere's edge. A turn by an angle moves a
 /// point at radius r by `2 r sin(angle / 2)`, and `2 sin(angle / 2)` is `sqrt(3 - trace)`.
@@ -338,6 +351,25 @@ fn cluster_list_texture(gpu: &Gpu, scene: &PagedScene) -> wgpu::Texture {
 mod tests {
     use super::*;
     use glam::Quat;
+
+    #[test]
+    fn a_run_of_texels_lies_on_the_rows_it_touches() {
+        let width = BONE_TEXTURE_WIDTH as usize;
+        assert_eq!(rows_of_texels(0..3), 0..1);
+        assert_eq!(rows_of_texels(0..width), 0..1);
+        assert_eq!(rows_of_texels(width - 1..width + 2), 0..2);
+        assert_eq!(rows_of_texels(width..width + 3), 1..2);
+        assert_eq!(rows_of_texels(2 * width..3 * width), 2..3);
+        // An empty skeleton's run comes to nothing to upload.
+        assert_eq!(merged_rows(vec![rows_of_texels(width..width)]), vec![]);
+    }
+
+    #[test]
+    fn runs_of_rows_are_joined_only_where_they_touch() {
+        assert_eq!(merged_rows(vec![5..6, 0..1, 1..2, 0..2]), vec![0..2, 5..6]);
+        assert_eq!(merged_rows(vec![0..4, 1..2]), vec![0..4]);
+        assert_eq!(merged_rows(vec![2..2, 3..3]), vec![]);
+    }
 
     #[test]
     fn a_still_bone_reaches_nothing() {

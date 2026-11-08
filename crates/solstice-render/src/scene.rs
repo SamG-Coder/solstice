@@ -160,6 +160,9 @@ pub struct GpuScene {
     pub gpu_instance_count: u32,
     /// Whether any instance is cut out, so its lists and pipelines are needed.
     pub has_masked: bool,
+    /// Whether anything bends to a pose. A scene with nothing that does has skinning compiled out
+    /// of its shaders.
+    pub has_skins: bool,
     /// The CPU's copy of `instances`, and what has changed in it.
     pub instance_table: InstanceTable,
     /// Bones for the scene's poses, and each skinned cluster's bone list.
@@ -217,6 +220,7 @@ impl GpuScene {
             material_sampler,
             gpu_instance_count: instances.len() as u32,
             has_masked: instances.iter().any(|i| i.has_flag(INSTANCE_MASKED)),
+            has_skins: instances.iter().any(GpuInstance::is_skinned),
             instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
             skins,
             light_count: scene.lights.len() as u32,

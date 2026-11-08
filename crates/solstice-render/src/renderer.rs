@@ -470,7 +470,7 @@ impl Renderer {
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
         let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
 
-        let cull = CullPipelines::new(gpu);
+        let cull = CullPipelines::new(gpu, scene.has_skins);
         let masked_capacity = if scene.has_masked {
             MASKED_VISIBLE_CAPACITY
         } else {
@@ -494,7 +494,7 @@ impl Renderer {
             masked_capacity,
             streamer.requests_buffer(),
         );
-        let rasterizer = Rasterizer::new(gpu, scene.has_masked);
+        let rasterizer = Rasterizer::new(gpu, scene.has_masked, scene.has_skins);
 
         // Views without occlusion culling never read the pyramid, but a binding is required.
         let no_hzb = Target::new(
@@ -553,7 +553,7 @@ impl Renderer {
         );
         Self {
             settings,
-            resolve: Resolve::new(gpu, waterline.resolve_layout()),
+            resolve: Resolve::new(gpu, waterline.resolve_layout(), scene.has_skins),
             waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),

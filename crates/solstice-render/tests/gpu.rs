@@ -4500,7 +4500,8 @@ fn turning_every_bone_turns_the_normals_with_it() {
 
 /// Everything about how a pose is found at once: a skinned mesh that isn't first in the scene,
 /// so its bone lists are offset; a pose whose bone lies across a row of the bone texture; two
-/// instances sharing a pose, one of them scaled; and another pose left alone.
+/// instances sharing a pose, one of them scaled; another pose left alone; and a pose wholly on
+/// a later row, posed alone afterwards, which uploads that row and no other.
 #[test]
 fn each_instance_finds_its_own_pose() {
     use solstice_asset::{Bone, Skeleton, NO_POSE};
@@ -4533,6 +4534,7 @@ fn each_instance_finds_its_own_pose() {
         placed(1, 1, at(-5.0, 1.0)),
         placed(1, 1, at(0.0, 1.0)),
         placed(1, 1, at(5.0, 2.0)),
+        placed(1, 1, at(-2.5, 1.0)),
     ];
     let bone = Bone {
         name: String::new(),
@@ -4546,14 +4548,16 @@ fn each_instance_finds_its_own_pose() {
     scene.skeletons = vec![Skeleton {
         bones: vec![bone; 200],
     }];
-    scene.poses = vec![0, 0];
-    scene.instance_poses = vec![NO_POSE, 0, 1, 1];
+    scene.poses = vec![0, 0, 0];
+    scene.instance_poses = vec![NO_POSE, 0, 1, 1, 2];
 
     let camera = over_the_floor();
     let mut stage = Stage::new(&gpu, &scene, untemporal(), 256);
     let mut bones = vec![Mat4::IDENTITY; 200];
     bones[usize::from(TOP)] = Mat4::from_translation(Vec3::Y * 1.5);
     assert!(stage.renderer.place_pose(1, &bones));
+    stage.frames(&gpu, &camera, &low_sun(), 3);
+    assert!(stage.renderer.place_pose(2, &bones));
     stage.frames(&gpu, &camera, &low_sun(), 3);
     let pixels = stage.pixels(&gpu);
     let red = |point: Vec3| {
@@ -4566,6 +4570,10 @@ fn each_instance_finds_its_own_pose() {
     assert!(
         red(Vec3::new(0.0, 3.25, 0.0)),
         "the shared pose moved nothing"
+    );
+    assert!(
+        red(Vec3::new(-2.5, 3.25, 0.0)),
+        "the pose on the later row moved nothing"
     );
     assert!(
         red(Vec3::new(5.0, 6.5, 0.0)),

@@ -7,6 +7,9 @@
 
 // Twins of NO_BONES and BONE_TEXTURE_WIDTH in skin.rs.
 const NO_BONES: u32 = 0xffffffffu;
+// False in the shaders of a scene with nothing skinned, so that it pays nothing for skinning: see
+// `shaders::module_for`.
+const SKINNING: bool = true;
 const BONE_TEXTURE_WIDTH: u32 = 1024u;
 
 // A vertex's blended skinning matrix, its top three rows.
@@ -17,7 +20,7 @@ struct Skinning {
 }
 
 fn instance_skinned(i: Instance) -> bool {
-    return i.bones != NO_BONES;
+    return SKINNING && i.bones != NO_BONES;
 }
 
 fn bone_texel(address: u32, rows_down: u32) -> vec4f {
