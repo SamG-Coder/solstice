@@ -1,8 +1,8 @@
 //! A scene's game, from its gameplay files to what is drawn.
 
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use solstice_asset::GameFile;
-use solstice_game::{Devices, Play, GAME_FILE};
+use solstice_asset::{Collision, CollisionShape, GameFile};
+use solstice_game::{Devices, Play, View, GAME_FILE};
 use solstice_script::{Script, ScriptValue};
 use solstice_world::{Name, STEP_SECONDS};
 use std::collections::HashMap;
@@ -54,7 +54,7 @@ fn a_placed_actor_moves_its_instances_when_its_script_moves_it() {
         ("cove/gate.actor", GATE_ACTOR),
         ("cove/gate.star", GATE),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     assert_eq!(play.instances().collect::<Vec<_>>(), vec![2, 3]);
     assert!(!play.has_player());
     assert_eq!(play.scripts(), ["cove/gate.star"]);
@@ -102,7 +102,7 @@ fn a_placements_settings_override_its_properties() {
         ("gate.actor", GATE_ACTOR),
         ("gate.star", GATE),
     ]);
-    let play = Play::load(&scene, baked).unwrap();
+    let play = Play::load(&scene, baked, None).unwrap();
     let world = &play.world().entities;
     let mut locks: Vec<_> = world
         .query::<&Script>()
@@ -142,7 +142,7 @@ fn recorded(mut devices: Devices) -> Play {
         ("recorder.actor", "name recorder\nscript recorder.star\n"),
         ("recorder.star", RECORDER),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     play.frame(STEP_SECONDS * 1.01, &mut devices, |_, _| {});
     let messages = play.take_messages();
     assert!(messages.is_empty(), "{messages:?}");
@@ -204,7 +204,7 @@ fn a_scene_can_bring_its_own_input_actions() {
         ("recorder.actor", "name recorder\nscript recorder.star\n"),
         ("recorder.star", RECORDER),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     let mut devices = Devices::new();
     devices.key("KeyJ", true);
     devices.key("KeyW", true);
@@ -230,7 +230,7 @@ fn the_player_camera_follows_the_player_and_looks_up_and_down() {
         ),
         ("walker.star", WALKER),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     assert!(play.has_player());
     let mut devices = Devices::new();
     devices.key("KeyW", true);
@@ -254,7 +254,7 @@ fn the_player_camera_follows_the_player_and_looks_up_and_down() {
         (GAME_FILE, "actor player.actor 0 0 0 180\n"),
         ("player.actor", "name player\ncamera 0.5 1.6 0\n"),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     let view = play
         .frame(STEP_SECONDS, &mut Devices::new(), |_, _| {})
         .unwrap();
@@ -283,7 +283,7 @@ fn every_mistake_in_a_scenes_gameplay_is_reported_with_its_file() {
         ("eye.actor", "name eye\ncamera 0 1 0\nscript nowhere.star\n"),
         ("rock.actor", "name rock\n"),
     ]);
-    let errors = Play::load(&scene, baked).err().unwrap();
+    let errors = Play::load(&scene, baked, None).err().unwrap();
     let expect = [
         "gate.actor has no property `colour`",
         "`locked`: a bool is true or false",
@@ -307,19 +307,20 @@ fn every_mistake_in_a_scenes_gameplay_is_reported_with_its_file() {
         1
     );
 
-    assert!(Play::load(&[], baked).err().unwrap()[0].contains("has no scene.game"));
-    let errors = Play::load(&files(&[(GAME_FILE, "actor x\n")]), baked)
+    assert!(Play::load(&[], baked, None).err().unwrap()[0].contains("has no scene.game"));
+    let errors = Play::load(&files(&[(GAME_FILE, "actor x\n")]), baked, None)
         .err()
         .unwrap();
     assert!(errors[0].starts_with("scene.game: line 1"), "{errors:?}");
     let errors = Play::load(
         &files(&[(GAME_FILE, "input a.input\n"), ("a.input", "jump key\n")]),
         baked,
+        None,
     )
     .err()
     .unwrap();
     assert!(errors[0].starts_with("a.input: line 1"), "{errors:?}");
-    let errors = Play::load(&files(&[(GAME_FILE, "input b.input\n")]), baked)
+    let errors = Play::load(&files(&[(GAME_FILE, "input b.input\n")]), baked, None)
         .err()
         .unwrap();
     assert!(errors[0].contains("b.input: missing"), "{errors:?}");
@@ -332,7 +333,7 @@ fn scripts_reload_while_playing_and_report_what_they_log() {
         ("talker.actor", "name talker\nscript talk.star\n"),
         ("talk.star", "def on_begin(self):\n    log(\"hello\")\n"),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     play.frame(STEP_SECONDS * 1.01, &mut Devices::new(), |_, _| {});
     let messages = play.take_messages();
     assert_eq!(messages.len(), 1);
@@ -365,7 +366,7 @@ fn the_mouse_turns_as_far_however_fast_the_frames_come() {
             ),
             ("walker.star", WALKER),
         ]);
-        let mut play = Play::load(&scene, baked).unwrap();
+        let mut play = Play::load(&scene, baked, None).unwrap();
         let mut devices = Devices::new();
         let frames = rate.round() as u32;
         let mut view = None;
@@ -404,7 +405,7 @@ fn a_quarter_turn_looks_along_minus_x_as_the_renderers_camera_does() {
             include_str!("../../../scenes/cove/player.star"),
         ),
     ]);
-    let mut play = Play::load(&scene, baked).unwrap();
+    let mut play = Play::load(&scene, baked, None).unwrap();
     let mut devices = Devices::new();
     devices.key("KeyW", true);
     // Two steps' walk, at 1.6 m/s.
@@ -420,8 +421,9 @@ fn a_quarter_turn_looks_along_minus_x_as_the_renderers_camera_does() {
     // before it: one step's walk.
     let walked = 1.6 * STEP_SECONDS as f32;
     assert!(
+        // Its height can sag a little: the player has weight, and here no ground.
         view.position
-            .abs_diff_eq(Vec3::new(-walked, 1.65, 0.0), 1.0e-4),
+            .abs_diff_eq(Vec3::new(-walked, 1.65, 0.0), 0.01),
         "{view:?}"
     );
 }
@@ -452,7 +454,7 @@ fn in_the_cove_the_player_walks_to_the_gate_and_opens_it() {
         ),
     ]);
     let gate_at = |_: u32| Some(Mat4::from_translation(Vec3::new(20.7, 0.0, 0.0)));
-    let mut play = Play::load(&scene, gate_at).unwrap();
+    let mut play = Play::load(&scene, gate_at, None).unwrap();
     let gate_y = std::cell::Cell::new(0.0);
     let frame = |play: &mut Play, devices: &mut Devices| {
         play.frame(STEP_SECONDS, devices, |_, at| gate_y.set(at.w_axis.y));
@@ -485,4 +487,128 @@ fn in_the_cove_the_player_walks_to_the_gate_and_opens_it() {
         "the gate rose to {}",
         gate_y.get()
     );
+}
+
+/// A flat floor at height zero, 40 m across.
+fn floor() -> Collision {
+    Collision {
+        shapes: vec![CollisionShape {
+            hull: false,
+            vertices: vec![
+                [-20.0, 0.0, -20.0],
+                [20.0, 0.0, -20.0],
+                [20.0, 0.0, 20.0],
+                [-20.0, 0.0, 20.0],
+            ],
+            triangles: vec![[0, 2, 1], [0, 3, 2]],
+        }],
+        instance_shapes: vec![0],
+        heightfield: None,
+    }
+}
+
+const WALKS: &str = r#"
+def on_tick(self, dt):
+    self.walk = vec3(0, 0, -input("forward") * 3)
+    self.vars.z = self.position.z
+"#;
+
+fn walking_game(extra: &[(&str, &str)], scene: &str) -> Play {
+    let mut list = vec![
+        (GAME_FILE, scene),
+        (
+            "hero.actor",
+            "name hero\nscript hero.star\ncamera 0 1.6 0\ncharacter 0.3 1.8\n",
+        ),
+        ("hero.star", WALKS),
+    ];
+    list.extend_from_slice(extra);
+    Play::load(&files(&list), |_| Some(Mat4::IDENTITY), Some(&floor())).unwrap()
+}
+
+fn walk_forward(play: &mut Play, frames: u32) -> View {
+    let mut devices = Devices::new();
+    devices.key("KeyW", true);
+    let mut view = None;
+    for _ in 0..frames {
+        view = play.frame(STEP_SECONDS, &mut devices, |_, _| {});
+    }
+    view.unwrap()
+}
+
+#[test]
+fn the_player_stands_on_the_scenes_collision_and_walks() {
+    let mut play = walking_game(&[], "actor hero.actor 0 0.5 0 0\n");
+    let view = walk_forward(&mut play, 60);
+    assert!(
+        view.position.y > 1.5 && view.position.y < 1.7,
+        "on the floor: {view:?}"
+    );
+    assert!(view.position.z < -2.0, "walked: {view:?}");
+    let messages = play.take_messages();
+    assert!(messages.is_empty(), "{messages:?}");
+}
+
+#[test]
+fn a_blocker_in_the_scene_stops_the_player() {
+    let mut play = walking_game(&[], "actor hero.actor 0 0.1 0 0\nblocker 0 2 -3 10 4 1 0\n");
+    let view = walk_forward(&mut play, 180);
+    assert!(view.position.z > -3.0, "{view:?}");
+}
+
+const GATEKEEPER: &str = r#"
+def on_enter(self, who):
+    self.vars.came = who
+    self.position = self.position + vec3(0, 5, 0)
+
+def on_exit(self, who):
+    self.vars.left = True
+"#;
+
+#[test]
+fn a_door_stops_the_player_and_a_sensor_opens_it() {
+    // A sensor across the way at z = -2 lifts itself and tells its script. A door at z = -4,
+    // blocking the way, is an ordinary collider, tested first without the sensor.
+    let door = ("door.actor", "name door\ncollider box 10 4 0.5 at 0 2 0\n");
+    let mut play = walking_game(
+        &[door],
+        "actor hero.actor 0 0.1 0 0\nactor door.actor 0 0 -4 0\n",
+    );
+    let view = walk_forward(&mut play, 180);
+    assert!(view.position.z > -4.0, "the door stops him: {view:?}");
+
+    let plate = (
+        "plate.actor",
+        "name plate\nscript plate.star\ncollider box 10 4 0.5 at 0 2 0 sensor\n",
+    );
+    let mut play = walking_game(
+        &[plate, ("plate.star", GATEKEEPER)],
+        "actor hero.actor 0 0.1 0 0\nactor plate.actor 0 0 -2 0\n",
+    );
+    let view = walk_forward(&mut play, 120);
+    assert!(view.position.z < -3.0, "a sensor stops nobody: {view:?}");
+    assert!(matches!(
+        var(&play, "plate", "came"),
+        Some(ScriptValue::Entity(_))
+    ));
+    assert_eq!(var(&play, "plate", "left"), Some(ScriptValue::Bool(true)));
+    assert!(play.take_messages().is_empty());
+}
+
+#[test]
+fn the_world_comes_from_the_scenes_collision_and_nothing_else() {
+    // Without collision, a character has nothing to stand on.
+    let scene = files(&[
+        (GAME_FILE, "actor hero.actor 0 0.5 0 0\n"),
+        (
+            "hero.actor",
+            "name hero\ncamera 0 1.6 0\ncharacter 0.3 1.8\n",
+        ),
+    ]);
+    let mut play = Play::load(&scene, |_| Some(Mat4::IDENTITY), None).unwrap();
+    let view = walk_forward(&mut play, 60);
+    assert!(view.position.y < -2.0, "it falls: {view:?}");
+    // With it, the world has the floor and the character.
+    let play = walking_game(&[], "actor hero.actor 0 0.5 0 0\n");
+    assert_eq!(play.physics().collider_count(), 1);
 }

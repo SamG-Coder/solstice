@@ -7,7 +7,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 solstice-world = { path = "../../../crates/solstice-world" }
 solstice-script = { path = "../../../crates/solstice-script" }
-glam = "0.30"
+glam = "0.33"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.130"
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }

@@ -22,5 +22,5 @@ pub use game::{Game, Schedule, TickGroup};
 pub use hecs::{self, Entity};
 pub use input::{Input, Recording};
 pub use name::Name;
-pub use transform::{GlobalTransform, Parent, Snap, Transform};
+pub use transform::{GlobalTransform, Parent, Snap, Transform, Walk};
 pub use world::World;

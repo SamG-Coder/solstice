@@ -177,6 +177,7 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
         scene: out,
         pages: pages.split_off(pinned),
         upper_textures,
+        collision: crate::collision::build_collision(scene),
     }
 }
 

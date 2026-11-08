@@ -17,15 +17,15 @@ if ! "$bindgen" --version 2>/dev/null | grep -q "$version"; then
 fi
 
 # Two builds (docs/gameplay.md): the plain viewer, which every page loads, and the gameplay
-# viewer, with scripts, loaded only to play a scene's game. They share one target folder, so the
-# dependencies are built once; each wasm is bound before the next build replaces it.
-wasm=target/wasm32-unknown-unknown/release/solstice_viewer.wasm
+# viewer, with scripts and physics, loaded only to play a scene's game. The gameplay build turns
+# on wasm SIMD, which halves physics' cost and every browser with WebGPU has. Different compiler
+# flags can't share compiled crates, so it has a target folder of its own.
 rm -rf dist
 mkdir -p dist/assets
 cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features
-"$bindgen" --target web --no-typescript --out-dir dist/pkg "$wasm"
-cargo build --release --target wasm32-unknown-unknown -p viewer --lib
-"$bindgen" --target web --no-typescript --out-dir dist/play "$wasm"
+"$bindgen" --target web --no-typescript --out-dir dist/pkg   target/wasm32-unknown-unknown/release/solstice_viewer.wasm
+RUSTFLAGS="-C target-feature=+simd128"   cargo build --release --target wasm32-unknown-unknown -p viewer --lib --target-dir target/web-play
+"$bindgen" --target web --no-typescript --out-dir dist/play   target/web-play/wasm32-unknown-unknown/release/solstice_viewer.wasm
 cp apps/viewer/web/index.html dist/
 # Scene files are already compressed where it helps, part by part, so that the page can fetch
 # any part alone. Hard links keep big scenes from taking disk space twice.

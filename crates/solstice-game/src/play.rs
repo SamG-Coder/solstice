@@ -10,9 +10,10 @@ use crate::input::{Devices, InputMap};
 use crate::resolve;
 use crate::scene::{SceneGame, GAME_FILE};
 use glam::{EulerRot, Mat4, Quat, Vec3};
-use solstice_asset::GameFile;
-use solstice_script::{Script, ScriptHost};
-use solstice_world::{Entity, Game, GlobalTransform, Name, Schedule, Transform, World};
+use solstice_asset::{Collision, GameFile};
+use solstice_physics::{Overlap, Physics};
+use solstice_script::{Script, ScriptEvent, ScriptHost};
+use solstice_world::{Entity, Game, GlobalTransform, Name, Schedule, TickGroup, Transform, World};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -68,14 +69,19 @@ pub struct Play {
     presses: Vec<String>,
     scripts: Vec<String>,
     messages: VecDeque<Message>,
+    physics: Rc<RefCell<Physics>>,
 }
 
 impl Play {
     /// Builds the game in a baked scene's gameplay `files`. `instance` gives where the bake
     /// placed a renderer instance. Every mistake found is reported, each with its file and line.
+    ///
+    /// `collision` is what the scene's static world is made of, if it has been fetched: without
+    /// it, characters have nothing to stand on.
     pub fn load(
         files: &[GameFile],
         instance: impl Fn(u32) -> Option<Mat4>,
+        collision: Option<&Collision>,
     ) -> Result<Self, Vec<String>> {
         let file = |name: &str| files.iter().find(|f| f.name == name).map(|f| &f.text);
         let mut errors = Vec::new();
@@ -98,6 +104,17 @@ impl Play {
         };
 
         let host = Rc::new(RefCell::new(ScriptHost::new()));
+        let physics = Rc::new(RefCell::new(Physics::new()));
+        if let Some(collision) = collision {
+            physics.borrow_mut().add_scene(collision, &instance);
+        }
+        for blocker in &scene.blockers {
+            physics.borrow_mut().add_blocker(
+                blocker.centre,
+                blocker.size,
+                blocker.yaw_degrees.to_radians(),
+            );
+        }
         let mut world = World::new();
         let mut drawn = Vec::new();
         let mut player = None;
@@ -162,6 +179,12 @@ impl Play {
                     line.file
                 ));
             }
+            if let Some(collider) = actor.collider {
+                components.add(collider);
+            }
+            if let Some(character) = actor.character {
+                components.add(character);
+            }
             let entity = world.spawn(components.build());
             if let Some(eye) = actor.camera {
                 if player.is_some() {
@@ -196,6 +219,21 @@ impl Play {
 
         let mut schedule = Schedule::new();
         ScriptHost::install(&host, &mut schedule);
+        Physics::install(&physics, &mut schedule);
+        // What enters and leaves a sensor reaches its script as `on_enter` and `on_exit`.
+        schedule.add(TickGroup::PostPhysics, "touches", |world| {
+            for overlap in world.read_cloned::<Overlap>() {
+                let name = if overlap.entered { "enter" } else { "exit" };
+                world.send(ScriptEvent::to(overlap.sensor, name).arg(overlap.other));
+            }
+        });
+        let mut messages = VecDeque::new();
+        for warning in physics.borrow_mut().warnings.drain(..) {
+            messages.push_back(Message {
+                error: true,
+                text: warning,
+            });
+        }
         Ok(Self {
             game: Game::new(world, schedule),
             host,
@@ -206,7 +244,8 @@ impl Play {
             unstepped: 0.0,
             presses: Vec::new(),
             scripts,
-            messages: VecDeque::new(),
+            messages,
+            physics,
         })
     }
 
@@ -301,6 +340,11 @@ impl Play {
     pub fn take_messages(&mut self) -> Vec<Message> {
         self.gather_messages();
         self.messages.drain(..).collect()
+    }
+
+    /// The simulation, for tests and tools to look into.
+    pub fn physics(&self) -> std::cell::Ref<'_, Physics> {
+        self.physics.borrow()
     }
 
     /// The world, for tests and tools to look into.

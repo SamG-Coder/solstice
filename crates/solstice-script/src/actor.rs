@@ -68,6 +68,10 @@ pub struct ActorValue<'v> {
     #[allocative(skip)]
     #[trace(static)]
     yaw: Cell<f32>,
+    /// How the handler wants a walking actor to move, if it said.
+    #[allocative(skip)]
+    #[trace(static)]
+    walk: Cell<Option<Vec3>>,
 }
 
 impl fmt::Display for ActorValue<'_> {
@@ -82,6 +86,8 @@ pub struct ActorState {
     pub vars: BTreeMap<String, ScriptValue>,
     pub position: Vec3,
     pub yaw: f32,
+    /// How it should walk, if the handler said.
+    pub walk: Option<Vec3>,
 }
 
 impl<'v> ActorValue<'v> {
@@ -107,6 +113,7 @@ impl<'v> ActorValue<'v> {
             vars,
             position: Cell::new(position),
             yaw: Cell::new(yaw),
+            walk: Cell::new(None),
         })
     }
 
@@ -134,6 +141,7 @@ impl<'v> ActorValue<'v> {
             vars: to_map(&vars.0.borrow(), "self.vars.")?,
             position: actor.position.get(),
             yaw: actor.yaw.get(),
+            walk: actor.walk.get(),
         })
     }
 }
@@ -146,17 +154,18 @@ impl<'v> StarlarkValue<'v> for ActorValue<'v> {
             "entity" => Some(heap.alloc(EntityValue(self.entity))),
             "position" => Some(heap.alloc(Vec3Value(self.position.get()))),
             "yaw" => Some(heap.alloc(StarlarkFloat(f64::from(self.yaw.get())))),
+            "walk" => Some(heap.alloc(Vec3Value(self.walk.get().unwrap_or(Vec3::ZERO)))),
             _ => self.properties.borrow().get(attribute).copied(),
         }
     }
 
     fn has_attr(&self, attribute: &str, _heap: Heap<'v>) -> bool {
-        matches!(attribute, "vars" | "entity" | "position" | "yaw")
+        matches!(attribute, "vars" | "entity" | "position" | "yaw" | "walk")
             || self.properties.borrow().contains_key(attribute)
     }
 
     fn dir_attr(&self) -> Vec<String> {
-        let mut names: Vec<String> = ["vars", "entity", "position", "yaw"]
+        let mut names: Vec<String> = ["vars", "entity", "position", "yaw", "walk"]
             .map(String::from)
             .to_vec();
         names.extend(self.properties.borrow().keys().cloned());
@@ -180,6 +189,12 @@ impl<'v> StarlarkValue<'v> for ActorValue<'v> {
                     );
                 };
                 self.yaw.set(yaw);
+            }
+            "walk" => {
+                let Some(walk) = new_value.downcast_ref::<Vec3Value>() else {
+                    return Err(anyhow::anyhow!("self.walk must be a vec3, not {new_value}").into());
+                };
+                self.walk.set(Some(walk.0));
             }
             "vars" | "entity" => {
                 return Err(anyhow::anyhow!("self.{attribute} can't be replaced").into());

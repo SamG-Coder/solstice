@@ -539,6 +539,60 @@ rest. At 60 fps a frame runs one fixed step:
 - **Versions.** Rapier 0.36 uses `glam` 0.33 (through `glamx`). Solstice is on 0.30, and moves
   to 0.33 so the two share one copy.
 
+**As built (step 5, `crates/solstice-physics`):**
+- **The bake** makes collision only for a scene with gameplay; any other scene has none, and is
+  written as before. Shapes are deflated into the data area, one by one, and listed in an
+  optional `COLL` section. *Play* fetches them, so a scene that is only looked at never does.
+  - A mesh is a cut of its cluster DAG at 5 cm of error, in world space: an instance scaled up
+    gets a finer cut in its own space. A mesh with a bounding radius under 0.75 m gets a convex
+    hull of the same cut, of at most about 512 points.
+  - A line that places geometry can end with `collide=none`, `collide=hull`, or `collide=coarse`,
+    a 10 cm cut for very large meshes such as ground or cliffs.
+  - Terrain becomes a heightfield, sampled about every metre. Water doesn't collide.
+  - An actor's mesh doesn't collide: its `collider` line does.
+  - `blocker X Y Z SX SY SZ YAW` adds an invisible wall, or an invisible step.
+- **Actors.** An `.actor` file's `collider box SX SY SZ` or `collider capsule RADIUS HEIGHT`
+  gives it a shape, kinematic by default, so it goes where its script puts it and pushes what
+  is in the way.
+  - `at X Y Z` moves the shape off the actor's origin: a door hinged at its origin has its box
+    out along the door.
+  - `sensor` blocks nothing, and calls the script's `on_enter(self, who)` and
+    `on_exit(self, who)`.
+  - `dynamic MASS` is moved by physics.
+  - `mesh PATH SCALE part=NAME` draws one named part of a model, by its own origin.
+- **Characters.** `character RADIUS HEIGHT` makes an actor walk, with Rapier's kinematic
+  controller: steps up to 0.35 m, slopes up to 45°, snapping to the ground, falling. Its
+  `Transform` is at its feet. The script says where it wants to go, `self.walk = vec3(...)`, in
+  metres a second across the ground, and physics does the walking. A script that sets
+  `self.position` moves it there at once.
+  Stairs are tested up to a 0.3 m rise. Taller steps are climbed more slowly.
+- **Order in a step.** Scripts in `PrePhysics`, then physics: kinematic actors move to where
+  scripts put them, the simulation steps, and characters walk. Sensors' events reach scripts
+  in the next step's `PrePhysics`.
+- **Seeing the colliders.** `bake --scene SCENE --show-collision` bakes what a scene collides
+  with instead of how it looks, to view in either viewer: blue triangle meshes, green hull
+  points, grey ground, red blockers. It needs no change to the renderer.
+- **Determinism.** Rapier's `enhanced-determinism` is on. It costs about 3% on a thousand
+  moving boxes, and 20% of a very small number for walking. A run of `tools/gameplay-bench/b_walk`
+  ends with the same bits natively and on the web.
+- **The gameplay web build** turns on wasm SIMD. It has a target folder of its own, as different
+  compiler flags can't share compiled crates.
+- **`glam` moved to 0.33.** It compiled unchanged, but deprecates the camera matrices the
+  renderer uses (`look_to_rh` and friends). `solstice-render` allows those for now, with one line
+  in its `lib.rs`; renaming them is left for a quiet moment in those passes.
+- **Cost** (`tools/gameplay-bench/b_walk`, 9800X3D, a scene of 330,000 triangles and a
+  heightfield):
+  - the player and 8 doors: 0.05 ms a step on the web, 0.03 natively, against a budget of 0.75 ms
+    on this machine;
+  - 8 walkers: 0.25 ms a step on the web, 0.2 natively.
+  - The cove's collision is 453,000 triangles and 6.5 MB, fetched on *Play*. Building the
+    world takes 1.1 s on the web, once, when the game starts.
+  - The gameplay web build grows from 2.15 MB to 3.0 MB gzipped, for Rapier.
+- **The demo** runs headless, with `viewer --play --capture --hold KEY@FROM-TO`: in the cove,
+  the player is stopped by the gate, opens it and walks through into the courtyard, climbs the
+  stair, and reaches the rampart, 7 m up, where the wall stops them. The stair's bottom step
+  is 0.5 m high, too high to step, so the scene adds an invisible half-step with a `blocker`.
+
 ### Floating on the sea
 
 A ship that floats must ride the waves that are drawn. The waves exist only on the GPU, but
@@ -964,7 +1018,7 @@ your go-ahead, and nothing is published without asking.
    step and memory caps, and errors with file and line. The benchmarks are run again in place.
    - Tests: hot reload keeps state; a runaway script is stopped and reported, at the same point
      natively and on the web; a broken reload keeps the old script running.
-4. **Scenes, actors and play mode.** *In review.* `.actor` files, `actor` lines in scene files and their
+4. **Scenes, actors and play mode.** *Done.* `.actor` files, `actor` lines in scene files and their
    tagged section, input actions, a player camera, and *Play* in both viewers, with the second
    web build.
    - Tests: actor files and scene lines read back what they wrote, and report mistakes clearly;
@@ -972,11 +1026,11 @@ your go-ahead, and nothing is published without asking.
      plain viewer exactly as before.
    - Demo: in the cove, walk up to the fort's gate and press E, and it rises
      (`viewer assets/cove.solstice --play`, or *Play* on the web page).
-5. **Physics for walking.** `solstice-physics`: collision baked and fetched on *Play*, bodies,
+5. **Physics for walking.** *In review.* `solstice-physics`: collision baked and fetched on *Play*, bodies,
    sensors, the character controller, a debug view of colliders, wasm SIMD, and determinism
    measured.
    - Demo: a capsule walks the fort, climbs the stair to the rampart, and opens the gate.
-6. **The character and the export tool.** *In review.* The Blender script that makes the MakeHuman
+6. **The character and the export tool.** *Done.* The Blender script that makes the MakeHuman
    character, and `tools/blender/solstice_export.py`. Installing MPFB 2 waits for your go-ahead.
    - First, a default character exported as MPFB 2 does it, to see what goes wrong.
    - Tests: the export's checks fail on a deliberately broken character, and pass on the real

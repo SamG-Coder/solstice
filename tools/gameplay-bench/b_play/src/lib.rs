@@ -19,7 +19,7 @@ fn play(actors: usize, script: &str) -> Play {
         file("a.actor", "name a\nscript a.star\n".to_owned()),
         file("a.star", script.to_owned()),
     ];
-    Play::load(&files, |_| Some(Mat4::IDENTITY)).unwrap()
+    Play::load(&files, |_| Some(Mat4::IDENTITY), None).unwrap()
 }
 
 pub fn bench() -> String {

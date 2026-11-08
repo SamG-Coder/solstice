@@ -263,7 +263,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
- "glam 0.30.10",
+ "glam 0.33.12",
  "solstice-asset",
  "solstice-game",
  "solstice-script",
@@ -298,7 +298,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
- "glam 0.30.10",
+ "glam 0.33.12",
  "solstice-script",
  "solstice-world",
  "wasm-bindgen",
@@ -317,12 +317,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "b_walk"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "glam 0.33.12",
+ "solstice-asset",
+ "solstice-physics",
+ "solstice-world",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "b_world"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
- "glam 0.30.10",
+ "glam 0.33.12",
  "solstice-world",
  "wasm-bindgen",
 ]
@@ -1352,9 +1365,6 @@ name = "glam"
 version = "0.30.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19fc433e8437a212d1b6f1e68c7824af3aed907da60afa994e7f542d18d12aa9"
-dependencies = [
- "bytemuck",
-]
 
 [[package]]
 name = "glam"
@@ -1375,6 +1385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bfe73dc8ec21f54d181e5a60554327ec3f1c600c455a75ccbfc65d2106a6c4"
 dependencies = [
  "approx",
+ "bytemuck",
  "libm",
  "serde_core",
 ]
@@ -2287,6 +2298,7 @@ dependencies = [
  "foldhash",
  "glamx",
  "hashbrown 0.17.1",
+ "indexmap",
  "log",
  "num-derive",
  "num-traits",
@@ -3162,6 +3174,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1a7200d82ff1c7b4235efd12f11e2537a402c91cf83a5cb97ce80eef787fde7"
 dependencies = [
  "approx",
+ "libm",
  "num-complex",
  "num-traits",
  "wide",
@@ -3222,7 +3235,7 @@ name = "solstice-asset"
 version = "0.2.0"
 dependencies = [
  "bytemuck",
- "glam 0.30.10",
+ "glam 0.33.12",
  "miniz_oxide",
 ]
 
@@ -3230,9 +3243,20 @@ dependencies = [
 name = "solstice-game"
 version = "0.2.0"
 dependencies = [
- "glam 0.30.10",
+ "glam 0.33.12",
  "solstice-asset",
+ "solstice-physics",
  "solstice-script",
+ "solstice-world",
+]
+
+[[package]]
+name = "solstice-physics"
+version = "0.2.0"
+dependencies = [
+ "glam 0.33.12",
+ "rapier3d",
+ "solstice-asset",
  "solstice-world",
 ]
 
@@ -3243,7 +3267,7 @@ dependencies = [
  "allocative",
  "anyhow",
  "getrandom 0.4.3",
- "glam 0.30.10",
+ "glam 0.33.12",
  "solstice-world",
  "starlark",
  "starlark_derive",
@@ -3253,7 +3277,7 @@ dependencies = [
 name = "solstice-world"
 version = "0.2.0"
 dependencies = [
- "glam 0.30.10",
+ "glam 0.33.12",
  "hecs",
 ]
 

@@ -518,7 +518,7 @@ async function main() {
     }
   });
 
-  const game = startGame(viewer);
+  const game = await startGame(viewer, file);
   const axis = (positive, negative) => (keys.has(positive) ? 1 : 0) - (keys.has(negative) ? 1 : 0);
 
   new ResizeObserver(() => {
@@ -607,7 +607,7 @@ async function main() {
 /// Offers Play on a scene with a game, and, in the gameplay build, runs it: passes the keys,
 /// mouse, gamepads and touch on to it, and shows what its scripts log. Returns what to call
 /// each frame, or nothing if no game runs.
-function startGame(viewer) {
+async function startGame(viewer, file) {
   if (!viewer.has_gameplay()) return null;
   if (!playing) {
     el("play").hidden = false;
@@ -632,7 +632,18 @@ function startGame(viewer) {
     }
   };
   try {
+    // Fetched only now: a scene that is only looked at never downloads its collision.
+    const started = performance.now();
+    const ranges = viewer.collision_ranges();
+    const parts = [];
+    for (let i = 0; i < ranges.length; i += 2) {
+      parts.push(file.read(ranges[i], ranges[i + 1]).then(inflate));
+    }
+    for (const part of await Promise.all(parts)) viewer.deliver_collision(part);
+    const fetched = performance.now();
     viewer.play();
+    console.info(`game loaded: collision fetched in ${(fetched - started).toFixed(0)} ms, ` +
+      `world built in ${(performance.now() - fetched).toFixed(0)} ms`);
   } catch (error) {
     show(String(error.message ?? error).split("\n").map((line) => `error: ${line}`));
     return null;

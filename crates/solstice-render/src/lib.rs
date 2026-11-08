@@ -15,6 +15,10 @@
 //! * [`particles`]: effects simulated on the GPU and drawn over the lit scene.
 //! * [`post`]: temporal resolve, exposure, bloom and tone mapping.
 
+// glam 0.33 moved its camera matrices (`look_to_rh` and friends) to new names. The old ones still
+// work; the renames can wait for a quiet moment in the passes they touch.
+#![allow(deprecated)]
+
 pub mod clouds;
 pub mod frame;
 pub mod gi;

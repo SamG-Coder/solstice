@@ -199,6 +199,11 @@ pub struct SceneAsset {
     pub sea: Option<Sea>,
     /// The scene's gameplay, if it has any. Empty for a scene that is only looked at.
     pub gameplay: Vec<GameFile>,
+    /// How each instance collides, where the scene says. Instances past its end are
+    /// [`Collide::Auto`](crate::collision::Collide::Auto).
+    pub collide: Vec<crate::collision::Collide>,
+    /// The ground as a grid of heights, for collision, if the scene has terrain.
+    pub ground: Option<crate::collision::Heightfield>,
 }
 
 impl SceneAsset {

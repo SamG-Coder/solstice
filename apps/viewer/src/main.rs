@@ -4,7 +4,8 @@
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
-//! viewer [SCENE] --play [--scripts DIR] [--capture out.png --frames N [--press ACTION@FRAME]...]
+//! viewer [SCENE] --play [--scripts DIR] [--capture out.png --frames N [--press ACTION@FRAME]...
+//!        [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
 //! ```
 //!
 //! `--play` runs the scene's game, if it has one: its actors move, the camera is the player's,
@@ -143,6 +144,29 @@ mod native {
             }
         }
 
+        /// The scene's collision, whole, read from its file if it wasn't all loaded.
+        fn collision(
+            &self,
+            path: &Path,
+        ) -> Result<Option<solstice_asset::Collision>, Box<dyn std::error::Error>> {
+            let paged = match self {
+                Self::Loaded(loaded) => return Ok(loaded.collision.clone()),
+                Self::Streamed(paged) => paged,
+            };
+            let Some(index) = &paged.collision else {
+                return Ok(None);
+            };
+            let mut file = std::fs::File::open(path)?;
+            let mut pieces = Vec::new();
+            for (offset, stored) in index.ranges() {
+                file.seek(SeekFrom::Start(paged.data_offset + offset))?;
+                let mut packed = vec![0; stored as usize];
+                file.read_exact(&mut packed)?;
+                pieces.push(solstice_asset::file::inflate(&packed)?);
+            }
+            Ok(Some(index.decode(&pieces)?))
+        }
+
         fn gameplay(&self) -> &[solstice_asset::GameFile] {
             match self {
                 Self::Loaded(loaded) => &loaded.scene.gameplay,
@@ -220,6 +244,11 @@ mod native {
         scripts: PathBuf,
         /// Actions to press in a capture, and the frame to press each in.
         presses: Vec<(String, u32)>,
+        /// Keys to hold in a capture, by their `KeyboardEvent.code`, and from which frame to
+        /// which.
+        holds: Vec<(String, u32, u32)>,
+        /// The mouse moved in a capture, by pixels across, at a frame.
+        mouse_moves: Vec<(f32, u32)>,
     }
 
     /// Starts the effects the options name.
@@ -250,7 +279,17 @@ mod native {
             log::warn!("--play: this scene has no gameplay, so there is nothing to play");
             return None;
         }
-        match PlayMode::start(renderer, files) {
+        let collision = match scene.collision(&options.scene) {
+            Ok(collision) => collision,
+            Err(error) => {
+                log::error!("the scene's collision can't be read: {error}");
+                None
+            }
+        };
+        if collision.is_none() {
+            log::warn!("this scene has no collision: rebake it to walk on it");
+        }
+        match PlayMode::start(renderer, files, collision.as_ref()) {
             Ok(play) => {
                 log::info!(
                     "playing: {} instances move, scripts {}",
@@ -371,6 +410,8 @@ mod native {
             play: false,
             scripts: PathBuf::from("scenes"),
             presses: Vec::new(),
+            holds: Vec::new(),
+            mouse_moves: Vec::new(),
         };
         // The time of day, built up from its options and made at the end.
         let (mut time, mut day_seconds, mut latitude) = (None, 0.0, None);
@@ -518,6 +559,25 @@ mod native {
                         .and_then(|(a, f)| Some((a.to_owned(), f.parse().ok()?)))
                         .ok_or("--press expects ACTION@FRAME")?;
                     options.presses.push((action, frame));
+                }
+                "--hold" => {
+                    let text = value()?;
+                    let parsed = text.split_once('@').and_then(|(key, range)| {
+                        let (from, to) = range.split_once('-')?;
+                        Some((key.to_owned(), from.parse().ok()?, to.parse().ok()?))
+                    });
+                    options
+                        .holds
+                        .push(parsed.ok_or("--hold expects KEY@FROM-TO")?);
+                }
+                "--mouse" => {
+                    let text = value()?;
+                    let parsed = text
+                        .split_once('@')
+                        .and_then(|(x, frame)| Some((x.parse().ok()?, frame.parse().ok()?)));
+                    options
+                        .mouse_moves
+                        .push(parsed.ok_or("--mouse expects PIXELS@FRAME")?);
                 }
                 "--geometry-budget-mb" => {
                     let megabytes: u64 = value()?
@@ -685,6 +745,18 @@ mod native {
                         play.play.press(action);
                     }
                 }
+                for (key, from, to) in &options.holds {
+                    if frame == *from {
+                        play.devices.key(key, true);
+                    } else if frame == *to {
+                        play.devices.key(key, false);
+                    }
+                }
+                for (pixels, at) in &options.mouse_moves {
+                    if *at == frame {
+                        play.devices.mouse_motion(*pixels, 0.0);
+                    }
+                }
                 log_messages(play.frame(&mut renderer, &mut camera, 1.0 / 60.0));
             }
             renderer.render(&gpu, &camera, &environment, &view, options.size, 1.0 / 60.0);
@@ -693,6 +765,10 @@ mod native {
                 slowest = slowest.max(last_time.elapsed().as_secs_f32());
             }
             last_time = Instant::now();
+        }
+        if play.is_some() {
+            let p = camera.position;
+            log::info!("the camera ended at {:.2}, {:.2}, {:.2}", p.x, p.y, p.z);
         }
         let average = start.elapsed().as_secs_f32() / options.frames.max(1) as f32;
 

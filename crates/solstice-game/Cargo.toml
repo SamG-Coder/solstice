@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 glam.workspace = true
 solstice-asset.workspace = true
+solstice-physics.workspace = true
 solstice-script.workspace = true
 solstice-world.workspace = true
