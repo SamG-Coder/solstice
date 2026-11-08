@@ -58,6 +58,7 @@ const DEBUG_VOXELS: u32 = 9u;
 const DEBUG_WETNESS: u32 = 11u;
 const DEBUG_MOTION: u32 = 12u;
 const DEBUG_PARTICLES: u32 = 13u;
+const DEBUG_PARTICLE_LIGHT: u32 = 14u;
 
 fn pixel_to_ndc(pixel: vec2f, inv_viewport: vec2f) -> vec2f {
     let uv = pixel * inv_viewport;

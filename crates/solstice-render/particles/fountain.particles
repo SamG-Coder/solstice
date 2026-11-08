@@ -14,7 +14,8 @@ emitter jet
   color 0.75 0.85 0.95 0.55
   color life 0=1 1 1 0 0.06=1 1 1 1 0.8=1 1 1 0.8 1=1 1 1 0
   size life 0=0.6 1=1.6
-  render sprite soft=0.1
+  # Water scatters light mostly onward: the jet sparkles with the sun behind it.
+  render sprite soft=0.1 phase=0.7
 
 emitter mist
   budget 1500
@@ -26,7 +27,7 @@ emitter mist
   size 0.15 0.3
   gravity 0.3
   drag 0.8
-  color 0.85 0.9 1 0.12
+  color 0.85 0.9 1 0.035
   color life 0=1 1 1 0 0.3=1 1 1 1 1=1 1 1 0
   size life 0=0.5 1=2.5
-  render sprite soft=0.5
+  render sprite soft=0.5 phase=0.6

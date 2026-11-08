@@ -206,14 +206,19 @@ it.
 ```text
  1. Input        gather keys, mouse, pads and touch; map them to actions
  2. Fixed steps  0 to 3 steps of 1/60 s, each one:
-      a. Events       this step's input actions and due timers, delivered to scripts
+      a. Start        the step's input is taken; timers due on it deliver their events
       b. PrePhysics   Rust systems, root motion, then script ticks for the actors that tick
       c. Physics      one Rapier step; contacts and triggers are queued
       d. PostPhysics  hits and overlaps delivered to scripts
+      e. Transforms   every entity's place in the world, keeping the step before
  3. Animation    state machines read gameplay's values; sample, blend, IK
  4. Late         the camera follows
  5. Extract      changed transforms, bone palettes, lights and environment go to the renderer
 ```
+
+As built (step 2, `crates/solstice-world`): `Game::frame` runs items 1 to 4 of this list.
+Extraction (item 5) comes with roadmap step 4, *Scenes, actors and play mode*. Items 3 and 4
+are the per-frame tick groups `Animation` and `Late`.
 
 - **Fixed steps.** Everything that decides what happens runs inside the steps, at 60 Hz from an
   accumulator: events, script ticks, Rust gameplay systems and physics. Input is gathered per
@@ -232,7 +237,27 @@ it.
   react to events: an overlap, an input action, a timer, the hour changing.
 - **Events are queued** and delivered between tick groups. A handler never runs halfway through
   another system, so the order is always the same and replays give the same result.
+  - Each event is stamped with the step and group that sent it. Every fixed-step group sees it
+    exactly once, within a step: what was sent before it in this step, and what was sent from
+    its own place on in the step before. So a script's event in PrePhysics reaches handlers in
+    PostPhysics of the same step, and in PrePhysics of the next.
+  - Events sent before a step (while setting up, or by timers as the step starts) are seen by
+    all of that step's groups.
+  - The per-frame groups see everything sent since they last ran, once, however many steps the
+    frame held. They send no events, set no timers and spawn nothing, and that is checked: they
+    run as often as frames come, which differs from run to run, and a replay doesn't run them.
+    They may write only what is drawn (poses, the camera).
+- **Input** is the frame's values, plus the actions pressed since the last step, so a tap
+  between two steps isn't lost. The per-frame groups also see the frame's own input, for a
+  camera that turns even in frames with no step.
+- **Replays are exact on the same build and platform.** Native and web builds may round some
+  maths differently, such as sines in `glam` and `libm`.
 - **Spawning and destroying** are deferred to the end of the tick group that asks for them.
+- **Timers** count steps, not seconds, so they fire on the same step in every run.
+- **Teleports** mark the entity `Snap`, so it is drawn at its new place at once, not sliding there.
+- **Later steps will need:** animation notifies (footsteps, hit frames) worked out in the fixed
+  step, alongside root motion, since the per-frame groups can't send events; and, for physics,
+  places worked out again before the physics group when something moved earlier in the step.
 
 ### Where work runs
 
@@ -390,6 +415,60 @@ def on_hour(self, hour):
   Starlark's bindings are generated from it, and so is a `.pyi`-style stub for editors. If
   Monty's interface becomes fit for a game, or Solstice ever grows its own language, only the
   generated layer changes; the API and the game's scripts stay put.
+
+**As built (step 3, `crates/solstice-script`):**
+- **Handlers.** `on_begin(self)` runs once, the first step an actor has the script.
+  `on_tick(self, dt)` runs every step, but only for scripts that have one. `on_<name>(self, ...)`
+  runs for each `ScriptEvent` named `<name>`, sent to the actor or to every actor, by a script
+  or by Rust.
+  - Each step they run in `PrePhysics`: beginnings, then events in the order they were sent,
+    then ticks, each in the world's order of entities.
+  - An event a script sends, even to itself, is handled the next step: one step, 1/60 s, of
+    latency between one actor and the next.
+- **`self`** is a copy of the actor on the call's heap:
+  - its properties, which can be set but not added;
+  - `self.vars`, where plain data can be kept: numbers, strings, `vec3`s, entities, and lists
+    and dicts of those, at most 64 deep and 100,000 values, and never containing themselves;
+  - `self.position` and `self.yaw`, written back to its `Transform`, local to its `Parent` if it
+    has one; an actor without a `Transform` gets one when it first moves, and both must stay
+    finite;
+  - `self.entity`, which can be a dict key.
+
+  Lists in `self.vars` are changed in place within a call, and kept.
+- **A failing handler changes nothing but the log.** Its copy is thrown away, and what it asked
+  of the world (events to send, timers to set or cancel) is held back until it succeeds, so an
+  actor is never left half-changed. Its log lines are kept, to show why it failed; what failed,
+  with file and line, goes to the host's errors.
+- **Timers** set by `after` and `every` belong to the actor: their handles are its own, and
+  `cancel` refuses, returning `False`, another actor's. `begin` and `tick` are the engine's own
+  events, and can't be sent.
+- **Loading.** Each script is parsed, run once and frozen, and its handlers are shared. A script
+  that fails to load, or whose `on_*` names aren't functions, leaves the old one running. Each
+  call gets a temporary heap of its own, dropped when the call ends; sharing one heap across a
+  step was tried, and was slower. Type checking is left to editors for now.
+  - Reloads aren't part of a `Recording`: a replay runs the scripts loaded when it starts.
+- **Limits.** Each call, and each load, may do 100,000 of Starlark's steps of work, and hold
+  16 MiB.
+  - Counting work, not time, stops a runaway script at the same point natively and on the web:
+    tested, at the same 100 lines of its log, plus one counting those dropped, on both.
+  - It stops in about 4 ms on the web: one hitch, not a hang.
+  - The memory limit is best effort. Starlark checks it now and then, and the host once more as
+    the call ends, from Starlark's own count of what it allocated. That count is of values,
+    which are larger on 64-bit than on wasm32, so a script near the limit may pass on the web
+    and fail natively.
+  - A call keeps 100 lines of log, of up to 1,000 characters each.
+- **The API** is the one `#[starlark_module]` in `api.rs`: `vec3`, `send`, `after`, `every`,
+  `cancel`, `find`, `input`, `held`, `pressed`, `now` and `log`. Starlark's own documentation,
+  `api_reference()`, renders it for people and editors, in place of a hand-written stub.
+- **Cost** (`tools/gameplay-bench/b_script`, 9800X3D):
+  - about 1.1 to 1.3 µs a ticking actor on the web, and 1.9 to 2.4 µs natively, most of it
+    setting up each call;
+  - so the 1 ms scripts line of the budget holds about 400 actors ticking every step on an
+    integrated-GPU laptop. Most actors don't tick: they wait for events.
+  - Starlark adds 1.4 MB, gzipped, to the gameplay web build.
+- **No `unsafe` code.** A frozen handler is called from a temporary heap by allocating it on the
+  call's frozen heap, which keeps its own heap alive for the call.
+- **`Name`** moved into `solstice-world`, since the world's own tools will find entities by it.
 
 ## Physics
 
@@ -696,7 +775,7 @@ Each step is its own PR, with mutation-tested tests, measured costs (natively an
 clippy clean on native and wasm32, and a review by a separate AI agent. It is merged only with
 your go-ahead, and nothing is published without asking.
 
-1. **Things that move.** *In review.* The renderer API for moving instances, with `prev_world`
+1. **Things that move.** *Done.* The renderer API for moving instances, with `prev_world`
    set to the transform each was drawn with last frame; hiding instances and scaling their glow;
    the moving flag, with moving instances left out of the cached shadows, the seabed map and the
    GI voxels, and drawn into per-cascade shadow maps of their own.
@@ -709,13 +788,20 @@ your go-ahead, and nothing is published without asking.
    - Tests: a moved instance's motion vectors and shadow follow it; cached shadows of static
      geometry stay as they were; nothing static is redrawn; nothing moving is left behind in a
      cache.
-2. **The world.** `solstice-world`: entities and components on `hecs`, the transform tree, tick
-   groups, events, timers, and the fixed clock with input per step. Headless.
+2. **The world.** *Done.* `solstice-world`: entities and components on `hecs`, the
+   transform tree, tick groups, events, timers, and the fixed clock with input per step.
+   Headless.
    - Tests: tick order; event order; a recorded run replays to the same state; the clock under
      slow and uneven frames.
-3. **Scripting.** `solstice-script` with Starlark: actor scripts, properties and `self.vars`,
-   events, timers, the engine API table and its generated bindings, hot reload, step and memory
-   caps, and errors with file and line. The benchmarks are run again in place.
+   - Cost: a step of the benchmark (`tools/gameplay-bench/b_world`: turning a thousand roots,
+     working out every place, and an event per root) takes about 16 ns an entity on the web
+     (wasm with SIMD, 9800X3D) and 13 ns natively. So 9,000 entities with transforms take
+     0.15 ms a step on the web; perhaps 0.3 ms on an integrated-GPU laptop, within the world's
+     line of the budget. Every entity with a transform is worked out every step. If scenes grow
+     past that, skipping what hasn't moved comes next.
+3. **Scripting.** *In review.* `solstice-script` with Starlark: actor scripts, properties and
+   `self.vars`, events, timers, the engine API table and its generated bindings, hot reload,
+   step and memory caps, and errors with file and line. The benchmarks are run again in place.
    - Tests: hot reload keeps state; a runaway script is stopped and reported, at the same point
      natively and on the web; a broken reload keeps the old script running.
 4. **Scenes, actors and play mode.** `.actor` files, `actor` lines in scene files and their

@@ -6,6 +6,9 @@
 const FLAG_LIVE: u32 = 1u;
 const FLAG_ADD: u32 = 2u;
 const FLAG_SURFACE: u32 = 4u;
+const FLAG_LIT: u32 = 8u;
+const FLAG_GLOW: u32 = 16u;
+const AIR_TEMPERATURE: f32 = 300.0;
 
 const SHAPE_SPHERE: u32 = 1u;
 const SHAPE_BOX: u32 = 2u;
@@ -35,6 +38,10 @@ struct Emitter {
     flags: u32,
     soft: f32,
     scale: f32,
+    // Temperature's range at birth in kelvin, then cooling per second and emissivity.
+    temperature_glow: vec4f,
+    // Henyey-Greenstein asymmetry in x.
+    phase: vec4f,
 }
 
 struct Particle {
@@ -46,8 +53,9 @@ struct Particle {
     size: f32,
     index: u32,
     rotation: f32,
-    _pad0: u32,
-    _pad1: u32,
+    // Temperature at birth, in kelvin; 0 for particles that do not glow.
+    temperature: f32,
+    _pad: u32,
 }
 
 // The GPU's running state for one emitter.
@@ -62,7 +70,8 @@ struct EmitterState {
     update_count: u32,
     spawn_start: u32,
     update_start: u32,
-    _pad: array<u32, 5>,
+    light_start: u32,
+    _pad: array<u32, 4>,
 }
 
 struct SimParams {
@@ -72,7 +81,13 @@ struct SimParams {
     parity: u32,
     // Slots in the pool, and so in each alive list.
     capacity: u32,
-    _pad: u32,
+    // Each particle's light is worked out afresh once in this many frames, staggered.
+    light_interval: u32,
+    // Steps each ambient ray takes through the GI volume.
+    ray_steps: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 fn particle_random(seed: u32, index: u32, stream: u32) -> f32 {
@@ -127,7 +142,16 @@ fn spawn_particle(e: Emitter, index: u32) -> Particle {
     p.size = (ls.z + (ls.w - ls.z) * particle_random(e.seed, index, 6u)) * e.scale;
     p.index = index;
     p.rotation = TAU * particle_random(e.seed, index, 8u);
+    let hot = e.temperature_glow;
+    p.temperature = hot.x + (hot.y - hot.x) * particle_random(e.seed, index, 9u);
     return p;
+}
+
+fn particle_temperature(p: Particle, e: Emitter) -> f32 {
+    if p.temperature <= 0.0 {
+        return 0.0;
+    }
+    return AIR_TEMPERATURE + (p.temperature - AIR_TEMPERATURE) * exp(-e.temperature_glow.z * p.age);
 }
 
 // Gravity and linear drag, integrated exactly: with d = exp(-k h), velocity becomes v d + a F

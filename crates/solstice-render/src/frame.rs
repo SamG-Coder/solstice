@@ -139,6 +139,8 @@ pub enum DebugView {
     Motion = 12,
     /// How many layers of particles cover each pixel: dark red for one, through yellow to white.
     Particles = 13,
+    /// The light each particle receives, as a white particle would scatter it, without haze.
+    ParticleLight = 14,
 }
 
 impl DebugView {
@@ -159,6 +161,7 @@ impl DebugView {
             "wetness" => Self::Wetness,
             "motion" => Self::Motion,
             "particles" => Self::Particles,
+            "particle-light" => Self::ParticleLight,
             _ => return None,
         })
     }

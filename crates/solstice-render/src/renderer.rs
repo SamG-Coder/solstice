@@ -12,7 +12,7 @@ use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::waterline::{SeaViews, Waterline};
 use crate::ocean::{Ocean, Sea, SeaState};
 use crate::particles::{
-    ParticleStats, ParticleTargets, Particles, POOL_HIGH, POOL_LOW, POOL_MEDIUM,
+    LightInputs, ParticleStats, ParticleTargets, Particles, POOL_HIGH, POOL_LOW, POOL_MEDIUM,
 };
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
@@ -100,6 +100,10 @@ pub struct RendererSettings {
     pub particle_pool: u32,
     /// Scales every effect's spawn rate: fewer particles for smaller GPUs.
     pub particle_detail: f32,
+    /// Each particle's light is worked out afresh once in this many frames, with ambient rays
+    /// of this many steps through the GI volume.
+    pub particle_light_interval: u32,
+    pub particle_ray_steps: u32,
 }
 
 impl Default for RendererSettings {
@@ -116,6 +120,8 @@ impl Default for RendererSettings {
             ocean_patch_cells: PATCH_CELLS,
             particle_pool: POOL_HIGH,
             particle_detail: 1.0,
+            particle_light_interval: 1,
+            particle_ray_steps: 16,
         }
     }
 }
@@ -139,10 +145,15 @@ impl RendererSettings {
         } else {
             PATCH_CELLS
         };
-        (self.particle_pool, self.particle_detail) = match quality {
-            Quality::Low => (POOL_LOW, 0.35),
-            Quality::Medium => (POOL_MEDIUM, 0.6),
-            Quality::High => (POOL_HIGH, 1.0),
+        (
+            self.particle_pool,
+            self.particle_detail,
+            self.particle_light_interval,
+            self.particle_ray_steps,
+        ) = match quality {
+            Quality::Low => (POOL_LOW, 0.35, 4, 8),
+            Quality::Medium => (POOL_MEDIUM, 0.6, 2, 12),
+            Quality::High => (POOL_HIGH, 1.0, 1, 16),
         };
     }
 }
@@ -492,7 +503,18 @@ impl Renderer {
             deferred: DeferredLighting::new(gpu, &environment_layout),
             light_tiles: LightTiles::new(gpu, &environment_layout),
             post: PostProcess::new(gpu, output_format),
-            particles: Particles::new(gpu, &frame_uniform, settings.particle_pool),
+            particles: Particles::new(
+                gpu,
+                &frame_uniform,
+                settings.particle_pool,
+                &environment_layout,
+                LightInputs {
+                    lights: scene.lights.clone(),
+                    shadow_uniform: shadows.uniform.clone(),
+                    shadow_maps: shadows.array_view.clone(),
+                    shadow_sampler: shadows.comparison_sampler.clone(),
+                },
+            ),
             profiler: Profiler::new(gpu),
             scene,
             streamer,
@@ -679,6 +701,10 @@ impl Renderer {
         self.time += delta_seconds;
         self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
         self.particles.resize(gpu, self.settings.particle_pool);
+        self.particles
+            .set_light_interval(self.settings.particle_light_interval);
+        self.particles
+            .set_ray_steps(self.settings.particle_ray_steps);
         // Particles take the frame's own time, so a host that pauses by passing 0 holds them
         // still, where the passes that filter over time need a step above zero.
         self.particles.prepare(
@@ -936,6 +962,7 @@ impl Renderer {
         // Particles, over the lit scene and the water.
         mark(&self.profiler, &mut encoder, section::PARTICLES);
         self.particles.record_simulation(&mut encoder);
+        self.particles.record_light(&mut encoder, &self.environment);
         mark(&self.profiler, &mut encoder, section::PARTICLE_DRAW);
         let debug = self.settings.debug_view;
         let scene_color = sized

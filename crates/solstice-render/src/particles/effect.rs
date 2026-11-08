@@ -89,6 +89,17 @@ pub enum Blend {
     Add,
 }
 
+/// How a particle is lit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Shading {
+    /// By the sun, the sky, light bounced off the scene and local lights, through its phase
+    /// function: smoke, dust, spray.
+    #[default]
+    Lit,
+    /// Its colour times its brightness, as light of its own: glows and test patterns.
+    Unlit,
+}
+
 /// Where a moving effect keeps its emitter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Follow {
@@ -163,11 +174,23 @@ pub struct Emitter {
     pub spread: Value,
     /// Radius of each particle in metres, between the two.
     pub size: [Value; 2],
-    /// Linear colour and opacity.
+    /// Linear colour and opacity. For lit particles the colour is how much light they scatter,
+    /// as an albedo; for unlit ones it is the light they give.
     pub color: [Value; 4],
-    /// Radiance of a white particle, in the scene's units: 1 is a white surface lit by a sun
-    /// of illuminance π.
+    /// Scales the colour. For unlit particles it is the radiance of a white one in the scene's
+    /// units: 1 is a white surface lit by a sun of illuminance π.
     pub brightness: Value,
+    pub shading: Shading,
+    /// Henyey-Greenstein asymmetry of the light a lit particle scatters, `-1..1`: 0 scatters
+    /// evenly, near 1 mostly onward, so that mist glows with the sun behind it.
+    pub phase: Value,
+    /// Temperature at birth in kelvin, between the two. Above about 800 K a particle glows as
+    /// a black body; 0 is no glow.
+    pub temperature: [Value; 2],
+    /// How fast it cools towards the air's 300 K, as a rate per second.
+    pub cooling: Value,
+    /// How much of a black body's light it gives at its temperature, `0..1`: its emissivity.
+    pub glow: Value,
     /// Downward acceleration in m/s².
     pub gravity: Value,
     /// Linear drag: the share of its velocity relative to still air a particle loses, per
@@ -199,6 +222,11 @@ impl Emitter {
             size: [Value::constant(0.05); 2],
             color: [Value::constant(1.0); 4],
             brightness: Value::constant(1.0),
+            shading: Shading::Lit,
+            phase: Value::constant(0.2),
+            temperature: [Value::constant(0.0); 2],
+            cooling: Value::constant(0.0),
+            glow: Value::constant(1.0),
             gravity: Value::constant(0.0),
             drag: Value::constant(0.0),
             color_life: Curve::constant([1.0; 4]),
@@ -587,6 +615,18 @@ fn module(
             no_options(words)?;
             emitter.brightness = single(plain, params, "brightness")?;
         }
+        "temperature" => {
+            no_options(words)?;
+            emitter.temperature = range(plain, params, "temperature")?;
+        }
+        "cooling" => {
+            no_options(words)?;
+            emitter.cooling = single(plain, params, "cooling")?;
+        }
+        "glow" => {
+            no_options(words)?;
+            emitter.glow = single(plain, params, "glow")?;
+        }
         "gravity" => {
             no_options(words)?;
             emitter.gravity = match plain {
@@ -599,7 +639,7 @@ fn module(
             emitter.drag = single(plain, params, "drag")?;
         }
         "render" => {
-            words.only(keyword, &["blend", "soft", "opacity"])?;
+            words.only(keyword, &["blend", "soft", "opacity", "shading", "phase"])?;
             match plain {
                 ["sprite"] => {}
                 _ => return Err("render takes sprite".into()),
@@ -616,6 +656,16 @@ fn module(
             }
             if let Some(v) = words.option("opacity") {
                 emitter.opacity = single(v, params, "opacity")?;
+            }
+            if let Some(v) = words.option("shading") {
+                emitter.shading = match v {
+                    ["lit"] => Shading::Lit,
+                    ["unlit"] => Shading::Unlit,
+                    _ => return Err("shading takes lit or unlit".into()),
+                };
+            }
+            if let Some(v) = words.option("phase") {
+                emitter.phase = single(v, params, "phase")?;
             }
         }
         _ => return Err(format!("unknown module {keyword:?}")),
@@ -645,7 +695,10 @@ mod tests {
           drag wind
           color life 0=1 1 1 0 0.2=1 1 1 1 1=0.4 0.4 0.4 0
           size life 0=0.5 1=2
-          render sprite blend=add soft=0.5 opacity=0.7
+          temperature 1200 1500
+          cooling 0.5
+          glow 0.3
+          render sprite blend=add soft=0.5 opacity=0.7 shading=unlit phase=0.6
         emitter embers
           follow camera
           shape sphere 2 surface
@@ -685,12 +738,19 @@ mod tests {
         assert_eq!(e.blend, Blend::Add);
         assert_eq!(e.soft.eval(&params), 0.5);
         assert_eq!(e.opacity.eval(&params), 0.7);
+        assert_eq!(e.shading, Shading::Unlit);
+        assert_eq!(e.phase.eval(&params), 0.6);
+        assert_eq!(e.temperature.map(|v| v.eval(&params)), [1200.0, 1500.0]);
+        assert_eq!(e.cooling.eval(&params), 0.5);
+        assert_eq!(e.glow.eval(&params), 0.3);
 
         let embers = &effect.emitters[1];
         assert_eq!(embers.follow, Follow::Camera);
         assert!(matches!(embers.shape, Shape::Sphere { surface: true, .. }));
         // Defaults for all it does not name.
         assert_eq!(embers.budget, 1000);
+        assert_eq!(embers.shading, Shading::Lit);
+        assert_eq!(embers.temperature.map(|v| v.eval(&params)), [0.0, 0.0]);
         assert_eq!(embers.gravity.eval(&params), 0.0);
     }
 
