@@ -308,6 +308,23 @@ mod tests {
     }
 
     #[test]
+    fn collide_coarse_keeps_fewer_triangles() {
+        // Ripples of about the two errors' size, so the two cuts differ.
+        let mesh = sheet(10.0, 128, 0.08);
+        let build = |how: Collide| {
+            let scene = SceneAsset {
+                meshes: vec![mesh.clone()],
+                instances: vec![at(0, 1.0, 0.0)],
+                collide: vec![how],
+                gameplay: game(),
+                ..Default::default()
+            };
+            build_collision(&scene).unwrap().shapes[0].triangles.len()
+        };
+        assert!(build(Collide::Coarse) < build(Collide::Auto));
+    }
+
+    #[test]
     fn hulls_are_thinned_to_a_limit() {
         let scene = SceneAsset {
             meshes: vec![sheet(0.4, 128, 0.0)],

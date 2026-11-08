@@ -502,6 +502,51 @@ fn a_sensor_reports_who_enters_and_leaves() {
 }
 
 #[test]
+fn a_sensor_notices_what_falls_through_it_too() {
+    // A falling crate reports no events of its own: the sensor has to.
+    let physics = Rc::new(RefCell::new(Physics::new()));
+    physics.borrow_mut().add_scene(
+        &Collision {
+            shapes: vec![floor()],
+            instance_shapes: vec![0],
+            heightfield: None,
+        },
+        |_| Some(Mat4::IDENTITY),
+    );
+    let mut schedule = Schedule::new();
+    Physics::install(&physics, &mut schedule);
+    let seen = Seen::default();
+    let log = seen.clone();
+    schedule.add(TickGroup::PostPhysics, "seen", move |world| {
+        for o in world.read_cloned::<Overlap>() {
+            log.0.borrow_mut().push((o.sensor, o.other, o.entered));
+        }
+    });
+    let mut game = Game::new(World::new(), schedule);
+    let zone = game.world.spawn((
+        Transform::from_translation(Vec3::new(0.0, 2.0, 0.0)),
+        ActorCollider {
+            shape: Shape::Box(Vec3::new(4.0, 1.0, 4.0)),
+            kind: BodyKind::Sensor,
+            offset: Vec3::ZERO,
+        },
+    ));
+    let falling = game.world.spawn((
+        Transform::from_translation(Vec3::new(0.0, 5.0, 0.0)),
+        ActorCollider {
+            shape: Shape::Box(Vec3::splat(0.5)),
+            kind: BodyKind::Dynamic(5.0),
+            offset: Vec3::ZERO,
+        },
+    ));
+    steps(&mut game, 120);
+    assert_eq!(
+        *seen.0.borrow(),
+        vec![(zone, falling, true), (zone, falling, false)]
+    );
+}
+
+#[test]
 fn a_dynamic_actor_falls_and_comes_to_rest() {
     let (mut game, _) = world_of(vec![floor()]);
     let crate_ = game.world.spawn((
