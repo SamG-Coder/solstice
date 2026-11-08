@@ -59,6 +59,8 @@ fn push_queue(entry: QueueEntry) {
     let slot = atomicAdd(&state.write_head, 1u);
     if slot < arrayLength(&queue) {
         queue[slot] = entry;
+    } else {
+        atomicAdd(&state.dropped, 1u);
     }
 }
 
@@ -66,21 +68,28 @@ fn push_retry(entry: QueueEntry) {
     let slot = atomicAdd(&state.retry_count, 1u);
     if slot < arrayLength(&retry) {
         retry[slot] = entry;
+    } else {
+        atomicAdd(&state.dropped, 1u);
     }
 }
 
 // Software clusters fill the list from the front and hardware from the back, so
-// both can append concurrently and each still forms one contiguous range.
-fn emit_cluster(instance: u32, cluster: u32, software: bool) {
+// both can append concurrently and each still forms one contiguous range. An entry is
+// claimed from a single count of both before either end is written, so the two ranges can
+// never meet, however many threads arrive at once. Returns false, and counts the loss, if
+// the list is full.
+fn emit_cluster(instance: u32, cluster: u32, software: bool) -> bool {
     let capacity = arrayLength(&visible);
-    if atomicLoad(&state.sw_count) + atomicLoad(&state.hw_count) + 256u >= capacity {
-        return;
+    if atomicAdd(&state.reserved, 1u) >= capacity {
+        atomicAdd(&state.dropped, 1u);
+        return false;
     }
     if software {
         visible[atomicAdd(&state.sw_count, 1u)] = VisibleCluster(instance, cluster);
     } else {
         visible[capacity - 1u - atomicAdd(&state.hw_count, 1u)] = VisibleCluster(instance, cluster);
     }
+    return true;
 }
 
 // Screen-space size of an error metric living on a sphere. Using the sphere's
@@ -205,7 +214,9 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
             software = 2.0 * radius * view.lod_scale / distance < SOFTWARE_MAX_DIAMETER_PX;
         }
     }
-    emit_cluster(entry.instance, cluster_index, software);
+    if !emit_cluster(entry.instance, cluster_index, software) {
+        return;
+    }
     request_texture_detail(cluster, instance, length(center - view.camera_position) - radius);
     atomicAdd(&state.triangle_count, cluster_triangle_count(cluster));
 }

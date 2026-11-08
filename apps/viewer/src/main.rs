@@ -530,6 +530,12 @@ mod native {
             "last shadow cascade: {} clusters, {} triangles",
             stats.shadow_clusters, stats.shadow_triangles
         );
+        if stats.dropped > 0 || stats.shadow_dropped > 0 {
+            println!(
+                "WARNING: the cull lists overflowed: {} dropped in the main view, {} in the last shadow cascade redrawn",
+                stats.dropped, stats.shadow_dropped
+            );
+        }
 
         if let Some(times) = renderer.section_times() {
             let parts: Vec<String> = solstice_render::profiler::SECTIONS
@@ -661,6 +667,7 @@ mod native {
         let mut previous_grid: Option<Vec<f32>> = None;
         let mut changes: Vec<(f32, GridChange)> = Vec::new();
         let mut clock = options.clock;
+        let (mut dropped, mut shadow_dropped) = (0, 0);
         for frame in 0..=frames {
             let time = frame as f32 * STEP;
             let start = Instant::now();
@@ -676,7 +683,10 @@ mod native {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             let elapsed = start.elapsed().as_secs_f32() * 1000.0;
             let sections = renderer.section_times().unwrap_or_default();
-            records.push((time, elapsed, renderer.stats().triangles, sections));
+            let stats = renderer.stats();
+            records.push((time, elapsed, stats.triangles, sections));
+            dropped = dropped.max(stats.dropped);
+            shadow_dropped = shadow_dropped.max(stats.shadow_dropped);
             if options.stability {
                 let pixels = read_pixels(&gpu, &target, options.size)?;
                 let grid = luma_grid(&pixels, options.size);
@@ -743,6 +753,11 @@ mod native {
             report_stability(&changes);
         }
 
+        if dropped > 0 || shadow_dropped > 0 {
+            println!(
+                "WARNING: the cull lists overflowed: up to {dropped} dropped in the main view, {shadow_dropped} in the last shadow cascade redrawn each frame"
+            );
+        }
         let errors = errors.lock().expect("error sink");
         if errors.is_empty() {
             println!("no GPU errors");
