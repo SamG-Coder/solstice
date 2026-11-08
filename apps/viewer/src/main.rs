@@ -526,6 +526,10 @@ mod native {
             stats.unique_triangles,
             stats.instances,
         );
+        println!(
+            "last shadow cascade: {} clusters, {} triangles",
+            stats.shadow_clusters, stats.shadow_triangles
+        );
 
         if let Some(times) = renderer.section_times() {
             let parts: Vec<String> = solstice_render::profiler::SECTIONS
