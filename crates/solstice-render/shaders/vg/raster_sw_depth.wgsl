@@ -6,7 +6,8 @@
 
 // Per pixel: the view's stamp in the top byte, over 24 bits of reversed depth, so that the
 // nearest sample of the current drawing has the largest value and anything an earlier
-// drawing left behind loses to it. The buffer is never cleared; the merge ignores other stamps.
+// drawing left behind loses to it. The buffer is not cleared per drawing, only once each time
+// the stamps start a new round (shadow.rs); the merge ignores other stamps.
 @group(1) @binding(0) var<storage, read_write> shadow_depth: array<atomic<u32>>;
 
 #include "vg/depth_stamp.wgsl"

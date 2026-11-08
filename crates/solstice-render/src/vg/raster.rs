@@ -260,8 +260,9 @@ impl Rasterizer {
 
     /// Rasterizes into `depth` the clusters the most recent cull of `work` sent to software,
     /// as depth alone, under the stamp the view at `slot` carries. [`Self::merge_depth`] then
-    /// lays them over a depth map. Nothing is cleared: a drawing's entries outrank any left by
-    /// earlier drawings, and the merge reads only its own stamp.
+    /// lays them over a depth map. Nothing is cleared per drawing: a drawing's entries outrank
+    /// any left by earlier drawings, the merge reads only its own stamp, and the caller clears
+    /// the buffer once each time the stamps start a new round.
     pub fn record_software_depth(
         &self,
         encoder: &mut wgpu::CommandEncoder,

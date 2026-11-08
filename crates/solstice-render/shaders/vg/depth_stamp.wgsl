@@ -1,7 +1,8 @@
 // How software-rasterized depth is kept for a depth map: a drawing's stamp in the top byte of
 // each word, over the reversed depth in 24 bits. An atomic max then keeps the nearest sample
-// of the latest drawing, whatever earlier drawings left in the word, so the buffer is never
-// cleared; the merge reads only words with its own stamp. Twin of the layout in raster.rs.
+// of the latest drawing, whatever earlier drawings left in the word, so the buffer is cleared
+// only when the stamps start a new round (shadow.rs); the merge reads only words with its own
+// stamp. Twin of the layout in raster.rs.
 
 const DEPTH_STAMP_SHIFT: u32 = 24u;
 const DEPTH_STAMP_RANGE: f32 = 16777215.0;
