@@ -33,6 +33,8 @@ const WATER_F0: f32 = 0.02;
 // Roughness of the water's surface between its drawn waves, for the sun's highlight. The
 // spectrum's finer ripples will set this properly (step 3).
 const WATER_ROUGHNESS: f32 = 0.08;
+// Depth of water over which the sea fades into the shore, in metres.
+const SHORE_FADE: f32 = 0.25;
 
 // The surface's normal at `calm`, from every cascade's slopes at the level whose texels match
 // `footprint` metres.
@@ -54,6 +56,51 @@ fn wave_normal(calm: vec2f, footprint: f32) -> vec3f {
     var normal = cross(along_z, along_x);
     normal.y = max(normal.y, 0.05);
     return normalize(normal);
+}
+
+// What is seen through the water at `world`: the lit scene behind it, bent by refraction where
+// the view ray enters, and dimmed and tinted by the water the light crosses, down to the bed and
+// back up to the eye, with the water's own glow, `body`, filling in as the path deepens. Over
+// sand a few centimetres down the water is almost clear; a metre turns it turquoise, red going
+// first; deeper, and over the open sea, it is the body's colour alone.
+fn through_water(
+    center: vec2f,
+    world: vec3f,
+    view: vec3f,
+    normal: vec3f,
+    water_depth: f32,
+    scene_depth: f32,
+    body: vec3f,
+    extinction: vec3f,
+) -> vec3f {
+    // Nothing behind this pixel but the sky: open sea, as deep as can be.
+    if scene_depth <= 0.0 {
+        return body;
+    }
+    let straight = reconstruct_world(frame, center, scene_depth);
+    let thickness = distance(straight, world);
+    // Follow the bent ray as far as the water is thick, and find the bed it reaches on screen.
+    let bent = refract(-view, normal, 1.0 / 1.33);
+    var pixel = center;
+    let reached = frame.view_proj * vec4f(world + bent * thickness, 1.0);
+    if reached.w > 0.0 {
+        let ndc = reached.xy / reached.w;
+        pixel = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * frame.viewport;
+    }
+    let last = vec2i(frame.viewport) - vec2i(1);
+    var bed_depth = textureLoad(opaque_depth, clamp(vec2i(pixel), vec2i(0), last), 0).r;
+    // What is found there must lie beyond the water's surface. Anything nearer is in front of
+    // the water, and the sky is beyond the scene; either way, look straight through instead.
+    if bed_depth <= 0.0 || bed_depth >= water_depth {
+        pixel = center;
+        bed_depth = scene_depth;
+    }
+    let bed = reconstruct_world(frame, pixel, bed_depth);
+    let path = distance(bed, world);
+    // The light reaching the bed came down through the water first.
+    let down = max(surface.sizes.w - bed.y, 0.0);
+    let seen = textureSampleLevel(lit, clamp_sampler, pixel * frame.inv_viewport, 0.0).rgb;
+    return seen * exp(-extinction * (path + down)) + body * (vec3f(1.0) - exp(-extinction * path));
 }
 
 @compute @workgroup_size(8, 8)
@@ -121,8 +168,17 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let sunlight = sun_irradiance_at(world) * max(sun.y, 0.0);
         let body = albedo * (skylight + sunlight) / PI * 0.5;
 
-        color = mix(body, reflected, fresnel) + highlight;
+        let underwater = through_water(center, world, view, normal, water, scene_depth, body, extinction);
+        color = mix(underwater, reflected, fresnel) + highlight;
         color = aerial_perspective(color, world, view, distance);
+        // At the very edge, where the water thins to nothing over the sand, it fades into the
+        // shore rather than ending in a line: a sheet a few centimetres deep barely shows. The
+        // shore behind has its own haze already.
+        if scene_depth > 0.0 {
+            let bed = reconstruct_world(frame, center, scene_depth);
+            let depth_here = max(world.y - bed.y, 0.0);
+            color = mix(behind.rgb, color, smoothstep(0.0, SHORE_FADE, depth_here));
+        }
     }
 
     let prev_clip = frame.prev_view_proj * vec4f(world, 1.0);
