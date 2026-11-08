@@ -8,6 +8,8 @@ const FLAG_ADD: u32 = 2u;
 const FLAG_SURFACE: u32 = 4u;
 const FLAG_LIT: u32 = 8u;
 const FLAG_GLOW: u32 = 16u;
+const FLAG_SOLID: u32 = 32u;
+const FLAG_SORT: u32 = 64u;
 const AIR_TEMPERATURE: f32 = 300.0;
 
 const SHAPE_SPHERE: u32 = 1u;
@@ -88,6 +90,9 @@ struct SimParams {
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
+    // Where the camera is and which way it looks, for sorting by distance along the view.
+    camera_position: vec4f,
+    camera_forward: vec4f,
 }
 
 fn particle_random(seed: u32, index: u32, stream: u32) -> f32 {

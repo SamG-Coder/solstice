@@ -23,6 +23,12 @@ struct Args {
     draw_instance_count: u32,
     draw_first_vertex: u32,
     draw_first_instance: u32,
+    // Draw: one triangle laying software-rasterized depth over a depth map, or nothing when
+    // no cluster went to software.
+    merge_vertex_count: u32,
+    merge_instance_count: u32,
+    merge_first_vertex: u32,
+    merge_first_instance: u32,
 }
 
 const MAX_CLUSTER_TRIANGLES: u32 = 128u;
@@ -54,6 +60,10 @@ fn finish() {
     args.draw_instance_count = atomicLoad(&state.hw_count) - state.hw_base;
     args.draw_first_vertex = 0u;
     args.draw_first_instance = 0u;
+    args.merge_vertex_count = 3u;
+    args.merge_instance_count = min(args.software_x, 1u);
+    args.merge_first_vertex = 0u;
+    args.merge_first_instance = 0u;
 }
 
 // Starts occlusion phase 1. The bind group swaps queue and retry buffers, so the

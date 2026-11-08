@@ -206,6 +206,8 @@ pub struct FrameStats {
     /// frames to arrive, and a redraw is skipped over while the last is still in flight.
     pub shadow_clusters: u32,
     pub shadow_triangles: u32,
+    /// How many of those clusters went to the software rasterizer.
+    pub shadow_software_clusters: u32,
     /// Queue entries and clusters the main view, and that cascade, lost for want of room in
     /// their lists. Zero unless the scene has outgrown them, in which case the image, or the
     /// shadow, has holes.
@@ -589,6 +591,24 @@ impl Renderer {
         &mut self.particles
     }
 
+    /// The scene's depth and motion as the temporal filter reads them, for tests that check
+    /// what was drawn into them.
+    #[cfg(test)]
+    pub(crate) fn reactive_mask(&self) -> Option<&wgpu::Texture> {
+        Some(self.sized.as_ref()?.particles.reactive_texture())
+    }
+
+    /// The scene's depth and motion as the temporal filter reads them, for tests that check
+    /// what was drawn into them.
+    #[cfg(test)]
+    pub(crate) fn scene_depth_and_motion(&self) -> Option<(&wgpu::Texture, &wgpu::Texture)> {
+        let sized = self.sized.as_ref()?;
+        Some(match &sized.water {
+            Some(water) => (&water.scene_depth.texture, &water.motion.texture),
+            None => (&sized.gbuffer.depth.texture, &sized.gbuffer.motion.texture),
+        })
+    }
+
     /// Gives the scene an open sea, easing from the current one over `seconds`, or at once for
     /// 0; `None` takes the sea away. Its waves follow the weather's wind.
     pub fn set_ocean(&mut self, ocean: Option<Ocean>, seconds: f32) {
@@ -647,6 +667,7 @@ impl Renderer {
             streaming: self.streamer.stats(),
             particles: self.particles.stats(),
             shadow_clusters: self.aux_work.stats().clusters(),
+            shadow_software_clusters: self.aux_work.stats().software_clusters(),
             shadow_triangles: self.aux_work.stats().triangles(),
             dropped: self.main_work.stats().dropped(),
             shadow_dropped: self.aux_work.stats().dropped(),
@@ -706,7 +727,7 @@ impl Renderer {
         // still, where the passes that filter over time need a step above zero.
         self.particles.prepare(
             gpu,
-            camera.position,
+            camera,
             delta_seconds.clamp(0.0, 0.25),
             self.settings.particle_detail,
         );
@@ -801,6 +822,7 @@ impl Renderer {
         self.shadows.record(
             &mut encoder,
             &self.cull,
+            &self.rasterizer,
             &self.scene,
             &self.aux_cull_scene,
             &self.aux_work,
@@ -959,6 +981,7 @@ impl Renderer {
         mark(&self.profiler, &mut encoder, section::PARTICLES);
         self.particles.record_simulation(&mut encoder);
         self.particles.record_light(&mut encoder, &self.environment);
+        self.particles.record_sort(&mut encoder);
         mark(&self.profiler, &mut encoder, section::PARTICLE_DRAW);
         let debug = self.settings.debug_view;
         let scene_color = sized
@@ -1082,13 +1105,16 @@ impl Renderer {
             ),
             None => (&hdr.view, &gbuffer.depth.view, &gbuffer.motion.view),
         };
-        let particles = self.particles.targets(gpu, render_size, scene_depth);
+        let particles = self
+            .particles
+            .targets(gpu, render_size, scene_depth, scene_motion);
         let post = self.post.bindings(
             gpu,
             &self.frame_uniform,
             scene_color,
             scene_depth,
             scene_motion,
+            particles.reactive(),
             history,
             render_size,
             output_size,
@@ -1208,7 +1234,7 @@ impl Renderer {
             eye_near: 0.0,
             receiver_plane_count: 0,
             instance_filter: InstanceFilter::All as u32,
-            _pad: 0,
+            stamp: 0,
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             _pad2: 0.0,

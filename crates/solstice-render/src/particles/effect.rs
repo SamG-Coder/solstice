@@ -30,6 +30,9 @@
 
 /// The most emitters one effect may have.
 pub const MAX_EMITTERS_PER_EFFECT: usize = 8;
+/// The largest budget a sorted emitter may have: its whole list is sorted in one workgroup's
+/// memory, of which WebGPU promises 16 KiB, four bytes a particle.
+pub const MAX_SORTED: u32 = 4096;
 /// Entries each curve is baked to on the GPU.
 pub const CURVE_ENTRIES: usize = 32;
 
@@ -181,6 +184,11 @@ pub struct Emitter {
     /// units: 1 is a white surface lit by a sun of illuminance π.
     pub brightness: Value,
     pub shading: Shading,
+    /// Drawn opaque where its shape is more than half covered, writing depth and motion like
+    /// any surface, so that the temporal filter follows it exactly: sparks, debris.
+    pub solid: bool,
+    /// Its particles are drawn far to near, so that dark smoke in front hides what is behind.
+    pub sort: bool,
     /// Henyey-Greenstein asymmetry of the light a lit particle scatters, `-1..1`: 0 scatters
     /// evenly, near 1 mostly onward, so that mist glows with the sun behind it.
     pub phase: Value,
@@ -223,6 +231,8 @@ impl Emitter {
             color: [Value::constant(1.0); 4],
             brightness: Value::constant(1.0),
             shading: Shading::Lit,
+            solid: false,
+            sort: false,
             phase: Value::constant(0.2),
             temperature: [Value::constant(0.0); 2],
             cooling: Value::constant(0.0),
@@ -284,6 +294,14 @@ impl Effect {
             };
             let at = |e: String| format!("line {}: {e}", index + 1);
             effect.line(keyword, rest).map_err(at)?;
+        }
+        for emitter in &effect.emitters {
+            if emitter.sort && emitter.budget > MAX_SORTED {
+                return Err(format!(
+                    "emitter {} sorts its particles, so its budget can be at most {MAX_SORTED}",
+                    emitter.name
+                ));
+            }
         }
         if effect.emitters.is_empty() {
             return Err("an effect needs at least one emitter".into());
@@ -641,8 +659,16 @@ fn module(
         "render" => {
             words.only(keyword, &["blend", "soft", "opacity", "shading", "phase"])?;
             match plain {
-                ["sprite"] => {}
-                _ => return Err("render takes sprite".into()),
+                ["sprite", flags @ ..] => {
+                    for flag in flags {
+                        match *flag {
+                            "solid" => emitter.solid = true,
+                            "sort" => emitter.sort = true,
+                            _ => return Err(format!("render sprite has no {flag:?}")),
+                        }
+                    }
+                }
+                _ => return Err("render takes sprite, then solid or sort".into()),
             }
             if let Some(v) = words.option("blend") {
                 emitter.blend = match v {
@@ -789,12 +815,22 @@ mod tests {
                 "emitter e\nemitter e",
                 "line 2: emitter e is declared twice",
             ),
+            (
+                "emitter e\n render sprite glossy",
+                "line 2: render sprite has no \"glossy\"",
+            ),
         ];
         for (text, expected) in cases {
             let error = Effect::parse(text).unwrap_err();
             assert!(error.starts_with(expected), "{text:?} gave {error:?}");
         }
         assert!(Effect::parse("# nothing\n").is_err());
+        // Sorting is done in one workgroup's memory, which bounds the budget.
+        let error = Effect::parse("emitter smoke\n budget 5000\n render sprite sort").unwrap_err();
+        assert!(error.contains("at most 4096"), "{error}");
+        let sorted =
+            Effect::parse("emitter smoke\n budget 4096\n render sprite sort solid").unwrap();
+        assert!(sorted.emitters[0].sort && sorted.emitters[0].solid);
     }
 
     #[test]

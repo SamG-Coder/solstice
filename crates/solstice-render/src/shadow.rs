@@ -17,18 +17,31 @@ use crate::frame::Camera;
 use crate::gpu::{Gpu, LayoutBuilder};
 use crate::scene::GpuScene;
 use crate::vg::{
-    CullPhase, CullPipelines, CullWork, InstanceFilter, PassView, RasterBindings, Rasterizer,
-    ViewSlots,
+    CullPhase, CullPipelines, CullWork, DepthBuffer, InstanceFilter, PassView, RasterBindings,
+    Rasterizer, ViewSlots, DEPTH_STAMPS,
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 pub const CASCADE_COUNT: usize = 4;
 const RESOLUTION: u32 = 2048;
+/// The stamps for `count` cascades drawn this frame through the software depth buffer, after
+/// `last` was the last one used: whether the buffer must be cleared before them, and the first
+/// of them, which the rest follow one by one. A frame's cascades never straddle a round, since
+/// the clear is recorded once before the frame's first cascade: a cascade stamped 1 after one
+/// stamped `DEPTH_STAMPS` in the same frame would lose every pixel the other had written.
+fn next_stamps(last: u32, count: u32) -> (bool, u32) {
+    if last + count > DEPTH_STAMPS {
+        (true, 1)
+    } else {
+        (false, last + 1)
+    }
+}
+
 /// Each cascade's quarter of the layer for movable instances, the last layer of the array.
 const MOVING_RESOLUTION: u32 = RESOLUTION / 2;
 const MOVING_LAYER: u32 = CASCADE_COUNT as u32;
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+const FORMAT: wgpu::TextureFormat = crate::vg::DEPTH_FORMAT;
 /// Far end of each cascade, in metres from the camera.
 const SPLITS: [f32; CASCADE_COUNT] = [12.0, 38.0, 120.0, 420.0];
 /// How far casters may lie towards the sun beyond a cascade's bounds.
@@ -108,6 +121,9 @@ struct ShadowUniform {
 pub struct ShadowWork {
     /// Cascades whose static contents are redrawn.
     pub due: [bool; CASCADE_COUNT],
+    /// Whether the software depth buffer must be cleared before this frame's cascades, as the
+    /// stamps have started a new round.
+    pub clear_software_depth: bool,
     /// Cascades with movable instances to draw.
     pub moving: [bool; CASCADE_COUNT],
     /// Whether the movable instances are culled once, through the slot after the cascades'
@@ -136,6 +152,15 @@ pub struct ShadowMaps {
     /// The layer movable instances are drawn into.
     moving_view: wgpu::TextureView,
     pipeline: wgpu::RenderPipeline,
+    /// Where the software rasterizer draws a cascade's small clusters before they are laid
+    /// over its map. Most of a wood's clusters are pixel-sized, and the hardware rasterizer
+    /// draws those slowly, as the main view found long ago.
+    software_depth: DepthBuffer,
+    /// The stamp of the last cascade drawn through it, 1 to `DEPTH_STAMPS`; 0 before any.
+    /// Before the stamps start a new round the buffer is cleared, or the words the last round
+    /// left, with their higher stamps, would win the atomic max against the new round's. See
+    /// [`next_stamps`].
+    software_stamp: u32,
     data: ShadowUniform,
     /// What each cascade last drew, to tell when it has gone stale.
     drawn: [Option<Drawn>; CASCADE_COUNT],
@@ -234,6 +259,8 @@ impl ShadowMaps {
             layer_views,
             moving_view,
             pipeline,
+            software_depth: rasterizer.depth_buffer(gpu, (RESOLUTION, RESOLUTION)),
+            software_stamp: 0,
             data: ShadowUniform {
                 view_proj: [Mat4::IDENTITY; CASCADE_COUNT],
                 splits: Vec4::from_array(SPLITS),
@@ -313,6 +340,13 @@ impl ShadowMaps {
         if std::mem::take(&mut self.redraw_all) {
             due = stale;
         }
+        // Every cascade drawn this frame takes a stamp of its own, and all of them come from
+        // one round: the clear is recorded once, before the frame's first cascade.
+        let (clear_software_depth, first_stamp) = next_stamps(
+            self.software_stamp,
+            due.iter().filter(|&&due| due).count() as u32,
+        );
+        self.software_stamp = first_stamp;
 
         for cascade in (0..CASCADE_COUNT).filter(|&c| due[c]) {
             self.outdated[cascade] = false;
@@ -334,7 +368,7 @@ impl ShadowMaps {
                 SPLITS[cascade],
                 texel * SNAP_TEXELS + slack,
             );
-            let view = PassView::orthographic(
+            let mut view = PassView::orthographic(
                 view_proj,
                 center,
                 Vec2::splat(RESOLUTION as f32),
@@ -349,6 +383,10 @@ impl ShadowMaps {
                 nearest[cascade],
             )
             .shadowing(&planes, sun_direction);
+            // Small clusters go to the software rasterizer, as in the main view.
+            view.allow_software = 1;
+            view.stamp = self.software_stamp;
+            self.software_stamp += 1;
             self.drawn[cascade] = Some(Drawn {
                 view_proj,
                 lod_threshold,
@@ -411,12 +449,15 @@ impl ShadowMaps {
             ));
             slots.write(gpu, first_moving_slot + CASCADE_COUNT as u32, &view);
         }
+        // Back to the last stamp used.
+        self.software_stamp -= 1;
         self.data.moving = Vec4::from_array(moving_due.map(|m| f32::from(u8::from(m))));
 
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&self.data));
         ShadowWork {
             due,
+            clear_software_depth,
             moving: moving_due,
             shared_cull,
         }
@@ -428,6 +469,7 @@ impl ShadowMaps {
         &self,
         encoder: &mut wgpu::CommandEncoder,
         cull: &CullPipelines,
+        rasterizer: &Rasterizer,
         scene: &GpuScene,
         cull_scene: &wgpu::BindGroup,
         work: &CullWork,
@@ -436,9 +478,13 @@ impl ShadowMaps {
         first_moving_slot: u32,
         shadow_work: &ShadowWork,
     ) {
+        if shadow_work.clear_software_depth {
+            encoder.clear_buffer(&self.software_depth.buffer, 0, None);
+        }
         for cascade in (0..CASCADE_COUNT).filter(|&c| shadow_work.due[c]) {
             let slot = first_slot + cascade as u32;
             cull.record(encoder, scene, cull_scene, slot, work, CullPhase::First);
+            rasterizer.record_software_depth(encoder, raster, slot, work, &self.software_depth);
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow cascade"),
@@ -456,6 +502,7 @@ impl ShadowMaps {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &raster.group, &[ViewSlots::offset(slot)]);
             pass.draw_indirect(work.args(), CullWork::draw_args_offset());
+            rasterizer.merge_depth(&mut pass, raster, slot, work, &self.software_depth);
         }
 
         if shadow_work.shared_cull && shadow_work.moving.iter().any(|&moving| moving) {
@@ -1199,5 +1246,19 @@ mod tests {
                 "shift of {value} texels"
             );
         }
+    }
+
+    #[test]
+    fn a_frame_of_cascades_never_straddles_a_round_of_stamps() {
+        // Stamps continue from the last one used while the round has room for the frame.
+        assert_eq!(next_stamps(0, 1), (false, 1));
+        assert_eq!(next_stamps(7, 4), (false, 8));
+        assert_eq!(next_stamps(DEPTH_STAMPS - 4, 4), (false, DEPTH_STAMPS - 3));
+        // A frame that would run past the last stamp starts a new round, cleared first, even
+        // when its first cascade alone would still have fitted.
+        assert_eq!(next_stamps(DEPTH_STAMPS - 3, 4), (true, 1));
+        assert_eq!(next_stamps(DEPTH_STAMPS, 1), (true, 1));
+        // A frame with no cascade due changes nothing.
+        assert_eq!(next_stamps(DEPTH_STAMPS, 0), (false, DEPTH_STAMPS + 1));
     }
 }

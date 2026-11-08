@@ -85,9 +85,40 @@ impl Rig {
         self.frame_at(seconds, Vec3::ZERO);
     }
 
+    /// Simulates one frame of `seconds`, seen from the origin looking along -Z, and sorts what
+    /// asks to be sorted.
+    fn frame_sorted(&mut self, seconds: f32) {
+        self.frame_sorted_from(
+            seconds,
+            &Camera {
+                position: Vec3::ZERO,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The same, seen from `camera`.
+    fn frame_sorted_from(&mut self, seconds: f32, camera: &Camera) {
+        self.particles.prepare(&self.gpu, camera, seconds, 1.0);
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        self.particles.record_simulation(&mut encoder);
+        self.particles.record_sort(&mut encoder);
+        self.gpu.queue.submit([encoder.finish()]);
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let errors = self.errors.lock().unwrap();
+        assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    }
+
     /// Simulates one frame of `seconds` with the camera at `camera`.
     fn frame_at(&mut self, seconds: f32, camera: Vec3) {
-        self.particles.prepare(&self.gpu, camera, seconds, 1.0);
+        let camera = Camera {
+            position: camera,
+            ..Default::default()
+        };
+        self.particles.prepare(&self.gpu, &camera, seconds, 1.0);
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         self.particles.record_simulation(&mut encoder);
         self.gpu.queue.submit([encoder.finish()]);
@@ -794,5 +825,426 @@ fn light_packing_and_black_bodies_hold_their_values() {
     assert!(
         (platinum / 600_000.0 - 1.0).abs() < 0.03,
         "a black body at 2,042 K: {platinum} cd/m²"
+    );
+}
+
+/// A sorted emitter's list, as drawn, runs far to near along the view, holding exactly the
+/// particles it did, at every size up to its limit; an emitter that does not sort is left as it
+/// was.
+#[test]
+fn sorted_emitters_list_their_particles_far_to_near() {
+    let Some(mut rig) = Rig::new(16384) else {
+        return;
+    };
+    // Spread along the view, -Z, and across it.
+    let sorted = |count: u32| {
+        Effect::parse(&format!(
+            "emitter smoke\n budget {count}\n spawn burst={count}\n lifetime 100\n shape box 6 6 60\n offset 0 0 -40\n render sprite sort"
+        ))
+        .unwrap()
+    };
+    for count in [3, 100, 1000, 4096] {
+        rig.particles.spawn(&sorted(count), Mat4::IDENTITY).unwrap();
+    }
+    let plain = Effect::parse(
+        "emitter plain\n budget 500\n spawn burst=500\n lifetime 100\n shape box 6 6 60\n offset 0 0 -40",
+    )
+    .unwrap();
+    rig.particles.spawn(&plain, Mat4::IDENTITY).unwrap();
+    rig.frame_sorted(1.0 / 60.0);
+    rig.frame_sorted(1.0 / 60.0);
+    let emitters = rig.emitters();
+    assert_eq!(emitters.len(), 5);
+    for e in &emitters[..4] {
+        let depths: Vec<f32> = e.particles.iter().map(|p| -p.position[2]).collect();
+        // Far first: each no nearer than the next, but for the keys' quantisation, about a
+        // millionth of the log of the depth.
+        for pair in depths.windows(2) {
+            assert!(
+                pair[0] >= pair[1] * (1.0 - 1.0e-4),
+                "{} then {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let mut slots = e.alive.clone();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), e.alive.len(), "each particle listed once");
+        assert!(slots
+            .iter()
+            .all(|s| (e.base..e.base + e.budget).contains(s)));
+    }
+    // The plain emitter's list is in whatever order the update left it, not sorted.
+    let plain: Vec<f32> = emitters[4]
+        .particles
+        .iter()
+        .map(|p| -p.position[2])
+        .collect();
+    assert!(plain.windows(2).any(|pair| pair[0] < pair[1]));
+}
+
+/// A solid particle moving across the view writes its own depth, and motion that takes it back
+/// to where it was last frame, into the scene's targets that the temporal filter reads: the
+/// G-buffer's, and the water's when there is a sea.
+#[test]
+fn solid_particles_write_their_depth_and_motion() {
+    solid_spark_reads_back(None);
+    solid_spark_reads_back(Some(-3.0));
+}
+
+fn solid_spark_reads_back(sea_level: Option<f32>) {
+    use solstice_builder::{build_virtual_mesh, paginate, BuildOptions, Mesh, Vertex};
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    // A wall 20 m off, along -Z.
+    let mut wall = Mesh::default();
+    for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        wall.vertices.push(Vertex {
+            position: Vec3::new(x * 60.0, y * 60.0, -20.0),
+            normal: Vec3::Z,
+            uv: glam::Vec2::new(x, y),
+        });
+    }
+    wall.indices = vec![0, 1, 2, 0, 2, 3];
+    let scene = solstice_asset::SceneAsset {
+        meshes: vec![build_virtual_mesh(&wall, &BuildOptions::default())],
+        materials: vec![solstice_asset::Material {
+            base_color: [0.5, 0.5, 0.5, 1.0],
+            flags: solstice_asset::Material::TWO_SIDED,
+            ..Default::default()
+        }],
+        instances: vec![solstice_asset::Instance {
+            mesh: 0,
+            material: 0,
+            transform: Mat4::IDENTITY,
+        }],
+        ..Default::default()
+    };
+    let settings = crate::RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = crate::Renderer::new(&gpu, &paginate(&scene), format, settings);
+    if let Some(level) = sea_level {
+        renderer.set_ocean(Some(crate::Ocean::by_name("coastal").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+    }
+    // Moving right at 6 m/s, 5 m in front of the camera.
+    let spark = Effect::parse(
+        "emitter spark\n budget 1\n spawn burst=1\n lifetime 100\n size 0.4\n velocity 6 0 0\n color 1 1 1 1\n render sprite solid shading=unlit",
+    )
+    .unwrap();
+    renderer
+        .particles()
+        .spawn(&spark, Mat4::from_translation(Vec3::new(-1.0, 0.0, -5.0)))
+        .unwrap();
+    let size = 128u32;
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test target"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let seconds = 1.0 / 60.0;
+    let frames = 10;
+    for _ in 0..frames {
+        renderer.render(
+            &gpu,
+            &camera,
+            &crate::Environment::default(),
+            &view,
+            (size, size),
+            seconds,
+        );
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    // Where the spark is now, and was a frame before.
+    let now = Vec3::new(-1.0 + 6.0 * seconds * frames as f32, 0.0, -5.0);
+    let before = now - Vec3::new(6.0 * seconds, 0.0, 0.0);
+    let view_proj = camera.projection(1.0) * camera.view();
+    let uv = |p: Vec3| {
+        let ndc = view_proj.project_point3(p);
+        glam::Vec2::new(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5)
+    };
+    let expected = uv(before) - uv(now);
+    let pixel = (uv(now) * size as f32).as_uvec2();
+
+    let (depth, motion) = renderer.scene_depth_and_motion().unwrap();
+    let read = |texture: &wgpu::Texture, texel_bytes: u32| -> Vec<u8> {
+        let row = (size * texel_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene readback"),
+            size: u64::from(row * size),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let data = staging.slice(..).get_mapped_range().unwrap();
+        let mut texels = Vec::new();
+        for line in data.chunks_exact(row as usize) {
+            texels.extend_from_slice(&line[..(size * texel_bytes) as usize]);
+        }
+        texels
+    };
+    let depths: Vec<f32> = bytemuck::pod_collect_to_vec(&read(depth, 4));
+    let motions: Vec<[f32; 2]> = bytemuck::pod_collect_to_vec(&read(motion, 8));
+    let at = (pixel.y * size + pixel.x) as usize;
+    let distance = camera.near / depths[at];
+    assert!(
+        (distance - 5.0).abs() < 0.1,
+        "the spark's depth: {distance} m"
+    );
+    let got = glam::Vec2::from(motions[at]);
+    assert!(
+        (got - expected).length() < expected.length() * 0.1,
+        "motion {got}, expected {expected}"
+    );
+    // The wall beside it has not moved.
+    let wall_at = (pixel.y * size + 5) as usize;
+    assert!(glam::Vec2::from(motions[wall_at]).length() < 1.0e-5);
+    assert!((camera.near / depths[wall_at] - 20.0).abs() < 0.5);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+}
+
+/// An emitter told to sort more than the sort can hold, by changing its budget in code after
+/// it was read, is drawn unsorted rather than sorted wrongly: its particles stay whole.
+#[test]
+fn an_emitter_too_large_to_sort_is_left_unsorted() {
+    let Some(mut rig) = Rig::new(16384) else {
+        return;
+    };
+    let mut effect = Effect::parse(
+        "emitter smoke\n budget 4096\n spawn burst=6000 rate=600\n lifetime 0.2 3\n shape box 6 6 60\n offset 0 0 -40\n render sprite sort",
+    )
+    .unwrap();
+    effect.emitters[0].budget = 8000;
+    rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    for frame in 0..60 {
+        rig.frame_sorted(UNEVEN[frame % UNEVEN.len()]);
+    }
+    let [e] = rig.emitters().try_into().ok().unwrap();
+    assert!(e.alive.len() > 4096, "{}", e.alive.len());
+    assert_eq!(e.state.free_count + e.alive.len() as u32, e.budget);
+    let mut seen = HashSet::new();
+    for &slot in e.free.iter().chain(&e.alive) {
+        assert!((e.base..e.base + e.budget).contains(&slot));
+        assert!(seen.insert(slot), "slot {slot} is listed twice");
+    }
+}
+
+/// Sorting follows the view however the camera is turned.
+#[test]
+fn sorting_follows_a_turned_camera() {
+    let Some(mut rig) = Rig::new(4096) else {
+        return;
+    };
+    let effect = Effect::parse(
+        "emitter smoke\n budget 2000\n spawn burst=2000\n lifetime 100\n shape box 60 6 60\n render sprite sort",
+    )
+    .unwrap();
+    rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    let camera = Camera {
+        position: Vec3::new(-40.0, 2.0, 15.0),
+        yaw: 2.2,
+        pitch: -0.2,
+        ..Default::default()
+    };
+    rig.frame_sorted_from(1.0 / 60.0, &camera);
+    rig.frame_sorted_from(1.0 / 60.0, &camera);
+    let [e] = rig.emitters().try_into().ok().unwrap();
+    let depths: Vec<f32> = e
+        .particles
+        .iter()
+        .map(|p| {
+            (Vec3::from(p.position) - camera.position)
+                .dot(camera.forward())
+                .max(0.0)
+        })
+        .collect();
+    for pair in depths.windows(2) {
+        assert!(
+            pair[0] >= pair[1] * (1.0 - 1.0e-4) - 1.0e-3,
+            "{} then {}",
+            pair[0],
+            pair[1]
+        );
+    }
+}
+
+/// Once particles stop, the reactive mask is cleared, so the temporal filter is left as it was
+/// before any particle was drawn.
+#[test]
+fn the_reactive_mask_clears_when_particles_stop() {
+    use solstice_builder::{build_virtual_mesh, paginate, BuildOptions, Mesh, Vertex};
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let mut floor = Mesh::default();
+    for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        floor.vertices.push(Vertex {
+            position: Vec3::new(x * 50.0, -2.0, z * 50.0),
+            normal: Vec3::Y,
+            uv: glam::Vec2::new(x, z),
+        });
+    }
+    floor.indices = vec![0, 2, 1, 0, 3, 2];
+    let scene = solstice_asset::SceneAsset {
+        meshes: vec![build_virtual_mesh(&floor, &BuildOptions::default())],
+        materials: vec![solstice_asset::Material {
+            base_color: [0.5; 4],
+            flags: solstice_asset::Material::TWO_SIDED,
+            ..Default::default()
+        }],
+        instances: vec![solstice_asset::Instance {
+            mesh: 0,
+            material: 0,
+            transform: Mat4::IDENTITY,
+        }],
+        ..Default::default()
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let mut renderer = crate::Renderer::new(
+        &gpu,
+        &paginate(&scene),
+        format,
+        crate::RendererSettings::default(),
+    );
+    let size = 64u32;
+    let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test target"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let frames = |renderer: &mut crate::Renderer, count: u32| {
+        for _ in 0..count {
+            renderer.render(
+                &gpu,
+                &camera,
+                &crate::Environment::default(),
+                &view,
+                (size, size),
+                1.0 / 60.0,
+            );
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+    };
+    let marked = |renderer: &crate::Renderer| -> u32 {
+        let texture = renderer.reactive_mask().unwrap();
+        let row = size.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reactive readback"),
+            size: u64::from(row * size),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let data = staging.slice(..).get_mapped_range().unwrap();
+        data.chunks_exact(row as usize)
+            .map(|line| line[..size as usize].iter().filter(|&&v| v > 0).count() as u32)
+            .sum()
+    };
+    let puff = Effect::parse(
+        "emitter e\n budget 1\n spawn burst=1\n lifetime 1000\n size 1\n color 1 1 1 0.5\n render sprite soft=0",
+    )
+    .unwrap();
+    let id = renderer
+        .particles()
+        .spawn(&puff, Mat4::from_translation(Vec3::new(0.0, 0.0, -5.0)))
+        .unwrap();
+    frames(&mut renderer, 3);
+    assert!(marked(&renderer) > 50, "the particle marks the mask");
+    renderer.particles().kill(id);
+    frames(&mut renderer, 2);
+    assert_eq!(
+        marked(&renderer),
+        0,
+        "the mask is clear once nothing is drawn"
     );
 }
