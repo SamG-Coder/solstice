@@ -4,8 +4,9 @@
 //
 // Hardware rasterizers shade 2x2 quads and waste most of their work on triangles near
 // pixel size. A compute shader has no such overhead, so small clusters come here. The
-// culling pass guarantees they are in front of the near plane and small on screen,
-// which keeps this loop simple: no clipping, and coordinates fit in 32-bit fixed point.
+// culling pass guarantees they are small on screen, which keeps this loop simple: no
+// clipping, and coordinates fit in 32-bit fixed point. A perspective view's clusters are in
+// front of the near plane too; an orthographic view's are rejected by depth, per pixel.
 
 // One workgroup per cluster, one thread per triangle, as Nanite does: the cluster's vertices
 // are transformed once, in parallel, into workgroup memory, and every triangle is then
@@ -158,9 +159,10 @@ fn rasterize_triangle(a_in: vec3f, b_given: vec3f, c_given: vec3f, id: u32, two_
                 let w0 = f32(e0 - bias0) * inv_area;
                 let w1 = f32(e1 - bias1) * inv_area;
                 let w2 = f32(e2 - bias2) * inv_area;
-                let depth = w0 * z0 + w1 * z1 + w2 * z2 + bias;
+                let depth = w0 * z0 + w1 * z1 + w2 * z2;
+                // Tested before the bias, as the hardware clips before it biases.
                 if depth > 0.0 {
-                    write_visibility(u32(y) * width + u32(x), depth, id);
+                    write_visibility(u32(y) * width + u32(x), depth + bias, id);
                 }
             }
             e0 += step_x0;

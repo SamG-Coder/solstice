@@ -130,6 +130,8 @@ struct Run {
     triangles: u32,
     clusters: u32,
     software_clusters: u32,
+    /// Clusters the last shadow cascade redrawn sent to the software rasterizer.
+    shadow_software_clusters: u32,
 }
 
 /// Renders a few frames in darkness, fails on any validation error, and reads back the result.
@@ -182,6 +184,7 @@ fn render_in(
         triangles: stats.triangles,
         clusters: stats.clusters,
         software_clusters: stats.software_clusters,
+        shadow_software_clusters: stats.shadow_software_clusters,
     }
 }
 
@@ -1044,9 +1047,9 @@ fn tiled_lights_reach_what_is_in_their_range_and_nothing_else() {
 
 /// Small casters are drawn into the shadow maps by the software rasterizer: a ball 20 cm
 /// across is a few clusters, each about twenty texels wide in the nearest cascade, so they all
-/// take that path,
-/// and if it drew nothing the ball would cast no shadow. Under a low sun the shadow falls on
-/// the floor a metre from the ball, where it must be darker than the same floor with no ball.
+/// take that path, and if it drew nothing the ball would cast no shadow. Under a low sun the
+/// shadow falls on the floor half a metre from the ball, where it must be darker than the same
+/// floor with no ball; and the cascade must report having sent clusters to software at all.
 #[test]
 fn small_casters_shadow_through_the_software_rasterizer() {
     let Some(gpu) = request_gpu() else {
@@ -1076,7 +1079,12 @@ fn small_casters_shadow_through_the_software_rasterizer() {
     let mut scene = ball_on_floor();
     scene.instances[0].transform =
         Mat4::from_scale_rotation_translation(Vec3::splat(radius), Quat::IDENTITY, centre);
-    let with_ball = render_in(&gpu, &scene, &camera, settings, size, &sun).pixels;
+    let run = render_in(&gpu, &scene, &camera, settings, size, &sun);
+    assert!(
+        run.shadow_software_clusters > 0,
+        "no cluster of the ball went to the software rasterizer"
+    );
+    let with_ball = run.pixels;
     scene.instances.remove(0);
     let floor = render_in(&gpu, &scene, &camera, settings, size, &sun).pixels;
     // Where the ball's centre casts to on the floor, on screen.
