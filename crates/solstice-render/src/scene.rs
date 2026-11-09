@@ -243,7 +243,9 @@ impl GpuScene {
             "a scene that keeps its cluster records outside its manifest can't be skinned"
         );
         let empty = |label: &str, records: u64| {
-            let bytes = records * std::mem::size_of::<solstice_asset::PackedCluster>() as u64;
+            // Never empty: a binding must hold at least one record.
+            let bytes =
+                records.max(1) * std::mem::size_of::<solstice_asset::PackedCluster>() as u64;
             gpu.storage_buffer(label, bytes, wgpu::BufferUsages::COPY_DST)
         };
         // Such a scene has records only for the pages in its pool, a block for each slot.

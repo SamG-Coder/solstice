@@ -30,7 +30,7 @@ const MERGE_GAP_CLUSTERS: usize = 8;
 /// Pages to install per frame. Each costs little, but many at once would be felt as a hitch.
 const INSTALLS_PER_FRAME: u32 = 32;
 /// The same for a scene with pools by level of detail, for which a new view is thousands of pages.
-const INSTALLS_PER_FRAME_LARGE: u32 = 384;
+const INSTALLS_PER_FRAME_LARGE: u32 = 192;
 /// Frames between plans of such a scene. Each looks over more than a million pages, and new
 /// requests a frame or two later change little.
 const FRAMES_PER_PLAN_LARGE: u32 = 3;
