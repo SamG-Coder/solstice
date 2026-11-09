@@ -43,7 +43,10 @@ pub struct Residency {
     /// How many pages depending on this one are installed.
     installed_dependants: Vec<u32>,
     last_wanted: Vec<u32>,
-    /// Which pool each page belongs in. Each has its own slots and evicts only its own pages.
+    /// Which pool each page belongs in, by its level of detail.
+    home_bands: Vec<u8>,
+    /// Which pool holds each page, or will: its home unless that had no room when it was
+    /// fetched and another did. Each pool evicts only the pages it holds.
     bands: Vec<u8>,
     free_slots: Vec<Vec<u32>>,
     fetching_by_band: Vec<u32>,
@@ -114,6 +117,7 @@ impl Residency {
             states: vec![State::Absent; count],
             installed_dependants: vec![0; count],
             last_wanted: vec![0; count],
+            home_bands: bands.clone(),
             bands,
             free_slots,
             fetching_by_band: vec![0; band_slots.len()],
@@ -199,6 +203,7 @@ impl Residency {
         for page in stale {
             self.arrived.remove(&page);
             self.states[page as usize] = State::Absent;
+            self.bands[page as usize] = self.home_bands[page as usize];
         }
 
         let mut wanted: Vec<u32> = (0..count as u32)
@@ -231,9 +236,22 @@ impl Residency {
             let Some(page) = self.queue.pop() else {
                 break;
             };
-            let band = usize::from(self.bands[page as usize]);
-            if self.states[page as usize] == State::Absent && room[band] > 0 {
+            if self.states[page as usize] != State::Absent {
+                continue;
+            }
+            // Its own pool first, and otherwise whichever has the most to spare: a pool lends
+            // only what it has free or isn't using, so no pool's wanted pages are pushed out.
+            let home = usize::from(self.home_bands[page as usize]);
+            let band = if room[home] > 0 {
+                home
+            } else {
+                (0..room.len())
+                    .max_by_key(|&band| room[band])
+                    .unwrap_or(home)
+            };
+            if room[band] > 0 {
                 room[band] -= 1;
+                self.bands[page as usize] = band as u8;
                 self.states[page as usize] = State::Fetching;
                 self.fetching_by_band[band] += 1;
                 started.push(page);
@@ -305,6 +323,7 @@ impl Residency {
             self.fetching -= 1;
             self.fetching_by_band[usize::from(self.bands[page as usize])] -= 1;
             self.states[page as usize] = State::Absent;
+            self.bands[page as usize] = self.home_bands[page as usize];
         }
     }
 
@@ -372,6 +391,7 @@ impl Residency {
 
     fn remove(&mut self, page: u32) {
         self.states[page as usize] = State::Absent;
+        self.bands[page as usize] = self.home_bands[page as usize];
         for index in 0..self.dependencies[page as usize].len() {
             let dependency = self.dependencies[page as usize][index];
             self.installed_dependants[dependency as usize] -= 1;
@@ -466,6 +486,51 @@ impl Residency {
 
 #[cfg(test)]
 mod tests {
+    /// A pool with no room borrows what another has free, and gets its page back home later.
+    #[test]
+    fn a_full_band_borrows_from_one_with_room() {
+        // Three pages at home in band 1, which has one slot. Band 0 has two, and no pages.
+        let mut residency = Residency::with_bands(vec![Vec::new(); 3], 0, vec![1, 1, 1], &[2, 1]);
+        let fetched = residency.plan(1, &[10; 3], 8);
+        assert_eq!(fetched.len(), 3, "the other band's slots are used");
+        for &page in &fetched {
+            residency.arrived(page);
+        }
+        let mut slots = Vec::new();
+        while let Some(install) = residency.next_install(1) {
+            assert_eq!(install.evicted, None);
+            slots.push(install.slot);
+        }
+        slots.sort_unstable();
+        assert_eq!(slots, [0, 1, 2]);
+        assert_eq!(residency.installed_by_band(), [2, 1]);
+
+        // Unwanted later, a borrowed page goes home: band 1 gets its first claim on a new one.
+        let later = PROTECTED_FRAMES + 10;
+        let wanted = vec![0u32; 3];
+        residency.plan(later, &wanted, 8);
+        let page = fetched
+            .iter()
+            .copied()
+            .find(|&p| residency.bands[p as usize] == 0)
+            .expect("one was lent");
+        residency.remove(page);
+        assert_eq!(residency.bands[page as usize], 1);
+    }
+
+    /// Lending must not take what a band's own wanted pages need.
+    #[test]
+    fn a_band_keeps_the_slots_its_wanted_pages_use() {
+        // Page 0 lives in band 0's only slot and stays wanted. Pages 1 and 2 are at home in band
+        // 1, which has one slot, so one of them must wait.
+        let mut residency = Residency::with_bands(vec![Vec::new(); 3], 0, vec![0, 1, 1], &[1, 1]);
+        residency.plan(1, &[10, 0, 0], 8);
+        residency.arrived(0);
+        assert!(residency.next_install(1).is_some());
+        let fetched = residency.plan(2, &[10, 10, 10], 8);
+        assert_eq!(fetched.len(), 1, "band 0's slot is in use: {fetched:?}");
+    }
+
     #[test]
     fn fetches_keep_coming_between_read_backs() {
         // Six independent pages, of which only two can be fetched at once.
