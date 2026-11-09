@@ -175,7 +175,11 @@ impl Rasterizer {
             .texture_unfilterable();
         if regions.is_some() {
             // The second cluster binding, and the pool's middle and far bands.
-            raster_layout = raster_layout.storage_read().storage_read().storage_read();
+            raster_layout = raster_layout
+                .storage_read()
+                .storage_read()
+                .storage_read()
+                .storage_read();
         }
         let raster_layout = raster_layout.build(gpu, "raster");
         let vis_layout = LayoutBuilder::new()
@@ -423,11 +427,14 @@ impl Rasterizer {
                     work.state().as_entire_binding(),
                     wgpu::BindingResource::TextureView(&scene.skins.bones_view),
                 ];
-                if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
+                if let (Some(more), Some(far), Some(spare)) =
+                    (&scene.clusters_more, &scene.pool_far, &scene.pool_spare)
+                {
                     resources.extend([
                         more.as_entire_binding(),
                         scene.triangles.as_entire_binding(),
                         far.as_entire_binding(),
+                        spare.as_entire_binding(),
                     ]);
                 }
                 gpu.bind_group("raster", &self.raster_layout, &resources)

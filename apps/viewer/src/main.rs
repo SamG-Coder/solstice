@@ -803,10 +803,10 @@ mod native {
                 streaming.evictions,
                 streaming.starved,
             );
-            if let Some([near, middle, far]) = streaming.bands {
+            if let Some([near, middle, far, spare]) = streaming.bands {
                 println!(
-                    "bands: near {}/{}, middle {}/{}, far {}/{}",
-                    near.0, near.1, middle.0, middle.1, far.0, far.1
+                    "bands: near {}/{}, middle {}/{}, far {}/{}, spare {}/{}",
+                    near.0, near.1, middle.0, middle.1, far.0, far.1, spare.0, spare.1
                 );
             }
             let memory = renderer.scene_bytes();

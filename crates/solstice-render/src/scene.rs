@@ -159,6 +159,8 @@ pub struct GpuScene {
     pub clusters_more: Option<wgpu::Buffer>,
     /// The far band's page pool, if the scene has regions.
     pub pool_far: Option<wgpu::Buffer>,
+    /// The band for what the other three can't hold, if the scene has regions.
+    pub pool_spare: Option<wgpu::Buffer>,
     pub materials: wgpu::Buffer,
     pub lights: wgpu::Buffer,
     pub textures: TextureArrays,
@@ -222,15 +224,16 @@ impl GpuScene {
                 wgpu::BufferUsages::COPY_DST,
             )
         };
-        let (pool, middle, far) = match regions {
+        let (pool, middle, far, spare) = match regions {
             Some(plan) => (
                 pool_of("page pool, near", plan.band_slots[0]),
                 pool_of("page pool, middle", plan.band_slots[1]),
                 Some(pool_of("page pool, far", plan.band_slots[2])),
+                Some(pool_of("page pool, spare", plan.band_slots[3])),
             ),
             None => {
                 let pool = pool_of("page pool", slots);
-                (pool.clone(), pool, None)
+                (pool.clone(), pool, None, None)
             }
         };
         let empty = |label: &str, records: u64| {
@@ -264,6 +267,7 @@ impl GpuScene {
             regions,
             clusters_more,
             pool_far: far,
+            pool_spare: spare,
             materials: gpu.storage_buffer_init("materials", &materials),
             lights: gpu.storage_buffer_init("lights", &scene.lights),
             textures,
@@ -288,10 +292,14 @@ impl GpuScene {
         match band {
             0 => &self.vertices,
             1 => &self.triangles,
-            _ => self
+            2 => self
                 .pool_far
                 .as_ref()
                 .expect("only scenes with regions have a far band"),
+            _ => self
+                .pool_spare
+                .as_ref()
+                .expect("only scenes with regions have a spare band"),
         }
     }
 
@@ -299,7 +307,10 @@ impl GpuScene {
     pub fn geometry_bytes(&self) -> (u64, u64) {
         let more = self.clusters_more.as_ref().map_or(0, wgpu::Buffer::size);
         let pools = match &self.pool_far {
-            Some(far) => self.vertices.size() + self.triangles.size() + far.size(),
+            Some(far) => {
+                let spare = self.pool_spare.as_ref().map_or(0, wgpu::Buffer::size);
+                self.vertices.size() + self.triangles.size() + far.size() + spare
+            }
             None => self.vertices.size(),
         };
         (self.clusters.size() + more, pools)

@@ -2,7 +2,7 @@
 //!
 //! wgpu limits a storage binding to 2 GiB, which a scene of billions of triangles passes twice:
 //! its cluster records, and the page pool it wants. So the cluster table is split in two, and the
-//! pool in three by level of detail: close, middle and far. A pool of its own also means far
+//! pool in three by level of detail, close, middle and far, with a fourth that no page calls home, taking what the others can't. A pool of its own also means far
 //! pages can't push out near ones that are wanted. A pool that has no room borrows what another
 //! has free or isn't using.
 //!
@@ -18,9 +18,9 @@
 use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
 
 /// How many pools a scene that needs regions has.
-pub const BANDS: usize = 3;
+pub const BANDS: usize = 4;
 /// Storage buffers per stage the heaviest pass binds when regions are on: the masked rasterizers.
-pub const REQUIRED_STORAGE_BUFFERS: u32 = 11;
+pub const REQUIRED_STORAGE_BUFFERS: u32 = 12;
 /// Set to force regions on any scene, so that tests can exercise this path.
 const FORCE_VARIABLE: &str = "SOLSTICE_FORCE_REGIONS";
 
@@ -136,7 +136,7 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
             pages.iter().all(|&count| count <= cap),
             "a band of this scene's pages can't fit in one binding"
         );
-        return pages.map(|count| count.max(1));
+        return std::array::from_fn(|band| if band == 3 { 0 } else { pages[band].max(1) });
     }
     // A page can't install before the coarser pages it depends on, and the far band's pages are
     // the top of every chain: drawing detail anywhere needs them first. So it comes first, and
@@ -144,11 +144,13 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
     let far = pages[2].min((slots / 2).max(pinned[2] + 1)).max(1);
     let rest = slots.saturating_sub(far);
     let near = rest / 2;
-    let wanted = [near, rest - near, far];
+    let wanted = [near, rest - near, far, 0];
 
     // No band gets more than it has pages for or one binding can hold, and what that leaves over
     // goes to whichever can use it.
-    let room = pages.map(|count| count.min(cap));
+    // The fourth band is a page's home for no page: it takes what the others can't hold.
+    let room: [u32; BANDS] =
+        std::array::from_fn(|band| if band == 3 { cap } else { pages[band].min(cap) });
     let mut given: [u32; BANDS] =
         std::array::from_fn(|band| wanted[band].max(pinned[band]).min(room[band]));
     // Raising a band to its pinned pages can overdraw the budget: the others pay, nearest first.
@@ -164,7 +166,14 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
         given[band] += more;
         left -= more;
     }
-    given.map(|count| count.max(1))
+    // The spare band may have no slots; a scene's own bands need one to bind.
+    std::array::from_fn(|band| {
+        if band == 3 {
+            given[3]
+        } else {
+            given[band].max(1)
+        }
+    })
 }
 
 /// Rewrites `name[...]` as `function(...)`, leaving longer names that end in `name` alone.
@@ -225,6 +234,7 @@ fn pool_word(address: u32) -> u32 {
     switch address >> 30u {
         case 1u: { return pool_middle[word]; }
         case 2u: { return pool_far[word]; }
+        case 3u: { return pool_spare[word]; }
         default: { return pool_near[word]; }
     }
 }
@@ -274,6 +284,10 @@ fn cluster_at(index: u32) -> Cluster {{
             "@group(0) @binding({}) var<storage, read> pool_far: array<u32>;\n",
             take()
         );
+        extra += &format!(
+            "@group(0) @binding({}) var<storage, read> pool_spare: array<u32>;\n",
+            take()
+        );
         extra += POOL_WORD;
     } else if out.contains(VERTICES) {
         // A binding each for vertices and triangles, which carry the first two bands here.
@@ -284,6 +298,10 @@ fn cluster_at(index: u32) -> Cluster {{
         out = out.replace(TRIANGLES, "var<storage, read> pool_middle: array<u32>;");
         extra += &format!(
             "@group(0) @binding({}) var<storage, read> pool_far: array<u32>;\n",
+            take()
+        );
+        extra += &format!(
+            "@group(0) @binding({}) var<storage, read> pool_spare: array<u32>;\n",
             take()
         );
         extra += POOL_WORD;
@@ -433,7 +451,7 @@ mod tests {
     #[test]
     fn a_resident_scene_gets_exactly_the_slots_it_needs() {
         let scene = scene(&[ROOT_ROUND, ROOT_ROUND, 9, 5, 4, 1, 1, 1], 2);
-        assert_eq!(band_slots(&scene, 8, 1 << 31), [4, 1, 3]);
+        assert_eq!(band_slots(&scene, 8, 1 << 31), [4, 1, 3, 0]);
     }
 
     #[test]

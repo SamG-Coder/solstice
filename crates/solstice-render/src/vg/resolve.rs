@@ -77,7 +77,7 @@ impl Resolve {
             .texture_unfilterable();
         if regions.is_some() {
             // The second cluster binding and the pool's far band.
-            data_layout = data_layout.storage_read().storage_read();
+            data_layout = data_layout.storage_read().storage_read().storage_read();
         }
         let data_layout = data_layout.build(gpu, "resolve data");
         let mut output_layout = LayoutBuilder::new()
@@ -145,8 +145,14 @@ impl Resolve {
                     scene.materials.as_entire_binding(),
                     wgpu::BindingResource::TextureView(&scene.skins.bones_view),
                 ];
-                if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
-                    resources.extend([more.as_entire_binding(), far.as_entire_binding()]);
+                if let (Some(more), Some(far), Some(spare)) =
+                    (&scene.clusters_more, &scene.pool_far, &scene.pool_spare)
+                {
+                    resources.extend([
+                        more.as_entire_binding(),
+                        far.as_entire_binding(),
+                        spare.as_entire_binding(),
+                    ]);
                 }
                 gpu.bind_group("resolve data", &self.data_layout, &resources)
             },

@@ -206,7 +206,7 @@ impl GiVolume {
             .sampler();
         if scene.regions.is_some() {
             // The second cluster binding and the pool's far band.
-            voxelize_layout = voxelize_layout.storage_read().storage_read();
+            voxelize_layout = voxelize_layout.storage_read().storage_read().storage_read();
         }
         let voxelize_layout = voxelize_layout.build(gpu, "gi voxelize");
         let flood_layout = LayoutBuilder::new()
@@ -279,8 +279,14 @@ impl GiVolume {
                             wgpu::BindingResource::TextureView(&scene.textures.base.color_view),
                             wgpu::BindingResource::Sampler(&scene.material_sampler),
                         ];
-                        if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
-                            resources.extend([more.as_entire_binding(), far.as_entire_binding()]);
+                        if let (Some(more), Some(far), Some(spare)) =
+                            (&scene.clusters_more, &scene.pool_far, &scene.pool_spare)
+                        {
+                            resources.extend([
+                                more.as_entire_binding(),
+                                far.as_entire_binding(),
+                                spare.as_entire_binding(),
+                            ]);
                         }
                         gpu.bind_group("gi voxelize", &voxelize_layout, &resources)
                     },

@@ -803,7 +803,7 @@ mod tests {
     fn slots_are_numbered_through_the_bands() {
         let plan = RegionPlan {
             cluster_chunk: 1,
-            band_slots: [2, 3, 4],
+            band_slots: [2, 3, 4, 1],
         };
         assert_eq!(locate_slot(Some(&plan), 1), (0, 1));
         assert_eq!(locate_slot(Some(&plan), 2), (1, 0));

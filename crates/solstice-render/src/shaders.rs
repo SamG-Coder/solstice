@@ -401,7 +401,7 @@ mod tests {
     fn shaders_rewritten_for_regions_are_valid() {
         let plan = RegionPlan {
             cluster_chunk: 1000,
-            band_slots: [1, 1, 1],
+            band_slots: [1, 1, 1, 1],
         };
         let check = |path: &str, source: String| {
             let module = naga::front::wgsl::parse_str(&source)
