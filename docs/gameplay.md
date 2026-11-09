@@ -972,7 +972,7 @@ the way actors do.
 - Animated characters update every frame within 15 m of the camera, every second frame to 40 m,
   every fourth to 90 m, and every eighth beyond that.
 - `scenes/walker.txt` is the smallest scene with an animated actor. It needs
-  `tools/blender/make_character.py` and `python -I scripts/fetch-ual.py` run first. Play it with
+  `tools/blender/make_character.py` and `python -I scripts/fetch-ual.py --zips FOLDER` run first. Play it with
   `viewer target/walker.solstice --play`, or `?scene=walker&play` on the web page.
 
 **As built (the Universal Animation Library).** The clips are Quaternius's Universal Animation
@@ -984,14 +984,18 @@ downloaded by hand from their name-your-own-price pages, which the script lists.
   library's mesh and root-motion variants aren't needed.
 - **Rest poses are lined up first.** The library rests in a T, and the keeper with its arms down
   and elbows bent, 50 degrees apart, with its legs leaning slightly out. Before a turn is carried
-  across, each limb is turned to lie along the source's: upper and lower arm, hand and fingers
-  going with them, and the leg. The collarbone isn't, since that would drag the shoulder away from
-  where the mesh has it, and nor is the spine, which is close enough.
-- **Speeds.** On the keeper, `Walk_Loop` wants 1.0 m/s and `Jog_Fwd_Loop` 5.6 m/s, measured from
-  the library's root-motion files and scaled by the ratio of leg lengths. Those are the blend points
-  in `scenes/walker/keeper.anim`. A walker going much faster than 1.0 m/s blends towards a jog, and
-  its feet slide; give it `speed` 1.0.
-- Feet slide under 8 cm over a stance, measured on the keeper. Step 9's IK removes the rest.
+  across, each limb is turned to lie along the source's, each bone from where its parent's lining-up
+  left it. The hand is lined up by its palm, with the forearm sharing its roll, and the fingers go
+  with it. The legs too, and the pelvis rises by what that lowered the feet. The collarbone isn't
+  lined up, since that would drag the shoulder away from where the mesh has it, and nor is the
+  spine, which is close enough. A role chain's bones are paired by where they lie along it, so an
+  arm with fewer bones than the source's is lined up less exactly.
+- **Speeds.** The library's root-motion files move 0.975 m/s for `Walk_Loop` and 5.36 m/s for
+  `Jog_Fwd_Loop`. Scaled by the keeper's ratio of leg lengths, 1.08, that is 1.06 and 5.8. A planted
+  foot in the retargeted walk goes back at 1.0 to 1.04 m/s, so the walk's blend point in
+  `scenes/walker/keeper.anim` is 1.0, and the jog's is 5.8. A walker going much faster than 1.0 m/s
+  blends towards a jog, and its feet slide; give it `speed` 1.0.
+- Feet slide about 8 cm over a stance, measured on the keeper. Step 9's IK removes the rest.
 - The library's `Idle_Loop` stands with its feet 45 cm apart, as it was authored.
 
 ## Gameplay and the world around it

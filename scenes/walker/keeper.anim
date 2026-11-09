@@ -5,11 +5,11 @@ roles ../../characters/rigs/ual.roles ../../characters/rigs/game_engine.roles
 clip idle Idle_Loop
 clip walk Walk_Loop
 clip jog Jog_Fwd_Loop
-notify walk 0.3 step_l
+notify walk 0.13 step_l
 notify walk 0.8 step_r
 param speed 0
 state idle clip idle
-state moving blend1d speed 0.1 idle 1.0 walk 5.6 jog
+state moving blend1d speed 0.1 idle 1.0 walk 5.8 jog
 start idle
 transition idle moving speed > 0.1 fade 0.25
 transition moving idle speed < 0.1 fade 0.3

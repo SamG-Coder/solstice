@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! # scenes/harbour/walker.anim
-//! source ../../target/characters/keeper_clips.glb     # the glTF the clips are in
+//! source ../../target/characters/keeper_clips.glb     # the glTF the clips are in; several can be
+//!                                                     # listed, and the first with a clip has it
 //! roles ual.roles keeper.roles                        # its rig's, and the character's (optional)
 //! clip idle Idle                                      # a name here, and in the file
 //! clip walk Walk
@@ -77,8 +78,9 @@ pub struct ClipLine {
 /// A parsed `.anim` file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AnimGraph {
-    /// The glTF the clips are in, relative to this file.
-    pub source: Option<String>,
+    /// The glTFs the clips are in, relative to this file. A clip comes from the first that has
+    /// it.
+    pub sources: Vec<String>,
     /// The role files of the source's rig and the character's, for retargeting. Without them,
     /// bones match by name.
     pub roles: Option<(String, String)>,
@@ -112,7 +114,7 @@ impl AnimGraph {
                 continue;
             };
             match (keyword, rest) {
-                ("source", [path]) => graph.source = Some((*path).to_owned()),
+                ("source", [path]) => graph.sources.push((*path).to_owned()),
                 ("roles", [source, character]) => {
                     graph.roles = Some(((*source).to_owned(), (*character).to_owned()))
                 }
@@ -703,6 +705,20 @@ mod tests {
             ("walk".to_owned(), clip("walk", 1, 2.0)),
             ("run".to_owned(), clip("run", 1, 4.0)),
         ])
+    }
+
+    #[test]
+    fn sources_are_all_kept_in_order() {
+        let graph = AnimGraph::parse(
+            "source a.glb
+source b.glb
+clip idle I
+state idle clip idle
+start idle
+",
+        )
+        .unwrap();
+        assert_eq!(graph.sources, ["a.glb", "b.glb"]);
     }
 
     #[test]

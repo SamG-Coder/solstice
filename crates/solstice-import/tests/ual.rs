@@ -1,6 +1,6 @@
 //! The Universal Animation Library's clips on the real character. Both are kept out of git, so
 //! this says so and passes without them: `python -I scripts/fetch-ual.py`, then
-//! `tools/blender/make_character.py` and `tools/blender/make_clips.py`, whose rig the tests use.
+//! `tools/blender/make_character.py`.
 
 use glam::{Quat, Vec3};
 use solstice_anim::Frames;
@@ -23,7 +23,7 @@ fn roles(file: &str) -> Roles {
 fn setup() -> Option<(ClipFile, Skeleton)> {
     let (ual, keeper) = (
         repo("target/ual/ual1/UAL1_Standard.glb"),
-        repo("target/characters/keeper_clips.glb"),
+        repo("target/characters/keeper.glb"),
     );
     if !ual.exists() || !keeper.exists() {
         eprintln!("the library or the keeper isn't here: skipping");
@@ -105,7 +105,10 @@ fn a_retargeted_walk_wants_its_own_speed_and_its_feet_hardly_slide() {
         let (speed, slide, frames) = stance(&keeper, &walk, foot);
         assert!((speed - 1.0).abs() < 0.1, "{foot} wants {speed} m/s");
         assert!(frames > 12, "{foot} is on the ground for {frames} frames");
-        assert!(slide < 0.08, "{foot} slides {slide} m while it bears weight");
+        // Played at the 1.0 m/s the demo walks at, what the foot does over its stance.
+        let slip = (speed - 1.0).abs() * frames as f32 / CLIP_HZ;
+        assert!(slip < 0.05, "{foot} slips {slip} m against the ground");
+        assert!(slide < 0.1, "{foot} slides {slide} m while it bears weight");
     }
 }
 
@@ -134,15 +137,17 @@ fn feet_stay_on_the_ground_the_character_stands_on() {
     let rest_ball = world(&keeper, &rest.rotations, &rest.translations)[bone(&keeper, "ball_l")].0;
     for clip in ["Idle_Loop", "Walk_Loop"] {
         let frames = keeper_clip(&library, &keeper, clip);
-        let lowest = track(&keeper, &frames, "ball_l")
-            .iter()
-            .map(|p| p.y)
-            .fold(f32::MAX, f32::min);
-        assert!(
-            (lowest - rest_ball.y).abs() < 0.04,
-            "in {clip} the foot gets down to {lowest}, against {} at rest",
-            rest_ball.y
-        );
+        for foot in ["ball_l", "ball_r"] {
+            let lowest = track(&keeper, &frames, foot)
+                .iter()
+                .map(|p| p.y)
+                .fold(f32::MAX, f32::min);
+            assert!(
+                lowest > rest_ball.y - 0.01 && lowest < rest_ball.y + 0.04,
+                "in {clip} {foot} gets down to {lowest}, against {} at rest",
+                rest_ball.y
+            );
+        }
     }
 }
 
@@ -174,6 +179,22 @@ fn the_librarys_t_pose_stands_the_character_in_a_t() {
                 .to_degrees();
             assert!(off < 3.0, "{from} is {off} degrees off the library's");
         }
+        // Its palm faces the way the library's does.
+        let palm = |rig: &Skeleton, p: &[(Vec3, Quat)]| {
+            let at = |name: String| p[bone(rig, &name)].0;
+            let along = at(format!("middle_01_{side}")) - at(format!("hand_{side}"));
+            let across = at(format!("pinky_01_{side}")) - at(format!("index_01_{side}"));
+            along.cross(across).normalize()
+        };
+        let off = palm(&keeper, &place)
+            .dot(palm(&library.rig, &source))
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+        assert!(
+            off < 5.0,
+            "the {side} palm is {off} degrees off the library's"
+        );
     }
 }
 

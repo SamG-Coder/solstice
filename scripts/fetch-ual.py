@@ -7,7 +7,9 @@ Standard zips by hand, free if you like, and put them in one folder:
     https://quaternius.itch.io/universal-animation-library
     https://quaternius.itch.io/universal-animation-library-2
 
-    python -I scripts/fetch-ual.py [--zips FOLDER] [--out target/ual]
+    python -I scripts/fetch-ual.py --zips FOLDER [--out DIR]
+
+`--out` defaults to the repository's target/ual, wherever this is run from.
 
 Each zip is checked against its known digest first. Only the glTF clip files and the licences
 come out: the rest is for other engines.
@@ -47,8 +49,9 @@ def digest(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--zips", type=pathlib.Path, default=pathlib.Path(r"D:\SolsticeAssets\ual"))
-    parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("target/ual"))
+    repository = pathlib.Path(__file__).resolve().parent.parent
+    parser.add_argument("--zips", type=pathlib.Path, required=True)
+    parser.add_argument("--out", type=pathlib.Path, default=repository / "target" / "ual")
     options = parser.parse_args()
 
     for name, expected, folder in ZIPS:

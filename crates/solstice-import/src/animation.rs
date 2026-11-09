@@ -244,13 +244,38 @@ fn leg_length(skeleton: &Skeleton, roles: &Roles) -> Option<f32> {
     Some(at(pelvis.first()?)?.distance(at(leg.last()?)?))
 }
 
+/// Turns `a` onto `to`, then rolls about `to` until `across`, turned the same way, lies as nearly
+/// along `to_across` as it can.
+fn frame_between(a: Vec3, across: Vec3, to: Vec3, to_across: Vec3) -> Quat {
+    let swing = Quat::from_rotation_arc(a, to);
+    let flat = |v: Vec3| (v - to * v.dot(to)).normalize_or_zero();
+    let (now, wanted) = (flat(swing * across), flat(to_across));
+    let roll = now.cross(wanted).dot(to).atan2(now.dot(wanted));
+    (Quat::from_axis_angle(to, roll) * swing).normalize()
+}
+
+/// How far `rotation` turns about `axis`, with the rest of its turn left out.
+fn twist_about(rotation: Quat, axis: Vec3) -> f32 {
+    let along = Vec3::new(rotation.x, rotation.y, rotation.z).dot(axis);
+    let angle = 2.0 * along.atan2(rotation.w);
+    // The short way round.
+    if angle > std::f32::consts::PI {
+        angle - std::f32::consts::TAU
+    } else if angle < -std::f32::consts::PI {
+        angle + std::f32::consts::TAU
+    } else {
+        angle
+    }
+}
+
 /// What turns each of the target's limbs, at rest, to lie along the source's. Rigs differ most in
 /// how they rest their limbs, one with its arms in a T and one with them down and the elbows bent,
 /// and carrying a bone's turn from rest to rest would keep that difference in every pose: a slight
 /// outward lean of the legs at rest stands a character with its feet far apart. So each limb's
-/// bones are lined up with the source's first, and whatever is at the end of the limb, the hand
-/// with its fingers or the toe, goes with the last of them. A collarbone isn't lined up: it would
-/// drag the shoulder away from where the mesh has it.
+/// bones are lined up with the source's first, each from where its parent's lining-up left it, so
+/// that no bone rolls against the one before. The hand is lined up by its palm as well, and its
+/// fingers go with it, with the forearm taking half of the hand's roll, as a forearm does. A
+/// collarbone isn't lined up: it would drag the shoulder away from where the mesh has it.
 fn limb_alignment(
     map: &[Option<usize>],
     target: &Skeleton,
@@ -266,53 +291,104 @@ fn limb_alignment(
             .find(|(r, _)| r == role)
             .map(|c| &c.1)
     };
+    // The way from one target bone to another, at rest, in the target and in the source.
+    let between = |from: usize, to: usize| -> Option<(Vec3, Vec3)> {
+        let target = (target_rest[to] - target_rest[from]).normalize_or_zero();
+        let source = (source_rest[map[to]?] - source_rest[map[from]?]).normalize_or_zero();
+        (target != Vec3::ZERO && source != Vec3::ZERO).then_some((target, source))
+    };
     let mut out = vec![Quat::IDENTITY; target.bones.len()];
-    // Lines up the bones of a chain from its `first`, and returns what its last bone gets.
-    let mut line_up = |chain: &[String], first: usize| {
-        let mut last = Quat::IDENTITY;
-        for pair in chain[first..].windows(2) {
+    // Lines up a chain's bones, and gives its last bone what the one before it got.
+    let mut line_up = |chain: &[String]| {
+        let mut carried = Quat::IDENTITY;
+        for pair in chain.windows(2) {
             let (Some(bone), Some(next)) = (number(&pair[0]), number(&pair[1])) else {
                 continue;
             };
-            let (Some(source), Some(source_next)) = (map[bone], map[next]) else {
-                continue;
-            };
-            let from = (target_rest[next] - target_rest[bone]).normalize_or_zero();
-            let to = (source_rest[source_next] - source_rest[source]).normalize_or_zero();
-            if from != Vec3::ZERO && to != Vec3::ZERO {
-                last = Quat::from_rotation_arc(from, to);
-                out[bone] = last;
+            if let Some((from, to)) = between(bone, next) {
+                carried = (Quat::from_rotation_arc(carried * from, to) * carried).normalize();
+                out[bone] = carried;
             }
         }
         if let Some(bone) = chain.last().and_then(&number) {
-            out[bone] = last;
+            out[bone] = carried;
         }
-        last
     };
-    let mut hands = [(Quat::IDENTITY, "l"), (Quat::IDENTITY, "r")];
-    for (hand, side) in &mut hands {
+    for side in ["l", "r"] {
         if let Some(arm) = chain_of(&format!("arm_{side}")) {
             // The upper arm, the lower arm and the hand, with or without a collarbone before them.
             if let Some(first) = arm.len().checked_sub(3) {
-                *hand = line_up(arm, first);
+                line_up(&arm[first..]);
             }
         }
         if let Some(leg) = chain_of(&format!("leg_{side}")) {
-            line_up(leg, 0);
+            line_up(leg);
         }
     }
-    for (hand, side) in hands {
+    for side in ["l", "r"] {
+        let Some(arm) = chain_of(&format!("arm_{side}")) else {
+            continue;
+        };
+        let (Some(hand), Some(lower)) = (
+            arm.last().and_then(&number),
+            arm.len().checked_sub(2).and_then(|i| number(&arm[i])),
+        ) else {
+            continue;
+        };
+        let start = |finger: &str| {
+            chain_of(&format!("{finger}_{side}"))
+                .and_then(|chain| chain.first())
+                .and_then(&number)
+        };
+        let palm = (|| {
+            let (along, along_to) = between(hand, start("middle")?)?;
+            let (across, across_to) = between(start("index")?, start("pinky")?)?;
+            let before = out[hand];
+            Some(frame_between(before * along, before * across, along_to, across_to) * before)
+        })();
+        if let (Some(whole), Some((_, axis))) = (palm, between(lower, hand)) {
+            let roll = twist_about(whole * out[hand].inverse(), axis);
+            out[lower] = (Quat::from_axis_angle(axis, roll * 0.5) * out[lower]).normalize();
+            out[hand] = whole;
+        }
         let fingers = ["thumb", "index", "middle", "ring", "pinky"];
         let chains = fingers
             .iter()
             .filter_map(|f| chain_of(&format!("{f}_{side}")));
         for name in chains.flatten() {
             if let Some(bone) = number(name) {
-                out[bone] = hand;
+                out[bone] = out[hand];
             }
         }
     }
     out
+}
+
+/// How far lining up the legs moved the feet down at rest, which the pelvis rises by so that they
+/// stay on the ground.
+fn leg_lift(target: &Skeleton, roles: &Roles, rest: &[Vec3], aligned: &[Quat]) -> f32 {
+    let number = |name: &String| target.bones.iter().position(|bone| bone.name == *name);
+    let mut lifts = Vec::new();
+    for leg in roles
+        .roles
+        .iter()
+        .filter(|(role, _)| role == "leg_l" || role == "leg_r")
+        .map(|(_, chain)| chain)
+    {
+        let bones: Option<Vec<usize>> = leg.iter().map(number).collect();
+        let Some(bones) = bones.filter(|bones| !bones.is_empty()) else {
+            continue;
+        };
+        let foot = bones.windows(2).fold(rest[bones[0]], |at, pair| {
+            at + aligned[pair[0]] * (rest[pair[1]] - rest[pair[0]])
+        });
+        lifts.push(rest[bones[bones.len() - 1]].y - foot.y);
+    }
+    if lifts.is_empty() {
+        0.0
+    } else {
+        lifts.iter().sum::<f32>() / lifts.len() as f32
+    }
 }
 
 /// Carries a clip from one rig onto another, by the two rigs' role files.
@@ -388,6 +464,7 @@ pub fn retarget(
         &target_rest_positions,
         &source_rest_positions,
     );
+    let lift = leg_lift(target, target_roles, &target_rest_positions, &aligned);
 
     let mut out = Frames::default();
     for (rotations, translations) in frames.rotations.iter().zip(&frames.translations) {
@@ -422,7 +499,7 @@ pub fn retarget(
         // its parents did on the way.
         if let (Some(source_p), Some(target_p)) = (source_pelvis, target_pelvis) {
             let moved = (positions[source_p] - source_rest_positions[source_p]) * scale;
-            let wanted = target_rest_positions[target_p] + moved;
+            let wanted = target_rest_positions[target_p] + moved + Vec3::Y * lift;
             let mut parent_position = Vec3::ZERO;
             let mut parent_rotation = Quat::IDENTITY;
             let chain = chain_to_root(target, target_p);

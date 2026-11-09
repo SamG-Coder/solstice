@@ -586,11 +586,9 @@ fn bake_clips(
     skeleton: u32,
 ) -> Result<Vec<solstice_asset::Clip>, String> {
     let graph = solstice_anim::AnimGraph::parse(text).map_err(|e| format!("{graph_file}: {e}"))?;
-    let source = graph
-        .source
-        .as_ref()
-        .ok_or_else(|| format!("{graph_file}: has no `source` line"))?;
-    let source_file = base.join(resolve(graph_file, source));
+    if graph.sources.is_empty() {
+        return Err(format!("{graph_file}: has no `source` line"));
+    }
     let looping = |name: &str| {
         graph
             .clips
@@ -598,8 +596,14 @@ fn bake_clips(
             .find(|clip| clip.source_name == name)
             .is_none_or(|clip| clip.looping)
     };
-    let file = solstice_import::animation::read_clips(&source_file, looping)
-        .map_err(|e| format!("{}: {e}", source_file.display()))?;
+    let mut files = Vec::with_capacity(graph.sources.len());
+    for source in &graph.sources {
+        let path = base.join(resolve(graph_file, source));
+        files.push(
+            solstice_import::animation::read_clips(&path, looping)
+                .map_err(|e| format!("{}: {e}", path.display()))?,
+        );
+    }
     let roles = match &graph.roles {
         None => None,
         Some((from, to)) => {
@@ -617,14 +621,19 @@ fn bake_clips(
     };
     let mut out = Vec::new();
     for line in &graph.clips {
-        let (_, frames) = file
-            .clips
+        let (file, frames) = files
             .iter()
-            .find(|(name, _)| *name == line.source_name)
+            .find_map(|file| {
+                let (_, frames) = file
+                    .clips
+                    .iter()
+                    .find(|(name, _)| *name == line.source_name)?;
+                Some((file, frames))
+            })
             .ok_or_else(|| {
                 format!(
                     "{graph_file}: {} has no clip `{}`",
-                    source_file.display(),
+                    graph.sources.join(" or "),
                     line.source_name
                 )
             })?;
