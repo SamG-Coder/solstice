@@ -317,7 +317,13 @@ impl Renderer {
             Some(&loaded.upper_textures),
             None,
         );
-        let mut streamer = Streamer::new(gpu, &loaded.scene, loaded.scene.pages.len() as u32, None);
+        let mut streamer = Streamer::new(
+            gpu,
+            &loaded.scene,
+            loaded.scene.pages.len() as u32,
+            None,
+            scene.regions,
+        );
         for page in 0..loaded.scene.pages.len() as u32 {
             streamer.install_now(gpu, &scene, page, loaded.page(page));
         }
@@ -342,7 +348,7 @@ impl Renderer {
             .min(paged.pages.len() as u32);
         let plan = choose_tiers(gpu, paged, budget.texture_bytes);
         let scene = GpuScene::new(gpu, paged, slots, None, Some(plan));
-        let mut streamer = Streamer::new(gpu, paged, slots, Some(plan));
+        let mut streamer = Streamer::new(gpu, paged, slots, Some(plan), scene.regions);
         for page in 0..paged.pinned_pages {
             streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
         }
@@ -470,7 +476,7 @@ impl Renderer {
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
         let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
 
-        let cull = CullPipelines::new(gpu, scene.has_skins);
+        let cull = CullPipelines::new(gpu, scene.has_skins, scene.regions);
         let masked_capacity = if scene.has_masked {
             MASKED_VISIBLE_CAPACITY
         } else {
@@ -494,7 +500,7 @@ impl Renderer {
             masked_capacity,
             streamer.requests_buffer(),
         );
-        let rasterizer = Rasterizer::new(gpu, scene.has_masked, scene.has_skins);
+        let rasterizer = Rasterizer::new(gpu, scene.has_masked, scene.has_skins, scene.regions);
 
         // Views without occlusion culling never read the pyramid, but a binding is required.
         let no_hzb = Target::new(
@@ -553,7 +559,12 @@ impl Renderer {
         );
         Self {
             settings,
-            resolve: Resolve::new(gpu, waterline.resolve_layout(), scene.has_skins),
+            resolve: Resolve::new(
+                gpu,
+                waterline.resolve_layout(),
+                scene.has_skins,
+                scene.regions,
+            ),
             waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
@@ -613,12 +624,12 @@ impl Renderer {
     pub fn scene_bytes(&self) -> SceneMemory {
         let buffer_bytes = self.scene.instances.size()
             + self.scene.nodes.size()
-            + self.scene.clusters.size()
+            + self.scene.geometry_bytes().0
             + self.scene.materials.size()
             + self.scene.lights.size();
         SceneMemory {
             records: buffer_bytes,
-            pages: self.scene.vertices.size(),
+            pages: self.scene.geometry_bytes().1,
             textures: self.scene.textures.bytes,
         }
     }

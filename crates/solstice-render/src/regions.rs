@@ -1,0 +1,364 @@
+//! Scenes too big for one GPU binding.
+//!
+//! wgpu limits a storage binding to 2 GiB, which a scene of billions of triangles passes twice:
+//! its cluster records, and the page pool it wants. So the cluster table is split in two, and the
+//! pool in three by level of detail: close, middle and far. A pool of its own also means far
+//! pages can't push out near ones.
+//!
+//! Only such a scene pays for any of this. The shaders are rewritten for it as text, so a scene
+//! that fits compiles the source it always did, with the bindings and limits it always had.
+//!
+//! **Supported only natively on x64 with an RTX 5080**, the one setup these scenes are for. Other
+//! devices may work, and fail with a clear message if they offer too few storage buffers.
+//!
+//! A pool address holds its band in the top two bits, above the place within that band's buffer.
+//! Adding a cluster's local offset to it needs no special care, and `counts` is left alone.
+
+use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
+
+/// How many pools a scene that needs regions has.
+pub const BANDS: usize = 3;
+/// Storage buffers per stage the heaviest pass binds when regions are on.
+pub const REQUIRED_STORAGE_BUFFERS: u32 = 10;
+/// Set to force regions on any scene, so that tests can exercise this path.
+const FORCE_VARIABLE: &str = "SOLSTICE_FORCE_REGIONS";
+
+/// The size of a [`solstice_asset::gpu::PackedCluster`] on the GPU.
+const CLUSTER_BYTES: u64 = 48;
+
+/// How a too-large scene is divided between bindings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionPlan {
+    /// Cluster records in the first binding. The rest go in the second.
+    pub cluster_chunk: u32,
+    /// Page slots in each band, nearest first.
+    pub band_slots: [u32; BANDS],
+}
+
+/// Which band a page belongs in, by how much its sets have been simplified.
+///
+/// The boundaries come from what views of Zorah installed: rounds 1 to 4 and 5 to 8 took about
+/// two fifths of a view's pages each, and the far band's coarsest rounds the small remainder.
+pub fn band_of_round(round: u32) -> usize {
+    match round {
+        ROOT_ROUND => 2,
+        0..=4 => 0,
+        5..=8 => 1,
+        _ => 2,
+    }
+}
+
+/// Each page's band.
+pub fn page_bands(scene: &PagedScene) -> Vec<u8> {
+    scene
+        .pages
+        .iter()
+        .map(|page| {
+            scene
+                .sets
+                .get(page.first_set as usize)
+                .map_or(0, |set| band_of_round(set.round) as u8)
+        })
+        .collect()
+}
+
+impl RegionPlan {
+    /// The plan for a scene with a pool of `slots`, or `None` if it fits in single bindings.
+    pub fn decide(limits: &wgpu::Limits, scene: &PagedScene, slots: u32) -> Option<Self> {
+        let forced = std::env::var_os(FORCE_VARIABLE).is_some();
+        let limit = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size);
+        let cluster_bytes = scene.clusters.len() as u64 * CLUSTER_BYTES;
+        let pool_bytes = u64::from(slots) * PAGE_BYTES as u64;
+        if !forced && cluster_bytes <= limit && pool_bytes <= limit {
+            return None;
+        }
+        assert!(
+            limits.max_storage_buffers_per_shader_stage >= REQUIRED_STORAGE_BUFFERS,
+            "this scene is too large for one storage binding and needs \
+             {REQUIRED_STORAGE_BUFFERS} storage buffers per stage, but this device offers {}",
+            limits.max_storage_buffers_per_shader_stage
+        );
+        let cluster_chunk = if forced {
+            // Half each, so that a small scene uses both bindings.
+            (scene.clusters.len() as u32).div_ceil(2).max(1)
+        } else {
+            (limit / CLUSTER_BYTES) as u32
+        };
+        assert!(
+            scene.clusters.len() as u64 <= u64::from(cluster_chunk) * 2,
+            "this scene has {} clusters, more than two bindings of {cluster_chunk} can hold",
+            scene.clusters.len()
+        );
+        Some(Self {
+            cluster_chunk,
+            band_slots: band_slots(scene, slots, limit),
+        })
+    }
+}
+
+/// Divides the pool between bands, each within what one binding can hold.
+fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
+    let mut pages = [0u32; BANDS];
+    for band in page_bands(scene) {
+        pages[band as usize] += 1;
+    }
+    let cap = (limit / PAGE_BYTES as u64) as u32;
+    if slots >= scene.pages.len() as u32 {
+        // Everything is on the GPU, so each band holds just its own.
+        assert!(
+            pages.iter().all(|&count| count <= cap),
+            "a band of this scene's pages can't fit in one binding"
+        );
+        return pages.map(|count| count.max(1));
+    }
+    // A page can't install before the coarser pages it depends on, and the far band's pages are
+    // the top of every chain: drawing detail anywhere needs them first. So it comes first, and
+    // the rest of the budget is shared.
+    let far = pages[2].min((slots / 2).max(scene.pinned_pages + 1)).max(1);
+    let rest = slots.saturating_sub(far);
+    let near = rest / 2;
+    let wanted = [near, rest - near, far];
+
+    // No band gets more than it has pages for or one binding can hold, and what that leaves over
+    // goes to whichever can use it.
+    let room = pages.map(|count| count.min(cap));
+    let mut given: [u32; BANDS] = std::array::from_fn(|band| wanted[band].min(room[band]));
+    let mut left = slots.saturating_sub(given.iter().sum());
+    for band in 0..BANDS {
+        let more = left.min(room[band] - given[band]);
+        given[band] += more;
+        left -= more;
+    }
+    given.map(|count| count.max(1))
+}
+
+/// Rewrites `name[...]` as `function(...)`, leaving longer names that end in `name` alone.
+fn replace_indexing(source: &str, name: &str, function: &str) -> String {
+    let opening = format!("{name}[");
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(found) = rest.find(&opening) {
+        let identifier = rest[..found]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        out.push_str(&rest[..found]);
+        if identifier {
+            out.push_str(&opening);
+            rest = &rest[found + opening.len()..];
+            continue;
+        }
+        let inner = &rest[found + opening.len()..];
+        let mut depth = 1;
+        let end = inner
+            .char_indices()
+            .find_map(|(at, c)| {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(at)
+            })
+            .expect("an index has its closing bracket");
+        out.push_str(function);
+        out.push('(');
+        out.push_str(&inner[..end]);
+        out.push(')');
+        rest = &inner[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The next free binding in group 0.
+fn next_binding(source: &str) -> u32 {
+    const PREFIX: &str = "@group(0) @binding(";
+    source
+        .match_indices(PREFIX)
+        .filter_map(|(at, _)| {
+            let number = &source[at + PREFIX.len()..];
+            number[..number.find(')')?].parse::<u32>().ok()
+        })
+        .max()
+        .map_or(0, |highest| highest + 1)
+}
+
+const POOL_WORD: &str = "
+fn pool_word(address: u32) -> u32 {
+    let word = address & 0x3fffffffu;
+    switch address >> 30u {
+        case 1u: { return pool_middle[word]; }
+        case 2u: { return pool_far[word]; }
+        default: { return pool_near[word]; }
+    }
+}
+";
+
+/// Vertex numbers to word addresses, keeping the band.
+const VERTEX_WORD: &str = "(index & 0xc0000000u) | ((index & 0x3fffffffu) * 4u)";
+
+/// Rewrites an expanded shader for a scene that needs regions.
+pub fn rewrite_shader(source: &str, cluster_chunk: u32) -> String {
+    let mut binding = next_binding(source);
+    let mut take = || {
+        binding += 1;
+        binding - 1
+    };
+    let mut out = replace_indexing(source, "clusters", "cluster_at");
+    let more = take();
+    let mut extra = format!(
+        "
+@group(0) @binding({more}) var<storage, read> clusters_more: array<Cluster>;
+const CLUSTER_CHUNK: u32 = {cluster_chunk}u;
+fn cluster_at(index: u32) -> Cluster {{
+    if index < CLUSTER_CHUNK {{ return clusters[index]; }}
+    return clusters_more[index - CLUSTER_CHUNK];
+}}
+"
+    );
+
+    const POOL: &str = "var<storage, read> pool: array<u32>;";
+    const VERTICES: &str = "var<storage, read> vertices: array<PackedVertex>;";
+    const TRIANGLES: &str = "var<storage, read> triangles: array<u32>;";
+    if out.contains(POOL) {
+        // One binding of words: the rasterizers.
+        const WORD: &str = "let word = index * 4u;";
+        assert!(
+            out.contains(WORD),
+            "the rasterizer's load_vertex has changed"
+        );
+        out = out.replace(WORD, &format!("let word = {VERTEX_WORD};"));
+        out = replace_indexing(&out, "pool", "pool_word");
+        out = out.replace(POOL, "var<storage, read> pool_near: array<u32>;");
+        extra += &format!(
+            "@group(0) @binding({}) var<storage, read> pool_middle: array<u32>;\n",
+            take()
+        );
+        extra += &format!(
+            "@group(0) @binding({}) var<storage, read> pool_far: array<u32>;\n",
+            take()
+        );
+        extra += POOL_WORD;
+    } else if out.contains(VERTICES) {
+        // A binding each for vertices and triangles, which carry the first two bands here.
+        out = replace_indexing(&out, "vertices", "region_vertex");
+        out = replace_indexing(&out, "triangles", "pool_word");
+        out = out.replace(VERTICES, "var<storage, read> pool_near: array<u32>;");
+        assert!(out.contains(TRIANGLES), "the triangles binding has changed");
+        out = out.replace(TRIANGLES, "var<storage, read> pool_middle: array<u32>;");
+        extra += &format!(
+            "@group(0) @binding({}) var<storage, read> pool_far: array<u32>;\n",
+            take()
+        );
+        extra += POOL_WORD;
+        extra += &format!(
+            "
+fn region_vertex(index: u32) -> PackedVertex {{
+    let word = {VERTEX_WORD};
+    return PackedVertex(
+        pool_word(word), pool_word(word + 1u), pool_word(word + 2u), pool_word(word + 3u));
+}}
+"
+        );
+    }
+    out + &extra
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexing_is_rewritten_through_nested_brackets() {
+        assert_eq!(
+            replace_indexing(
+                "let a = clusters[entry[1].cluster]; let b = visible_clusters[3];",
+                "clusters",
+                "cluster_at"
+            ),
+            "let a = cluster_at(entry[1].cluster); let b = visible_clusters[3];"
+        );
+    }
+
+    #[test]
+    fn extra_bindings_come_after_the_last_one_in_group_zero() {
+        let source = "@group(0) @binding(3) var a: u32;\n@group(1) @binding(9) var b: u32;\n\
+                      @group(0) @binding(5) var c: u32;";
+        assert_eq!(next_binding(source), 6);
+    }
+
+    #[test]
+    fn coarser_rounds_go_in_farther_bands() {
+        assert_eq!(band_of_round(1), 0);
+        assert_eq!(band_of_round(4), 0);
+        assert_eq!(band_of_round(5), 1);
+        assert_eq!(band_of_round(8), 1);
+        assert_eq!(band_of_round(9), 2);
+        assert_eq!(band_of_round(ROOT_ROUND), 2);
+    }
+
+    fn scene(rounds: &[u32], pinned: u32) -> PagedScene {
+        use solstice_asset::paged::{ClusterSet, PageInfo};
+        PagedScene {
+            pages: (0..rounds.len() as u32)
+                .map(|first_set| PageInfo {
+                    first_set,
+                    set_count: 1,
+                    ..Default::default()
+                })
+                .collect(),
+            sets: rounds
+                .iter()
+                .map(|&round| ClusterSet {
+                    round,
+                    ..Default::default()
+                })
+                .collect(),
+            pinned_pages: pinned,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_resident_scene_gets_exactly_the_slots_it_needs() {
+        let scene = scene(&[ROOT_ROUND, ROOT_ROUND, 9, 5, 4, 1, 1, 1], 2);
+        assert_eq!(band_slots(&scene, 8, 1 << 31), [4, 1, 3]);
+    }
+
+    #[test]
+    fn a_streaming_scene_splits_its_budget_within_the_binding_limit() {
+        let rounds: Vec<u32> = (0..200_000).map(|i| 1 + i % 12).collect();
+        let scene = scene(&rounds, 100);
+        let page = PAGE_BYTES as u64;
+        // 40 GiB wanted, 2 GiB a binding.
+        let slots = band_slots(&scene, 160_000, 2 * (1 << 30));
+        assert!(
+            slots.iter().all(|&s| u64::from(s) * page <= 2 << 30),
+            "{slots:?}"
+        );
+        assert!(slots[2] >= 100, "the far band holds the pinned pages");
+    }
+
+    /// The far band's few coarse pages must not take room that other bands could use.
+    #[test]
+    fn slots_a_band_cannot_use_go_to_the_others() {
+        // Mostly near pages, few far ones: the far band's share would be wasted.
+        let mut rounds = vec![ROOT_ROUND; 4];
+        rounds.extend(std::iter::repeat_n(1, 1000));
+        let slots = band_slots(&scene(&rounds, 4), 400, 1 << 31);
+        assert_eq!(slots[2], 4, "the far band only has its pinned pages");
+        assert_eq!(slots[0], 396);
+    }
+
+    /// Whatever a page depends on sits in a band with room beyond its pinned pages.
+    #[test]
+    fn the_far_band_has_room_beyond_its_pinned_pages() {
+        let mut rounds = vec![ROOT_ROUND; 4];
+        rounds.extend((0..40).map(|i| 1 + i % 9));
+        let slots = band_slots(&scene(&rounds, 4), 14, 1 << 31);
+        assert!(slots[2] > 4, "{slots:?}");
+    }
+}

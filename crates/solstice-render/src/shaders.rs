@@ -5,6 +5,7 @@
 //! include. Sources are embedded at compile time, so there is no file I/O at runtime
 //! and the browser build needs nothing extra.
 
+use crate::regions::{rewrite_shader, RegionPlan};
 use std::collections::HashSet;
 
 macro_rules! shader_table {
@@ -212,20 +213,47 @@ const SKINNING_ON: &str = "const SKINNING: bool = true;";
 
 /// The source of an entry point that places vertices, for a scene with or without anything
 /// skinned. Without, skinning is compiled out, so that scene costs what it did before skinning.
-pub fn expand_for(path: &str, skinned: bool) -> String {
+pub fn expand_for(path: &str, skinned: bool, regions: Option<RegionPlan>) -> String {
     let source = expand(path);
-    if skinned {
-        return source;
+    let source = if skinned {
+        source
+    } else {
+        assert!(source.contains(SKINNING_ON), "{path} doesn't skin");
+        source.replace(SKINNING_ON, "const SKINNING: bool = false;")
+    };
+    match regions {
+        Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
+        None => source,
     }
-    assert!(source.contains(SKINNING_ON), "{path} doesn't skin");
-    source.replace(SKINNING_ON, "const SKINNING: bool = false;")
 }
 
 /// Compiles an entry-point file that places vertices: see [`expand_for`].
-pub fn module_for(device: &wgpu::Device, path: &str, skinned: bool) -> wgpu::ShaderModule {
+pub fn module_for(
+    device: &wgpu::Device,
+    path: &str,
+    skinned: bool,
+    regions: Option<RegionPlan>,
+) -> wgpu::ShaderModule {
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(path),
-        source: wgpu::ShaderSource::Wgsl(expand_for(path, skinned).into()),
+        source: wgpu::ShaderSource::Wgsl(expand_for(path, skinned, regions).into()),
+    })
+}
+
+/// Compiles an entry-point file that reads the scene's geometry but places no vertices.
+pub fn module_regions(
+    device: &wgpu::Device,
+    path: &str,
+    regions: Option<RegionPlan>,
+) -> wgpu::ShaderModule {
+    let source = expand(path);
+    let source = match regions {
+        Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
+        None => source,
+    };
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(path),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
     })
 }
 
@@ -313,7 +341,7 @@ mod tests {
             "vg/raster_hw_masked.wgsl",
             "vg/resolve.wgsl",
         ] {
-            let source = expand_for(path, false);
+            let source = expand_for(path, false, None);
             let module = naga::front::wgsl::parse_str(&source).expect("the shader parses");
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
@@ -323,6 +351,44 @@ mod tests {
             .unwrap_or_else(|error| panic!("{path}: {error}"));
             assert!(source.contains("const SKINNING: bool = false;"), "{path}");
         }
+    }
+
+    /// Scenes too large for one binding read everything through the rewritten accessors.
+    #[test]
+    fn shaders_rewritten_for_regions_are_valid() {
+        let plan = RegionPlan {
+            cluster_chunk: 1000,
+            band_slots: [1, 1, 1],
+        };
+        let check = |path: &str, source: String| {
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+            assert!(source.contains("clusters_more"), "{path}");
+        };
+        for path in [
+            "vg/cull.wgsl",
+            "vg/raster_sw.wgsl",
+            "vg/raster_hw_fragment.wgsl",
+            "vg/raster_sw_depth.wgsl",
+            "vg/raster_sw_masked.wgsl",
+            "vg/raster_sw_depth_masked.wgsl",
+            "vg/raster_hw_masked.wgsl",
+            "vg/resolve.wgsl",
+        ] {
+            for skinned in [false, true] {
+                check(path, expand_for(path, skinned, Some(plan)));
+            }
+        }
+        check(
+            "gi/voxelize.wgsl",
+            rewrite_shader(&expand("gi/voxelize.wgsl"), plan.cluster_chunk),
+        );
     }
 
     /// Operators WGSL will not mix without parentheses: a bitwise operator with any other

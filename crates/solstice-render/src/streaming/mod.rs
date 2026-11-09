@@ -8,6 +8,7 @@ mod feedback;
 pub mod residency;
 pub mod textures;
 
+use crate::regions::{page_bands, RegionPlan};
 use crate::scene::{
     starting_materials, unpack_bc5, unpack_bc7, GpuScene, TierArrays, UNPACKED_MAX_EDGE,
 };
@@ -74,6 +75,8 @@ pub struct StreamingStats {
     pub top_layers: u32,
     /// Texture levels being fetched.
     pub texture_fetches: u32,
+    /// For a scene with regions: pages installed and slots in each band, nearest first.
+    pub bands: Option<[(u32, u32); crate::regions::BANDS]>,
 }
 
 /// Keeps the GPU's cluster and node records in step with which pages are installed.
@@ -89,6 +92,7 @@ pub struct Streamer {
     dirty_clusters: Vec<u32>,
     /// Pool slot of each installed page.
     slots: Vec<u32>,
+    regions: Option<RegionPlan>,
     frame: u32,
     feedback: RequestFeedback,
     /// The latest requests read back, not yet planned for.
@@ -105,13 +109,30 @@ pub struct Streamer {
 impl Streamer {
     /// Starts with nothing installed and a pool of `slots`. Textures stream only if a plan is
     /// given, and otherwise stay as they were created.
-    pub fn new(gpu: &Gpu, scene: &PagedScene, slots: u32, plan: Option<TierPlan>) -> Self {
+    pub fn new(
+        gpu: &Gpu,
+        scene: &PagedScene,
+        slots: u32,
+        plan: Option<TierPlan>,
+        regions: Option<RegionPlan>,
+    ) -> Self {
+        let residency = match regions {
+            Some(regions) => Residency::with_bands(
+                scene.page_dependencies(),
+                scene.pinned_pages,
+                page_bands(scene),
+                &regions.band_slots,
+            ),
+            None => Residency::new(scene.page_dependencies(), scene.pinned_pages, slots),
+        };
+        let slot_count = regions.map_or(slots, |r| r.band_slots.iter().sum());
         Self {
             pages: scene.pages.clone(),
             sets: scene.sets.clone(),
             generated: scene.generated.clone(),
             clusters: scene.clusters.clone(),
-            residency: Residency::new(scene.page_dependencies(), scene.pinned_pages, slots),
+            residency,
+            regions,
             arrived: HashMap::new(),
             dirty_clusters: Vec::new(),
             slots: vec![u32::MAX; scene.pages.len()],
@@ -121,7 +142,7 @@ impl Streamer {
                 (scene.pages.len() + scene.base_textures.len()) as u32,
             ),
             fresh_requests: None,
-            slot_count: slots,
+            slot_count,
             data_offset: scene.data_offset,
             textures: plan
                 .filter(|_| !scene.base_textures.is_empty())
@@ -240,6 +261,10 @@ impl Streamer {
             middle_layers: self.textures.as_ref().map_or(0, |t| t.residency.counts().0),
             top_layers: self.textures.as_ref().map_or(0, |t| t.residency.counts().1),
             texture_fetches: self.textures.as_ref().map_or(0, |t| t.residency.fetching()),
+            bands: self.regions.map(|regions| {
+                let installed = self.residency.installed_by_band();
+                std::array::from_fn(|band| (installed[band], regions.band_slots[band]))
+            }),
         }
     }
 
@@ -290,6 +315,9 @@ impl Streamer {
             else {
                 break;
             };
+            for released in self.residency.take_released() {
+                self.apply_eviction(gpu, scene, released);
+            }
             if let Some(victim) = evicted {
                 self.apply_eviction(gpu, scene, victim);
             }
@@ -305,13 +333,14 @@ impl Streamer {
 
     fn apply_install(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32, slot: u32, data: &[u8]) {
         self.slots[page as usize] = slot;
+        let (band, local) = locate_slot(self.regions.as_ref(), slot);
         gpu.queue.write_buffer(
-            &scene.vertices,
-            u64::from(slot) * u64::from(PAGE_WORDS) * 4,
+            scene.pool(band),
+            u64::from(local) * u64::from(PAGE_WORDS) * 4,
             data,
         );
         let info = self.pages[page as usize];
-        let (vertex_base, triangle_base) = slot_bases(slot, info.vertex_count);
+        let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_count);
         for index in info.first_set..info.first_set + info.set_count {
             let set = self.sets[index as usize];
             for c in set.first_cluster..set.first_cluster + set.cluster_count {
@@ -333,7 +362,8 @@ impl Streamer {
         self.evictions += 1;
         let slot = self.slots[page as usize];
         let info = self.pages[page as usize];
-        let (vertex_base, triangle_base) = slot_bases(slot, info.vertex_count);
+        let (band, local) = locate_slot(self.regions.as_ref(), slot);
+        let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_count);
         for index in info.first_set..info.first_set + info.set_count {
             let set = self.sets[index as usize];
             // The GPU can't reach these any more, so only this copy needs changing.
@@ -353,12 +383,28 @@ impl Streamer {
 
     /// Writes all cluster records changed since the last call.
     pub fn flush(&mut self, gpu: &Gpu, scene: &GpuScene) {
+        let chunk = self.regions.map_or(u32::MAX, |r| r.cluster_chunk);
+        let bytes = std::mem::size_of::<PackedCluster>() as u64;
         for (first, last) in merged_runs(&mut self.dirty_clusters) {
-            gpu.queue.write_buffer(
-                &scene.clusters,
-                u64::from(first) * std::mem::size_of::<PackedCluster>() as u64,
-                bytemuck::cast_slice(&self.clusters[first as usize..=last as usize]),
-            );
+            if first < chunk {
+                let end = last.min(chunk - 1);
+                gpu.queue.write_buffer(
+                    &scene.clusters,
+                    u64::from(first) * bytes,
+                    bytemuck::cast_slice(&self.clusters[first as usize..=end as usize]),
+                );
+            }
+            if last >= chunk {
+                let start = first.max(chunk);
+                gpu.queue.write_buffer(
+                    scene
+                        .clusters_more
+                        .as_ref()
+                        .expect("a chunk means a second binding"),
+                    u64::from(start - chunk) * bytes,
+                    bytemuck::cast_slice(&self.clusters[start as usize..=last as usize]),
+                );
+            }
         }
         self.dirty_clusters.clear();
     }
@@ -565,13 +611,30 @@ fn write_node_flags(gpu: &Gpu, scene: &GpuScene, node: u32, flags: u32) {
     );
 }
 
+/// Which band a pool slot is in, and its place within that band.
+fn locate_slot(regions: Option<&RegionPlan>, slot: u32) -> (usize, u32) {
+    let Some(regions) = regions else {
+        return (0, slot);
+    };
+    let mut first = 0;
+    for (band, &slots) in regions.band_slots.iter().enumerate() {
+        if slot < first + slots {
+            return (band, slot - first);
+        }
+        first += slots;
+    }
+    panic!("slot {slot} is outside the pool");
+}
+
 /// Where a slot's vertices and triangles begin, in units of vertices and of triangle words.
-/// Triangles start right after the page's own vertices.
-fn slot_bases(slot: u32, vertex_count: u32) -> (u32, u32) {
+/// Triangles start right after the page's own vertices. The band goes in the top two bits, which
+/// is zero in a scene with one pool.
+fn slot_bases(band: usize, local: u32, vertex_count: u32) -> (u32, u32) {
+    let band = (band as u32) << 30;
     (
-        slot * PAGE_VERTICES,
-        slot * PAGE_WORDS
-            + vertex_count * (std::mem::size_of::<solstice_asset::PackedVertex>() as u32 / 4),
+        band | (local * PAGE_VERTICES),
+        band | (local * PAGE_WORDS
+            + vertex_count * (std::mem::size_of::<solstice_asset::PackedVertex>() as u32 / 4)),
     )
 }
 
@@ -601,7 +664,32 @@ mod tests {
 
     #[test]
     fn triangles_follow_a_pages_vertices_within_its_slot() {
-        assert_eq!(slot_bases(0, 10), (0, 40));
-        assert_eq!(slot_bases(2, 10), (2 * PAGE_VERTICES, 2 * PAGE_WORDS + 40));
+        assert_eq!(slot_bases(0, 0, 10), (0, 40));
+        assert_eq!(
+            slot_bases(0, 2, 10),
+            (2 * PAGE_VERTICES, 2 * PAGE_WORDS + 40)
+        );
+    }
+
+    #[test]
+    fn a_band_is_carried_above_the_place_in_its_buffer() {
+        let (vertices, triangles) = slot_bases(2, 3, 10);
+        assert_eq!(vertices >> 30, 2);
+        assert_eq!(vertices & 0x3fff_ffff, 3 * PAGE_VERTICES);
+        assert_eq!(triangles >> 30, 2);
+        assert_eq!(triangles & 0x3fff_ffff, 3 * PAGE_WORDS + 40);
+    }
+
+    #[test]
+    fn slots_are_numbered_through_the_bands() {
+        let plan = RegionPlan {
+            cluster_chunk: 1,
+            band_slots: [2, 3, 4],
+        };
+        assert_eq!(locate_slot(Some(&plan), 1), (0, 1));
+        assert_eq!(locate_slot(Some(&plan), 2), (1, 0));
+        assert_eq!(locate_slot(Some(&plan), 4), (1, 2));
+        assert_eq!(locate_slot(Some(&plan), 8), (2, 3));
+        assert_eq!(locate_slot(None, 8), (0, 8));
     }
 }

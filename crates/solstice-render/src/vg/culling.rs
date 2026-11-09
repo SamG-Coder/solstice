@@ -1,6 +1,7 @@
 //! GPU-driven hierarchy traversal. See `shaders/vg/cull.wgsl` for the algorithm.
 
 use crate::gpu::{groups_for, Gpu, LayoutBuilder};
+use crate::regions::RegionPlan;
 use crate::scene::GpuScene;
 use crate::shaders;
 use bytemuck::{Pod, Zeroable};
@@ -479,16 +480,19 @@ pub struct CullPipelines {
 }
 
 impl CullPipelines {
-    pub fn new(gpu: &Gpu, skinned: bool) -> Self {
-        let scene_layout = LayoutBuilder::new()
+    pub fn new(gpu: &Gpu, skinned: bool, regions: Option<RegionPlan>) -> Self {
+        let mut scene_layout = LayoutBuilder::new()
             .uniform_dynamic()
             .storage_read()
             .storage_read()
             .storage_read()
             .texture_unfilterable()
             .texture_unfilterable()
-            .texture_uint()
-            .build(gpu, "cull scene");
+            .texture_uint();
+        if regions.is_some() {
+            scene_layout = scene_layout.storage_read();
+        }
+        let scene_layout = scene_layout.build(gpu, "cull scene");
         let work_layout = LayoutBuilder::new()
             .storage_write()
             .storage_write()
@@ -501,7 +505,7 @@ impl CullPipelines {
             .storage_write()
             .build(gpu, "cull control");
 
-        let cull = shaders::module_for(&gpu.device, "vg/cull.wgsl", skinned);
+        let cull = shaders::module_for(&gpu.device, "vg/cull.wgsl", skinned, regions);
         let control = shaders::module(&gpu.device, "vg/cull_control.wgsl");
         let cull_layouts = [&scene_layout, &work_layout];
         Self {
@@ -529,19 +533,22 @@ impl CullPipelines {
         scene: &GpuScene,
         hzb: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
-        gpu.bind_group(
-            "cull scene",
-            &self.scene_layout,
-            &[
-                slots.binding(),
-                scene.instances.as_entire_binding(),
-                scene.nodes.as_entire_binding(),
-                scene.clusters.as_entire_binding(),
-                wgpu::BindingResource::TextureView(hzb),
-                wgpu::BindingResource::TextureView(&scene.skins.bones_view),
-                wgpu::BindingResource::TextureView(&scene.skins.lists_view),
-            ],
-        )
+        let mut resources = vec![
+            slots.binding(),
+            scene.instances.as_entire_binding(),
+            scene.nodes.as_entire_binding(),
+            scene.clusters.as_entire_binding(),
+            wgpu::BindingResource::TextureView(hzb),
+            wgpu::BindingResource::TextureView(&scene.skins.bones_view),
+            wgpu::BindingResource::TextureView(&scene.skins.lists_view),
+        ];
+        resources.extend(
+            scene
+                .clusters_more
+                .iter()
+                .map(wgpu::Buffer::as_entire_binding),
+        );
+        gpu.bind_group("cull scene", &self.scene_layout, &resources)
     }
 
     /// Records one culling run. On return, `work` holds indirect arguments for

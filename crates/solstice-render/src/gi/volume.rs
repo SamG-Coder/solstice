@@ -192,7 +192,7 @@ impl GiVolume {
         });
         let atlas_view = atlas.create_view(&Default::default());
 
-        let voxelize_layout = LayoutBuilder::new()
+        let mut voxelize_layout = LayoutBuilder::new()
             .uniform()
             .storage_read()
             .storage_read()
@@ -203,8 +203,12 @@ impl GiVolume {
             .storage_read()
             .storage_write()
             .texture_array()
-            .sampler()
-            .build(gpu, "gi voxelize");
+            .sampler();
+        if scene.regions.is_some() {
+            // The second cluster binding and the pool's far band.
+            voxelize_layout = voxelize_layout.storage_read().storage_read();
+        }
+        let voxelize_layout = voxelize_layout.build(gpu, "gi voxelize");
         let flood_layout = LayoutBuilder::new()
             .uniform()
             .storage_read()
@@ -225,7 +229,8 @@ impl GiVolume {
             .storage_texture_3d(ATLAS_FORMAT)
             .build(gpu, "gi write");
 
-        let voxelize_module = shaders::module(&gpu.device, "gi/voxelize.wgsl");
+        let voxelize_module =
+            shaders::module_regions(&gpu.device, "gi/voxelize.wgsl", scene.regions);
         let flood_module = shaders::module(&gpu.device, "gi/jump_flood.wgsl");
         let light_module = shaders::module(&gpu.device, "gi/voxel_light.wgsl");
         let write_module = shaders::module(&gpu.device, "gi/volume_write.wgsl");
@@ -260,10 +265,8 @@ impl GiVolume {
                     voxel_size,
                     origin_voxels: None,
                     light_updates: 0,
-                    voxelize_group: gpu.bind_group(
-                        "gi voxelize",
-                        &voxelize_layout,
-                        &[
+                    voxelize_group: {
+                        let mut resources = vec![
                             voxelize_params.as_entire_binding(),
                             scene.instances.as_entire_binding(),
                             scene.clusters.as_entire_binding(),
@@ -275,8 +278,12 @@ impl GiVolume {
                             voxels.as_entire_binding(),
                             wgpu::BindingResource::TextureView(&scene.textures.base.color_view),
                             wgpu::BindingResource::Sampler(&scene.material_sampler),
-                        ],
-                    ),
+                        ];
+                        if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
+                            resources.extend([more.as_entire_binding(), far.as_entire_binding()]);
+                        }
+                        gpu.bind_group("gi voxelize", &voxelize_layout, &resources)
+                    },
                     seed_group: gpu.bind_group(
                         "gi seed",
                         &flood_layout,
