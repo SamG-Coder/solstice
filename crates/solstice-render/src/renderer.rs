@@ -241,6 +241,8 @@ struct SizedResources {
     water: Option<WaterTargets>,
     /// The depth particles test against.
     particles: ParticleTargets,
+    /// The scene's depth with any water in it, which cards test against.
+    scene_depth: wgpu::TextureView,
 }
 
 /// Previous-frame camera state, for reprojection and occlusion culling.
@@ -564,6 +566,7 @@ impl Renderer {
                 waterline.resolve_layout(),
                 scene.has_skins,
                 scene.regions,
+                scene.glow_maps.is_some(),
             ),
             waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
@@ -1066,6 +1069,21 @@ impl Renderer {
             .water
             .as_ref()
             .map_or(&sized.hdr.view, |water| &water.color.view);
+        if let Some(cards) = self
+            .scene
+            .cards
+            .as_ref()
+            .filter(|_| debug == DebugView::Lit)
+        {
+            cards.record(
+                gpu,
+                &mut encoder,
+                scene_color,
+                &sized.scene_depth,
+                &self.frame_uniform,
+                camera.position,
+            );
+        }
         self.particles.record_draw(
             &mut encoder,
             scene_color,
@@ -1204,6 +1222,7 @@ impl Renderer {
             output_size,
         );
 
+        let scene_depth = scene_depth.clone();
         self.history = None;
         self.frame_index = 0;
         self.sized = Some(SizedResources {
@@ -1223,6 +1242,7 @@ impl Renderer {
             hdr,
             water,
             particles,
+            scene_depth,
         });
     }
 

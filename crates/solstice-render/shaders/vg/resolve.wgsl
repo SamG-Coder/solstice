@@ -43,6 +43,15 @@ fn load_vertex(index: u32) -> PackedVertex {
 @group(1) @binding(12) var top_color: texture_2d_array<f32>;
 @group(1) @binding(13) var top_normal: texture_2d_array<f32>;
 @group(1) @binding(14) var top_material: texture_2d_array<f32>;
+// glow:begin
+// The emissive maps, for a scene that has any. Compiled out of one that hasn't.
+@group(1) @binding(15) var glow_maps: texture_2d_array<f32>;
+// `flags` above this bit: one more than the material's layer among the emissive maps, or zero.
+const MATERIAL_GLOW_SHIFT: u32 = 16u;
+// `Material.emissive` of a material with a map is the map's light taken over its surface, as this
+// fraction of it glows: `Material::GLOW_MAP_AVERAGE`.
+const MATERIAL_GLOW_AVERAGE: f32 = 0.1;
+// glow:end
 // Where the sea has been, for how wet each surface is.
 @group(2) @binding(0) var<uniform> waterline: WaterlineParams;
 @group(2) @binding(1) var waterline_map: texture_2d<f32>;
@@ -299,6 +308,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let motion = (prev_ndc - current_ndc) * vec2f(0.5, -0.5);
 
     var emissive = material.emissive * instance.glow;
+    // glow:begin
+    let glow_layer = material.flags >> MATERIAL_GLOW_SHIFT;
+    if glow_layer != 0u {
+        emissive *= textureSampleGrad(glow_maps, material_sampler, uv, i32(glow_layer - 1u), duv_dx * frame.mip_scale, duv_dy * frame.mip_scale).rgb / MATERIAL_GLOW_AVERAGE;
+    }
+    // glow:end
 
     switch frame.debug_mode {
         case DEBUG_CLUSTERS: {

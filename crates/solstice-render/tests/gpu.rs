@@ -2,7 +2,10 @@
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 use solstice_asset::PackedSkin;
-use solstice_asset::{Instance, Light, LoadedScene, Material, SceneAsset, TextureLayer};
+use solstice_asset::{
+    Card, CardImage, CardVertex, Cards, GlowMaps, Instance, Light, LoadedScene, Material,
+    SceneAsset, TextureLayer,
+};
 use solstice_builder::{
     build_virtual_mesh, compress_textures, masked_mip_chain, mip_chain, paginate, BuildOptions,
     Mesh, Vertex,
@@ -2393,6 +2396,215 @@ fn wall(albedo: f32) -> SceneAsset {
         instances: vec![instance(0, Mat4::IDENTITY)],
         ..Default::default()
     }
+}
+
+/// A BC7 block of one colour: mode 6, with both ends the same.
+fn solid_bc7([r, g, b, a]: [u8; 4]) -> [u8; 16] {
+    let mut bits = 1u128 << 6;
+    let mut at = 7;
+    for channel in [r, r, g, g, b, b, a, a] {
+        bits |= u128::from(channel >> 1) << at;
+        at += 7;
+    }
+    bits |= 3 << at;
+    bits.to_le_bytes()
+}
+
+/// A whole mip chain of a BC7 texture of one colour.
+fn solid_chain(width: u32, height: u32, color: [u8; 4]) -> Vec<Vec<u8>> {
+    (0..=width.max(height).ilog2())
+        .map(|level| {
+            let side = |edge: u32| (edge >> level).max(1).div_ceil(4) as usize;
+            solid_bc7(color).repeat(side(width) * side(height))
+        })
+        .collect()
+}
+
+/// Renders a scene as [`render_in`] does, from what is to be drawn as it would be on disk, in the
+/// dark, without the temporal filter. Fails on any validation error.
+fn render_loaded(gpu: &Gpu, loaded: &LoadedScene, camera: &Camera, size: u32) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut renderer = Renderer::new(gpu, loaded, FORMAT, untemporal());
+    let target = test_target(gpu, size);
+    let view = target.create_view(&Default::default());
+    for _ in 0..8 {
+        renderer.render(
+            gpu,
+            camera,
+            &Environment::default(),
+            &view,
+            (size, size),
+            1.0 / 60.0,
+        );
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, size);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    pixels
+}
+
+fn has_block_textures(gpu: &Gpu) -> bool {
+    gpu.device
+        .features()
+        .contains(wgpu::Features::TEXTURE_COMPRESSION_BC)
+}
+
+/// A square of `half` metres around (`x`, `y`, `z`), facing the camera, as six corners.
+fn card_square(x: f32, y: f32, z: f32, half: f32) -> [CardVertex; 6] {
+    let corner = |sx: f32, sy: f32| CardVertex {
+        position: [x + sx * half, y + sy * half, z],
+        uv: [sx * 0.5 + 0.5, 0.5 - sy * 0.5],
+    };
+    [
+        corner(-1.0, -1.0),
+        corner(1.0, -1.0),
+        corner(1.0, 1.0),
+        corner(-1.0, -1.0),
+        corner(1.0, 1.0),
+        corner(-1.0, 1.0),
+    ]
+}
+
+/// Cards, one per entry: where it is, and which of the images it shows.
+fn cards_of(places: &[(f32, f32, f32, u32)], images: Vec<CardImage>) -> Cards {
+    let mut cards = Cards {
+        images,
+        ..Default::default()
+    };
+    for &(x, y, z, image) in places {
+        let first_vertex = cards.vertices.len() as u32;
+        cards.vertices.extend(card_square(x, y, z, 1.0));
+        cards.cards.push(Card {
+            first_vertex,
+            vertex_count: 6,
+            image,
+            opacity: 1.0,
+            emissive: [200.0; 3],
+        });
+    }
+    cards
+}
+
+fn image_of(alpha: u8, glow: u8) -> CardImage {
+    CardImage {
+        width: 8,
+        height: 64,
+        color_mips: solid_chain(8, 64, [255, 255, 255, alpha]),
+        glow_mips: solid_chain(8, 64, [glow, glow, glow, 255]),
+    }
+}
+
+/// A card adds its glow, is hidden by what is nearer, and covers what is behind it by its alpha.
+#[test]
+fn cards_glow_cover_and_go_behind_what_is_nearer() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    if !has_block_textures(&gpu) {
+        return;
+    }
+    let size = 64;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    // The wall, 10 m off, glows enough to see it covered.
+    let mut scene = wall(0.0);
+    scene.materials[0].emissive = [5.0; 3];
+    let mut loaded = paginate(&scene);
+    let at = |x: f32, z: f32| pixel_of(&camera, size, Vec3::new(x, 0.0, z));
+    let glowing = (-2.5, -5.0, 1);
+    let behind = (2.5, -20.0, 1);
+    let covering = (0.0, -5.0, 2);
+    loaded.scene.cards = cards_of(
+        &[
+            (glowing.0, 0.0, glowing.1, 0),
+            (behind.0 * 4.0, 0.0, behind.1, 0),
+            (covering.0, 0.0, covering.1, 1),
+        ],
+        vec![image_of(0, 255), image_of(255, 0)],
+    );
+    let pixels = render_loaded(&gpu, &loaded, &camera, size);
+    let at_pixels = |(x, y): (u32, u32)| brightness(patch(&pixels, size, x, y, 0));
+    // Exposure follows the whole picture, so each is compared with the wall beside it.
+    let wall_beside = at_pixels(pixel_of(&camera, size, Vec3::new(0.0, -5.0, -10.0)));
+    assert!(wall_beside > 10.0, "the wall shows: {wall_beside}");
+
+    let glow = at_pixels(at(glowing.0, glowing.1));
+    assert!(
+        glow > wall_beside + 20.0,
+        "the glow {glow} is added to {wall_beside}"
+    );
+    let hidden = at_pixels(at(behind.0 * 4.0, behind.1));
+    assert!(
+        (hidden - wall_beside).abs() < 5.0,
+        "the wall hides what is behind it: {hidden} against {wall_beside}"
+    );
+    let covered = at_pixels(at(covering.0, covering.1));
+    assert!(
+        covered < wall_beside * 0.5,
+        "a solid card with no glow hides the wall: {covered} against {wall_beside}"
+    );
+}
+
+/// An emissive map decides where a material glows, and two materials can have different ones.
+#[test]
+fn emissive_maps_decide_where_a_material_glows() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    if !has_block_textures(&gpu) {
+        return;
+    }
+    let size = 64;
+    let camera = Camera {
+        position: Vec3::ZERO,
+        ..Default::default()
+    };
+    let mut scene = wall(0.0);
+    let glowing = |layer: u32| Material {
+        base_color: [0.0, 0.0, 0.0, 1.0],
+        emissive: [Material::GLOW_MAP_AVERAGE * 100.0; 3],
+        flags: Material::TWO_SIDED | (layer + 1) << Material::GLOW_SHIFT,
+        ..Default::default()
+    };
+    scene.materials = vec![glowing(0), glowing(1)];
+    scene.instances = vec![
+        Instance {
+            mesh: 0,
+            material: 0,
+            transform: Mat4::from_translation(Vec3::new(-60.0, 0.0, 0.0)),
+        },
+        Instance {
+            mesh: 0,
+            material: 1,
+            transform: Mat4::from_translation(Vec3::new(60.0, 0.0, 0.0)),
+        },
+    ];
+    let mut loaded = paginate(&scene);
+    loaded.scene.glow = GlowMaps {
+        edge: 16,
+        layers: vec![
+            solid_chain(16, 16, [255, 255, 255, 255]),
+            solid_chain(16, 16, [0, 0, 0, 255]),
+        ],
+    };
+    let pixels = render_loaded(&gpu, &loaded, &camera, size);
+    let left = brightness(patch(&pixels, size, size / 4, size / 2, 1));
+    let right = brightness(patch(&pixels, size, size * 3 / 4, size / 2, 1));
+    // Exposure follows the whole picture, so what counts is the difference.
+    assert!(
+        left > right + 40.0,
+        "the white map {left} glows more than the black {right}"
+    );
 }
 
 /// `count` still white particles of radius 3 m in one place, fading over `soft` metres: large

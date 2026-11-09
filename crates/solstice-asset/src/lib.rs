@@ -21,6 +21,6 @@ pub use collision::{
 pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedSkin, PackedVertex};
 pub use paged::{LoadedScene, PagedScene};
 pub use scene::{
-    GameFile, Instance, Light, Material, SceneAsset, Sea, TextureEncoding, TextureLayer, Viewpoint,
-    VirtualMesh,
+    Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, SceneAsset,
+    Sea, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
 };

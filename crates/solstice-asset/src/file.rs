@@ -20,7 +20,8 @@ use crate::paged::{
     upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
 };
 use crate::scene::{
-    GameFile, Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint,
+    Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, Sea,
+    TextureEncoding, TextureLayer, Viewpoint,
 };
 use crate::skeleton::{Bone, BoneTrack, Clip, Skeleton, MAX_BONES, NO_POSE};
 use bytemuck::{Pod, Zeroable};
@@ -42,6 +43,10 @@ const COLLISION_TAG: [u8; 4] = *b"COLL";
 const SKIN_TAG: [u8; 4] = *b"SKIN";
 /// The optional section holding a scene's animation clips, written only if it has any.
 const CLIP_TAG: [u8; 4] = *b"CLIP";
+/// The optional section holding the emissive maps, written only if there are any.
+const GLOW_TAG: [u8; 4] = *b"GLOW";
+/// The optional section holding the transparent glowing cards, written only if there are any.
+const CARD_TAG: [u8; 4] = *b"CARD";
 /// In a skin section's mesh list: a mesh that isn't skinned.
 const NO_BONE_LISTS: i32 = i32::MIN;
 
@@ -58,6 +63,8 @@ pub enum DecodeError {
     BadGameplay,
     BadCollision,
     BadSkin,
+    BadGlow,
+    BadCards,
 }
 
 impl fmt::Display for DecodeError {
@@ -80,6 +87,8 @@ impl fmt::Display for DecodeError {
             Self::BadGameplay => write!(f, "the scene's gameplay files are malformed"),
             Self::BadCollision => write!(f, "the scene's collision shapes are malformed"),
             Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
+            Self::BadGlow => write!(f, "the scene's emissive maps are malformed"),
+            Self::BadCards => write!(f, "the scene's cards are malformed"),
         }
     }
 }
@@ -277,7 +286,140 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     if !scene.clips.is_empty() {
         w.section(CLIP_TAG, &encode_clips(&scene.clips));
     }
+    if !scene.glow.layers.is_empty() {
+        w.section(GLOW_TAG, &encode_glow(&scene.glow));
+    }
+    if !scene.cards.cards.is_empty() {
+        w.section(CARD_TAG, &encode_cards(&scene.cards));
+    }
     w.finish()
+}
+
+/// Bytes in one level of a BC7 texture: 16 per block, and a small level still fills one.
+fn bc7_level_bytes(width: u32, height: u32, level: usize) -> usize {
+    let side = |edge: u32| (edge >> level).max(1).div_ceil(4) as usize;
+    side(width) * side(height) * 16
+}
+
+/// Whether these are a whole mip chain of a BC7 texture of this size.
+fn is_whole_chain(mips: &[Vec<u8>], width: u32, height: u32) -> bool {
+    width.is_multiple_of(4)
+        && height.is_multiple_of(4)
+        && width > 0
+        && height > 0
+        && mips.len() == width.max(height).ilog2() as usize + 1
+        && mips
+            .iter()
+            .enumerate()
+            .all(|(level, mip)| mip.len() == bc7_level_bytes(width, height, level))
+}
+
+fn encode_glow(glow: &GlowMaps) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.pod(&glow.edge);
+    w.pod(&(glow.layers.len() as u32));
+    for layer in &glow.layers {
+        w.pod(&(layer.len() as u32));
+        for mip in layer {
+            w.slice(mip);
+        }
+    }
+    w.finish()
+}
+
+fn decode_glow(bytes: &[u8]) -> Result<GlowMaps, DecodeError> {
+    let bad = |_| DecodeError::BadGlow;
+    let mut r = Reader { bytes };
+    let edge: u32 = r.pod().map_err(bad)?;
+    let count: u32 = r.pod().map_err(bad)?;
+    if count as usize > bytes.len() {
+        return Err(DecodeError::BadGlow);
+    }
+    let mut layers = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mip_count: u32 = r.pod().map_err(bad)?;
+        if mip_count > 32 {
+            return Err(DecodeError::BadGlow);
+        }
+        let mut mips = Vec::with_capacity(mip_count as usize);
+        for _ in 0..mip_count {
+            mips.push(r.slice::<u8>().map_err(bad)?);
+        }
+        if !edge.is_power_of_two() || !is_whole_chain(&mips, edge, edge) {
+            return Err(DecodeError::BadGlow);
+        }
+        layers.push(mips);
+    }
+    if !r.bytes.is_empty() {
+        return Err(DecodeError::BadGlow);
+    }
+    Ok(GlowMaps { edge, layers })
+}
+
+fn encode_cards(cards: &Cards) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.slice(&cards.vertices);
+    w.slice(&cards.cards);
+    w.pod(&(cards.images.len() as u32));
+    for image in &cards.images {
+        w.pod(&image.width);
+        w.pod(&image.height);
+        w.pod(&(image.color_mips.len() as u32));
+        for mip in image.color_mips.iter().chain(&image.glow_mips) {
+            w.slice(mip);
+        }
+    }
+    w.finish()
+}
+
+fn decode_cards(bytes: &[u8]) -> Result<Cards, DecodeError> {
+    let bad = |_| DecodeError::BadCards;
+    let mut r = Reader { bytes };
+    let vertices: Vec<CardVertex> = r.slice().map_err(bad)?;
+    let cards: Vec<Card> = r.slice().map_err(bad)?;
+    let count: u32 = r.pod().map_err(bad)?;
+    if count as usize > bytes.len() {
+        return Err(DecodeError::BadCards);
+    }
+    let mut images = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let width: u32 = r.pod().map_err(bad)?;
+        let height: u32 = r.pod().map_err(bad)?;
+        let mip_count: u32 = r.pod().map_err(bad)?;
+        if mip_count > 32 {
+            return Err(DecodeError::BadCards);
+        }
+        let read = |r: &mut Reader<'_>| -> Result<Vec<Vec<u8>>, DecodeError> {
+            (0..mip_count)
+                .map(|_| r.slice::<u8>().map_err(bad))
+                .collect()
+        };
+        let color_mips = read(&mut r)?;
+        let glow_mips = read(&mut r)?;
+        if !is_whole_chain(&color_mips, width, height) || !is_whole_chain(&glow_mips, width, height)
+        {
+            return Err(DecodeError::BadCards);
+        }
+        images.push(CardImage {
+            width,
+            height,
+            color_mips,
+            glow_mips,
+        });
+    }
+    let cards_ok = cards.iter().all(|card| {
+        card.vertex_count.is_multiple_of(3)
+            && u64::from(card.first_vertex) + u64::from(card.vertex_count) <= vertices.len() as u64
+            && (card.image as usize) < images.len()
+    });
+    if !r.bytes.is_empty() || !cards_ok {
+        return Err(DecodeError::BadCards);
+    }
+    Ok(Cards {
+        vertices,
+        cards,
+        images,
+    })
 }
 
 fn encode_clips(clips: &[Clip]) -> Vec<u8> {
@@ -649,6 +791,8 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let mut collision = None;
     let mut skin = None;
     let mut clips = Vec::new();
+    let mut glow = GlowMaps::default();
+    let mut cards = Cards::default();
     while !r.bytes.is_empty() {
         let tag: [u8; 4] = r.pod()?;
         let contents: Vec<u8> = r.slice()?;
@@ -668,7 +812,19 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             skin = Some(decode_skin(&contents)?);
         } else if tag == CLIP_TAG {
             clips = decode_clips(&contents)?;
+        } else if tag == GLOW_TAG {
+            glow = decode_glow(&contents)?;
+        } else if tag == CARD_TAG {
+            cards = decode_cards(&contents)?;
         }
+    }
+    let glow_ok = materials.iter().all(|material| {
+        material
+            .glow_layer()
+            .is_none_or(|l| (l as usize) < glow.layers.len())
+    });
+    if !glow_ok {
+        return Err(DecodeError::BadGlow);
     }
     let mut meshes = meshes;
     let (cluster_bones, skeletons, poses, instance_poses) = match skin {
@@ -722,6 +878,8 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         poses,
         instance_poses,
         clips,
+        glow,
+        cards,
     };
     if !tables_are_consistent(&scene) {
         return Err(DecodeError::BadPages);
@@ -1116,6 +1274,131 @@ mod tests {
         );
         assert_eq!(decoded.page(0), loaded.page(0));
         assert_eq!(decoded.page(1), loaded.page(1));
+    }
+
+    /// A BC7 chain of this size, filled with `fill`.
+    fn chain_of(width: u32, height: u32, fill: u8) -> Vec<Vec<u8>> {
+        (0..=width.max(height).ilog2() as usize)
+            .map(|level| vec![fill; bc7_level_bytes(width, height, level)])
+            .collect()
+    }
+
+    fn sample_glow() -> GlowMaps {
+        GlowMaps {
+            edge: 16,
+            layers: vec![chain_of(16, 16, 7), chain_of(16, 16, 9)],
+        }
+    }
+
+    fn sample_cards() -> Cards {
+        Cards {
+            vertices: vec![CardVertex::default(); 6],
+            cards: vec![Card {
+                first_vertex: 3,
+                vertex_count: 3,
+                image: 0,
+                opacity: 0.5,
+                emissive: [2.0, 1.0, 0.5],
+            }],
+            images: vec![CardImage {
+                width: 8,
+                height: 64,
+                color_mips: chain_of(8, 64, 1),
+                glow_mips: chain_of(8, 64, 2),
+            }],
+        }
+    }
+
+    #[test]
+    fn glow_and_cards_travel_with_their_scene() {
+        let mut loaded = sample_scene();
+        loaded.scene.materials[0].flags |= 2 << Material::GLOW_SHIFT;
+        loaded.scene.glow = sample_glow();
+        loaded.scene.cards = sample_cards();
+        let decoded = decode(&encode(&loaded)).unwrap().scene;
+        assert_eq!(decoded.glow, sample_glow());
+        assert_eq!(decoded.cards, sample_cards());
+        assert_eq!(decoded.materials[0].glow_layer(), Some(1));
+    }
+
+    #[test]
+    fn a_version_4_file_with_neither_section_still_loads() {
+        let loaded = sample_scene();
+        let bytes = encode(&loaded);
+        assert_eq!(bytes[8..12], 4u32.to_le_bytes(), "the version hasn't moved");
+        let manifest = encode_manifest(&loaded.scene);
+        assert!(!manifest
+            .windows(4)
+            .any(|tag| tag == GLOW_TAG || tag == CARD_TAG));
+        let decoded = decode(&bytes).unwrap();
+        assert!(decoded.scene.glow.layers.is_empty() && decoded.scene.cards.cards.is_empty());
+        assert_eq!(decoded.scene.materials, loaded.scene.materials);
+        assert_eq!(decoded.pages, loaded.pages);
+    }
+
+    /// What is written from here on must not trouble a reader that doesn't know the sections.
+    #[test]
+    fn sections_a_reader_does_not_know_are_skipped() {
+        let mut loaded = sample_scene();
+        loaded.scene.cards = sample_cards();
+        let manifest = encode_manifest(&loaded.scene);
+        let renamed: Vec<u8> = {
+            let at = manifest
+                .windows(4)
+                .position(|tag| tag == CARD_TAG)
+                .expect("written");
+            let mut bytes = manifest.clone();
+            bytes[at..at + 4].copy_from_slice(b"NEW!");
+            bytes
+        };
+        let scene = decode_manifest(&renamed, 0).unwrap();
+        assert!(scene.cards.cards.is_empty());
+        assert_eq!(scene.materials, loaded.scene.materials);
+    }
+
+    #[test]
+    fn a_material_cannot_name_a_glow_layer_that_is_not_there() {
+        let mut loaded = sample_scene();
+        loaded.scene.materials[0].flags |= 3 << Material::GLOW_SHIFT;
+        loaded.scene.glow = sample_glow();
+        assert_eq!(decode(&encode(&loaded)).err(), Some(DecodeError::BadGlow));
+    }
+
+    #[test]
+    fn broken_glow_and_cards_are_errors() {
+        let section = encode_glow(&sample_glow());
+        for cut in 0..section.len() {
+            assert_eq!(
+                decode_glow(&section[..cut]),
+                Err(DecodeError::BadGlow),
+                "cut at {cut}"
+            );
+        }
+        let mut wrong = sample_glow();
+        wrong.layers[1].pop();
+        assert_eq!(decode_glow(&encode_glow(&wrong)), Err(DecodeError::BadGlow));
+
+        let section = encode_cards(&sample_cards());
+        for cut in 0..section.len() {
+            assert_eq!(
+                decode_cards(&section[..cut]),
+                Err(DecodeError::BadCards),
+                "cut at {cut}"
+            );
+        }
+        let bad = |change: fn(&mut Cards)| {
+            let mut cards = sample_cards();
+            change(&mut cards);
+            assert_eq!(
+                decode_cards(&encode_cards(&cards)),
+                Err(DecodeError::BadCards)
+            );
+        };
+        bad(|c| c.cards[0].image = 1);
+        bad(|c| c.cards[0].first_vertex = 4);
+        bad(|c| c.cards[0].vertex_count = 2);
+        bad(|c| c.images[0].width = 6);
+        bad(|c| c.images[0].glow_mips[0].pop().map(|_| ()).unwrap());
     }
 
     #[test]

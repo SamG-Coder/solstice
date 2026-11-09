@@ -22,7 +22,10 @@ use rayon::prelude::*;
 use solstice_asset::file::{deflate_page, encode_header_and_manifest};
 use solstice_asset::paged::{upper_mip_count, PagedScene};
 use solstice_asset::scene::TextureEncoding;
-use solstice_asset::{Instance, Material, PackedVertex, SceneAsset, TextureLayer, VirtualMesh};
+use solstice_asset::{
+    Card, CardImage, CardVertex, Cards, GlowMaps, Instance, Material, PackedVertex, SceneAsset,
+    TextureLayer, VirtualMesh,
+};
 use solstice_builder::{
     build_virtual_mesh, paginate_from, BuildOptions, ClusterRange, ClusterRecords, ClusterStore,
 };
@@ -51,6 +54,8 @@ pub struct LargeOptions {
     pub free_space: fn(&Path) -> Option<u64>,
     /// How much may be written between looks at the free space.
     pub check_every_bytes: u64,
+    /// Multiplies every emissive factor, as glTF says nothing of how bright 1 is.
+    pub glow_strength: f32,
 }
 
 impl Default for LargeOptions {
@@ -63,6 +68,7 @@ impl Default for LargeOptions {
             triangles_in_flight: 120_000_000,
             free_space: free_bytes,
             check_every_bytes: 8 << 30,
+            glow_strength: 1.0,
         }
     }
 }
@@ -81,6 +87,10 @@ pub struct LargeReport {
     pub page_seconds: f32,
     pub texture_seconds: f32,
     pub texture_layers: usize,
+    /// Emissive maps kept.
+    pub glow_maps: usize,
+    /// Transparent glowing cards kept.
+    pub cards: usize,
     /// Things in the file that the result does not reproduce.
     pub warnings: Vec<String>,
 }
@@ -283,6 +293,9 @@ struct Walk<'a> {
     buffers: &'a [buffer::Data],
     region: Option<(Vec3, f32)>,
     placements: Vec<Placement>,
+    /// What is drawn transparent and glowing, instead of being built.
+    card_placements: Vec<Placement>,
+    textures: bool,
     bounds: Bounds,
     left_out: usize,
     warnings: Vec<String>,
@@ -337,9 +350,7 @@ impl Walk<'_> {
                 return;
             }
         }
-        self.bounds
-            .add_box(Vec3::from(box_.min), Vec3::from(box_.max), world);
-        self.placements.push(Placement {
+        let placement = Placement {
             source: MeshKey {
                 mesh: mesh.index(),
                 primitive: primitive.index(),
@@ -347,7 +358,14 @@ impl Walk<'_> {
             },
             material: primitive.material().index(),
             transform: world,
-        });
+        };
+        if self.textures && is_card(&primitive.material()) {
+            self.card_placements.push(placement);
+            return;
+        }
+        self.bounds
+            .add_box(Vec3::from(box_.min), Vec3::from(box_.max), world);
+        self.placements.push(placement);
     }
 }
 
@@ -551,6 +569,8 @@ fn bake_inner(
         buffers: &buffers,
         region: options.region,
         placements: Vec::new(),
+        card_placements: Vec::new(),
+        textures: options.textures,
         bounds: Bounds::default(),
         left_out: 0,
         warnings: Vec::new(),
@@ -564,6 +584,7 @@ fn bake_inner(
     }
     let Walk {
         placements,
+        card_placements,
         bounds,
         left_out,
         warnings,
@@ -584,6 +605,7 @@ fn bake_inner(
     let mut material_slots: HashMap<Option<usize>, u32> = HashMap::new();
     let mut materials: Vec<Material> = Vec::new();
     let mut layers = LayerTable::default();
+    let mut glow = GlowTable::default();
     let mut instances = Vec::with_capacity(placements.len());
     for placement in &placements {
         let mesh = *slots.entry(placement.source).or_insert_with(|| {
@@ -594,8 +616,9 @@ fn bake_inner(
             materials.push(convert_material(
                 &document,
                 placement.material,
-                options.textures,
+                options,
                 &mut layers,
+                &mut glow,
                 &mut report.warnings,
             ));
             materials.len() as u32 - 1
@@ -609,6 +632,10 @@ fn bake_inner(
 
     // A problem with a texture should cost seconds, not the hours of building that come first.
     check_images(&document, folder, &layers.keys)?;
+    let glow_maps = read_glow_maps(&document, folder, &glow.images)?;
+    let cards = build_cards(&document, folder, &card_placements, options)?;
+    report.glow_maps = glow_maps.layers.len();
+    report.cards = cards.cards.len();
 
     let mut by_source: HashMap<usize, Vec<usize>> = HashMap::new();
     for (index, key) in keys.iter().enumerate() {
@@ -830,6 +857,9 @@ fn bake_inner(
     report.texture_seconds = texture_start.elapsed().as_secs_f32();
     report.texture_layers = layers.keys.len();
 
+    paged.glow = glow_maps;
+    paged.cards = cards;
+
     report.clusters = paged.clusters.len();
     report.pages = paged.pages.len();
 
@@ -895,13 +925,157 @@ impl LayerTable {
     }
 }
 
+/// Most emissive maps a scene keeps: as many layers as WebGPU promises an array can have.
+const MOST_GLOW_MAPS: usize = 256;
+/// Edge of the emissive maps. They are soft light, so this is plenty.
+const GLOW_EDGE: u32 = 512;
+
+/// The emissive maps in use, by image.
+#[derive(Default)]
+struct GlowTable {
+    images: Vec<usize>,
+}
+
+impl GlowTable {
+    fn slot(&mut self, image: usize) -> Option<u32> {
+        if let Some(at) = self.images.iter().position(|&i| i == image) {
+            return Some(at as u32);
+        }
+        (self.images.len() < MOST_GLOW_MAPS).then(|| {
+            self.images.push(image);
+            self.images.len() as u32 - 1
+        })
+    }
+}
+
+/// Whether a material is drawn as transparent glowing cards: it blends, and has maps for that.
+fn is_card(material: &gltf::Material<'_>) -> bool {
+    material.alpha_mode() == gltf::material::AlphaMode::Blend
+        && material.emissive_texture().is_some()
+        && material
+            .pbr_metallic_roughness()
+            .base_color_texture()
+            .is_some()
+}
+
+fn read_glow_maps(
+    document: &Document,
+    folder: &Path,
+    images: &[usize],
+) -> Result<GlowMaps, String> {
+    let layers = images
+        .par_iter()
+        .map(|&image| open_image(document, image, folder, &COLOR_FORMATS)?.fit_square(GLOW_EDGE))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GlowMaps {
+        edge: GLOW_EDGE,
+        layers,
+    })
+}
+
+/// The whole mip chain of an image, as the file has it.
+fn whole_chain(texture: &Ktx2) -> Result<Vec<Vec<u8>>, String> {
+    (0..texture.level_count())
+        .map(|level| texture.level(level))
+        .collect()
+}
+
+/// Puts what blends and glows into world space, kept apart from the scene's clusters.
+fn build_cards(
+    document: &Document,
+    folder: &Path,
+    placements: &[Placement],
+    options: &LargeOptions,
+) -> Result<Cards, String> {
+    let mut cards = Cards::default();
+    let mut images: HashMap<(usize, usize), u32> = HashMap::new();
+    let mut buffers: HashMap<usize, Vec<buffer::Data>> = HashMap::new();
+    for placement in placements {
+        let source = placement.source;
+        let mesh = document
+            .meshes()
+            .nth(source.mesh)
+            .expect("from walking this file");
+        let primitive = mesh
+            .primitives()
+            .nth(source.primitive)
+            .expect("from walking this file");
+        let material = primitive.material();
+        let pbr = material.pbr_metallic_roughness();
+        let color = pbr.base_color_texture().expect("cards have one");
+        let glow = material.emissive_texture().expect("cards have one");
+        let key = (
+            color.texture().source().index(),
+            glow.texture().source().index(),
+        );
+        let image = match images.get(&key) {
+            Some(&image) => image,
+            None => {
+                let color = open_image(document, key.0, folder, &COLOR_FORMATS)?;
+                let glow = open_image(document, key.1, folder, &COLOR_FORMATS)?;
+                let name = material.name().unwrap_or("unnamed");
+                if (color.width, color.height) != (glow.width, glow.height) {
+                    return Err(format!(
+                        "card material '{name}': its colour and emissive maps differ in size"
+                    ));
+                }
+                let levels = color.width.max(color.height).ilog2() as usize + 1;
+                if !color.width.is_multiple_of(4)
+                    || !color.height.is_multiple_of(4)
+                    || color.level_count() != levels
+                    || glow.level_count() != levels
+                {
+                    return Err(format!(
+                        "card material '{name}': its maps need whole mip chains and a size in whole blocks"
+                    ));
+                }
+                cards.images.push(CardImage {
+                    width: color.width,
+                    height: color.height,
+                    color_mips: whole_chain(&color)?,
+                    glow_mips: whole_chain(&glow)?,
+                });
+                let image = cards.images.len() as u32 - 1;
+                images.insert(key, image);
+                image
+            }
+        };
+        if let std::collections::hash_map::Entry::Vacant(slot) = buffers.entry(source.mesh) {
+            slot.insert(load_mesh_buffers(document, &mesh, folder)?);
+        }
+        let geometry = read_primitive(&primitive, &buffers[&source.mesh], false);
+        let first_vertex = cards.vertices.len() as u32;
+        cards.vertices.extend(geometry.indices.iter().map(|&index| {
+            let vertex = geometry.vertices[index as usize];
+            CardVertex {
+                position: placement
+                    .transform
+                    .transform_point3(vertex.position)
+                    .to_array(),
+                uv: vertex.uv.to_array(),
+            }
+        }));
+        let [red, green, blue] = material.emissive_factor();
+        cards.cards.push(Card {
+            first_vertex,
+            vertex_count: cards.vertices.len() as u32 - first_vertex,
+            image,
+            opacity: pbr.base_color_factor()[3],
+            emissive: [red, green, blue].map(|c| c * options.glow_strength),
+        });
+    }
+    Ok(cards)
+}
+
 fn convert_material(
     document: &Document,
     index: Option<usize>,
-    textures: bool,
+    options: &LargeOptions,
     layers: &mut LayerTable,
+    glow: &mut GlowTable,
     warnings: &mut Vec<String>,
 ) -> Material {
+    let textures = options.textures;
     let Some(source) = index.and_then(|i| document.materials().nth(i)) else {
         return Material {
             base_color: [1.0; 4],
@@ -916,7 +1090,11 @@ fn convert_material(
             "material '{name}': alpha mode Blend is drawn as opaque"
         ));
     }
-    if source.emissive_texture().is_some() {
+    let glow_layer = source
+        .emissive_texture()
+        .filter(|_| textures)
+        .and_then(|map| glow.slot(map.texture().source().index()));
+    if source.emissive_texture().is_some() && glow_layer.is_none() {
         warnings.push(format!(
             "material '{name}': emissive texture is ignored, only its factor is used"
         ));
@@ -966,12 +1144,20 @@ fn convert_material(
     let has_roughness_map = key.is_some() && metallic_roughness.is_some();
     Material {
         base_color: pbr.base_color_factor(),
-        emissive: [er, eg, eb],
+        emissive: [er, eg, eb].map(|c| {
+            c * options.glow_strength
+                * if glow_layer.is_some() {
+                    Material::GLOW_MAP_AVERAGE
+                } else {
+                    1.0
+                }
+        }),
         flags: if source.double_sided() {
             Material::TWO_SIDED
         } else {
             0
-        } | if masked { Material::MASKED } else { 0 },
+        } | if masked { Material::MASKED } else { 0 }
+            | glow_layer.map_or(0, |layer| (layer + 1) << Material::GLOW_SHIFT),
         roughness: pbr.roughness_factor() * if has_roughness_map { 0.5 } else { 1.0 },
         metallic: pbr.metallic_factor(),
         uv_scale: 1.0,

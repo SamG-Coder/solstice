@@ -62,6 +62,7 @@ impl Resolve {
         wetness: &wgpu::BindGroupLayout,
         skinned: bool,
         regions: Option<RegionPlan>,
+        glow: bool,
     ) -> Self {
         let mut data_layout = LayoutBuilder::new()
             .uniform()
@@ -79,7 +80,7 @@ impl Resolve {
             data_layout = data_layout.storage_read().storage_read();
         }
         let data_layout = data_layout.build(gpu, "resolve data");
-        let output_layout = LayoutBuilder::new()
+        let mut output_layout = LayoutBuilder::new()
             .storage_texture(ALBEDO_FORMAT)
             .storage_texture(NORMAL_FORMAT)
             .storage_texture(EMISSIVE_FORMAT)
@@ -94,9 +95,21 @@ impl Resolve {
             .texture_array()
             .texture_array()
             .texture_array()
-            .texture_array()
-            .build(gpu, "resolve output");
-        let module = shaders::module_for(&gpu.device, "vg/resolve.wgsl", skinned, regions);
+            .texture_array();
+        if glow {
+            output_layout = output_layout.texture_array();
+        }
+        let output_layout = output_layout.build(gpu, "resolve output");
+        let mut source = shaders::expand_for("vg/resolve.wgsl", skinned, regions);
+        if !glow {
+            source = shaders::without_glow(&source);
+        }
+        let module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("vg/resolve.wgsl"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
         Self {
             pipeline: gpu.compute_pipeline(
                 "resolve",
@@ -137,10 +150,8 @@ impl Resolve {
                 }
                 gpu.bind_group("resolve data", &self.data_layout, &resources)
             },
-            output: gpu.bind_group(
-                "resolve output",
-                &self.output_layout,
-                &[
+            output: {
+                let mut resources = vec![
                     wgpu::BindingResource::TextureView(&gbuffer.albedo.view),
                     wgpu::BindingResource::TextureView(&gbuffer.normal.view),
                     wgpu::BindingResource::TextureView(&gbuffer.emissive.view),
@@ -156,8 +167,12 @@ impl Resolve {
                     wgpu::BindingResource::TextureView(&scene.textures.top.color_view),
                     wgpu::BindingResource::TextureView(&scene.textures.top.normal_view),
                     wgpu::BindingResource::TextureView(&scene.textures.top.material_view),
-                ],
-            ),
+                ];
+                if let Some(glow) = &scene.glow_maps {
+                    resources.push(wgpu::BindingResource::TextureView(glow));
+                }
+                gpu.bind_group("resolve output", &self.output_layout, &resources)
+            },
         }
     }
 
