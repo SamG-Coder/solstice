@@ -76,6 +76,16 @@ the same resolve shader and bindings as before.
 
 ## Viewing it
 
-The full scene's cluster table and the page pool it wants are each over wgpu's 2 GiB binding limit, so `viewer --stream --geometry-budget-mb N` splits them between bindings for such a scene (`crates/solstice-render/src/regions.rs`): cluster records in two, and the pool in three by how simplified a page is. Pages are stored coarsest first, so the far band fills with the pages every other page depends on. The whole of Zorah has more of those always-loaded pages (19,537) than one binding holds (16,383), so the rest of the far band's pages go in the middle band. **This path is supported only natively on x64 with an RTX 5080.** It needs 11 storage buffers per stage. Scenes that fit in single bindings don't use it, and compile the same shaders with the same limits as before.
+The whole map runs in the browser, served locally. A browser has 4 GiB of memory, and the scene's manifest unpacks to 5.65 GB, so it needs a second file holding the manifest without its 3.05 GB of cluster records and 2.07 GB of pinned pages, which follow it uncompressed. Make it from a baked scene, which takes about a minute and needs no re-bake:
+
+```
+bake --web-split zorah.solstice --output zorah.web
+```
+
+Put `zorah.solstice` and `zorah.web` in `dist/assets/`, serve `dist/` and open `?scene=zorah&split&geometry-mb=4500&texture-mb=1000`. The page hands those tables to the GPU in parts, and pages still stream from the scene file. The browser keeps only the 12 bytes of each cluster record that change as pages come and go. The file version doesn't change, and the native viewer refuses the `.web` file.
+
+Tested by hand on one machine: Chrome 152 (Dawn), RTX 5080, Windows 11, at 1600×900, at budgets of 4,500 MiB geometry and 1,000 MiB textures. The tables load in about 12 seconds, and the opening view ran at 125 fps, 30.8 million triangles, with no GPU errors and about 10.7 GB in use on the card. CI doesn't run this path; a GPU test covers the split path on small scenes natively.
+
+The full scene's cluster table and the page pool it wants are each over wgpu's 2 GiB binding limit, so `viewer --stream --geometry-budget-mb N` splits them between bindings for such a scene (`crates/solstice-render/src/regions.rs`): cluster records in two, and the pool in three by how simplified a page is. Pages are stored coarsest first, so the far band fills with the pages every other page depends on. The whole of Zorah has more of those always-loaded pages (19,537) than one binding holds (16,383), so the rest of the far band's pages go in the middle band. The path is for an RTX 5080 on x64, natively or in Chrome. It needs 11 storage buffers per stage, and Chrome 152 reports 16 on that card, with a 2,147,483,644-byte storage binding and a 2 GiB buffer limit. Integrated GPUs are out of scope for this scene. Scenes that fit in single bindings don't use it, and compile the same shaders with the same limits as before.
 
 To run the renderer's GPU tests through this path on small scenes: `SOLSTICE_FORCE_REGIONS=1 cargo test -p solstice-render --test gpu`.

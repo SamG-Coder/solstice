@@ -8,8 +8,8 @@
 //! Only such a scene pays for any of this. The shaders are rewritten for it as text, so a scene
 //! that fits compiles the source it always did, with the bindings and limits it always had.
 //!
-//! **Supported only natively on x64 with an RTX 5080**, the one setup these scenes are for. Other
-//! devices may work, and fail with a clear message if they offer too few storage buffers.
+//! For an RTX 5080 on x64, natively or in Chrome: the one setup these scenes are for. Other devices
+//! may work, and fail with a clear message if they offer too few storage buffers.
 //!
 //! A pool address holds its band in the top two bits, above the place within that band's buffer.
 //! Adding a cluster's local offset to it needs no special care, and `counts` is left alone.
