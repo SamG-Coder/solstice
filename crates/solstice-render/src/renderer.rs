@@ -849,7 +849,7 @@ impl Renderer {
 
         // Everything below draws what's installed from here on, with instances where they are
         // this frame.
-        self.streamer.update(gpu, &self.scene);
+        self.streamer.update(gpu, &self.scene, delta_seconds);
         let changes = self.scene.update_instances(gpu);
         let streamed = self.streamer.should_refresh_cached_views();
         let shadows_streamed = streamed & (1 << HOLD_SHADOWS) != 0;

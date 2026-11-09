@@ -29,6 +29,15 @@ const NODE_FLAGS_OFFSET: u64 = std::mem::offset_of!(PackedNode, is_leaf) as u64;
 const MERGE_GAP_CLUSTERS: usize = 8;
 /// Pages to install per frame. Each costs little, but many at once would be felt as a hitch.
 const INSTALLS_PER_FRAME: u32 = 32;
+/// The streamer's clock: it counts time in ticks of a sixtieth of a second, and everything here
+/// and in `residency.rs` that is measured in frames is measured in these. At sixty frames a
+/// second a frame is a tick. A host drawing two hundred frames a second would otherwise plan,
+/// and let go of what it holds, three times as often as one drawing sixty.
+const TICKS_PER_SECOND: f32 = 60.0;
+/// How many pages of a scene with pools by level of detail install in a second, at most: more
+/// than a host can fetch, shared out over the frames, so that a fast frame isn't given a slow
+/// frame's worth of uploads.
+const INSTALLS_PER_SECOND_LARGE: f32 = 9000.0;
 /// The same for a scene with pools by level of detail, for which a new view is thousands of pages.
 const INSTALLS_PER_FRAME_LARGE: u32 = 192;
 /// Frames between plans of such a scene. Each looks over more than a million pages, and new
@@ -119,6 +128,8 @@ pub struct Streamer {
     changed_since_refresh: u8,
     frames_since_refresh: u32,
     last_plan_frame: u32,
+    /// The part of a tick that has passed since the last whole one.
+    tick_fraction: f32,
 }
 
 /// The host's copy of the cluster records, which installing pages changes.
@@ -303,6 +314,7 @@ impl Streamer {
             changed_since_refresh: 0,
             frames_since_refresh: 0,
             last_plan_frame: 0,
+            tick_fraction: 0.0,
         }
     }
 
@@ -329,9 +341,10 @@ impl Streamer {
         }
     }
 
-    /// Queues a copy of the requests since the last one, if that has been dealt with.
+    /// Queues a copy of the requests since the last one, if that has been dealt with: read
+    /// back, and planned for. Copying sooner would only bring requests that wait behind those.
     pub fn capture_requests(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        self.requests_copied = self.feedback.capture(encoder);
+        self.requests_copied = self.fresh_requests.is_none() && self.feedback.capture(encoder);
     }
 
     /// Starts reading back requests captured this frame. Call after submitting.
@@ -340,14 +353,27 @@ impl Streamer {
     }
 
     /// One frame's work: picks up requests read back and installs waiting pages.
-    pub fn update(&mut self, gpu: &Gpu, scene: &GpuScene) {
-        self.frame = self.frame.wrapping_add(1);
-        self.frames_since_refresh = self.frames_since_refresh.saturating_add(1);
+    ///
+    /// `delta_seconds` is the time since the last call. A host that holds time still, passing
+    /// none, is taken to draw sixty frames a second.
+    pub fn update(&mut self, gpu: &Gpu, scene: &GpuScene, delta_seconds: f32) {
+        let seconds = if delta_seconds > 0.0 {
+            delta_seconds.min(0.25)
+        } else {
+            1.0 / TICKS_PER_SECOND
+        };
+        // A little over, so that a frame of exactly a tick is never rounded down to none.
+        self.tick_fraction += seconds * TICKS_PER_SECOND;
+        let ticks = (self.tick_fraction + 1.0e-3) as u32;
+        self.tick_fraction = (self.tick_fraction - ticks as f32).max(0.0);
+        self.frame = self.frame.wrapping_add(ticks);
+        self.frames_since_refresh = self.frames_since_refresh.saturating_add(ticks);
         if let Some(requests) = self.feedback.take_latest() {
             self.fresh_requests = Some(requests);
         }
         let installs = if self.regions.is_some() {
-            INSTALLS_PER_FRAME_LARGE
+            ((seconds * INSTALLS_PER_SECOND_LARGE) as u32)
+                .clamp(INSTALLS_PER_FRAME, INSTALLS_PER_FRAME_LARGE)
         } else {
             INSTALLS_PER_FRAME
         };
