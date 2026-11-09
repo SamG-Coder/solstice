@@ -8,7 +8,7 @@ mod feedback;
 pub mod residency;
 pub mod textures;
 
-use crate::regions::{page_bands, RegionPlan};
+use crate::regions::{binding_slots, page_bands, RegionPlan};
 use crate::scene::{
     starting_materials, unpack_bc5, unpack_bc7, GpuScene, TierArrays, UNPACKED_MAX_EDGE,
 };
@@ -120,7 +120,7 @@ impl Streamer {
             Some(regions) => Residency::with_bands(
                 scene.page_dependencies(),
                 scene.pinned_pages,
-                page_bands(scene),
+                page_bands(scene, binding_slots(&gpu.limits)),
                 &regions.band_slots,
             ),
             None => Residency::new(scene.page_dependencies(), scene.pinned_pages, slots),
