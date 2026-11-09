@@ -471,6 +471,63 @@ fn a_scene_whose_tables_arrive_separately_draws_the_same() {
     assert_eq!(actual, expected);
 }
 
+/// With prefetch on, pages load for what is near the camera but behind it, down to a coarser
+/// level than for what it sees.
+#[test]
+fn prefetch_loads_what_is_near_but_out_of_view() {
+    let Some(gpu) = request_gpu() else { return };
+    // Two meshes, so that each has pages of its own: one in view, one behind the camera.
+    let scene = SceneAsset {
+        meshes: vec![
+            build_virtual_mesh(&sphere(7), &BuildOptions::default()),
+            build_virtual_mesh(&sphere(7), &BuildOptions::default()),
+        ],
+        materials: vec![Material::default()],
+        instances: vec![
+            instance(0, Mat4::IDENTITY),
+            instance(1, Mat4::from_translation(Vec3::new(0.0, 0.0, 3.2))),
+        ],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    const SIZE: u32 = 256;
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 1.6),
+        fov_y: 50.0_f32.to_radians(),
+        near: 0.05,
+        ..Default::default()
+    };
+    let installed = |prefetch_radius: f32| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Albedo,
+            temporal_accumulation: false,
+            prefetch_radius,
+            ..Default::default()
+        };
+        let mut renderer =
+            Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, generous_budget());
+        let target = test_target(&gpu, SIZE);
+        let view = target.create_view(&Default::default());
+        let mut queue = Vec::new();
+        for _ in 0..160 {
+            pump(&mut renderer, &loaded, &mut queue, 8);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        renderer.stats().streaming.installed
+    };
+    let pinned = loaded.scene.pinned_pages;
+    let (facing, around, far) = (installed(0.0), installed(10.0), installed(0.05));
+    let seen = facing - pinned;
+    assert!(seen > 2, "the sphere in view streams in: {seen} pages");
+    let behind = around - facing;
+    assert!(behind > 0, "what is behind the camera loads too");
+    assert!(behind < seen, "but coarser: {behind} pages against {seen}");
+    assert_eq!(far, facing, "and not from beyond the radius");
+}
+
 /// The scene starts with only its coarsest pages and fills in slowly. Every frame along the way
 /// must cover the whole sphere, with detail only ever being added.
 #[test]

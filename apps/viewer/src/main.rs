@@ -610,6 +610,10 @@ mod native {
                 }
                 "--flyover" => options.flyover = Some(PathBuf::from(value()?)),
                 "--out" => options.flyover_out = PathBuf::from(value()?),
+                "--prefetch" => {
+                    options.settings.prefetch_radius =
+                        value()?.parse().map_err(|e| format!("--prefetch: {e}"))?;
+                }
                 "--move" => {
                     options.capture_motion =
                         value()?.parse().map_err(|e| format!("--move: {e}"))?;

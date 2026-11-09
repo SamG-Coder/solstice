@@ -85,6 +85,10 @@ pub struct RendererSettings {
     /// The same, in shadow map texels. Shadow maps are the costliest pass on small GPUs, and
     /// a shadow's outline hides far more error than a directly visible surface does.
     pub shadow_lod_threshold: f32,
+    /// For a streamed scene: how far around the camera, in metres, pages are loaded for what it
+    /// isn't facing, at a coarser level of detail, so that turning or moving fast starts from
+    /// more than the coarsest geometry. 0 loads only what is seen.
+    pub prefetch_radius: f32,
     /// Internal resolution relative to the output. Temporal upscaling fills in the rest.
     pub render_scale: f32,
     pub debug_view: DebugView,
@@ -115,6 +119,7 @@ impl Default for RendererSettings {
         Self {
             lod_threshold: 1.0,
             shadow_lod_threshold: 1.0,
+            prefetch_radius: 0.0,
             render_scale: 1.0,
             debug_view: DebugView::Lit,
             temporal_accumulation: true,
@@ -1362,6 +1367,8 @@ impl Renderer {
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             masked_lists: 1,
+            prefetch_radius: self.settings.prefetch_radius,
+            _pad_prefetch: [0; 3],
         };
         self.view_slots.write(
             gpu,

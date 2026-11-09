@@ -40,6 +40,9 @@ struct PassView {
     // 1 if this view sends cut-out clusters through their own lists and rasterizers; 0 if it
     // draws them with the rest, as solid or testing the mask itself.
     masked_lists: u32,
+    // For the camera's own view of a streamed scene: how far around the camera pages are asked
+    // for that it isn't facing, at a coarser level of detail. 0 for none.
+    prefetch_radius: f32,
 }
 
 // Twins of `InstanceFilter` in vg/culling.rs.

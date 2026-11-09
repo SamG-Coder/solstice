@@ -53,6 +53,10 @@ pub struct PassView {
     /// 1 if this view sends cut-out clusters through their own lists and rasterizers; 0 if it
     /// draws them with everything else, solid or testing the mask itself.
     pub masked_lists: u32,
+    /// For the camera's own view of a streamed scene: how far around the camera pages are asked
+    /// for that it isn't facing, at a coarser level of detail. 0 for none.
+    pub prefetch_radius: f32,
+    pub _pad_prefetch: [u32; 3],
 }
 
 /// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
@@ -124,6 +128,8 @@ impl PassView {
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             masked_lists: 0,
+            prefetch_radius: 0.0,
+            _pad_prefetch: [0; 3],
         }
     }
 
@@ -640,6 +646,7 @@ mod tests {
                 receiver_planes,
                 eye_light,
                 masked_lists,
+                prefetch_radius,
             ]
         );
     }

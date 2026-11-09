@@ -69,6 +69,9 @@ pub struct WebViewer {
     messages: Vec<crate::play::Message>,
 }
 
+/// How far around the camera a scene read in parts loads what isn't in view, in metres.
+const LARGE_SCENE_PREFETCH: f32 = 24.0;
+
 #[wasm_bindgen]
 impl WebViewer {
     /// Creates a viewer from an unpacked manifest of a scene, which draws what it has while
@@ -146,7 +149,15 @@ impl WebViewer {
             &gpu,
             &scene,
             config.format,
-            RendererSettings::default(),
+            RendererSettings {
+                // A scene this large takes a moment to bring in what a turn reveals.
+                prefetch_radius: if scene.external.is_some() {
+                    LARGE_SCENE_PREFETCH
+                } else {
+                    0.0
+                },
+                ..Default::default()
+            },
             budget,
         );
         Ok(WebViewer {

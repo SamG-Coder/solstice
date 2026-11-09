@@ -36,6 +36,8 @@ const REQUEST_LOWEST_LOAD: u32 = 2u;
 const REQUEST_PER_PIXEL: f32 = 16.0;
 const REQUEST_MAX_PIXELS: f32 = 100000.0;
 // Shadow and voxel views only affect the image indirectly, so they yield to the main camera.
+// How many times coarser what is near but out of view may be than if it were seen.
+const PREFETCH_RELAX: f32 = 4.0;
 const REQUEST_ORTHO_WEIGHT: f32 = 0.125;
 // `Instance.texture_info` of a material with no texture.
 const NO_TEXTURE: u32 = 0xffffffffu;
@@ -362,6 +364,20 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     let center = transform_point(instance, node.center);
     let radius = (node.radius + instance.lod_margin) * instance.max_scale;
     if !in_frustum(center, radius) {
+        // Near the camera but out of its view: nothing is drawn, but pages are asked for down
+        // to a coarser level, so that a turn or a fast move finds more than the coarsest
+        // geometry already there. What is in view is always wanted more.
+        if view.prefetch_radius > 0.0 && view.phase == 0u
+            && parent_pixels > view.lod_threshold * PREFETCH_RELAX
+            && distance(center, view.camera_position) - radius < view.prefetch_radius {
+            if node.is_leaf == 0u {
+                for (var i = 0u; i < node.count; i++) {
+                    push_queue(QueueEntry(entry.instance, node.first + i));
+                }
+            } else {
+                atomicMax(&page_requests[page], REQUEST_LOWEST_LOAD);
+            }
+        }
         return;
     }
     if !passes_occlusion(center, radius) {
