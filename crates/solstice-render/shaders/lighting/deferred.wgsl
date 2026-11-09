@@ -94,6 +94,9 @@ fn local_light(index: u32, s: Surface, view: vec3f, world: vec3f) -> vec3f {
     return shade_light(s, view, direction) * light.intensity * falloff * open;
 }
 
+// The most of the haze's glow that skylight alone gives the air, where no sun reaches it.
+const AIR_SKY_SHARE: f32 = 0.25;
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     let size = vec2u(frame.viewport);
@@ -197,7 +200,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     color += emissive;
 
-    color = aerial_perspective(color, world, view, distance);
+    // The air between glows only as far as light reaches it: sunlight by the shadow maps, and
+    // skylight by how much of the open sky's light arrives here.
+    let air_sun = air_lit(view, distance, noise);
+    let open_sky = PI * luminance(clear_sky_radiance(vec3f(0.0, 1.0, 0.0)));
+    let air_sky = clamp(luminance(irradiance) / max(open_sky, 1.0e-4), 0.0, 1.0) * AIR_SKY_SHARE;
+    color = aerial_perspective_lit(color, world, view, distance, mix(air_sky, 1.0, air_sun));
 
     switch frame.debug_mode {
         case DEBUG_DIFFUSE_GI: {

@@ -67,6 +67,12 @@ const HAZE: f32 = 0.0011;
 // `color` of a surface at `world`, `distance` from the camera along `view` (towards the camera),
 // seen through the air between: distant things fade towards the sky colour behind them.
 fn aerial_perspective(color: vec3f, world: vec3f, view: vec3f, distance: f32) -> vec3f {
+    return aerial_perspective_lit(color, world, view, distance, 1.0);
+}
+
+// The same, where only `lit` of the air between is lit: under a roof the air scatters almost no
+// light towards the eye, and a room would otherwise fill with the glow of the open sky.
+fn aerial_perspective_lit(color: vec3f, world: vec3f, view: vec3f, distance: f32, lit: f32) -> vec3f {
     let transmittance = exp(-distance * HAZE);
     // How far into the haze this is: nearby haze glows with light from all around, but over a
     // long path the air takes the colour of the sky at the horizon behind the object.
@@ -86,7 +92,7 @@ fn aerial_perspective(color: vec3f, world: vec3f, view: vec3f, distance: f32) ->
     let haze_limit = luminance(clear_sky_radiance(away_from_sun)) * shade * 2.0;
     haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
     haze_color = mix(haze_color, clear_sky_radiance(toward_horizon(-view)) * shade, far);
-    return mix(haze_color, color, transmittance);
+    return mix(haze_color * lit, color, transmittance);
 }
 
 // Radiance of the sky towards `direction`, clouds included, excluding the sun disc.

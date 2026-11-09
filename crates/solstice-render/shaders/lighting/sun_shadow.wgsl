@@ -69,6 +69,35 @@ fn sample_cascade(cascade: u32, world: vec3f, normal: vec3f, angle: f32) -> f32 
     return lit;
 }
 
+// Whether the sun reaches a point in the air, `distance` from the camera: one tap, unfiltered.
+// Past the cascades the air is taken as lit.
+fn air_tap(point: vec3f, distance: f32) -> f32 {
+    for (var cascade = 0u; cascade < CASCADE_COUNT; cascade++) {
+        if distance < shadows.splits[cascade] {
+            let clip = shadows.view_proj[cascade] * vec4f(point, 1.0);
+            let uv = vec2f(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
+            if any(uv < vec2f(0.0)) || any(uv > vec2f(1.0)) || clip.z > 1.0 {
+                return 1.0;
+            }
+            return textureSampleCompareLevel(shadow_maps, shadow_sampler, uv, i32(cascade), clip.z);
+        }
+    }
+    return 1.0;
+}
+
+const AIR_SAMPLES: u32 = 4u;
+
+// How much of the air between the camera and a surface `distance` away the sun reaches. `view`
+// points from the surface to the camera. The taps are jittered, for TAA to resolve.
+fn air_lit(view: vec3f, distance: f32, noise: f32) -> f32 {
+    var lit = 0.0;
+    for (var i = 0u; i < AIR_SAMPLES; i++) {
+        let along = distance * (f32(i) + noise) / f32(AIR_SAMPLES);
+        lit += air_tap(frame.camera_position - view * along, along);
+    }
+    return lit / f32(AIR_SAMPLES);
+}
+
 fn sun_shadow(world: vec3f, normal: vec3f, distance: f32, noise: f32) -> f32 {
     var cascade = CASCADE_COUNT;
     for (var i = 0u; i < CASCADE_COUNT; i++) {

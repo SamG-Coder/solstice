@@ -19,6 +19,13 @@ const SCREEN_DISTANCE: f32 = 200.0;
 const SCREEN_STEPS: u32 = 64u;
 const SCREEN_THICKNESS: f32 = 0.25;
 const REFINE_ATTEMPTS: u32 = 6u;
+// The smoothest a surface is taken to be when it reflects the GI volume.
+const VOLUME_MIN_ROUGHNESS: f32 = 0.25;
+// How many times what has built up at a pixel one sample may be, on a smooth and a rough surface.
+const SMOOTH_REACH: f32 = 16.0;
+const ROUGH_REACH: f32 = 3.0;
+// The share of itself a sample is always allowed, so that a dark history can brighten.
+const FIREFLY_SHARE: f32 = 0.02;
 
 // Samples the GGX distribution of visible normals (Heitz 2018).
 fn sample_vndf(view_local: vec3f, a: f32, u: vec2f) -> vec3f {
@@ -120,6 +127,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     if screen.weight < 1.0 {
         let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
         let voxel = volume_params.levels[level].w;
+        // Voxels are coarse, so a sharp reflection of them shows their blocks. A smooth surface
+        // sees them spread as a rougher one would.
+        if roughness < VOLUME_MIN_ROUGHNESS {
+            let spread = basis * sample_vndf(view_local, VOLUME_MIN_ROUGHNESS * VOLUME_MIN_ROUGHNESS, noise);
+            let wider = reflect(-view, spread);
+            if dot(wider, normal) > 0.0 {
+                direction = wider;
+            }
+        }
         let hit = trace_refined(world + normal * voxel * 1.5, direction, voxel * 0.5);
         let sky = sky_radiance(toward_horizon(direction));
         // Fade by where the ray ended up. A ray leaving the volume before reaching something sees
@@ -144,6 +160,19 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let previous_uv = center * frame.inv_viewport + motion;
     if all(previous_uv > vec2f(0.0)) && all(previous_uv < vec2f(1.0)) && frame.frame_index > 0u {
         let history = textureSampleLevel(reflection_history, clamp_sampler, previous_uv, 0.0);
+        // A rough surface's rays scatter, and one in many finds something far brighter than the
+        // rest: the sky through a gap, a sunlit patch. Such a sample is held to a few times what
+        // has built up here, plus a small share of itself so that a dark history can still
+        // brighten. A smooth surface's rays agree with each other, and are trusted further.
+        if history.a > 0.5 {
+            let known = luminance(history.rgb / history.a);
+            let reach = mix(SMOOTH_REACH, ROUGH_REACH, smoothstep(0.08, 0.4, roughness));
+            let brightest = max(result.x, max(result.y, result.z));
+            let allowed = known * reach + brightest * FIREFLY_SHARE;
+            if brightest > allowed {
+                result = vec4f(result.rgb * (allowed / brightest), result.a);
+            }
+        }
         // Rough reflections are noisier and depend less on the view, so they keep more history.
         let blend = frame_rate_blend(mix(0.25, 0.07, clamp(roughness / MAX_TRACED_ROUGHNESS, 0.0, 1.0)), frame.frame_seconds);
         let moved = length(motion * frame.viewport);
