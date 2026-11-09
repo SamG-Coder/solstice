@@ -903,11 +903,8 @@ mod native {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             let stats = renderer.stats().streaming;
             let textures_busy = stats.texture_fetches > 0;
-            if stats.installed == before
-                && stats.in_transit == 0
-                && !textures_busy
-                && reader.is_idle()
-            {
+            // Pages may be left waiting with nowhere to go, so those don't count as busy.
+            if stats.installed == before && !textures_busy && reader.is_idle() {
                 quiet += 1;
             } else {
                 quiet = 0;
