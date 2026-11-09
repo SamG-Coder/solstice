@@ -11,8 +11,8 @@ use solstice_builder::{
     Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
-    StreamRequest, StreamingBudget, TimeOfDay, Weather,
+    Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Pond, Quality, Renderer,
+    RendererSettings, StreamRequest, StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
 
@@ -2040,6 +2040,105 @@ fn what_stands_out_of_the_sea_is_not_covered_by_it() {
         "the sea in front is missing: {:?}",
         at(64, 120)
     );
+}
+
+/// The ball on its floor with these ponds, and a calm sea at `sea` if any, as finally drawn.
+fn render_ponds(gpu: &Gpu, camera: &Camera, ponds: &[Pond], sea: Option<f32>) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut settings = RendererSettings::default();
+    settings.apply_quality(Quality::High);
+    // Each pixel is then this frame's alone, so one outside a pond can be held to what it was.
+    settings.temporal_accumulation = false;
+    let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
+    if let Some(level) = sea {
+        renderer.set_ocean(Some(Ocean::by_name("murky").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+    }
+    renderer.set_ponds(ponds);
+    // Daylight well above what the views measure keeps exposure at its limit, the same for all.
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        daylight_illuminance: 4000.0,
+        ..Default::default()
+    };
+    let target = test_target(gpu, POND_SIZE);
+    let view = target.create_view(&Default::default());
+    for _ in 0..30 {
+        renderer.render(
+            gpu,
+            camera,
+            &environment,
+            &view,
+            (POND_SIZE, POND_SIZE),
+            1.0 / 60.0,
+        );
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, POND_SIZE);
+    let errors = errors.lock().unwrap();
+    assert!(
+        errors.is_empty(),
+        "GPU errors: {}",
+        errors.join(
+            "
+"
+        )
+    );
+    pixels
+}
+
+const POND_SIZE: u32 = 128;
+
+/// How far apart two colours are: the most any channel differs.
+fn apart(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn a_pond_is_water_within_its_rectangle_and_nothing_outside_it() {
+    let Some(gpu) = request_gpu() else { return };
+    // Looking down at the floor with the ball in the middle. A pond 2.5 m deep covers the floor
+    // to the ball's left, and stops short of the ball.
+    let camera = Camera {
+        position: Vec3::new(0.0, 8.0, 10.0),
+        pitch: -0.7,
+        ..Default::default()
+    };
+    let pond = Pond::parse("-60,-60,-1.5,60,2.5").unwrap();
+    let dry = render_ponds(&gpu, &camera, &[], None);
+    let wet = render_ponds(&gpu, &camera, &[pond], None);
+    let (left, right, row) = (POND_SIZE / 4, POND_SIZE * 3 / 4, POND_SIZE / 2);
+    let changed = apart(
+        patch(&dry, POND_SIZE, left, row, 6),
+        patch(&wet, POND_SIZE, left, row, 6),
+    );
+    let kept = apart(
+        patch(&dry, POND_SIZE, right, row, 6),
+        patch(&wet, POND_SIZE, right, row, 6),
+    );
+    assert!(kept < 3.0, "the floor outside the pond changed by {kept}");
+    assert!(
+        changed > 20.0,
+        "the floor under the pond changed by only {changed}"
+    );
+
+    // A scene with a sea draws the sea, and its ponds not at all.
+    let sea = render_ponds(&gpu, &camera, &[], Some(1.0));
+    let both = render_ponds(&gpu, &camera, &[pond], Some(1.0));
+    for x in [left, right] {
+        let differs = apart(
+            patch(&sea, POND_SIZE, x, row, 6),
+            patch(&both, POND_SIZE, x, row, 6),
+        );
+        assert!(differs < 3.0, "a pond changed the sea by {differs} at {x}");
+    }
 }
 
 #[test]

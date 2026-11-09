@@ -27,8 +27,8 @@ mod native {
     use solstice_asset::scene::Viewpoint;
     use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Effect, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
-        StreamRequest, StreamingBudget, TimeOfDay, Weather,
+        Camera, DebugView, Effect, Environment, Gpu, Ocean, Pond, Quality, Renderer,
+        RendererSettings, StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
     use solstice_viewer::bob::Bobbing;
     use solstice_viewer::play::PlayMode;
@@ -213,6 +213,7 @@ mod native {
             if let Some(level) = options.sea_level {
                 renderer.set_sea_level(level);
             }
+            renderer.set_ponds(&options.ponds);
             spawn_effects(&mut renderer, options);
             (renderer, reader)
         }
@@ -249,6 +250,8 @@ mod native {
         /// their own bring both.
         ocean: Option<Ocean>,
         sea_level: Option<f32>,
+        /// Still water to lay over the scene: each a rectangle and the water's height.
+        ponds: Vec<Pond>,
         /// Particle effects to run, by name or file, and where.
         effects: Vec<(Effect, Vec3)>,
         /// Instances to rock as if afloat: those centred within a radius of a point across the
@@ -421,6 +424,7 @@ mod native {
             weather: Weather::default(),
             ocean: None,
             sea_level: None,
+            ponds: Vec::new(),
             clock: None,
             effects: Vec::new(),
             bob: None,
@@ -540,6 +544,10 @@ mod native {
                 "--sea-level" => {
                     options.sea_level =
                         Some(value()?.parse().map_err(|e| format!("--sea-level: {e}"))?);
+                }
+                "--pond" => {
+                    let ponds = Pond::parse_list(&value()?).map_err(|e| format!("--pond: {e}"))?;
+                    options.ponds.extend(ponds);
                 }
                 "--weather" => {
                     let name = value()?;
@@ -1003,6 +1011,7 @@ mod native {
         if let Some(level) = options.sea_level {
             renderer.set_sea_level(level);
         }
+        renderer.set_ponds(&options.ponds);
         spawn_effects(&mut renderer, options);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),

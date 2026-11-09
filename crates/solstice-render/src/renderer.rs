@@ -10,6 +10,7 @@ use crate::lighting::{
     environment_group, environment_layout, DeferredLighting, LightShadows, LightTiles,
 };
 use crate::ocean::grid::PATCH_CELLS;
+use crate::ocean::pond::{Pond, PondWater};
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::waterline::{SeaViews, Waterline};
 use crate::ocean::{Ocean, Sea, SeaState};
@@ -252,7 +253,7 @@ struct SizedResources {
     light_tiles_group: wgpu::BindGroup,
     post: PostBindings,
     hdr: Target,
-    /// Where the water pass draws, when there is a sea.
+    /// Where the water pass draws, when there is a sea, or ponds.
     water: Option<WaterTargets>,
     /// The depth particles test against.
     particles: ParticleTargets,
@@ -305,6 +306,9 @@ pub struct Renderer {
     sea_level: f32,
     /// Draws and shades the sea's surface, when there is a sea.
     water: Option<WaterSurface>,
+    /// The scene's still water, and what shades it: made when there are ponds and no sea.
+    ponds: Vec<Pond>,
+    pond_water: Option<PondWater>,
     /// Effects, and the pool their particles live in.
     particles: Particles,
     /// The layout of the lighting bind group, for passes made after the renderer.
@@ -411,6 +415,24 @@ impl Renderer {
     /// Sets the calm sea's level, in metres.
     pub fn set_sea_level(&mut self, level: f32) {
         self.sea_level = level;
+    }
+
+    /// Sets the scene's ponds: level sheets of still, clear water. A scene with an open sea
+    /// draws the sea and not its ponds.
+    pub fn set_ponds(&mut self, ponds: &[Pond]) {
+        self.ponds = ponds.to_vec();
+        // Made again with the new ponds on the next frame, which has the GPU to hand.
+        self.pond_water = None;
+    }
+
+    /// Whether the frame has water over the lit scene, and whether that water is a sea.
+    fn water_kind(&self) -> Option<bool> {
+        (self.sea.is_some() || self.has_ponds()).then_some(self.sea.is_some())
+    }
+
+    /// Whether the scene's ponds are drawn: it has some, and no sea.
+    fn has_ponds(&self) -> bool {
+        self.sea.is_none() && !self.ponds.is_empty()
     }
 
     /// How many instances the scene has. Instances are named by their index in the scene file,
@@ -636,6 +658,8 @@ impl Renderer {
             ocean_request: None,
             sea_level: 0.0,
             water: None,
+            ponds: Vec::new(),
+            pond_water: None,
             environment_layout,
             sized: None,
             history: None,
@@ -820,6 +844,14 @@ impl Renderer {
                 &self.rasterizer,
                 cells,
             ));
+        }
+        if !self.has_ponds() {
+            self.pond_water = None;
+        } else if self.pond_water.is_none() {
+            let water = PondWater::new(gpu, &self.environment_layout);
+            let clear = Ocean::by_name("clear").unwrap_or_default();
+            water.set(gpu, &self.ponds, &clear);
+            self.pond_water = Some(water);
         }
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
@@ -1097,6 +1129,21 @@ impl Renderer {
                 },
                 &self.shadows,
             );
+        } else if let (Some(ponds), Some(targets)) = (&mut self.pond_water, &sized.water) {
+            ponds.record(
+                gpu,
+                &mut encoder,
+                &self.environment,
+                targets,
+                SceneViews {
+                    lit: &sized.hdr.view,
+                    depth: &sized.gbuffer.depth.view,
+                    motion: &sized.gbuffer.motion.view,
+                    depth_pyramid: sized.screen_gi.depth_pyramid_view(),
+                    normals: &sized.gbuffer.normal.view,
+                },
+                &self.shadows,
+            );
         }
 
         // Particles, over the lit scene and the water.
@@ -1181,7 +1228,7 @@ impl Renderer {
             s.render_size == render_size
                 && s.output_size == output_size
                 && s.screen_gi.probe_rays() == self.settings.probe_rays
-                && s.water.is_some() == self.sea.is_some()
+                && s.water.as_ref().map(WaterTargets::for_sea) == self.water_kind()
         });
         if unchanged {
             return;
@@ -1239,9 +1286,8 @@ impl Renderer {
             &self.light_shadows.view,
         );
         let water = self
-            .sea
-            .is_some()
-            .then(|| WaterTargets::new(gpu, render_size));
+            .water_kind()
+            .map(|sea| WaterTargets::new(gpu, render_size, sea));
         let (scene_color, scene_depth, scene_motion) = match &water {
             Some(water) => (
                 &water.color.view,

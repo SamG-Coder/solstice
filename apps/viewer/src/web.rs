@@ -498,6 +498,21 @@ impl WebViewer {
         )
     }
 
+    /// Lays still water over the scene: ponds written `x0,z0,x1,z1,level`, with `;` between
+    /// them. Returns false, changing nothing, if they can't be read.
+    pub fn set_ponds(&mut self, ponds: &str) -> bool {
+        match solstice_render::Pond::parse_list(ponds) {
+            Ok(ponds) => {
+                self.renderer.set_ponds(&ponds);
+                true
+            }
+            Err(error) => {
+                log::warn!("ponds: {error}");
+                false
+            }
+        }
+    }
+
     pub fn set_camera(&mut self, x: f32, y: f32, z: f32, yaw: f32, pitch: f32) {
         self.camera.camera.position = Vec3::new(x, y, z);
         self.camera.camera.yaw = yaw;

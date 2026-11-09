@@ -21,6 +21,7 @@
 //! wavelength, and [`waves`] turns that into moving waves on the GPU.
 
 pub mod grid;
+pub mod pond;
 pub mod sea;
 pub mod seabed;
 pub mod spectrum;
@@ -28,6 +29,7 @@ pub mod surface;
 pub mod waterline;
 pub mod waves;
 
+pub use pond::Pond;
 pub use sea::Sea;
 pub use spectrum::SeaState;
 pub use waves::OceanWaves;

@@ -67,6 +67,16 @@ The throne room has no lamps that light it: what is seen there is sunlight that 
 - **White patches lay at the foot of each step.** A reflection's ray counts as hitting only what it is closing in on, which its first sample can't tell. One starting at the foot of a riser, among the floor's voxels and below the middle of them, saw itself only leaving them, went through the floor and out under the scene, and brought back the sky. A ray that starts beside a surface other than its own has now hit it (`met_at_once` in `gi/reflections.wgsl`), a ray that leaves the volume pointing well down brings nothing where there is no sea, and one that runs out of steps among surfaces brings the light of the nearest (`miss_radiance`).
 - **White dots lay on the columns and doors.** One ray in many finds a window, two thousand times brighter than the room. A reflection sample was allowed several times the light around it, and a pixel seen for the first time anything at all. It is now held to about the light arriving there plus what has built up, new pixels too, and what is truly brighter builds up over a few frames.
 
+## Water
+
+The public export has basins and no water: no mesh, material or node of it describes a water surface. So the viewer is told where the water lies (`ocean/pond.rs`): `--pond x0,z0,x1,z1,level` natively and `?ponds=` on the page, a rectangle and a height each, with `;` between ponds, up to eight. For the courtyard's long pool and the two garden ponds:
+
+```
+24.13,-5.51,59.39,5.47,1.9;-1.67,-37.3,3.55,-23.07,1.5;-1.67,23.05,3.55,37.28,1.5
+```
+
+A pond is a level sheet of still, clear water, shaded as the sea's is, with what it reflects and what is seen through it. Nothing is drawn or simulated for it: one pass over the lit scene finds where each pixel's view ray meets a pond. A basin's own walls hide the sheet's edges. A scene with a sea draws the sea and not its ponds, and a scene with neither makes none of this.
+
 ## Cards
 
 Cards are drawn after the lit scene and water, and before particles (`src/cards.rs`,
