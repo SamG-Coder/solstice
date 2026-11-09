@@ -233,15 +233,27 @@ impl GpuScene {
                 (pool.clone(), pool, None)
             }
         };
-        let (clusters, clusters_more) = match regions {
-            Some(plan) => {
+        let empty = |label: &str, records: u64| {
+            let bytes = records * std::mem::size_of::<solstice_asset::PackedCluster>() as u64;
+            gpu.storage_buffer(label, bytes, wgpu::BufferUsages::COPY_DST)
+        };
+        let (clusters, clusters_more) = match (regions, scene.external) {
+            (Some(plan), Some(tables)) => {
+                let first = u64::from(plan.cluster_chunk);
+                (
+                    empty("clusters", first),
+                    Some(empty("clusters, more", tables.clusters - first)),
+                )
+            }
+            (None, Some(tables)) => (empty("clusters", tables.clusters), None),
+            (Some(plan), None) => {
                 let (first, rest) = scene.clusters.split_at(plan.cluster_chunk as usize);
                 (
                     gpu.storage_buffer_init("clusters", first),
                     Some(gpu.storage_buffer_init("clusters, more", rest)),
                 )
             }
-            None => (gpu.storage_buffer_init("clusters", &scene.clusters), None),
+            (None, None) => (gpu.storage_buffer_init("clusters", &scene.clusters), None),
         };
         Self {
             instances: gpu.storage_buffer_init("instances", &instances),

@@ -124,10 +124,14 @@ mod native {
         let mut packed = vec![0; header.manifest_bytes as usize];
         file.read_exact(&mut packed)?;
         let manifest = solstice_asset::file::inflate(&packed)?;
-        Ok(solstice_asset::file::decode_manifest(
+        let scene = solstice_asset::file::decode_manifest(
             &manifest,
             header.manifest_offset + header.manifest_bytes,
-        )?)
+        )?;
+        if scene.external.is_some() {
+            return Err("this is the file made for browsers: open the .solstice file".into());
+        }
+        Ok(scene)
     }
 
     /// A scene as this run holds it: all in memory, or read from disk as wanted.

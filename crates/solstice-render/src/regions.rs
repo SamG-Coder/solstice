@@ -88,7 +88,7 @@ impl RegionPlan {
     pub fn decide(limits: &wgpu::Limits, scene: &PagedScene, slots: u32) -> Option<Self> {
         let forced = std::env::var_os(FORCE_VARIABLE).is_some();
         let limit = binding_bytes(limits);
-        let cluster_bytes = scene.clusters.len() as u64 * CLUSTER_BYTES;
+        let cluster_bytes = scene.cluster_count() as u64 * CLUSTER_BYTES;
         let pool_bytes = u64::from(slots) * PAGE_BYTES as u64;
         if !forced && cluster_bytes <= limit && pool_bytes <= limit {
             return None;
@@ -99,7 +99,7 @@ impl RegionPlan {
              {REQUIRED_STORAGE_BUFFERS} storage buffers per stage, but this device offers {}",
             limits.max_storage_buffers_per_shader_stage
         );
-        let clusters = scene.clusters.len() as u32;
+        let clusters = scene.cluster_count() as u32;
         let cluster_chunk = if forced {
             // Half each, so that a small scene uses both bindings.
             clusters.div_ceil(2)
@@ -108,9 +108,9 @@ impl RegionPlan {
             ((limit / CLUSTER_BYTES) as u32).min(clusters)
         };
         assert!(
-            scene.clusters.len() as u64 <= u64::from(cluster_chunk) * 2,
+            scene.cluster_count() as u64 <= u64::from(cluster_chunk) * 2,
             "this scene has {} clusters, more than two bindings of {cluster_chunk} can hold",
-            scene.clusters.len()
+            scene.cluster_count()
         );
         Some(Self {
             cluster_chunk,
