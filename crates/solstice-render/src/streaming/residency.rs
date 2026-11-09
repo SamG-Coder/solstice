@@ -9,6 +9,14 @@ use std::collections::BTreeSet;
 /// In the request array, a page that was seen but occluded: worth keeping, not worth loading.
 pub const REQUEST_KEEP: u32 = 1;
 
+/// In the request array, the most a page is asked for with by a view that doesn't see it yet:
+/// one fetching ahead of need. Twin of `REQUEST_LOWEST_LOAD` in `vg/cull.wgsl`.
+pub const REQUEST_AHEAD: u32 = 2;
+
+/// How many times as wanted as an installed page a page without a slot must be to take its
+/// slot. Well over one, so that two pages wanted about as much don't keep changing places.
+pub const OUTBID: u32 = 2;
+
 /// Frames a page stays safe from eviction after it was last wanted. Long enough that looking
 /// around doesn't throw away what's about to be seen again.
 pub const PROTECTED_FRAMES: u32 = 30;
@@ -20,13 +28,43 @@ pub const PROTECTED_FRAMES_LARGE: u32 = 10;
 /// Frames an unpacked page may wait for a slot, unwanted, before it is thrown away.
 const ARRIVED_PATIENCE_FRAMES: u32 = 120;
 
-/// Frames a page stays safe after a view kept from frame to frame asked for it, or after it came
-/// for one. Such a view asks only when it is redrawn, and a page's coming makes it redraw: were
-/// the page let go in between, the redraw would ask for it again, and never stop.
+/// Frames a page stays safe after it came for a view kept from frame to frame, and frames of
+/// such a view's redrawing for which a page stays safe after the view asked for it. Such a view
+/// asks only when it is redrawn, and a page's coming makes it redraw: were the page let go in
+/// between, the redraw would ask for it again, and never stop. So only redraws that leave a
+/// page unasked count against it. While nothing redraws the view it stands on the page still,
+/// however long that is.
 pub const HOLD_FRAMES: u32 = 240;
+
+/// Frames in each of the two spans over which a page counts as wanted as much as it was asked
+/// for at most. Views ask by turns: one kept from frame to frame only when it is redrawn, and
+/// between its redraws a page it needs is asked for with far less by the others, or as one only
+/// hidden. Taken by the last asking alone, such a page would lose its slot at each turn and
+/// take another's at the next.
+pub const ASKED_FRAMES: u32 = 120;
+
+/// Frames of such views' redrawing for which a page counts as wanted as much as a view kept
+/// from frame to frame asked for it with at most. Such a view asks again only when something
+/// makes it redraw, and a page's coming does: so a page that lost its slot for being left
+/// unasked would be asked for again as soon as the page that took it came, and take it back.
+/// There are several such views of a kind, each redrawn in its own time and wanting the page as
+/// much as it sees of it. Long enough that this hardly happens, and not for ever, as a view may
+/// move on and not ask again. Also the frames after which a kind of such view that has asked
+/// for nothing counts as gone.
+pub const KEPT_ASKED_FRAMES: u32 = 3600;
 
 /// Frames for which a page's coming is news to the kept views that asked for it.
 const AWAIT_FRAMES: u32 = 3600;
+
+/// What is known of one kind of view kept from frame to frame.
+#[derive(Clone, Copy, Default)]
+struct Kept {
+    /// For how many frames its views were being redrawn: the frames up to each plan for which
+    /// one of them asked for a page.
+    redrawn: u32,
+    /// The frame of the last such plan.
+    asked_at: u32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -89,7 +127,7 @@ pub struct Residency {
     /// Each band's pages that may be evicted, likeliest last, found once a frame as that takes
     /// a whole scan.
     victims: Vec<Vec<u32>>,
-    victims_frame: u32,
+    victims_frame: Option<u32>,
     /// Pages let go by another band, whose records the caller must update.
     released: Vec<u32>,
     /// The frame, plus one, at which a view kept from frame to frame last asked for each page
@@ -100,6 +138,30 @@ pub struct Residency {
     /// The kinds of kept view for which such a page has installed since
     /// [`Self::take_awaited_arrival`].
     awaited_arrival: u8,
+    /// The most each page was asked for with in the span of [`ASKED_FRAMES`] it was last asked
+    /// in, and in the span before that one.
+    asked: Vec<[u32; 2]>,
+    /// The span each page was last asked in.
+    asked_span: Vec<u32>,
+    /// The most each page was asked for with as a view kept from frame to frame asked for it,
+    /// in the [`KEPT_ASKED_FRAMES`] before it was last asked for with that much, and what
+    /// `kept_redrawn` was then.
+    kept_asked: Vec<(u32, u32)>,
+    /// For how many frames views kept from frame to frame were being redrawn, of any kind: the
+    /// frames up to each plan for which one asked for a page.
+    kept_redrawn: u32,
+    /// Each kind of view kept from frame to frame that has asked for a page.
+    kept: Vec<Kept>,
+    /// For each such kind, and each page: [`Kept::redrawn`], plus one, when a view of the kind
+    /// last asked for the page. 0 for never.
+    held_at: Vec<u32>,
+    /// The frame of the last plan.
+    planned_at: u32,
+    /// The plan, as numbered by `plans`, that found each page outbid. Until the next plan such
+    /// a page may be evicted though it is wanted.
+    outbid: Vec<u32>,
+    /// How many plans have been made, from 1.
+    plans: u32,
 }
 
 impl Residency {
@@ -167,11 +229,20 @@ impl Residency {
             queue: Vec::new(),
             reclaimable_at_plan: vec![0; band_slots.len()],
             victims: vec![Vec::new(); band_slots.len()],
-            victims_frame: 0,
+            victims_frame: None,
             released: Vec::new(),
             awaited: vec![0; count],
             awaited_by: vec![0; count],
             awaited_arrival: 0,
+            asked: vec![[0; 2]; count],
+            asked_span: vec![0; count],
+            kept_asked: vec![(0, 0); count],
+            kept_redrawn: 0,
+            kept: Vec::new(),
+            held_at: Vec::new(),
+            planned_at: 0,
+            outbid: vec![0; count],
+            plans: 1,
         }
     }
 
@@ -214,8 +285,9 @@ impl Residency {
 
     /// As [`Self::plan`], with the pages that views kept from frame to frame asked for: for
     /// each kind of such view, up to eight, a bit per page in `held`. Such a view asks only when
-    /// it is redrawn, so its pages are kept for [`HOLD_FRAMES`], and their coming is reported,
-    /// by kind, by [`Self::take_awaited_arrival`].
+    /// it is redrawn, so its pages are kept until views of its kind have been redrawn for
+    /// [`HOLD_FRAMES`] without asking again, and their coming is reported, by kind, by
+    /// [`Self::take_awaited_arrival`].
     pub fn plan_holding(
         &mut self,
         frame: u32,
@@ -239,6 +311,30 @@ impl Residency {
                 }
             }
         }
+        if self.kept.len() < held.len() {
+            self.kept.resize(held.len(), Kept::default());
+            self.held_at.resize(held.len() * count, 0);
+        }
+        let elapsed = frame.saturating_sub(self.planned_at);
+        self.planned_at = frame;
+        let mut redrawn = false;
+        for (kind, kept) in self.kept.iter_mut().enumerate() {
+            let asked = held
+                .get(kind)
+                .is_some_and(|words| words.iter().any(|&word| word != 0));
+            if asked {
+                kept.asked_at = frame;
+            }
+            // A kind left alone for long may be drawn no more, and must not keep its pages for
+            // ever: its frames count again.
+            if asked || frame.saturating_sub(kept.asked_at) > KEPT_ASKED_FRAMES {
+                kept.redrawn = kept.redrawn.saturating_add(elapsed);
+                redrawn = true;
+            }
+        }
+        if redrawn {
+            self.kept_redrawn = self.kept_redrawn.saturating_add(elapsed);
+        }
 
         // Parents have lower ids, so one pass downwards carries wants all the way up. A parent
         // is at least as wanted as any child, as it must arrive first.
@@ -248,10 +344,22 @@ impl Residency {
             if wanted == 0 && held == 0 {
                 continue;
             }
-            // Not simply this frame: a hold reaches past it.
+            // Not simply this frame: a page that came for a kept view is safe for longer.
             self.last_wanted[page] = self.last_wanted[page].max(frame);
+            if wanted != 0 {
+                self.ask(page, frame, wanted);
+            }
             if held != 0 {
-                self.last_wanted[page] = frame.saturating_add(HOLD_FRAMES);
+                let (kept, at) = self.kept_asked[page];
+                if wanted >= kept || self.kept_redrawn - at > KEPT_ASKED_FRAMES {
+                    self.kept_asked[page] = (wanted, self.kept_redrawn);
+                }
+                let mut kinds = held;
+                while kinds != 0 {
+                    let kind = kinds.trailing_zeros() as usize;
+                    self.held_at[kind * count + page] = self.kept[kind].redrawn.saturating_add(1);
+                    kinds &= kinds - 1;
+                }
                 if !self.is_installed(page as u32) {
                     let fresh = frame.saturating_sub(self.awaited[page].saturating_sub(1))
                         <= AWAIT_FRAMES
@@ -280,6 +388,7 @@ impl Residency {
             .copied()
             .filter(|&page| {
                 frame.saturating_sub(self.last_wanted[page as usize]) > ARRIVED_PATIENCE_FRAMES
+                    && !self.is_held(page as usize)
             })
             .collect();
         for page in stale {
@@ -288,15 +397,24 @@ impl Residency {
             self.bands[page as usize] = self.home_bands[page as usize];
         }
 
-        let mut wanted: Vec<u32> = (0..count as u32)
-            .filter(|&page| {
-                self.states[page as usize] == State::Absent
-                    && priority[page as usize] > REQUEST_KEEP
-            })
-            .collect();
+        let mut wanted = Vec::new();
+        // How wanted the pages already on their way are: each has a slot to come.
+        let mut coming = Vec::new();
+        for (page, &worth) in priority.iter().enumerate() {
+            match self.states[page] {
+                State::Absent if worth > REQUEST_KEEP => wanted.push(page as u32),
+                State::Fetching | State::Arrived => coming.push(worth),
+                _ => {}
+            }
+        }
         wanted.sort_by_key(|&page| (std::cmp::Reverse(priority[page as usize]), page));
 
+        self.plans = self.plans.wrapping_add(1).max(1);
         self.reclaimable_at_plan = self.reclaimable(frame);
+        coming.extend(wanted.iter().map(|&page| priority[page as usize]));
+        self.find_outbid(frame, coming);
+        // Listed before this plan, the pages that may leave lack those it found outbid.
+        self.victims_frame = None;
         let room: u32 = self.room().1.iter().sum();
         self.starved = (wanted.len() as u32).saturating_sub(room);
         wanted.reverse();
@@ -328,7 +446,7 @@ impl Residency {
                 continue;
             }
             // Its own pool first, and otherwise whichever has the most to spare: a pool lends
-            // only what it has free or isn't using, so no pool's wanted pages are pushed out.
+            // only what it has free, isn't using, or wants far less than this page is wanted.
             // An empty slot anywhere comes before one that a page must leave: what isn't wanted
             // now is often wanted again soon, by a view that is only drawn now and then.
             let home = usize::from(self.home_bands[page as usize]);
@@ -353,6 +471,105 @@ impl Residency {
         }
         self.fetching += started.len() as u32;
         started
+    }
+
+    /// When more pages need slots than the pool can give, finds the installed pages that are
+    /// wanted far less than those left without: each page left out, most wanted first, takes
+    /// the place of the least wanted page still in, while it is wanted [`OUTBID`] times as
+    /// much. So a full pool comes to hold what is wanted most, whatever came first, and what a
+    /// view only fetched ahead, or kept though hidden, makes way for what is seen.
+    ///
+    /// `bids` is how wanted each page needing a slot is: those on their way, and those absent.
+    /// The pages found count as reclaimable, and may be evicted, until the next plan.
+    fn find_outbid(&mut self, frame: u32, mut bids: Vec<u32>) {
+        let slots = self.free_slots.iter().map(|band| band.len()).sum::<usize>()
+            + self.reclaimable_at_plan.iter().sum::<u32>() as usize;
+        if bids.len() <= slots {
+            return;
+        }
+        // Left out: the least wanted, past what the empty and unwanted slots hold.
+        bids.select_nth_unstable_by(slots, |a, b| b.cmp(a));
+        let bids = &mut bids[slots..];
+        bids.sort_unstable_by(|a, b| b.cmp(a));
+        let best = bids[0];
+        // What no view sees yet outbids nothing: it would only be in the way in its turn.
+        if best <= REQUEST_AHEAD {
+            return;
+        }
+        let mut standing: Vec<(u32, std::cmp::Reverse<u32>)> = self
+            .installed
+            .range(self.pinned..)
+            .filter(|&&page| {
+                self.installed_dependants[page as usize] == 0
+                    && self.is_wanted(page as usize, frame)
+            })
+            .map(|&page| {
+                (
+                    self.asked(page as usize, frame).max(1),
+                    std::cmp::Reverse(page),
+                )
+            })
+            .filter(|&(asked, _)| asked.saturating_mul(OUTBID) <= best)
+            .collect();
+        // The least wanted first, and of those the finest, which change the image least.
+        if standing.len() > bids.len() {
+            standing.select_nth_unstable(bids.len());
+            standing.truncate(bids.len());
+        }
+        standing.sort_unstable();
+        for (&bid, &(asked, std::cmp::Reverse(page))) in bids.iter().zip(&standing) {
+            if bid <= REQUEST_AHEAD || bid < asked.saturating_mul(OUTBID) {
+                break;
+            }
+            self.outbid[page as usize] = self.plans;
+            self.reclaimable_at_plan[usize::from(self.bands[page as usize])] += 1;
+        }
+    }
+
+    /// Records that a page was asked for with `wanted` at `frame`.
+    fn ask(&mut self, page: usize, frame: u32, wanted: u32) {
+        let span = frame / ASKED_FRAMES;
+        let asked = &mut self.asked[page];
+        match span.wrapping_sub(self.asked_span[page]) {
+            0 => asked[0] = asked[0].max(wanted),
+            1 => *asked = [wanted, asked[0]],
+            _ => *asked = [wanted, 0],
+        }
+        self.asked_span[page] = span;
+    }
+
+    /// How wanted a page is at `frame`: the most it was asked for with in this span of
+    /// [`ASKED_FRAMES`] and the one before, so over at least one span's length and at most two,
+    /// and no less than a view kept from frame to frame asked for it with in the last
+    /// [`KEPT_ASKED_FRAMES`] of such views' redrawing.
+    fn asked(&self, page: usize, frame: u32) -> u32 {
+        let asked = self.asked[page];
+        let lately = match (frame / ASKED_FRAMES).wrapping_sub(self.asked_span[page]) {
+            0 => asked[0].max(asked[1]),
+            1 => asked[0],
+            _ => 0,
+        };
+        let (kept, at) = self.kept_asked[page];
+        if self.kept_redrawn - at <= KEPT_ASKED_FRAMES {
+            lately.max(kept)
+        } else {
+            lately
+        }
+    }
+
+    /// Whether a view kept from frame to frame asked for a page, and views of its kind have not
+    /// been redrawn for [`HOLD_FRAMES`] since.
+    fn is_held(&self, page: usize) -> bool {
+        let count = self.states.len();
+        self.kept.iter().enumerate().any(|(kind, kept)| {
+            let at = self.held_at[kind * count + page];
+            at != 0 && kept.redrawn - (at - 1) <= HOLD_FRAMES
+        })
+    }
+
+    /// Whether a page is still wanted: it keeps its slot unless outbid.
+    fn is_wanted(&self, page: usize, frame: u32) -> bool {
+        frame.saturating_sub(self.last_wanted[page]) <= self.protected_frames || self.is_held(page)
     }
 
     /// How many more pages could be brought into each band: into slots that are empty, and in
@@ -384,7 +601,7 @@ impl Residency {
         // Highest first: what a page depends on has a lower id, so its dependants are decided.
         for &page in self.installed.range(self.pinned..).rev() {
             let page = page as usize;
-            let recent = frame.saturating_sub(self.last_wanted[page]) <= self.protected_frames;
+            let recent = self.is_wanted(page, frame);
             let held = self.dependants[page]
                 .iter()
                 .any(|&d| needed[d as usize] && self.is_installed(d));
@@ -558,6 +775,7 @@ impl Residency {
 
     fn remove(&mut self, page: u32) {
         self.states[page as usize] = State::Absent;
+        self.outbid[page as usize] = 0;
         self.bands[page as usize] = self.home_bands[page as usize];
         self.installed.remove(&page);
         for index in 0..self.dependencies[page as usize].len() {
@@ -609,7 +827,7 @@ impl Residency {
     }
 
     fn choose_victim(&mut self, frame: u32, band: usize) -> Option<u32> {
-        if self.victims_frame != frame {
+        if self.victims_frame != Some(frame) {
             self.find_victims(frame);
         }
         // Evicting a page adds any parent that frees to its list, so once a frame is enough.
@@ -629,10 +847,16 @@ impl Residency {
     fn may_be_evicted(&self, page: usize, frame: u32) -> bool {
         self.is_installed(page as u32)
             && self.installed_dependants[page] == 0
-            && frame.saturating_sub(self.last_wanted[page]) > self.protected_frames
+            && (!self.is_wanted(page, frame) || self.is_outbid(page))
     }
 
-    /// Lists every page that may be evicted, by band, least recently wanted last so it pops first.
+    /// Whether the last plan found a page wanted far less than one without a slot.
+    fn is_outbid(&self, page: usize) -> bool {
+        self.outbid[page] == self.plans
+    }
+
+    /// Lists every page that may be evicted, by band, likeliest last so it pops first: those
+    /// nobody wants, least recently wanted first, and then those outbid, least wanted first.
     fn find_victims(&mut self, frame: u32) {
         let mut lists = vec![Vec::new(); self.victims.len()];
         for &page in self.installed.range(self.pinned..) {
@@ -642,11 +866,17 @@ impl Residency {
         }
         for list in &mut lists {
             list.sort_unstable_by_key(|&page| {
-                std::cmp::Reverse((self.last_wanted[page as usize], std::cmp::Reverse(page)))
+                let outbid = self.is_outbid(page as usize);
+                let order = if outbid {
+                    self.asked(page as usize, frame)
+                } else {
+                    self.last_wanted[page as usize]
+                };
+                (!outbid, std::cmp::Reverse((order, std::cmp::Reverse(page))))
             });
         }
         self.victims = lists;
-        self.victims_frame = frame;
+        self.victims_frame = Some(frame);
     }
 }
 
@@ -767,19 +997,45 @@ mod tests {
         assert!(!residency.is_installed(2));
         assert_eq!(residency.installed_count(), 2);
 
-        // After the hold, the held pages make way.
-        let frame = 2 + HOLD_FRAMES + PROTECTED_FRAMES + 5;
-        assert_eq!(residency.plan(frame, &[0, 0, 10], 8), [2]);
+        // Nor is there long after, while the view that asked is not redrawn: it stands on what
+        // it asked for.
+        let frame = 3 * (HOLD_FRAMES + PROTECTED_FRAMES);
+        assert!(residency.plan(frame, &[0, 0, 10], 8).is_empty());
+
+        // Once views of its kind have been redrawn for the length of the hold without asking
+        // again, the held pages make way.
+        for redrawn in 1..=HOLD_FRAMES {
+            let started = residency.plan_holding(frame + redrawn, &[0, 0, 10], &[&[], &[0b100]], 8);
+            assert!(started.is_empty(), "after {redrawn} frames of redrawing");
+        }
+        let frame = frame + HOLD_FRAMES + 1;
+        assert_eq!(
+            residency.plan_holding(frame, &[0, 0, 10], &[&[], &[0b100]], 8),
+            [2]
+        );
         residency.arrived(2);
         assert_eq!(
             residency.next_install(frame).and_then(|i| i.evicted),
             Some(1)
         );
-        assert_eq!(
-            residency.take_awaited_arrival(),
-            0,
-            "nothing kept asked for this one"
-        );
+        assert_eq!(residency.take_awaited_arrival(), 0b10);
+    }
+
+    /// A kind of kept view that is drawn no more does not keep its pages for ever.
+    #[test]
+    fn what_a_kept_view_asked_for_makes_way_once_the_view_is_long_gone() {
+        let mut r = Residency::new(vec![Vec::new(); 2], 0, 1);
+        r.install_now(0);
+        r.plan_holding(1, &[4, 0], &[&[1]], 16);
+        // Only fetched ahead of need, the other page outbids nothing.
+        let requests = [0, REQUEST_AHEAD];
+        for frame in 2..=KEPT_ASKED_FRAMES + 1 {
+            assert!(r.plan(frame, &requests, 16).is_empty(), "at frame {frame}");
+        }
+        let started: Vec<u32> = (0..HOLD_FRAMES + 2)
+            .flat_map(|turn| r.plan(KEPT_ASKED_FRAMES + 2 + turn, &requests, 16))
+            .collect();
+        assert_eq!(started, [1]);
     }
 
     #[test]
@@ -1109,6 +1365,215 @@ mod tests {
         assert!(r.is_waiting(1));
         r.plan(ARRIVED_PATIENCE_FRAMES + 5, &[0; 5], 16);
         assert!(!r.is_waiting(1));
+        assert_eq!(r.in_transit(), 0);
+    }
+
+    /// A pool of three, full of pages 0, 1 and 2, each last asked for at `frame` with the
+    /// priority given. Three more pages have no slot.
+    fn full_of(priorities: [u32; 3], frame: u32) -> Residency {
+        let mut r = Residency::new(vec![Vec::new(); 6], 0, 3);
+        for page in 0..3 {
+            r.install_now(page);
+        }
+        let asked = [(0, priorities[0]), (1, priorities[1]), (2, priorities[2])];
+        assert!(r.plan(frame, &want(&asked, 6), 16).is_empty());
+        r
+    }
+
+    #[test]
+    fn a_seen_page_takes_the_slot_of_one_kept_hidden_or_fetched_ahead() {
+        // One page hidden, one fetched ahead of need, one in plain view: all asked for every
+        // frame, so none would ever leave by going unwanted.
+        let standing = [(0, REQUEST_KEEP), (1, REQUEST_AHEAD), (2, 40)];
+        let mut r = full_of([REQUEST_KEEP, REQUEST_AHEAD, 40], 1);
+        let mut requests = want(&standing, 6);
+        requests[3] = 40;
+        requests[4] = 6;
+        assert_eq!(r.plan(2, &requests, 16), [3, 4]);
+        assert_eq!(r.starved(), 0);
+        r.arrived(3);
+        r.arrived(4);
+        // The least wanted leaves first.
+        let installs = install_all(&mut r, 2);
+        assert_eq!(installs[0].evicted, Some(0));
+        assert_eq!(installs[1].evicted, Some(1));
+        assert!(r.is_installed(2) && r.is_installed(3) && r.is_installed(4));
+    }
+
+    #[test]
+    fn a_page_must_be_wanted_twice_as_much_to_take_a_slot() {
+        let standing = [(0, 9), (1, 9), (2, 9)];
+        let mut r = full_of([9, 9, 9], 1);
+        let mut requests = want(&standing, 6);
+        requests[3] = 9 * OUTBID - 1;
+        assert!(r.plan(2, &requests, 16).is_empty());
+        assert_eq!(r.starved(), 1);
+        requests[3] = 9 * OUTBID;
+        assert_eq!(r.plan(3, &requests, 16), [3]);
+        // The finest page of those wanted least makes way.
+        r.arrived(3);
+        assert_eq!(r.next_install(3).unwrap().evicted, Some(2));
+    }
+
+    #[test]
+    fn a_page_fetched_ahead_takes_no_slot_from_one_kept_hidden() {
+        let mut r = full_of([REQUEST_KEEP; 3], 1);
+        let mut requests = vec![REQUEST_KEEP; 6];
+        requests[3] = REQUEST_AHEAD;
+        assert!(r.plan(2, &requests, 16).is_empty());
+        requests[3] = REQUEST_AHEAD + 1;
+        assert_eq!(r.plan(3, &requests, 16), [3]);
+    }
+
+    #[test]
+    fn pages_do_not_keep_changing_places() {
+        let mut r = full_of([10, 30, 30], 1);
+        let requests = want(&[(0, 10), (1, 30), (2, 30), (3, 20)], 6);
+        assert_eq!(r.plan(2, &requests, 16), [3]);
+        r.arrived(3);
+        assert_eq!(r.next_install(2).unwrap().evicted, Some(0));
+        // The page that left is still wanted, at half what the page that took its slot is: it
+        // waits, and so does the next plan.
+        for frame in 3..6 {
+            assert!(r.plan(frame, &requests, 16).is_empty());
+            assert!(install_all(&mut r, frame).is_empty());
+            assert_eq!(r.starved(), 1);
+        }
+        assert!(r.is_installed(3) && !r.is_installed(0));
+    }
+
+    #[test]
+    fn a_page_asked_for_by_turns_is_wanted_as_much_as_the_most_of_them() {
+        let mut r = full_of([40, 40, 40], 1);
+        // A view drawn now and then needs page 0 badly. The view drawn every frame hardly does,
+        // and it is by that view's asking that a page half as wanted as the first would take
+        // its slot, to lose it at the next redraw.
+        let mut frame = 2;
+        for turn in 0..3 * ASKED_FRAMES {
+            let first = if turn % 20 == 0 { 40 } else { 3 };
+            let requests = want(&[(0, first), (1, 40), (2, 40), (3, 20)], 6);
+            assert!(r.plan(frame, &requests, 16).is_empty(), "at frame {frame}");
+            frame += 1;
+        }
+        // Once that view has left it alone for long enough, the page is worth what the other
+        // gives it.
+        let requests = want(&[(0, 3), (1, 40), (2, 40), (3, 20)], 6);
+        let started: Vec<u32> = (0..2 * ASKED_FRAMES)
+            .flat_map(|turn| r.plan(frame + turn, &requests, 16))
+            .collect();
+        assert_eq!(started, [3]);
+    }
+
+    #[test]
+    fn a_page_a_kept_view_asked_for_stays_as_wanted_for_long() {
+        let mut r = full_of([40, 40, 40], 1);
+        // A view kept from frame to frame asks once for page 0. From then on only the view
+        // drawn every frame asks for it, and another kept view that sees little of it: both
+        // with far less. A kept view of page 1 is redrawn every frame.
+        r.plan_holding(
+            2,
+            &want(&[(0, 40), (1, 40), (2, 40), (3, 20)], 6),
+            &[&[1]],
+            16,
+        );
+        let requests = want(&[(0, 3), (1, 40), (2, 40), (3, 20)], 6);
+        for frame in 3..KEPT_ASKED_FRAMES {
+            let held: &[&[u32]] = if frame % 50 == 0 {
+                &[&[0b11]]
+            } else {
+                &[&[0b10]]
+            };
+            let started = r.plan_holding(frame, &requests, held, 16);
+            assert!(started.is_empty(), "at frame {frame}");
+        }
+        let started: Vec<u32> = (KEPT_ASKED_FRAMES..KEPT_ASKED_FRAMES + 2 * ASKED_FRAMES)
+            .flat_map(|frame| r.plan_holding(frame, &requests, &[&[0b10]], 16))
+            .collect();
+        assert_eq!(started, [3]);
+    }
+
+    #[test]
+    fn a_page_a_kept_view_asked_for_stays_as_wanted_while_none_is_redrawn() {
+        let mut r = full_of([40, 40, 40], 1);
+        r.plan_holding(
+            2,
+            &want(&[(0, 40), (1, 40), (2, 40), (3, 20)], 6),
+            &[&[1]],
+            16,
+        );
+        // No kept view is redrawn again, so none asks, and the one that asked stands on page 0
+        // as it did. By the view drawn every frame alone, page 3 would take the slot.
+        let requests = want(&[(0, 3), (1, 40), (2, 40), (3, 20)], 6);
+        for frame in 3..KEPT_ASKED_FRAMES + 1000 {
+            assert!(r.plan(frame, &requests, 16).is_empty(), "at frame {frame}");
+        }
+    }
+
+    #[test]
+    fn a_page_is_outbid_only_until_the_next_plan() {
+        let mut r = full_of([REQUEST_KEEP, 30, 30], 1);
+        let mut requests = want(&[(0, REQUEST_KEEP), (1, 30), (2, 30), (3, 20)], 6);
+        assert_eq!(r.plan(2, &requests, 16), [3]);
+        // Before the page comes, what it made way for comes into view itself.
+        requests[0] = 30;
+        r.plan(3, &requests, 16);
+        r.arrived(3);
+        assert!(install_all(&mut r, 3).is_empty(), "nothing may leave now");
+        assert!(r.is_installed(0));
+    }
+
+    #[test]
+    fn pinned_pages_and_parents_are_never_outbid() {
+        // Page 0 is pinned, and page 2 hangs off page 1.
+        let dependencies = vec![vec![], vec![0], vec![1], vec![], vec![]];
+        let mut r = Residency::new(dependencies, 1, 3);
+        for page in 0..3 {
+            r.install_now(page);
+        }
+        r.plan(1, &want(&[(2, 50)], 5), 16);
+        // The parent is now only kept, but its child, seen a frame ago, still stands on it.
+        let requests = want(&[(0, REQUEST_KEEP), (1, REQUEST_KEEP), (3, 40)], 5);
+        assert!(r.plan(2, &requests, 16).is_empty());
+        assert_eq!(r.starved(), 1);
+        // Once the child has been wanted little enough for long enough, it goes, and the parent
+        // may follow it.
+        let later = 2 * ASKED_FRAMES + 3;
+        let requests = want(&[(0, REQUEST_KEEP), (2, REQUEST_KEEP), (3, 40), (4, 40)], 5);
+        assert_eq!(r.plan(later, &requests, 16), [3]);
+        r.arrived(3);
+        assert_eq!(r.next_install(later).unwrap().evicted, Some(2));
+        assert_eq!(r.plan(later + 1, &requests, 16), [4]);
+        r.arrived(4);
+        assert_eq!(r.next_install(later + 1).unwrap().evicted, Some(1));
+        assert!(r.is_installed(0));
+    }
+
+    #[test]
+    fn a_held_page_makes_way_for_one_wanted_far_more() {
+        let mut r = Residency::new(vec![Vec::new(); 3], 0, 1);
+        r.install_now(0);
+        // A view kept from frame to frame asks once, and its page is held long after.
+        r.plan_holding(1, &[4, 0, 0], &[&[1]], 16);
+        assert!(r.plan(2, &[0, 4 * OUTBID - 1, 0], 16).is_empty());
+        assert_eq!(r.plan(3, &[0, 0, 4 * OUTBID], 16), [2]);
+    }
+
+    #[test]
+    fn pages_on_their_way_count_against_those_outbid() {
+        let mut r = full_of([REQUEST_KEEP; 3], 1);
+        let mut requests = vec![REQUEST_KEEP; 6];
+        // One more page comes into view at each plan, and none has come yet: each takes the
+        // slot of one page more.
+        for (frame, page) in [(2, 3), (3, 4), (4, 5)] {
+            requests[page as usize] = 40;
+            assert_eq!(r.plan(frame, &requests, 16), [page]);
+        }
+        assert!(r.plan(5, &requests, 16).is_empty());
+        for page in 3..6 {
+            r.arrived(page);
+        }
+        assert_eq!(install_all(&mut r, 5).len(), 3);
+        assert_eq!(r.installed_count(), 3);
         assert_eq!(r.in_transit(), 0);
     }
 
