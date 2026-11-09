@@ -224,7 +224,7 @@ pub fn expand_for(path: &str, skinned: bool, regions: Option<RegionPlan>) -> Str
         source.replace(SKINNING_ON, "const SKINNING: bool = false;")
     };
     match regions {
-        Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
+        Some(plan) => rewrite_shader(&source, plan.cluster_chunk, plan.pools()),
         None => source,
     }
 }
@@ -266,7 +266,7 @@ pub fn module_regions(
 ) -> wgpu::ShaderModule {
     let source = expand(path);
     let source = match regions {
-        Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
+        Some(plan) => rewrite_shader(&source, plan.cluster_chunk, plan.pools()),
         None => source,
     };
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -401,7 +401,7 @@ mod tests {
     fn shaders_rewritten_for_regions_are_valid() {
         let plan = RegionPlan {
             cluster_chunk: 1000,
-            band_slots: [1, 1, 1, 1],
+            band_slots: [1, 1, 1, 1, 0, 0, 0, 0],
         };
         let check = |path: &str, source: String| {
             let module = naga::front::wgsl::parse_str(&source)
@@ -430,7 +430,11 @@ mod tests {
         }
         check(
             "gi/voxelize.wgsl",
-            rewrite_shader(&expand("gi/voxelize.wgsl"), plan.cluster_chunk),
+            rewrite_shader(
+                &expand("gi/voxelize.wgsl"),
+                plan.cluster_chunk,
+                plan.pools(),
+            ),
         );
     }
 

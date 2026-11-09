@@ -803,7 +803,11 @@ mod native {
                 streaming.evictions,
                 streaming.starved,
             );
-            if let Some([near, middle, far, spare]) = streaming.bands {
+            if let Some(bands) = streaming.bands {
+                let [near, middle, far] = [bands[0], bands[1], bands[2]];
+                let spare = bands[3..]
+                    .iter()
+                    .fold((0, 0), |sum, band| (sum.0 + band.0, sum.1 + band.1));
                 println!(
                     "bands: near {}/{}, middle {}/{}, far {}/{}, spare {}/{}",
                     near.0, near.1, middle.0, middle.1, far.0, far.1, spare.0, spare.1

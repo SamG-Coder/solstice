@@ -749,7 +749,7 @@ fn locate_slot(regions: Option<&RegionPlan>, slot: u32) -> (usize, u32) {
 /// Triangles start right after the page's own vertices. The band goes in the top two bits, which
 /// is zero in a scene with one pool.
 fn slot_bases(band: usize, local: u32, vertex_count: u32) -> (u32, u32) {
-    let band = (band as u32) << 30;
+    let band = (band as u32) << crate::regions::BAND_SHIFT;
     (
         band | (local * PAGE_VERTICES),
         band | (local * PAGE_WORDS
@@ -803,7 +803,7 @@ mod tests {
     fn slots_are_numbered_through_the_bands() {
         let plan = RegionPlan {
             cluster_chunk: 1,
-            band_slots: [2, 3, 4, 1],
+            band_slots: [2, 3, 4, 1, 0, 0, 0, 0],
         };
         assert_eq!(locate_slot(Some(&plan), 1), (0, 1));
         assert_eq!(locate_slot(Some(&plan), 2), (1, 0));
