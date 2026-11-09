@@ -61,7 +61,7 @@ mod native {
 
     impl PageReader {
         /// Pages to read at once: enough to use the disk, few enough to stay out of the way.
-        const MAX_FETCHING: u32 = 32;
+        const MAX_FETCHING: u32 = 256;
 
         fn new(path: &Path) -> Self {
             let (finished_sender, finished) = mpsc::channel();

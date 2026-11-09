@@ -314,9 +314,71 @@ async function readWithRetries(file, start, end) {
 }
 
 /// Fetches what the viewer asks for, keeping the page responsive while it does.
+/// Runs in workers: fetches one run of a scene file and unpacks its pages, off the main thread,
+/// so that streaming doesn't cost the frame rate.
+const FETCH_WORKER = `
+async function inflate(bytes) {
+  const unpacked = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(unpacked).arrayBuffer());
+}
+onmessage = async ({ data: { url, ticket, run } }) => {
+  try {
+    const first = run[0].start;
+    const response = await fetch(url, { headers: { Range: "bytes=" + first + "-" + (run[run.length - 1].end - 1) } });
+    if (response.status !== 206) throw new Error("HTTP " + response.status);
+    const stored = new Uint8Array(await response.arrayBuffer());
+    const pages = await Promise.all(run.map(async (request) => {
+      const part = stored.subarray(request.start - first, request.end - first);
+      return { id: request.id, data: request.deflated ? await inflate(part) : part.slice() };
+    }));
+    postMessage({ ticket, pages }, pages.map((page) => page.data.buffer));
+  } catch (error) {
+    postMessage({ ticket, failed: run.map((request) => request.id), error: String(error) });
+  }
+};
+`;
+
+/// Fetches runs of pages in workers, each going to whichever has the least to do.
+class WorkerFetcher {
+  #workers;
+  #busy;
+  #tickets = new Map();
+  #next = 0;
+  #url;
+
+  constructor(url, count, onPages, onFailed) {
+    this.#url = url;
+    const script = URL.createObjectURL(new Blob([FETCH_WORKER], { type: "text/javascript" }));
+    this.#busy = new Array(count).fill(0);
+    this.#workers = this.#busy.map((_, index) => {
+      const worker = new Worker(script);
+      worker.onmessage = ({ data }) => {
+        this.#busy[index]--;
+        this.#tickets.delete(data.ticket);
+        if (data.failed) {
+          console.warn(`Could not fetch part of the scene, and will retry: ${data.error}`);
+          onFailed(data.failed);
+        } else {
+          onPages(data.pages);
+        }
+      };
+      return worker;
+    });
+  }
+
+  fetch(run) {
+    const index = this.#busy.indexOf(Math.min(...this.#busy));
+    this.#busy[index]++;
+    const ticket = this.#next++;
+    this.#tickets.set(ticket, run);
+    this.#workers[index].postMessage({ url: new URL(this.#url, location.href).href, ticket, run });
+  }
+}
+
 class Streamer {
   // Pages being fetched at once. ?fetching=N tries another number.
-  static MAX_FETCHING = Number(params.get("fetching")) || 16;
+  static MAX_FETCHING = Number(params.get("fetching")) || (params.has("split") ? 256 : 16);
+  static WORKERS = Number(params.get("workers")) || Math.min(8, navigator.hardwareConcurrency || 4);
   // Browsers run about six connections per host over HTTP/1.1, so requests for parts of the file
   // that are close together share one, as long as what lies between them is small.
   static MERGE_GAP_BYTES = 256 * 1024;
@@ -324,10 +386,20 @@ class Streamer {
   static RETRY_MS = 1000;
   #viewer;
   #file;
+  #workers = null;
 
   constructor(viewer, file) {
     this.#viewer = viewer;
     this.#file = file;
+    // Only for a scene read in parts, which is served with Range requests by something known.
+    if (params.has("split")) {
+      this.#workers = new WorkerFetcher(
+        sceneUrl,
+        Streamer.WORKERS,
+        (pages) => { for (const { id, data } of pages) this.#viewer.deliver(id, data); },
+        (ids) => { for (const id of ids) setTimeout(() => this.#viewer.request_failed(id), Streamer.RETRY_MS); },
+      );
+    }
   }
 
   /// Call once per frame.
@@ -352,6 +424,10 @@ class Streamer {
   }
 
   async #fetchRun(run) {
+    if (this.#workers) {
+      this.#workers.fetch(run);
+      return;
+    }
     const start = run[0].start;
     const end = run[run.length - 1].end;
     let stored;

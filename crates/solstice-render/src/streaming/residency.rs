@@ -13,6 +13,10 @@ pub const REQUEST_KEEP: u32 = 1;
 /// around doesn't throw away what's about to be seen again.
 pub const PROTECTED_FRAMES: u32 = 30;
 
+/// The same for a scene with pools by level of detail, whose pools are full nearly all the time:
+/// what has left the view makes way sooner, so a new view fills in faster.
+pub const PROTECTED_FRAMES_LARGE: u32 = 10;
+
 /// Frames an unpacked page may wait for a slot, unwanted, before it is thrown away.
 const ARRIVED_PATIENCE_FRAMES: u32 = 120;
 
@@ -40,6 +44,12 @@ pub struct Residency {
     dependants: Vec<Vec<u32>>,
     pinned: u32,
     states: Vec<State>,
+    /// The installed pages, so that a look over them costs what's installed, not the whole scene.
+    installed: BTreeSet<u32>,
+    /// Scratch for [`Self::reclaimable`], all false between uses.
+    needed: Vec<bool>,
+    /// See [`PROTECTED_FRAMES`].
+    protected_frames: u32,
     /// How many pages depending on this one are installed.
     installed_dependants: Vec<u32>,
     last_wanted: Vec<u32>,
@@ -63,8 +73,6 @@ pub struct Residency {
     /// a whole scan.
     victims: Vec<Vec<u32>>,
     victims_frame: u32,
-    /// Times the victims may be listed again this frame, in a pool with bands.
-    rescans_left: u32,
     /// Pages let go by another band, whose records the caller must update.
     released: Vec<u32>,
 }
@@ -115,6 +123,13 @@ impl Residency {
             dependants,
             pinned,
             states: vec![State::Absent; count],
+            installed: BTreeSet::new(),
+            needed: vec![false; count],
+            protected_frames: if band_slots.len() > 1 {
+                PROTECTED_FRAMES_LARGE
+            } else {
+                PROTECTED_FRAMES
+            },
             installed_dependants: vec![0; count],
             last_wanted: vec![0; count],
             home_bands: bands.clone(),
@@ -128,7 +143,6 @@ impl Residency {
             reclaimable_at_plan: vec![0; band_slots.len()],
             victims: vec![Vec::new(); band_slots.len()],
             victims_frame: 0,
-            rescans_left: 0,
             released: Vec::new(),
         }
     }
@@ -140,19 +154,14 @@ impl Residency {
     /// How many pages are installed in each band.
     pub fn installed_by_band(&self) -> Vec<u32> {
         let mut count = vec![0; self.free_slots.len()];
-        for (page, state) in self.states.iter().enumerate() {
-            if matches!(state, State::Installed(_)) {
-                count[usize::from(self.bands[page])] += 1;
-            }
+        for &page in &self.installed {
+            count[usize::from(self.bands[page as usize])] += 1;
         }
         count
     }
 
     pub fn installed_count(&self) -> u32 {
-        self.states
-            .iter()
-            .filter(|state| matches!(state, State::Installed(_)))
-            .count() as u32
+        self.installed.len() as u32
     }
 
     /// Pages being fetched, or fetched and waiting to install.
@@ -277,14 +286,13 @@ impl Residency {
 
     /// Installed pages of each band that could be evicted, now or once what depends on them has
     /// gone.
-    fn reclaimable(&self, frame: u32) -> Vec<u32> {
-        let mut needed = vec![false; self.states.len()];
+    fn reclaimable(&mut self, frame: u32) -> Vec<u32> {
+        let mut needed = std::mem::take(&mut self.needed);
         let mut count = vec![0; self.free_slots.len()];
-        for page in (self.pinned as usize..self.states.len()).rev() {
-            if !self.is_installed(page as u32) {
-                continue;
-            }
-            let recent = frame.saturating_sub(self.last_wanted[page]) <= PROTECTED_FRAMES;
+        // Highest first: what a page depends on has a lower id, so its dependants are decided.
+        for &page in self.installed.range(self.pinned..).rev() {
+            let page = page as usize;
+            let recent = frame.saturating_sub(self.last_wanted[page]) <= self.protected_frames;
             let held = self.dependants[page]
                 .iter()
                 .any(|&d| needed[d as usize] && self.is_installed(d));
@@ -293,6 +301,10 @@ impl Residency {
                 count[usize::from(self.bands[page])] += 1;
             }
         }
+        for &page in self.installed.range(self.pinned..) {
+            needed[page as usize] = false;
+        }
+        self.needed = needed;
         count
     }
 
@@ -383,6 +395,7 @@ impl Residency {
 
     fn place(&mut self, page: u32, slot: u32) {
         self.states[page as usize] = State::Installed(slot);
+        self.installed.insert(page);
         for index in 0..self.dependencies[page as usize].len() {
             let dependency = self.dependencies[page as usize][index];
             self.installed_dependants[dependency as usize] += 1;
@@ -392,9 +405,14 @@ impl Residency {
     fn remove(&mut self, page: u32) {
         self.states[page as usize] = State::Absent;
         self.bands[page as usize] = self.home_bands[page as usize];
+        self.installed.remove(&page);
         for index in 0..self.dependencies[page as usize].len() {
             let dependency = self.dependencies[page as usize][index];
             self.installed_dependants[dependency as usize] -= 1;
+            // Its last dependant has gone, so it may go next, with no need to look again.
+            if self.installed_dependants[dependency as usize] == 0 && dependency >= self.pinned {
+                self.victims[usize::from(self.bands[dependency as usize])].push(dependency);
+            }
         }
     }
 
@@ -431,23 +449,11 @@ impl Residency {
     }
 
     fn choose_victim(&mut self, frame: u32, band: usize) -> Option<u32> {
-        /// Each listing is a scan of every page, so a stuck pool mustn't do one per install.
-        const RESCANS_PER_FRAME: u32 = 4;
         if self.victims_frame != frame {
             self.find_victims(frame);
-            self.rescans_left = RESCANS_PER_FRAME;
         }
-        self.victim_from_list(frame, band).or_else(|| {
-            if self.free_slots.len() > 1 {
-                if self.rescans_left == 0 {
-                    return None;
-                }
-                self.rescans_left -= 1;
-            }
-            // Evicting a page can free its parents, which the list won't have.
-            self.find_victims(frame);
-            self.victim_from_list(frame, band)
-        })
+        // Evicting a page adds any parent that frees to its list, so once a frame is enough.
+        self.victim_from_list(frame, band)
     }
 
     /// The likeliest page in a band's list that may still be evicted.
@@ -463,15 +469,15 @@ impl Residency {
     fn may_be_evicted(&self, page: usize, frame: u32) -> bool {
         self.is_installed(page as u32)
             && self.installed_dependants[page] == 0
-            && frame.saturating_sub(self.last_wanted[page]) > PROTECTED_FRAMES
+            && frame.saturating_sub(self.last_wanted[page]) > self.protected_frames
     }
 
     /// Lists every page that may be evicted, by band, least recently wanted last so it pops first.
     fn find_victims(&mut self, frame: u32) {
         let mut lists = vec![Vec::new(); self.victims.len()];
-        for page in self.pinned as usize..self.states.len() {
-            if self.may_be_evicted(page, frame) {
-                lists[usize::from(self.bands[page])].push(page as u32);
+        for &page in self.installed.range(self.pinned..) {
+            if self.may_be_evicted(page as usize, frame) {
+                lists[usize::from(self.bands[page as usize])].push(page);
             }
         }
         for list in &mut lists {
@@ -487,6 +493,48 @@ impl Residency {
 #[cfg(test)]
 mod tests {
     /// A pool with no room borrows what another has free, and gets its page back home later.
+    /// Evicting a page frees its parent to go as well, without another look over the pages.
+    #[test]
+    fn a_parent_can_follow_its_last_child_out_in_one_frame() {
+        // A chain, 0 <- 1 <- 2, in one slot-starved band, with two more pages wanted.
+        let deps = vec![vec![], vec![0], vec![1], vec![], vec![]];
+        let mut residency = Residency::with_bands(deps, 0, vec![0; 5], &[3, 1]);
+        residency.plan(1, &[10, 10, 10, 0, 0], 8);
+        for page in 0..3 {
+            residency.arrived(page);
+        }
+        while residency.next_install(1).is_some() {}
+        assert_eq!(residency.installed_count(), 3);
+
+        let frame = PROTECTED_FRAMES + 10;
+        residency.plan(frame, &[0, 0, 0, 10, 10], 8);
+        residency.arrived(3);
+        residency.arrived(4);
+        let mut evicted = Vec::new();
+        while let Some(install) = residency.next_install(frame) {
+            evicted.extend(install.evicted);
+        }
+        assert_eq!(
+            evicted,
+            [2, 1],
+            "the child and then its parent, in the same frame"
+        );
+    }
+
+    #[test]
+    fn counting_installed_pages_follows_installs_and_evictions() {
+        let mut residency = Residency::new(vec![Vec::new(); 3], 1, 2);
+        residency.install_now(0);
+        assert_eq!(residency.installed_count(), 1);
+        residency.plan(1, &[0, 10, 0], 8);
+        residency.arrived(1);
+        residency.next_install(1).expect("room");
+        assert_eq!(residency.installed_count(), 2);
+        assert_eq!(residency.installed_by_band(), [2]);
+        residency.remove(1);
+        assert_eq!(residency.installed_count(), 1);
+    }
+
     #[test]
     fn a_full_band_borrows_from_one_with_room() {
         // Three pages at home in band 1, which has one slot. Band 0 has two, and no pages.

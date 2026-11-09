@@ -29,6 +29,11 @@ const NODE_FLAGS_OFFSET: u64 = std::mem::offset_of!(PackedNode, is_leaf) as u64;
 const MERGE_GAP_CLUSTERS: usize = 8;
 /// Pages to install per frame. Each costs little, but many at once would be felt as a hitch.
 const INSTALLS_PER_FRAME: u32 = 32;
+/// The same for a scene with pools by level of detail, for which a new view is thousands of pages.
+const INSTALLS_PER_FRAME_LARGE: u32 = 160;
+/// Frames between plans of such a scene. Each looks over more than a million pages, and new
+/// requests a frame or two later change little.
+const FRAMES_PER_PLAN_LARGE: u32 = 3;
 /// Frames between redraws of cached views, which a stream of arriving pages would otherwise
 /// make redraw constantly.
 const REFRESH_INTERVAL_FRAMES: u32 = 30;
@@ -104,6 +109,7 @@ pub struct Streamer {
     /// Whether what's installed changed since cached views last refreshed.
     changed_since_refresh: bool,
     frames_since_refresh: u32,
+    last_plan_frame: u32,
 }
 
 /// Where in a [`PackedCluster`] the fields that change as pages come and go begin: its vertex
@@ -197,6 +203,7 @@ impl Streamer {
             evictions: 0,
             changed_since_refresh: false,
             frames_since_refresh: 0,
+            last_plan_frame: 0,
         }
     }
 
@@ -230,7 +237,12 @@ impl Streamer {
         if let Some(requests) = self.feedback.take_latest() {
             self.fresh_requests = Some(requests);
         }
-        self.install_waiting(gpu, scene, INSTALLS_PER_FRAME);
+        let installs = if self.regions.is_some() {
+            INSTALLS_PER_FRAME_LARGE
+        } else {
+            INSTALLS_PER_FRAME
+        };
+        self.install_waiting(gpu, scene, installs);
         if let Some(textures) = &mut self.textures {
             textures.write_waiting(gpu, scene);
         }
@@ -239,7 +251,16 @@ impl Streamer {
     /// What to start fetching now, from the latest requests read back. At most `max_fetching`
     /// pages and a few texture levels are ever outstanding.
     pub fn take_fetches(&mut self, max_fetching: u32) -> Vec<StreamRequest> {
-        let requests = self.fresh_requests.take();
+        let due = self.regions.is_none()
+            || self.frame.wrapping_sub(self.last_plan_frame) >= FRAMES_PER_PLAN_LARGE;
+        let requests = if due {
+            self.fresh_requests.take()
+        } else {
+            None
+        };
+        if requests.is_some() {
+            self.last_plan_frame = self.frame;
+        }
         let pages = match &requests {
             Some(requests) => self.plan(requests, max_fetching),
             None => self.residency.refill(max_fetching),
