@@ -3,7 +3,7 @@
 //! ```text
 //! bake [--quality draft|web|high] [--output FILE]
 //! bake --gltf MODEL.glb [--fit METRES] [--ground] [--texture-size N] [--output FILE]
-//! bake --large-gltf SCENE.gltf [--region X,Y,Z,RADIUS] [--no-textures] [--texture-size N] [--output FILE]
+//! bake --large-gltf SCENE.gltf [--region X,Y,Z,RADIUS] [--no-textures] [--glow STRENGTH] [--texture-size N] [--output FILE]
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
 //! bake --gallery [--texture-size N] [--output FILE]
 //! bake --forest [--texture-size N] [--output FILE]
@@ -103,6 +103,10 @@ fn parse_args() -> Result<Options, String> {
             "--gltf" => options.gltf = Some(PathBuf::from(value()?)),
             "--large-gltf" => options.large_gltf = Some(PathBuf::from(value()?)),
             "--no-textures" => options.large.textures = false,
+            "--glow" => {
+                options.large.glow_strength =
+                    value()?.parse().map_err(|e| format!("--glow: {e}"))?;
+            }
             "--region" => {
                 let text = value()?;
                 let numbers = text
@@ -193,6 +197,7 @@ fn bake_large(path: &std::path::Path, options: &Options, start: Instant) -> Resu
         "{} meshes, {} instances, {} unique triangles, {} instanced triangles",
         report.meshes, report.instances, report.unique_triangles, report.instanced_triangles,
     );
+    println!("{} glow maps, {} cards", report.glow_maps, report.cards);
     println!(
         "{} clusters, {} pages, {} texture layers; building {:.1}s, paging {:.1}s, textures {:.1}s",
         report.clusters,

@@ -99,6 +99,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "particles/sort.wgsl",
     "particles/collide.wgsl",
     "particles/draw.wgsl",
+    "cards/draw.wgsl",
     "particles/depth_copy.wgsl",
     "post/taa.wgsl",
     "post/exposure.wgsl",
@@ -153,6 +154,7 @@ pub const ENTRY_POINTS: &[&str] = &[
     "particles/sort.wgsl",
     "particles/collide.wgsl",
     "particles/draw.wgsl",
+    "cards/draw.wgsl",
     "particles/depth_copy.wgsl",
     "post/taa.wgsl",
     "post/exposure.wgsl",
@@ -225,6 +227,22 @@ pub fn expand_for(path: &str, skinned: bool, regions: Option<RegionPlan>) -> Str
         Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
         None => source,
     }
+}
+
+/// A shader with the lines between `// glow:begin` and `// glow:end` taken out, as they were
+/// never written, for a scene with no emissive maps.
+pub fn without_glow(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut inside = false;
+    for line in source.split_inclusive('\n') {
+        match line.trim() {
+            "// glow:begin" => inside = true,
+            "// glow:end" => inside = false,
+            _ if !inside => out.push_str(line),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Compiles an entry-point file that places vertices: see [`expand_for`].
@@ -329,6 +347,31 @@ mod tests {
     }
 
     /// Every shader `module_for` is used on, in the form scenes with nothing skinned get.
+    /// A scene with no emissive maps must get the shader it had before they existed.
+    #[test]
+    fn resolve_without_glow_binds_and_mentions_none_of_it() {
+        let source = without_glow(&expand("vg/resolve.wgsl"));
+        for gone in ["glow_maps", "glow:begin", "MATERIAL_GLOW", "binding(15)"] {
+            assert!(!source.contains(gone), "{gone} is still there");
+        }
+        let module = naga::front::wgsl::parse_str(&source).expect("the shader parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        .expect("the shader is valid");
+    }
+
+    #[test]
+    fn the_average_a_glow_map_is_taken_for_matches_its_twin() {
+        let expected = format!(
+            "const MATERIAL_GLOW_AVERAGE: f32 = {:?};",
+            solstice_asset::Material::GLOW_MAP_AVERAGE
+        );
+        assert!(expand("vg/resolve.wgsl").contains(&expected), "{expected}");
+    }
+
     #[test]
     fn shaders_with_skinning_compiled_out_are_valid() {
         for path in [

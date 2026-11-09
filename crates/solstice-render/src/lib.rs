@@ -19,6 +19,7 @@
 // work; the renames can wait for a quiet moment in the passes they touch.
 #![allow(deprecated)]
 
+pub mod cards;
 pub mod clouds;
 pub mod frame;
 pub mod gi;

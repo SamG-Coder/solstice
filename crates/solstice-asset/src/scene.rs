@@ -82,6 +82,18 @@ impl Material {
     /// Cut out: alpha in its colour map is coverage instead of cavity, and a texel is solid when
     /// that is at least 0.5. The cut-off is built into the map (`docs/cutouts.md`).
     pub const MASKED: u32 = 4;
+    /// `flags` above this bit hold one more than the material's layer in [`GlowMaps`], or zero
+    /// for a material whose emissive colour is even all over.
+    pub const GLOW_SHIFT: u32 = 16;
+    /// The `emissive` of a material with an emissive map is what the map gives averaged over the
+    /// surface, taken as this fraction of it glowing, so that what reads no map, such as the
+    /// light it gives the scene, sees about the right amount. Mirrored in `vg/resolve.wgsl`.
+    pub const GLOW_MAP_AVERAGE: f32 = 0.1;
+
+    /// The material's layer in the scene's [`GlowMaps`], if it has one.
+    pub fn glow_layer(&self) -> Option<u32> {
+        (self.flags >> Self::GLOW_SHIFT).checked_sub(1)
+    }
 }
 
 impl Default for Material {
@@ -125,6 +137,57 @@ pub struct TextureLayer {
     pub color_mips: Vec<Vec<u8>>,
     pub normal_mips: Vec<Vec<u8>>,
     pub material_mips: Vec<Vec<u8>>,
+}
+
+/// The emissive maps of a scene's materials: one array of square BC7 sRGB textures. They hold
+/// soft light and are few, so they are small and all loaded with the scene.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GlowMaps {
+    /// Edge length of every layer.
+    pub edge: u32,
+    /// Each layer's whole mip chain, finest first.
+    pub layers: Vec<Vec<Vec<u8>>>,
+}
+
+/// A corner of a [`Card`], in world space.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct CardVertex {
+    pub position: [f32; 3],
+    pub uv: [f32; 2],
+}
+
+/// Triangles drawn transparent and glowing over the lit scene, such as a flame on a lamp.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Card {
+    pub first_vertex: u32,
+    /// A multiple of three.
+    pub vertex_count: u32,
+    /// Index into [`Cards::images`].
+    pub image: u32,
+    pub opacity: f32,
+    /// Multiplies the glow map, as RGB radiance.
+    pub emissive: [f32; 3],
+}
+
+/// The two maps of a card, of the same size and not necessarily square. BC7 sRGB, whole chains.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardImage {
+    pub width: u32,
+    pub height: u32,
+    /// Alpha is coverage.
+    pub color_mips: Vec<Vec<u8>>,
+    /// RGB light.
+    pub glow_mips: Vec<Vec<u8>>,
+}
+
+/// A scene's transparent glowing cards, which are kept out of its clusters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Cards {
+    pub vertices: Vec<CardVertex>,
+    pub cards: Vec<Card>,
+    pub images: Vec<CardImage>,
 }
 
 /// How a scene's texture maps are stored.

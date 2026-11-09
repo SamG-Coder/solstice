@@ -164,6 +164,10 @@ pub struct GpuScene {
     pub textures: TextureArrays,
     pub texture_summary: String,
     pub material_sampler: wgpu::Sampler,
+    /// The emissive maps, for a scene that has any and a GPU that can read them.
+    pub glow_maps: Option<wgpu::TextureView>,
+    /// The scene's transparent glowing cards, if it has any.
+    pub cards: Option<crate::cards::Cards>,
     /// Instances on the GPU: those of the scene's instances that have geometry.
     pub gpu_instance_count: u32,
     /// Whether any instance is cut out, so its lists and pipelines are needed.
@@ -253,6 +257,8 @@ impl GpuScene {
             textures,
             texture_summary,
             material_sampler,
+            glow_maps: upload_glow_maps(gpu, scene),
+            cards: crate::cards::Cards::new(gpu, scene),
             gpu_instance_count: instances.len() as u32,
             has_masked: instances.iter().any(|i| i.has_flag(INSTANCE_MASKED)),
             has_skins: instances.iter().any(GpuInstance::is_skinned),
@@ -302,6 +308,65 @@ impl GpuScene {
         }
         changes
     }
+}
+
+/// The emissive maps, as one array. `None` for a scene without any or a GPU that can't read
+/// them, and such a scene binds nothing for them: its materials glow evenly, by their factors.
+fn upload_glow_maps(gpu: &Gpu, scene: &PagedScene) -> Option<wgpu::TextureView> {
+    let block = gpu
+        .device
+        .features()
+        .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+    if !block || scene.glow.layers.is_empty() {
+        return None;
+    }
+    let (edge, layers) = (scene.glow.edge, &scene.glow.layers);
+    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("glow maps"),
+        size: wgpu::Extent3d {
+            width: edge,
+            height: edge,
+            depth_or_array_layers: layers.len() as u32,
+        },
+        mip_level_count: edge.ilog2() + 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bc7RgbaUnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (layer, mips) in layers.iter().enumerate() {
+        for (level, data) in mips.iter().enumerate() {
+            let blocks = (edge >> level).max(1).div_ceil(4);
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(blocks * 16),
+                    rows_per_image: Some(blocks),
+                },
+                wgpu::Extent3d {
+                    width: blocks * 4,
+                    height: blocks * 4,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+    Some(texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    }))
 }
 
 /// The scene's materials, as they stand with every texture in the base tier.

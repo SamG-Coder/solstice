@@ -142,6 +142,10 @@ pub struct PagedScene {
     pub instance_poses: Vec<u32>,
     /// See [`crate::SceneAsset::clips`].
     pub clips: Vec<crate::skeleton::Clip>,
+    /// The emissive maps of its materials.
+    pub glow: crate::scene::GlowMaps,
+    /// Its transparent glowing cards.
+    pub cards: crate::scene::Cards,
 }
 
 impl PagedScene {

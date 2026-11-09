@@ -1050,6 +1050,144 @@ fn a_large_bake_checks_its_textures_first() {
     assert!(!output.exists());
 }
 
+/// A plain KTX2 file of BC7 blocks, with a whole mip chain.
+fn write_ktx2(path: &Path, width: u32, height: u32) {
+    const HEADER: usize = 80;
+    let levels = width.max(height).ilog2() as usize + 1;
+    let mut file = vec![
+        0xab, b'K', b'T', b'X', b' ', b'2', b'0', 0xbb, b'\r', b'\n', 0x1a, b'\n',
+    ];
+    for word in [ktx2::BC7_SRGB, 1, width, height, 0, 0, 1, levels as u32, 0] {
+        file.extend_from_slice(&word.to_le_bytes());
+    }
+    file.resize(HEADER, 0);
+    let mut at = HEADER + levels * 24;
+    let mut data = Vec::new();
+    for level in 0..levels {
+        let blocks = |edge: u32| (edge >> level).max(1).div_ceil(4) as usize;
+        let bytes = blocks(width) * blocks(height) * 16;
+        for number in [at, bytes, bytes] {
+            file.extend_from_slice(&(number as u64).to_le_bytes());
+        }
+        data.resize(data.len() + bytes, level as u8);
+        at += bytes;
+    }
+    file.extend_from_slice(&data);
+    std::fs::write(path, file).unwrap();
+}
+
+/// A mesh with one primitive that is built and has an emissive map, and one that blends and glows.
+fn write_glow_and_card(dir: &TempDir) -> PathBuf {
+    write_ktx2(&dir.0.join("glow.ktx2"), 512, 512);
+    write_ktx2(&dir.0.join("flame.ktx2"), 8, 64);
+    write_ktx2(&dir.0.join("flame_glow.ktx2"), 8, 64);
+    let path = write_grid(dir, None);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text.replacen(
+        r#""scene": 0,"#,
+        r#""scene": 0,
+        "materials": [
+            {"emissiveTexture": {"index": 0}, "emissiveFactor": [1, 0.5, 0]},
+            {"alphaMode": "BLEND", "emissiveTexture": {"index": 2}, "emissiveFactor": [1, 1, 1],
+             "pbrMetallicRoughness": {"baseColorTexture": {"index": 1}, "baseColorFactor": [1, 1, 1, 0.5]}}
+        ],
+        "textures": [{"source": 0}, {"source": 1}, {"source": 2}],
+        "images": [{"uri": "glow.ktx2"}, {"uri": "flame.ktx2"}, {"uri": "flame_glow.ktx2"}],"#,
+        1,
+    );
+    let text = text.replacen(
+        r#""primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]"#,
+        r#""primitives": [
+            {"attributes": {"POSITION": 0}, "indices": 1, "material": 0},
+            {"attributes": {"POSITION": 0}, "indices": 1, "material": 1}
+        ]"#,
+        1,
+    );
+    assert!(text.contains(r#""material": 1"#));
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn what_blends_and_glows_becomes_cards_and_emissive_maps_are_kept() {
+    let dir = TempDir::new();
+    let path = write_glow_and_card(&dir);
+    let output = dir.0.join("out.solstice");
+    let options = streamed::LargeOptions {
+        textures: true,
+        glow_strength: 4.0,
+        ..large_options()
+    };
+    let report = streamed::bake_large(&path, &output, &options).unwrap();
+    assert_eq!((report.glow_maps, report.cards), (1, 1));
+    assert_eq!(report.instances, 1, "the card is not built as geometry");
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("emissive") || w.contains("Blend")),
+        "{:?}",
+        report.warnings
+    );
+    let scene = solstice_asset::file::decode(&std::fs::read(&output).unwrap())
+        .unwrap()
+        .scene;
+    assert_eq!(scene.glow.edge, 512);
+    assert_eq!(scene.materials[0].glow_layer(), Some(0));
+    let average = Material::GLOW_MAP_AVERAGE;
+    assert_eq!(
+        scene.materials[0].emissive,
+        [1.0 * 4.0 * average, 0.5 * 4.0 * average, 0.0],
+        "the factor over its surface, for what reads no map"
+    );
+    let card = scene.cards.cards[0];
+    assert_eq!(card.opacity, 0.5);
+    assert_eq!(card.emissive, [4.0; 3]);
+    assert_eq!(card.vertex_count as usize, scene.cards.vertices.len());
+    assert_eq!(card.vertex_count % 3, 0);
+    let image = &scene.cards.images[0];
+    assert_eq!((image.width, image.height), (8, 64));
+    assert_eq!(image.color_mips.len(), 7);
+    // In world space: the node moves everything one along X.
+    let leftmost = scene
+        .cards
+        .vertices
+        .iter()
+        .map(|v| v.position[0])
+        .fold(f32::MAX, f32::min);
+    assert_eq!(leftmost, 1.0);
+}
+
+/// Without textures there is nothing to draw a card with, so it is left as it was.
+#[test]
+fn without_textures_a_blended_material_stays_solid() {
+    let dir = TempDir::new();
+    let path = write_glow_and_card(&dir);
+    let output = dir.0.join("out.solstice");
+    let report = streamed::bake_large(&path, &output, &large_options()).unwrap();
+    assert_eq!((report.glow_maps, report.cards), (0, 0));
+    assert_eq!(report.instances, 2);
+    assert!(report.warnings.iter().any(|w| w.contains("Blend")));
+    assert!(report
+        .warnings
+        .iter()
+        .any(|w| w.contains("emissive texture is ignored")));
+}
+
+/// A card's maps must be usable as they are, which is found out before the hours of building.
+#[test]
+fn a_card_whose_maps_differ_in_size_is_refused() {
+    let dir = TempDir::new();
+    let path = write_glow_and_card(&dir);
+    write_ktx2(&dir.0.join("flame.ktx2"), 8, 32);
+    let options = streamed::LargeOptions {
+        textures: true,
+        ..large_options()
+    };
+    let error = streamed::bake_large(&path, dir.0.join("out.solstice"), &options).unwrap_err();
+    assert!(error.contains("differ in size"), "{error}");
+}
+
 /// The drive running out partway through stops the bake and clears up, not only at the start.
 #[test]
 fn a_bake_stops_when_the_drive_fills_up_on_the_way() {
