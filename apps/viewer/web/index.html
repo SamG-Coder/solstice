@@ -323,14 +323,24 @@ async function inflate(bytes) {
 }
 onmessage = async ({ data: { url, ticket, run } }) => {
   try {
-    const first = run[0].start;
-    const response = await fetch(url, { headers: { Range: "bytes=" + first + "-" + (run[run.length - 1].end - 1) } });
-    if (response.status !== 206) throw new Error("HTTP " + response.status);
+    // Many parts of the file in one response, one after another: scripts/serve.py.
+    const ranges = run.map((request) => request.start + "-" + (request.end - 1)).join(",");
+    const response = await fetch(url, { headers: { "X-Solstice-Ranges": ranges } });
+    if (!response.headers.get("X-Solstice-Ranges")) {
+      throw new Error("this scene needs scripts/serve.py, which can send many parts at once");
+    }
     const stored = new Uint8Array(await response.arrayBuffer());
-    const pages = await Promise.all(run.map(async (request) => {
-      const part = stored.subarray(request.start - first, request.end - first);
-      return { id: request.id, data: request.deflated ? await inflate(part) : part.slice() };
-    }));
+    let at = 0;
+    const parts = run.map((request) => {
+      const length = request.end - request.start;
+      const part = stored.subarray(at, at + length);
+      at += length;
+      return part;
+    });
+    const pages = await Promise.all(run.map(async (request, index) => ({
+      id: request.id,
+      data: request.deflated ? await inflate(parts[index]) : parts[index].slice(),
+    })));
     postMessage({ ticket, pages }, pages.map((page) => page.data.buffer));
   } catch (error) {
     postMessage({ ticket, failed: run.map((request) => request.id), error: String(error) });
@@ -377,13 +387,15 @@ class WorkerFetcher {
 
 class Streamer {
   // Pages being fetched at once. ?fetching=N tries another number.
-  static MAX_FETCHING = Number(params.get("fetching")) || (params.has("split") ? 256 : 16);
+  static MAX_FETCHING = Number(params.get("fetching")) || (params.has("split") ? 512 : 16);
   static WORKERS = Number(params.get("workers")) || Math.min(8, navigator.hardwareConcurrency || 4);
   // Browsers run about six connections per host over HTTP/1.1, so requests for parts of the file
   // that are close together share one, as long as what lies between them is small.
   static MERGE_GAP_BYTES = 256 * 1024;
   static MERGE_MAX_BYTES = 8 * 1048576;
   static RETRY_MS = 1000;
+  // Pages asked for in one request, by the workers. Six requests at a time is all a browser sends.
+  static PAGES_PER_REQUEST = Number(params.get("batch")) || 48;
   #viewer;
   #file;
   #workers = null;
@@ -410,6 +422,12 @@ class Streamer {
       requests.push({ id: flat[i], start: flat[i + 1], end: flat[i + 2], deflated: flat[i + 3] !== 0 });
     }
     requests.sort((a, b) => a.start - b.start);
+    if (this.#workers) {
+      for (let i = 0; i < requests.length; i += Streamer.PAGES_PER_REQUEST) {
+        this.#workers.fetch(requests.slice(i, i + Streamer.PAGES_PER_REQUEST));
+      }
+      return;
+    }
     let run = [];
     for (const request of requests) {
       const last = run[run.length - 1];
@@ -424,10 +442,6 @@ class Streamer {
   }
 
   async #fetchRun(run) {
-    if (this.#workers) {
-      this.#workers.fetch(run);
-      return;
-    }
     const start = run[0].start;
     const end = run[run.length - 1].end;
     let stored;

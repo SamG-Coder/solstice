@@ -60,11 +60,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         self.respond(send_body=True)
 
+    def respond_many(self, full, ranges):
+        """Serves many parts of a file as one response, one after another. The browser allows six
+        connections per host, so asking for pages one at a time caps a local scene at about a
+        thousand pages a second, however fast the disk is."""
+        size = os.path.getsize(full)
+        spans = []
+        for part in ranges.split(","):
+            first, last = (int(number) for number in part.split("-"))
+            if not 0 <= first <= last < size:
+                self.send_error(416)
+                return
+            spans.append((first, last))
+        total = sum(last - first + 1 for first, last in spans)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(total))
+        self.send_header("X-Solstice-Ranges", "1")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        with open(full, "rb") as file:
+            for first, last in spans:
+                file.seek(first)
+                part = file.read(last - first + 1)
+                self.throttle.wait(len(part))
+                try:
+                    self.wfile.write(part)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return
+
     def respond(self, send_body):
         time.sleep(self.latency)
         full = self.resolve()
         if full is None:
             self.send_error(404)
+            return
+        ranges = self.headers.get("X-Solstice-Ranges")
+        if ranges and send_body:
+            try:
+                self.respond_many(full, ranges)
+            except ValueError:
+                self.send_error(400)
             return
         stat = os.stat(full)
         size = stat.st_size
