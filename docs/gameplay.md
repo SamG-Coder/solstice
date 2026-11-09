@@ -991,10 +991,11 @@ downloaded by hand from their name-your-own-price pages, which the script lists.
   spine, which is close enough. A role chain's bones are paired by where they lie along it, so an
   arm with fewer bones than the source's is lined up less exactly.
 - **Speeds.** The library's root-motion files move 0.975 m/s for `Walk_Loop` and 5.36 m/s for
-  `Jog_Fwd_Loop`. Scaled by the keeper's ratio of leg lengths, 1.08, that is 1.06 and 5.8. A planted
-  foot in the retargeted walk goes back at 1.0 to 1.04 m/s, so the walk's blend point in
-  `scenes/walker/keeper.anim` is 1.0, and the jog's is 5.8. A walker going much faster than 1.0 m/s
-  blends towards a jog, and its feet slide; give it `speed` 1.0.
+  `Jog_Fwd_Loop`. Scaled by the keeper's ratio of leg lengths, 1.084, that is 1.06 and 5.8. What
+  matters to the eye is a planted foot, which in the retargeted clips goes back at about 1.04 m/s
+  in the walk and 6.2 m/s in the jog. So the blend points in `scenes/walker/keeper.anim` are 1.0,
+  which slips 3 cm over a stance, and 6.2. A walker going much faster than 1.0 m/s blends towards a
+  jog, and its feet slide; give it `speed` 1.0.
 - Feet slide about 8 cm over a stance, measured on the keeper. Step 9's IK removes the rest.
 - The library's `Idle_Loop` stands with its feet 45 cm apart, as it was authored.
 

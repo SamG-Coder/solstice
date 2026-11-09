@@ -652,6 +652,11 @@ mod tests {
         } else {
             Quat::IDENTITY
         };
+        let roll = if hanging {
+            Quat::from_rotation_x(0.6)
+        } else {
+            Quat::IDENTITY
+        };
         let along = Vec3::X * 0.3;
         Skeleton {
             bones: vec![
@@ -659,16 +664,17 @@ mod tests {
                 bone("clavicle", Some(0), Vec3::Y, Quat::IDENTITY),
                 bone("upper", Some(1), Vec3::X * 0.1, down),
                 bone("lower", Some(2), along, bend),
-                bone("hand", Some(3), along, Quat::IDENTITY),
-                bone("finger", Some(4), Vec3::X * 0.1, Quat::IDENTITY),
+                bone("hand", Some(3), along, roll),
+                bone("index", Some(4), Vec3::new(0.1, 0.0, 0.03), Quat::IDENTITY),
+                bone("middle", Some(4), Vec3::X * 0.1, Quat::IDENTITY),
+                bone("pinky", Some(4), Vec3::new(0.1, 0.0, -0.03), Quat::IDENTITY),
             ],
         }
     }
 
     #[test]
     fn a_rig_resting_its_arms_differently_is_lined_up_with_the_clips() {
-        let roles =
-            Roles::parse("root root\narm_l clavicle upper lower hand\nindex_l finger\n").unwrap();
+        let roles = Roles::parse("root root\narm_l clavicle upper lower hand\nindex_l index\nmiddle_l middle\npinky_l pinky\n").unwrap();
         let (source, target) = (armed(false), armed(true));
         // The source standing at its rest: arms straight out along +X.
         let rest = Pose::rest(&source);
@@ -684,16 +690,40 @@ mod tests {
                 .map_or((Vec3::ZERO, Quat::IDENTITY), |p| places[p as usize]);
             places.push((p + r * out.translations[0][i], r * out.rotations[0][i]));
         }
-        // Each arm bone lies along the source's, and the finger stays in line with the hand.
-        for (bone, next) in [(2, 3), (3, 4), (4, 5)] {
+        // Each arm bone lies along the source's, and so does the hand, to its middle finger.
+        for (bone, next) in [(2, 3), (3, 4), (4, 6)] {
             let along = (places[next].0 - places[bone].0).normalize();
             assert!(
-                along.dot(Vec3::X) > 0.999,
+                along.dot(Vec3::X) > 0.9999,
                 "bone {bone} points along {along}"
             );
         }
+        // The hand's palm faces as the source's does, though it rests rolled.
+        let across = (places[7].0 - places[5].0).normalize();
+        assert!(
+            across.dot(Vec3::NEG_Z) > 0.9999,
+            "the palm lies across {across}"
+        );
         // The collarbone is left where it was: the shoulder stays put.
         assert!((places[2].0 - Vec3::new(0.1, 1.0, 0.0)).length() < 1.0e-5);
+    }
+
+    #[test]
+    fn a_rig_with_arms_onto_itself_comes_back_unchanged() {
+        let roles = Roles::parse("root root\narm_l clavicle upper lower hand\nindex_l index\nmiddle_l middle\npinky_l pinky\n").unwrap();
+        let rig = armed(true);
+        let rest = Pose::rest(&rig);
+        let frames = Frames {
+            rotations: vec![rest.rotations.clone()],
+            translations: vec![rest.translations.clone()],
+        };
+        let out = retarget(&rig, &roles, &rig, &roles, &frames);
+        for (bone, (a, b)) in out.rotations[0].iter().zip(&rest.rotations).enumerate() {
+            assert!(
+                a.dot(*b).abs() > 0.99999,
+                "bone {bone} turned: {a} against {b}"
+            );
+        }
     }
 
     #[test]

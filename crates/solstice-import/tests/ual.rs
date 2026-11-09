@@ -1,5 +1,5 @@
 //! The Universal Animation Library's clips on the real character. Both are kept out of git, so
-//! this says so and passes without them: `python -I scripts/fetch-ual.py`, then
+//! this says so and passes without them: `python -I scripts/fetch-ual.py --zips FOLDER`, then
 //! `tools/blender/make_character.py`.
 
 use glam::{Quat, Vec3};
@@ -192,7 +192,7 @@ fn the_librarys_t_pose_stands_the_character_in_a_t() {
             .acos()
             .to_degrees();
         assert!(
-            off < 5.0,
+            off < 0.2,
             "the {side} palm is {off} degrees off the library's"
         );
     }
