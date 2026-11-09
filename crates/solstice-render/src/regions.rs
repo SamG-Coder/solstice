@@ -3,7 +3,8 @@
 //! wgpu limits a storage binding to 2 GiB, which a scene of billions of triangles passes twice:
 //! its cluster records, and the page pool it wants. So the cluster table is split in two, and the
 //! pool in three by level of detail: close, middle and far. A pool of its own also means far
-//! pages can't push out near ones.
+//! pages can't push out near ones that are wanted. A pool that has no room borrows what another
+//! has free or isn't using.
 //!
 //! Only such a scene pays for any of this. The shaders are rewritten for it as text, so a scene
 //! that fits compiles the source it always did, with the bindings and limits it always had.
