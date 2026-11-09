@@ -50,8 +50,11 @@ pub struct Residency {
     starved: u32,
     /// What the last plan wanted and could not start yet, most wanted last.
     queue: Vec<u32>,
-    /// Slots the last plan found reclaimable, which is slow to work out.
+    /// Slots the last plan found reclaimable, which is slow to work out. Each eviction spends one.
     reclaimable_at_plan: u32,
+    /// Pages that may be evicted, likeliest last, found once a frame as that takes a whole scan.
+    victims: Vec<u32>,
+    victims_frame: u32,
 }
 
 impl Residency {
@@ -80,6 +83,8 @@ impl Residency {
             starved: 0,
             queue: Vec::new(),
             reclaimable_at_plan: 0,
+            victims: Vec::new(),
+            victims_frame: 0,
         }
     }
 
@@ -252,6 +257,7 @@ impl Residency {
                     unreachable!("victims are installed");
                 };
                 self.remove(victim);
+                self.reclaimable_at_plan = self.reclaimable_at_plan.saturating_sub(1);
                 (slot, Some(victim))
             }
         };
@@ -299,15 +305,44 @@ impl Residency {
 
     /// The least recently wanted page that nothing depends on, unprotected. Ties go to the
     /// finest page, which has the least effect on the image.
-    fn choose_victim(&self, frame: u32) -> Option<u32> {
-        (self.pinned as usize..self.states.len())
-            .filter(|&page| {
-                self.is_installed(page as u32)
-                    && self.installed_dependants[page] == 0
-                    && frame.saturating_sub(self.last_wanted[page]) > PROTECTED_FRAMES
-            })
-            .min_by_key(|&page| (self.last_wanted[page], std::cmp::Reverse(page)))
+    fn choose_victim(&mut self, frame: u32) -> Option<u32> {
+        if self.victims_frame != frame {
+            self.find_victims(frame);
+        }
+        self.victim_from_list(frame).or_else(|| {
+            // Evicting a page can free its parents, which the list won't have.
+            self.find_victims(frame);
+            self.victim_from_list(frame)
+        })
+    }
+
+    /// The likeliest page in the list that may still be evicted.
+    fn victim_from_list(&mut self, frame: u32) -> Option<u32> {
+        while let Some(page) = self.victims.pop() {
+            if self.may_be_evicted(page as usize, frame) {
+                return Some(page);
+            }
+        }
+        None
+    }
+
+    fn may_be_evicted(&self, page: usize, frame: u32) -> bool {
+        self.is_installed(page as u32)
+            && self.installed_dependants[page] == 0
+            && frame.saturating_sub(self.last_wanted[page]) > PROTECTED_FRAMES
+    }
+
+    /// Lists every page that may be evicted, least recently wanted last so it pops first.
+    fn find_victims(&mut self, frame: u32) {
+        let mut victims: Vec<u32> = (self.pinned as usize..self.states.len())
+            .filter(|&page| self.may_be_evicted(page, frame))
             .map(|page| page as u32)
+            .collect();
+        victims.sort_unstable_by_key(|&page| {
+            std::cmp::Reverse((self.last_wanted[page as usize], std::cmp::Reverse(page)))
+        });
+        self.victims = victims;
+        self.victims_frame = frame;
     }
 }
 
@@ -337,6 +372,45 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), everything.len());
         assert_eq!(unique.len(), 6);
+    }
+
+    #[test]
+    fn a_new_plan_replaces_what_was_queued() {
+        let mut residency = Residency::new(vec![Vec::new(); 6], 0, 6);
+        let first = residency.plan(1, &[10; 6], 1);
+        assert_eq!(first.len(), 1);
+        residency.arrived(first[0]);
+
+        // Now only one other page is wanted, so the rest of the old queue must not be fetched.
+        let wanted = (first[0] + 1) % 6;
+        let mut requests = vec![0; 6];
+        requests[wanted as usize] = 10;
+        assert_eq!(residency.plan(2, &requests, 1), [wanted]);
+        residency.arrived(wanted);
+        assert!(residency.refill(4).is_empty());
+    }
+
+    #[test]
+    fn refill_does_not_overcommit_the_pool() {
+        // Three slots, all full of pages nobody wants any more.
+        let mut residency = Residency::new(vec![Vec::new(); 7], 0, 3);
+        for page in 0..3 {
+            residency.install_now(page);
+        }
+        let frame = PROTECTED_FRAMES + 10;
+        let mut requests = vec![0; 7];
+        requests[3..7].fill(10);
+        // Room for three, one fetched at a time: the fourth must wait for a later plan.
+        let mut fetched = residency.plan(frame, &requests, 1);
+        for _ in 0..8 {
+            for page in std::mem::take(&mut fetched) {
+                assert!(residency.arrived(page));
+            }
+            while residency.next_install(frame).is_some() {}
+            fetched = residency.refill(1);
+        }
+        assert_eq!(residency.installed_count(), 3, "the pool is full");
+        assert_eq!(residency.in_transit(), 0, "and nothing is left stranded");
     }
 
     use super::*;
@@ -541,6 +615,7 @@ mod tests {
                     }
                 }
             }
+            in_flight.extend(r.refill(8));
             while let Some(install) = r.next_install(frame) {
                 used += 1;
                 if install.evicted.is_some() {
