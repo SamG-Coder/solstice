@@ -7,8 +7,9 @@
 //! each actor file and script, the input actions, and [`GAME_FILE`], which lists the actors in
 //! the same form, with the renderer instances the bake placed for each actor's mesh.
 
-use crate::{coordinate, is_name, lines, number, FileError};
+use crate::{coordinate, is_name, lines, number, resolve, ActorFile, FileError};
 use glam::Vec3;
+use solstice_asset::GameFile;
 use std::fmt::Write;
 use std::ops::Range;
 
@@ -175,6 +176,38 @@ impl SceneGame {
     }
 }
 
+/// The files a scene's gameplay names that `files` lacks, each once, in the order named: for
+/// a viewer that is handed a game a file at a time, to ask for the rest. [`GAME_FILE`] is the
+/// first, then the input actions and actor files it names, then each actor's script and
+/// animation. A file that can't be read names nothing: loading the game says what is wrong
+/// with it.
+pub fn missing_files(files: &[GameFile]) -> Vec<String> {
+    let file = |name: &str| files.iter().find(|f| f.name == name).map(|f| &*f.text);
+    let mut named = Vec::new();
+    match file(GAME_FILE).map(SceneGame::parse) {
+        None => named.push(GAME_FILE.to_owned()),
+        Some(Err(_)) => {}
+        Some(Ok(scene)) => {
+            named.extend(scene.input);
+            for line in scene.actors {
+                let actor = file(&line.file).map(ActorFile::parse);
+                named.push(line.file.clone());
+                if let Some(Ok(actor)) = actor {
+                    let relative = actor.script.iter().chain(&actor.animation);
+                    named.extend(relative.map(|name| resolve(&line.file, name)));
+                }
+            }
+        }
+    }
+    let mut missing: Vec<String> = Vec::new();
+    for name in named {
+        if file(&name).is_none() && !missing.contains(&name) {
+            missing.push(name);
+        }
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +308,52 @@ mod tests {
             assert_eq!(error.line, 1);
             assert!(error.message.contains(part), "{line}: {error}");
         }
+    }
+
+    #[test]
+    fn the_files_a_game_names_and_lacks_are_listed_as_they_come_to_light() {
+        let file = |name: &str, text: &str| GameFile {
+            name: name.to_owned(),
+            text: text.to_owned(),
+        };
+        let mut files = Vec::new();
+        assert_eq!(missing_files(&files), [GAME_FILE]);
+        files.push(file(
+            GAME_FILE,
+            "input keys.input
+actor doors/door.actor 0 0 0 0
+actor doors/door.actor 1 0 0 0
+actor rock.actor 0 0 0 0
+",
+        ));
+        assert_eq!(
+            missing_files(&files),
+            ["keys.input", "doors/door.actor", "rock.actor"]
+        );
+        files.push(file(
+            "doors/door.actor",
+            "name door
+script door.star
+animation ../door.anim
+",
+        ));
+        files.push(file(
+            "rock.actor",
+            "name rock
+",
+        ));
+        files.push(file(
+            "keys.input",
+            "interact key KeyF
+",
+        ));
+        assert_eq!(missing_files(&files), ["doors/door.star", "door.anim"]);
+        files.push(file("doors/door.star", ""));
+        files.push(file("door.anim", ""));
+        assert!(missing_files(&files).is_empty());
+        // A file with a mistake names nothing: loading the game reports it.
+        files[0].text = "actor".to_owned();
+        assert!(missing_files(&files).is_empty());
     }
 
     #[test]

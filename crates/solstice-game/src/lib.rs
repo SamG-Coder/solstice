@@ -21,7 +21,7 @@ pub mod scene;
 pub use actor::{ActorFile, Mesh, Property, PropertyKind};
 pub use input::{Binding, Device, Devices, InputMap};
 pub use play::{Message, Play, View};
-pub use scene::{ActorLine, Blocker, SceneGame, GAME_FILE};
+pub use scene::{missing_files, ActorLine, Blocker, SceneGame, GAME_FILE};
 
 use std::fmt;
 

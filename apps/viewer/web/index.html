@@ -875,11 +875,45 @@ async function main() {
   requestAnimationFrame(tick);
 }
 
+/// ?game=NAME gives the scene the game in games/NAME/ beside the page, in place of any baked
+/// into it: its scene.game, and, to play it, each file that names. So a scene baked without a
+/// game, or too big to bake again, gets one. A scene opened without ?game= fetches nothing.
+async function giveGame(viewer) {
+  const name = params.get("game");
+  if (name === null) return;
+  viewer.clear_game();
+  if (!/^[\w-]+$/.test(name)) throw new Error("invalid game name");
+  const read = async (file) => {
+    // Only what lies in the game's own folder.
+    if (!/^[\w.-]+(\/[\w.-]+)*$/.test(file) || file.split("/").includes("..")) {
+      throw new Error(`games/${name}: ${file} is not a file in it`);
+    }
+    const response = await fetch(`./games/${name}/${file}`);
+    if (!response.ok) throw new Error(`games/${name}/${file}: ${response.status}`);
+    return response.text();
+  };
+  viewer.add_game_file("scene.game", await read("scene.game"));
+  // The plain build only needs to know there is a game to offer.
+  if (!playing) return;
+  // What scene.game names, and then what those name: a few rounds at most.
+  for (let round = 0; round < 8; round += 1) {
+    const missing = viewer.game_files_missing();
+    if (missing.length === 0) return;
+    const texts = await Promise.all(missing.map(read));
+    missing.forEach((file, i) => viewer.add_game_file(file, texts[i]));
+  }
+  throw new Error(`games/${name}: its files never stop naming more`);
+}
+
 /// Offers Play on a scene with a game, and, in the gameplay build, runs it: passes the keys,
 /// mouse, gamepads and touch on to it, and shows what its scripts log. Returns what to call
 /// each frame, or nothing if no game runs.
 async function startGame(viewer, file) {
-  if (!viewer.has_gameplay()) return null;
+  const given = await giveGame(viewer).catch((error) => error);
+  const failed = given instanceof Error;
+  // Said where a game's mistakes are, when playing; a page only looking is not stopped by it.
+  if (failed && !playing) console.warn(String(given.message ?? given));
+  if (!viewer.has_gameplay() && !(failed && playing)) return null;
   if (!playing) {
     el("play").hidden = false;
     el("play").querySelector("button").addEventListener("click", () => {
@@ -903,6 +937,7 @@ async function startGame(viewer, file) {
     }
   };
   try {
+    if (failed) throw given;
     // Fetched only now: a scene that is only looked at never downloads its collision.
     const started = performance.now();
     const ranges = viewer.collision_ranges();

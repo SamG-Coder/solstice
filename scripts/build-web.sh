@@ -34,5 +34,12 @@ for scene in assets/*.solstice; do
   [ -e "$scene" ] || continue
   ln -f "$scene" "dist/assets/$(basename "$scene")" 2>/dev/null || cp "$scene" "dist/assets/"
 done
+# Games kept as folders of text, to play on scenes baked without them (?game=NAME): each
+# folder in scenes/ with a scene.game of its own.
+for game in scenes/*/scene.game; do
+  [ -e "$game" ] || continue
+  mkdir -p "dist/games/$(basename "$(dirname "$game")")"
+  cp -r "$(dirname "$game")"/* "dist/games/$(basename "$(dirname "$game")")/"
+done
 
 echo "built dist/. To try it: python scripts/serve.py"

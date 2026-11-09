@@ -6,11 +6,20 @@
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
 //! viewer [SCENE] --play [--scripts DIR] [--capture out.png --frames N [--press ACTION@FRAME]...
 //!        [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
+//! viewer [SCENE] --game DIR [the same as with --play]
+//! viewer [SCENE] --instances-near x,y,z,radius
 //! ```
 //!
 //! `--play` runs the scene's game, if it has one: its actors move, the camera is the player's,
 //! and keys and the mouse are its input. Its scripts are reloaded from `--scripts` (by default
 //! `scenes`, where scene text files live) when they change on disk.
+//!
+//! `--game DIR` plays the game in a folder in place of the one baked into the scene, if any:
+//! its `scene.game`, and the actor files, scripts and input actions that names. So a scene
+//! baked without a game, or one too big to bake again, is given one, or a new one, without a
+//! bake. Its `actor` lines name the scene's instances themselves (`instances=FIRST+COUNT`),
+//! which `--instances-near` lists: each instance placed within a radius of a point, with its
+//! mesh, material, place and yaw.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
@@ -171,6 +180,28 @@ mod native {
             Ok(Some(index.decode(&pieces)?))
         }
 
+        /// Prints the instances placed within a radius of a point, `near` being x, y, z and the
+        /// radius: what a scene's game needs to say which instances an actor moves.
+        fn list_instances(&self, near: [f32; 4]) {
+            let paged = match self {
+                Self::Loaded(loaded) => &loaded.scene,
+                Self::Streamed(paged) => paged,
+            };
+            let [x, y, z, radius] = near;
+            println!("instance  mesh  material  x y z  yaw");
+            for (id, instance) in paged.instances.iter().enumerate() {
+                let (_, rotation, at) = instance.transform.to_scale_rotation_translation();
+                if at.distance(Vec3::new(x, y, z)) > radius {
+                    continue;
+                }
+                let yaw = rotation.to_euler(glam::EulerRot::YXZ).0.to_degrees();
+                println!(
+                    "{id}  {}  {}  {:.3} {:.3} {:.3}  {yaw:.1}",
+                    instance.mesh, instance.material, at.x, at.y, at.z
+                );
+            }
+        }
+
         fn gameplay(&self) -> &[solstice_asset::GameFile] {
             match self {
                 Self::Loaded(loaded) => &loaded.scene.gameplay,
@@ -259,6 +290,10 @@ mod native {
         bob: Option<[f32; 5]>,
         /// Run the scene's game.
         play: bool,
+        /// A folder holding the game to run, in place of the scene's own.
+        game: Option<PathBuf>,
+        /// List the instances placed within a radius of a point, as x, y, z, radius, and stop.
+        instances_near: Option<[f32; 4]>,
         /// Where the scene's scripts are on disk, by the names the scene gives them, to reload
         /// them when they change.
         scripts: PathBuf,
@@ -294,7 +329,19 @@ mod native {
         if !options.play {
             return None;
         }
-        let files = scene.gameplay();
+        let side;
+        let files = match &options.game {
+            None => scene.gameplay(),
+            Some(folder) => {
+                let mut files = Vec::new();
+                if let Err(error) = read_game_files(folder, "", &mut files) {
+                    log::error!("--game {}: {error}", folder.display());
+                    return None;
+                }
+                side = files;
+                &side
+            }
+        };
         if files.is_empty() {
             log::warn!("--play: this scene has no gameplay, so there is nothing to play");
             return None;
@@ -325,6 +372,26 @@ mod native {
                 None
             }
         }
+    }
+
+    /// Reads every text file in a folder, and the folders in it, as gameplay files named as a
+    /// scene's are: from the folder, with `/` between folders.
+    fn read_game_files(
+        folder: &Path,
+        prefix: &str,
+        files: &mut Vec<solstice_asset::GameFile>,
+    ) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(folder)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type()?.is_dir() {
+                read_game_files(&entry.path(), &format!("{name}/"), files)?;
+            } else if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                files.push(solstice_asset::GameFile { name, text });
+            }
+        }
+        Ok(())
     }
 
     /// Logs what a game's scripts logged, and its errors.
@@ -429,6 +496,8 @@ mod native {
             effects: Vec::new(),
             bob: None,
             play: false,
+            game: None,
+            instances_near: None,
             scripts: PathBuf::from("scenes"),
             presses: Vec::new(),
             holds: Vec::new(),
@@ -576,6 +645,19 @@ mod native {
                 }
                 "--stream" => options.stream = true,
                 "--play" => options.play = true,
+                "--game" => {
+                    // Its scripts are watched where they were read from.
+                    let folder = PathBuf::from(value()?);
+                    options.play = true;
+                    options.scripts.clone_from(&folder);
+                    options.game = Some(folder);
+                }
+                "--instances-near" => {
+                    options.instances_near = Some(
+                        <[f32; 4]>::try_from(floats(&value()?)?)
+                            .map_err(|_| "--instances-near expects x,y,z,radius")?,
+                    );
+                }
                 "--scripts" => options.scripts = PathBuf::from(value()?),
                 "--press" => {
                     let text = value()?;
@@ -685,6 +767,10 @@ mod native {
         } else {
             Source::Loaded(load_scene(&options.scene)?)
         };
+        if let Some(near) = options.instances_near {
+            scene.list_instances(near);
+            return Ok(());
+        }
         if options.flyover.is_some() {
             let Source::Loaded(scene) = &scene else {
                 return Err("flyovers load the whole scene, so they can't use --stream".into());

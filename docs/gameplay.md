@@ -1090,6 +1090,19 @@ def on_hour(self, hour):
     touch: a stick under the left thumb, looking under the right, and taps. It shows what
     scripts log, and their errors, in a panel.
   - Gamepads natively are left for later: they need a crate of their own (`gilrs`).
+  - **A game from a folder.** `viewer SCENE --game DIR` plays the game in a folder in place of
+    the scene's own: its `scene.game`, and the actor files, scripts and input actions that
+    names, all named from the folder. On the web, `?game=NAME` does the same with
+    `games/NAME/` beside the page, which `scripts/build-web.sh` fills from each folder in
+    `scenes/` that has a `scene.game`. The page fetches `scene.game` to offer *Play*, and the
+    rest only to play; without `?game=` it fetches nothing.
+    - This is for scenes baked without a game, or too big to bake again: a script is changed
+      and the page reloaded. `scenes/zorah/` gives Zorah doors that open this way.
+    - Such an actor has no mesh of its own. Its line names the instances the scene already
+      draws (`instances=FIRST+COUNT`), and placed at their hinge, it turns them about it.
+      `viewer SCENE --instances-near x,y,z,radius` lists the instances near a point.
+    - Instance numbers belong to one bake. Baked again from other sources, a scene may number
+      them otherwise, and nothing checks that a game's numbers still mean what they did.
   - With actors but no player, the keys both fly the camera and reach the game.
   - Keys typed into the page's own controls don't reach the game.
 - **Left for later.** An actor's instances are movable from the start, so a gate that seldom

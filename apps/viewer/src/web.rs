@@ -569,6 +569,21 @@ impl WebViewer {
         !self.gameplay.is_empty()
     }
 
+    /// Forgets the scene's game, so that another can be given in its place.
+    pub fn clear_game(&mut self) {
+        self.gameplay.clear();
+    }
+
+    /// Gives the scene a gameplay file, in place of any of that name. So a game kept in a
+    /// folder beside the page is played on a scene baked without it. Before `play`.
+    pub fn add_game_file(&mut self, name: &str, text: &str) {
+        self.gameplay.retain(|file| file.name != name);
+        self.gameplay.push(GameFile {
+            name: name.to_owned(),
+            text: text.to_owned(),
+        });
+    }
+
     /// Whether this build can play one: the gameplay build can, the plain one can't.
     pub fn can_play() -> bool {
         cfg!(feature = "gameplay")
@@ -619,6 +634,12 @@ impl WebViewer {
     /// Takes one part of the collision, inflated, in the order of `collision_ranges`.
     pub fn deliver_collision(&mut self, bytes: Vec<u8>) {
         self.collision_pieces.push(bytes);
+    }
+
+    /// The files the scene's game names and lacks: for a game given file by file, what to give
+    /// next. Empty once it has them all.
+    pub fn game_files_missing(&self) -> Vec<String> {
+        solstice_game::missing_files(&self.gameplay)
     }
 
     /// Starts the scene's game, with its collision delivered. Rejects with every mistake in its
