@@ -391,7 +391,7 @@ mod tests {
         let slots = band_slots(&scene, 11, cap);
         assert_eq!(slots[2], 5);
         assert!(
-            slots[1] >= 2 + 1,
+            slots[1] >= 3,
             "the middle band can hold its pinned pages: {slots:?}"
         );
     }
