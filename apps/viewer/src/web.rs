@@ -71,6 +71,10 @@ pub struct WebViewer {
 
 /// How far around the camera a scene read in parts loads what isn't in view, in metres.
 const LARGE_SCENE_PREFETCH: f32 = 24.0;
+/// Such a scene's clusters under this many texels of a shadow cascade, or voxels of the GI,
+/// across are drawn into it as specks: its coarsest clusters are small, and far cascades and
+/// coarse voxels are nearly all specks.
+const LARGE_SCENE_SPECKS: f32 = 1.0;
 
 #[wasm_bindgen]
 impl WebViewer {
@@ -153,6 +157,11 @@ impl WebViewer {
                 // A scene this large takes a moment to bring in what a turn reveals.
                 prefetch_radius: if scene.external.is_some() {
                     LARGE_SCENE_PREFETCH
+                } else {
+                    0.0
+                },
+                speck_texels: if scene.external.is_some() {
+                    LARGE_SCENE_SPECKS
                 } else {
                     0.0
                 },

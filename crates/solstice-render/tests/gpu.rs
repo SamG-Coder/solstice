@@ -138,6 +138,8 @@ struct Run {
     /// Clusters the last shadow cascade redrawn sent to the software rasterizer.
     shadow_software_clusters: u32,
     shadow_clusters: u32,
+    /// Clusters it drew as specks.
+    shadow_specks: u32,
 }
 
 /// Renders a few frames in darkness, fails on any validation error, and reads back the result.
@@ -192,6 +194,7 @@ fn render_in(
         software_clusters: stats.software_clusters,
         shadow_software_clusters: stats.shadow_software_clusters,
         shadow_clusters: stats.shadow_clusters,
+        shadow_specks: stats.shadow_specks,
     }
 }
 
@@ -1353,6 +1356,153 @@ fn small_casters_shadow_through_the_software_rasterizer() {
     assert!(
         shadowed + 30.0 < lit,
         "the floor at ({px}, {py}) is {shadowed} with the ball and {lit} without: no shadow"
+    );
+}
+
+/// The floor of [`ball_on_floor`] with, in place of the ball, a square sheet of `side` by `side`
+/// balls of `radius`, touching, level at `height` over the origin. Each ball is one cluster.
+fn sheet_of_balls(side: u32, radius: f32, height: f32) -> SceneAsset {
+    let mut scene = ball_on_floor();
+    scene.meshes[0] = build_virtual_mesh(&sphere(0), &BuildOptions::default());
+    let floor = scene.instances.pop().expect("the floor");
+    scene.instances.clear();
+    let half = side as f32 * radius;
+    for z in 0..side {
+        for x in 0..side {
+            let at = Vec3::new(
+                (2 * x + 1) as f32 * radius - half,
+                height,
+                (2 * z + 1) as f32 * radius - half,
+            );
+            scene.instances.push(instance(
+                0,
+                Mat4::from_scale_rotation_translation(Vec3::splat(radius), Quat::IDENTITY, at),
+            ));
+        }
+    }
+    scene.instances.push(floor);
+    scene
+}
+
+/// Clusters under a texel of a shadow map across are drawn into it as specks: a point each, in
+/// place of their triangles. A sheet of touching balls four millimetres across, half a texel of
+/// even the nearest cascade, must cast a shadow, and the cascade must report that the balls
+/// went as specks, so that the shadow cannot be the rasterizers'. A speck marks every texel its
+/// bounds touch, where a rasterizer marks only the texels whose centres a triangle covers, and
+/// misses most of them at this size: so specks never let through more light than triangles do.
+#[test]
+fn clusters_under_a_texel_shadow_as_specks() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 2.5),
+        yaw: 0.0,
+        pitch: -0.7,
+        ..Default::default()
+    };
+    let sun_direction = Vec3::new(1.0, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let size = 256;
+    let settings = |speck_texels: f32| RendererSettings {
+        temporal_accumulation: false,
+        speck_texels,
+        ..Default::default()
+    };
+    let (side, height) = (150, 0.5);
+    let scene = sheet_of_balls(side, 0.002, height);
+    // On the floor in the sheet's shadow, clear of the sheet as the camera sees it.
+    let in_shadow = Vec3::new(-0.5, 0.0, 0.1);
+    let (px, py) = pixel_of(&camera, size, in_shadow);
+
+    let specks = render_in(&gpu, &scene, &camera, settings(1.0), size, &sun);
+    assert!(
+        specks.shadow_specks >= side * side / 2,
+        "{} of the sheet's {} balls were drawn as specks",
+        specks.shadow_specks,
+        side * side
+    );
+    let triangles = render_in(&gpu, &scene, &camera, settings(0.0), size, &sun);
+    assert_eq!(triangles.shadow_specks, 0, "specks are off");
+
+    let mut bare = scene.clone();
+    bare.instances.drain(..(side * side) as usize);
+    let lit = brightness(patch(
+        &render_in(&gpu, &bare, &camera, settings(1.0), size, &sun).pixels,
+        size,
+        px,
+        py,
+        2,
+    ));
+    let as_specks = brightness(patch(&specks.pixels, size, px, py, 2));
+    let as_triangles = brightness(patch(&triangles.pixels, size, px, py, 2));
+    assert!(
+        as_specks + 30.0 < lit,
+        "the floor at ({px}, {py}) is {as_specks} under the sheet and {lit} without it: no shadow"
+    );
+    assert!(
+        as_specks < as_triangles + 12.0,
+        "the shadow is {as_specks} drawn as specks, lighter than the {as_triangles} of triangles"
+    );
+}
+
+/// The GI's voxels take clusters under a voxel across as specks too: a clump of small red balls
+/// shows red in the voxels, where only the specks' own pass can have put it.
+#[test]
+fn clusters_under_a_voxel_are_voxelized_as_specks() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 96;
+    let camera = over_the_floor();
+    let mut scene = red_ball_on_floor();
+    scene.meshes[0] = build_virtual_mesh(&sphere(0), &BuildOptions::default());
+    let floor = scene.instances.pop().expect("the floor");
+    scene.instances.clear();
+    // A block of balls a twentieth of a metre across, in voxels a fifth of a metre across.
+    let centre = Vec3::new(0.0, 1.0, 0.0);
+    for index in 0..1000 {
+        let cell = Vec3::new(
+            (index % 10) as f32,
+            (index / 10 % 10) as f32,
+            (index / 100) as f32,
+        );
+        let mut ball = instance(
+            0,
+            Mat4::from_scale_rotation_translation(
+                Vec3::splat(0.025),
+                Quat::IDENTITY,
+                centre + (cell - 4.5) * 0.1,
+            ),
+        );
+        ball.material = 1;
+        scene.instances.push(ball);
+    }
+    scene.instances.push(floor);
+    let (bx, by) = pixel_of(&camera, size, centre);
+    let redness = |speck_texels: f32| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Voxels,
+            speck_texels,
+            ..Default::default()
+        };
+        let mut stage = Stage::new(&gpu, &scene, settings, size);
+        stage.frames(&gpu, &camera, &low_sun(), 12);
+        let [r, g, _] = patch(&stage.pixels(&gpu), size, bx, by, 1);
+        r / g.max(1.0)
+    };
+    let as_specks = redness(1.0);
+    assert!(
+        as_specks > 2.0,
+        "the balls drawn as specks aren't in the voxels: {as_specks}"
+    );
+    let as_triangles = redness(0.0);
+    assert!(
+        as_triangles > 2.0,
+        "the balls drawn as triangles aren't in the voxels: {as_triangles}"
     );
 }
 

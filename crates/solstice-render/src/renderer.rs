@@ -91,6 +91,11 @@ pub struct RendererSettings {
     /// isn't facing, at a coarser level of detail, so that turning or moving fast starts from
     /// more than the coarsest geometry. 0 loads only what is seen.
     pub prefetch_radius: f32,
+    /// Clusters under this many texels of a shadow cascade, or voxels of the GI, across are
+    /// drawn into it as specks: a point each, by one thread, where a rasterizer gives each a
+    /// workgroup. For a scene whose coarsest clusters are small, of which a far cascade is
+    /// nearly all specks. 0 draws every cluster's triangles.
+    pub speck_texels: f32,
     /// Internal resolution relative to the output. Temporal upscaling fills in the rest.
     pub render_scale: f32,
     pub debug_view: DebugView,
@@ -122,6 +127,7 @@ impl Default for RendererSettings {
             lod_threshold: 1.0,
             shadow_lod_threshold: 1.0,
             prefetch_radius: 0.0,
+            speck_texels: 0.0,
             render_scale: 1.0,
             debug_view: DebugView::Lit,
             temporal_accumulation: true,
@@ -219,6 +225,8 @@ pub struct FrameStats {
     pub shadow_triangles: u32,
     /// How many of those clusters went to the software rasterizer.
     pub shadow_software_clusters: u32,
+    /// Clusters it drew as specks, besides those.
+    pub shadow_specks: u32,
     /// Queue entries and clusters the main view, and that cascade, lost for want of room in
     /// their lists. Zero unless the scene has outgrown them, in which case the image, or the
     /// shadow, has holes.
@@ -765,6 +773,7 @@ impl Renderer {
             particles: self.particles.stats(),
             shadow_clusters: self.aux_work.stats().clusters(),
             shadow_software_clusters: self.aux_work.stats().software_clusters(),
+            shadow_specks: self.aux_work.stats().specks(),
             shadow_triangles: self.aux_work.stats().triangles(),
             dropped: self.main_work.stats().dropped(),
             shadow_dropped: self.aux_work.stats().dropped(),
@@ -863,6 +872,8 @@ impl Renderer {
         let parity = (self.frame_index & 1) as usize;
 
         self.write_frame_data(gpu, camera, environment, render_size);
+        self.shadows.speck_texels = self.settings.speck_texels;
+        self.volume.speck_voxels = self.settings.speck_texels;
         let shadow_work = self.shadows.prepare(
             gpu,
             &self.view_slots,
@@ -1380,7 +1391,8 @@ impl Renderer {
             masked_lists: 1,
             prefetch_radius: self.settings.prefetch_radius,
             hold_requests: 0,
-            _pad_prefetch: [0; 2],
+            speck_texels: 0.0,
+            _pad_prefetch: 0,
         };
         self.view_slots.write(
             gpu,

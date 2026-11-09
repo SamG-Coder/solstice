@@ -614,6 +614,10 @@ mod native {
                     options.settings.prefetch_radius =
                         value()?.parse().map_err(|e| format!("--prefetch: {e}"))?;
                 }
+                "--specks" => {
+                    options.settings.speck_texels =
+                        value()?.parse().map_err(|e| format!("--specks: {e}"))?;
+                }
                 "--move" => {
                     options.capture_motion =
                         value()?.parse().map_err(|e| format!("--move: {e}"))?;

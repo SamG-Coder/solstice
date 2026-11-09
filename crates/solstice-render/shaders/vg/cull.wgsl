@@ -103,6 +103,41 @@ fn emit_cluster(instance: u32, cluster: u32, software: bool) -> bool {
     return true;
 }
 
+// Sends a cluster to be drawn as a speck. For a voxelization it goes to the hardware end of the
+// list, which nothing else there uses, and gi/voxelize.wgsl marks the voxels its bounds touch.
+// For a depth map, the texels its bounds touch and its depth are worked out here, where its
+// bounds are to hand, and vg/speck_depth.wgsl only writes them.
+fn emit_speck(instance: u32, cluster: u32, center: vec3f, radius: f32) {
+    if view.allow_software == 2u {
+        _ = emit_cluster(instance, cluster, false);
+        return;
+    }
+    let clip = view.raster_view_proj * vec4f(center, 1.0);
+    let at = vec2f((clip.x * 0.5 + 0.5) * view.viewport.x, (0.5 - clip.y * 0.5) * view.viewport.y);
+    let reach = radius * view.lod_scale;
+    let last = vec2i(view.viewport) - 1;
+    let low = vec2i(floor(at - reach));
+    let high = vec2i(floor(at + reach));
+    // Nothing of it lands in the map. Depth runs 0 at the light's side to 1 at the far side.
+    if any(high < vec2i(0)) || any(low > last) || clip.z <= 0.0 || clip.z >= 1.0 {
+        return;
+    }
+    let slot = atomicAdd(&state.speck_count, 1u);
+    if slot >= arrayLength(&retry) {
+        atomicAdd(&state.dropped, 1u);
+        return;
+    }
+    // The far side of its bounds, so that it does not shadow itself.
+    let m = view.raster_view_proj;
+    let depth = min(clip.z + radius * length(vec3f(m[0][2], m[1][2], m[2][2])), 1.0);
+    let first = vec2u(max(low, vec2i(0)));
+    let more = min(vec2u(min(high, last)) - first, vec2u(3u));
+    retry[slot] = QueueEntry(
+        first.x | (first.y << 13u) | (more.x << 26u) | (more.y << 28u),
+        max(u32((1.0 - depth) * 16777215.0), 1u),
+    );
+}
+
 // The same for cut-out clusters, in the part of the list after the opaque clusters' part.
 fn emit_masked_cluster(instance: u32, cluster: u32, software: bool) -> bool {
     let end = arrayLength(&visible);
@@ -230,6 +265,16 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
         if view.phase == 0u {
             push_retry(QueueEntry(entry.instance, cluster_index | CLUSTER_BIT));
         }
+        return;
+    }
+
+    // A cluster under a texel of a depth map, or a voxel, across marks the same texel or two
+    // whichever of its triangles is drawn, and a rasterizer gives it a hundred threads and more
+    // to do so. In a scene whose coarsest clusters are small, a far cascade is nearly all such
+    // clusters: they are drawn as points, by a thread each.
+    if view.speck_texels > 0.0 && view.is_ortho != 0u && !instance_masked(instance)
+        && 2.0 * radius * view.lod_scale < view.speck_texels {
+        emit_speck(entry.instance, cluster_index, center, radius);
         return;
     }
 

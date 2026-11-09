@@ -111,6 +111,8 @@ pub struct GiVolume {
     flood_a: wgpu::Buffer,
     levels: Vec<Level>,
     voxelize_pipeline: wgpu::ComputePipeline,
+    /// Voxelizes the clusters under a voxel across, a thread each.
+    voxelize_specks_pipeline: wgpu::ComputePipeline,
     seed_pipeline: wgpu::ComputePipeline,
     flood_pipeline: wgpu::ComputePipeline,
     light_pipeline: wgpu::ComputePipeline,
@@ -128,6 +130,8 @@ pub struct GiVolume {
     pub hold_off: bool,
     /// Frames in a row that rebuilding has been held off.
     held_off: u32,
+    /// See [`crate::RendererSettings::speck_texels`].
+    pub speck_voxels: f32,
 }
 
 /// What [`GiVolume::prepare`] decided should happen this frame.
@@ -387,6 +391,12 @@ impl GiVolume {
                 "main",
                 &[&voxelize_layout],
             ),
+            voxelize_specks_pipeline: gpu.compute_pipeline(
+                "gi voxelize specks",
+                &voxelize_module,
+                "specks",
+                &[&voxelize_layout],
+            ),
             seed_pipeline: gpu.compute_pipeline("gi seed", &flood_module, "seed", &[&flood_layout]),
             flood_pipeline: gpu.compute_pipeline(
                 "gi flood",
@@ -418,6 +428,7 @@ impl GiVolume {
             refresh_waiting: false,
             hold_off: false,
             held_off: 0,
+            speck_voxels: 0.0,
         }
     }
 
@@ -434,6 +445,7 @@ impl GiVolume {
         let first_build = self.levels[0].origin_voxels.is_none();
         let mut rebuild = Vec::new();
         let mut slice = None;
+        let speck_voxels = self.speck_voxels;
         if first_build {
             for (index, level) in self.levels.iter_mut().enumerate() {
                 let wanted = snapped_origin(camera_position, level.voxel_size);
@@ -445,6 +457,7 @@ impl GiVolume {
                     first_slot + index as u32,
                     wanted,
                     level.voxel_size,
+                    speck_voxels,
                 );
             }
         } else {
@@ -462,6 +475,7 @@ impl GiVolume {
                         first_slot + pending.level as u32,
                         pending.origin,
                         level.voxel_size,
+                        speck_voxels,
                     );
                 }
             }
@@ -685,6 +699,12 @@ impl GiVolume {
             pass.set_pipeline(&self.voxelize_pipeline);
             pass.set_bind_group(0, &self.levels[index].voxelize_group, &[]);
             pass.dispatch_workgroups_indirect(cull_work.args(), CullWork::software_args_offset());
+            // Nothing, unless the level's view draws specks.
+            pass.set_pipeline(&self.voxelize_specks_pipeline);
+            pass.dispatch_workgroups_indirect(
+                cull_work.args(),
+                CullWork::voxel_speck_args_offset(),
+            );
         }
     }
 
@@ -788,6 +808,7 @@ fn write_level_view(
     slot: u32,
     origin_voxels: IVec3,
     voxel_size: f32,
+    speck_voxels: f32,
 ) {
     let half = voxel_size * RESOLUTION as f32 * 0.5;
     let center = (origin_voxels.as_vec3() + Vec3::splat(RESOLUTION as f32 * 0.5)) * voxel_size;
@@ -801,7 +822,8 @@ fn write_level_view(
         // Half a voxel of geometric error is invisible at this resolution.
         0.5,
     )
-    .drawing(InstanceFilter::Gi);
+    .drawing(InstanceFilter::Gi)
+    .with_specks(speck_voxels);
     pass_view.allow_software = 2;
     slots.write(gpu, slot, &pass_view);
 }

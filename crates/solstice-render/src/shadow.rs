@@ -178,6 +178,8 @@ pub struct ShadowMaps {
     /// The centre and radius of each cascade's view as last drawn.
     extents: [(Vec3, f32); CASCADE_COUNT],
     next_far_cascade: usize,
+    /// See [`crate::RendererSettings::speck_texels`].
+    pub speck_texels: f32,
     /// Cascades that must redraw because the geometry on the GPU has improved.
     outdated: [bool; CASCADE_COUNT],
     /// Redraw every stale cascade next frame, rather than the far ones taking turns.
@@ -336,6 +338,7 @@ impl ShadowMaps {
             drawn: [None; CASCADE_COUNT],
             extents: [(Vec3::ZERO, 1.0); CASCADE_COUNT],
             next_far_cascade: 1,
+            speck_texels: 0.0,
             outdated: [false; CASCADE_COUNT],
             redraw_all: false,
         }
@@ -455,7 +458,8 @@ impl ShadowMaps {
                 eye_lod_scale,
                 nearest[cascade],
             )
-            .shadowing(&planes, sun_direction);
+            .shadowing(&planes, sun_direction)
+            .with_specks(self.speck_texels);
             // Small clusters go to the software rasterizer, as in the main view.
             view.allow_software = 1;
             view = view.cutting_out();
