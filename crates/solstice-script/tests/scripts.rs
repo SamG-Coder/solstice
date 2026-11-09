@@ -417,6 +417,44 @@ def on_tick(self, dt):
 }
 
 #[test]
+fn scripts_know_where_they_are_watched_from_and_a_replay_does_too() {
+    let source = r#"
+def on_begin(self):
+    self.vars.near = 0
+
+def on_tick(self, dt):
+    off = viewer() - self.position
+    if sqrt(off.x * off.x + off.y * off.y + off.z * off.z) < 2.0:
+        self.vars.near += 1
+"#;
+    let run = |replay: Option<&solstice_world::Recording>| {
+        let (mut game, host) = game_with(&[("door", source)]);
+        let door = game.world.spawn((
+            Transform::from_translation(Vec3::new(10.0, 0.0, 0.0)),
+            Script::new("door"),
+        ));
+        match replay {
+            Some(recording) => game.replay(recording),
+            None => {
+                game.record();
+                // The viewer walks along x, past the door: near it for the steps from 8 to 12.
+                for step in 0..20 {
+                    let mut input = Input::new();
+                    input.set_viewer(Vec3::new(step as f32 + 0.5, 0.0, 0.0));
+                    game.step(&input);
+                }
+            }
+        }
+        assert!(host.borrow_mut().take_errors().is_empty());
+        (var(&game, door, "near"), game.take_recording())
+    };
+    let (live, recording) = run(None);
+    assert_eq!(live, Some(ScriptValue::Int(4)));
+    let (replayed, _) = run(Some(&recording.unwrap()));
+    assert_eq!(replayed, live);
+}
+
+#[test]
 fn what_cant_be_kept_or_set_is_refused_with_a_reason() {
     let source = r#"
 def on_tick(self, dt):
@@ -509,7 +547,7 @@ fn the_api_reference_lists_every_engine_function() {
     let reference = api_reference();
     for name in [
         "vec3", "send", "after", "every", "cancel", "find", "input", "held", "pressed", "now",
-        "log", "sin", "cos", "atan2", "sqrt",
+        "log", "sin", "cos", "atan2", "sqrt", "viewer",
     ] {
         let heading = format!("def {name}(");
         assert!(

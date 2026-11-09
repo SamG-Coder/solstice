@@ -250,6 +250,9 @@ are the per-frame tick groups `Animation` and `Late`.
 - **Input** is the frame's values, plus the actions pressed since the last step, so a tap
   between two steps isn't lost. The per-frame groups also see the frame's own input, for a
   camera that turns even in frames with no step.
+  - It also carries where the game is watched from, the camera's place, which scripts read as
+    `viewer()`. A camera flown freely is not an actor, and belongs to no step; being input, it
+    is recorded, so a replay puts it where it was.
 - **Replays are exact on the same build and platform.** Native and web builds may round some
   maths differently, such as sines in `glam` and `libm`.
 - **Spawning and destroying** are deferred to the end of the tick group that asks for them.
@@ -458,8 +461,9 @@ def on_hour(self, hour):
     and fail natively.
   - A call keeps 100 lines of log, of up to 1,000 characters each.
 - **The API** is the one `#[starlark_module]` in `api.rs`: `vec3`, `send`, `after`, `every`,
-  `cancel`, `find`, `input`, `held`, `pressed`, `now` and `log`. Starlark's own documentation,
-  `api_reference()`, renders it for people and editors, in place of a hand-written stub.
+  `cancel`, `find`, `input`, `held`, `pressed`, `viewer`, `now` and `log`. Starlark's own
+  documentation, `api_reference()`, renders it for people and editors, in place of a hand-written
+  stub.
 - **Cost** (`tools/gameplay-bench/b_script`, 9800X3D):
   - about 1.1 to 1.3 µs a ticking actor on the web, and 1.9 to 2.4 µs natively, most of it
     setting up each call;

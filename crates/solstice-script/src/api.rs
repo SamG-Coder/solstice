@@ -313,6 +313,12 @@ pub(crate) fn engine(builder: &mut GlobalsBuilder) {
         Ok(context(eval)?.world.input().pressed(action))
     }
 
+    /// Where the game is watched from this step: the camera, whether the player's or one flown
+    /// freely. `viewer() - self.position` is how far off it is, and which way.
+    fn viewer(eval: &mut Evaluator) -> anyhow::Result<Vec3Value> {
+        Ok(Vec3Value(context(eval)?.world.input().viewer()))
+    }
+
     /// Simulated seconds since the game started.
     fn now(eval: &mut Evaluator) -> anyhow::Result<f64> {
         Ok(context(eval)?.world.seconds())

@@ -305,7 +305,8 @@ impl Play {
         Ok(())
     }
 
-    /// Where the camera is, which decides how often distant characters update.
+    /// Where the camera is, which decides how often distant characters update, and is what
+    /// scripts get from `viewer()`.
     pub fn set_viewer(&mut self, position: Vec3) {
         self.viewer = position;
     }
@@ -353,6 +354,7 @@ impl Play {
     ) -> Option<View> {
         self.unstepped += seconds;
         let mut input = self.map.actions(devices, self.unstepped as f32);
+        input.set_viewer(self.viewer);
         for action in self.presses.drain(..) {
             input.press(&action);
         }

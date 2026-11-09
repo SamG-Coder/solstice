@@ -6,17 +6,20 @@
 //! step before, so a tap that comes and goes between two steps isn't lost.
 //!
 //! Gameplay reads the input of the step it is in, never of the frame, so a recording of each
-//! step's input replays a run exactly.
+//! step's input replays a run exactly. Where the game is watched from is part of it for the same
+//! reason: a door that opens to whoever stands by it must open in the replay too.
 
+use glam::Vec3;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-/// Each action's value, and which were pressed since the step before. Actions not mentioned
-/// are 0.
+/// Each action's value, which were pressed since the step before, and where the game is watched
+/// from. Actions not mentioned are 0.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Input {
     values: BTreeMap<Arc<str>, f32>,
     pressed: BTreeSet<Arc<str>>,
+    viewer: Vec3,
 }
 
 impl Input {
@@ -54,6 +57,19 @@ impl Input {
         self.pressed.contains(action)
     }
 
+    /// Says where the game is watched from: the camera, whoever moves it. A place that isn't
+    /// finite is ignored.
+    pub fn set_viewer(&mut self, position: Vec3) {
+        if position.is_finite() {
+            self.viewer = position;
+        }
+    }
+
+    /// Where the game is watched from, or the origin if nobody said.
+    pub fn viewer(&self) -> Vec3 {
+        self.viewer
+    }
+
     /// Every action that isn't 0, in name order.
     pub fn values(&self) -> impl Iterator<Item = (&str, f32)> {
         self.values.iter().map(|(name, &value)| (&**name, value))
@@ -70,11 +86,12 @@ impl Input {
         into.extend(self.pressed.iter().cloned());
     }
 
-    /// This input's values, with `pressed` as what was pressed.
+    /// This input's values and viewer, with `pressed` as what was pressed.
     pub(crate) fn with_pressed(&self, pressed: &BTreeSet<Arc<str>>) -> Input {
         Input {
             values: self.values.clone(),
             pressed: pressed.clone(),
+            viewer: self.viewer,
         }
     }
 }
@@ -151,6 +168,24 @@ mod tests {
         now.presses_since(&before, &mut pressed);
         let pressed: Vec<&str> = pressed.iter().map(|p| &**p).collect();
         assert_eq!(pressed, ["jump", "use"]);
+    }
+
+    #[test]
+    fn the_viewer_is_part_of_a_steps_input() {
+        let mut input = Input::new();
+        assert_eq!(input.viewer(), Vec3::ZERO);
+        input.set_viewer(Vec3::new(1.0, 2.0, 3.0));
+        input.set_viewer(Vec3::new(f32::NAN, 0.0, 0.0));
+        assert_eq!(input.viewer(), Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(
+            input.with_pressed(&BTreeSet::new()).viewer(),
+            input.viewer()
+        );
+        // A step watched from elsewhere is another input, so a recording keeps both.
+        let mut recording = Recording::new(0);
+        recording.push(&Input::new());
+        recording.push(&input);
+        assert_eq!(recording.runs.len(), 2);
     }
 
     #[test]
