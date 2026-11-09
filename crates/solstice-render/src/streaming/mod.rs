@@ -27,7 +27,7 @@ const NODE_FLAGS_OFFSET: u64 = std::mem::offset_of!(PackedNode, is_leaf) as u64;
 /// Close runs of changed cluster records are written as one, as each write has a cost.
 const MERGE_GAP_CLUSTERS: usize = 8;
 /// Pages to install per frame. Each costs little, but many at once would be felt as a hitch.
-const INSTALLS_PER_FRAME: u32 = 8;
+const INSTALLS_PER_FRAME: u32 = 32;
 /// Frames between redraws of cached views, which a stream of arriving pages would otherwise
 /// make redraw constantly.
 const REFRESH_INTERVAL_FRAMES: u32 = 30;
@@ -171,11 +171,13 @@ impl Streamer {
     /// What to start fetching now, from the latest requests read back. At most `max_fetching`
     /// pages and a few texture levels are ever outstanding.
     pub fn take_fetches(&mut self, max_fetching: u32) -> Vec<StreamRequest> {
-        let Some(requests) = self.fresh_requests.take() else {
-            return Vec::new();
+        let requests = self.fresh_requests.take();
+        let pages = match &requests {
+            Some(requests) => self.plan(requests, max_fetching),
+            None => self.residency.refill(max_fetching),
         };
         let mut out = Vec::new();
-        for page in self.plan(&requests, max_fetching) {
+        for page in pages {
             let info = &self.pages[page as usize];
             let start = self.data_offset + info.offset;
             out.push(StreamRequest {
@@ -185,8 +187,8 @@ impl Streamer {
                 deflated: true,
             });
         }
-        if let Some(textures) = &mut self.textures {
-            out.extend(textures.plan(self.frame, &requests));
+        if let (Some(textures), Some(requests)) = (&mut self.textures, &requests) {
+            out.extend(textures.plan(self.frame, requests));
         }
         out
     }
