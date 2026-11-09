@@ -315,8 +315,12 @@ async function readWithRetries(file, start, end) {
 
 /// Fetches what the viewer asks for, keeping the page responsive while it does.
 class Streamer {
-  // Browsers run about six connections per host over HTTP/1.1, and more over HTTP/2.
-  static MAX_FETCHING = 16;
+  // Pages being fetched at once. ?fetching=N tries another number.
+  static MAX_FETCHING = Number(params.get("fetching")) || 16;
+  // Browsers run about six connections per host over HTTP/1.1, so requests for parts of the file
+  // that are close together share one, as long as what lies between them is small.
+  static MERGE_GAP_BYTES = 256 * 1024;
+  static MERGE_MAX_BYTES = 8 * 1048576;
   static RETRY_MS = 1000;
   #viewer;
   #file;
@@ -328,19 +332,47 @@ class Streamer {
 
   /// Call once per frame.
   pump() {
-    const requests = this.#viewer.stream_requests(Streamer.MAX_FETCHING);
-    for (let i = 0; i < requests.length; i += 4) {
-      this.#fetchOne(requests[i], requests[i + 1], requests[i + 2], requests[i + 3] !== 0);
+    const flat = this.#viewer.stream_requests(Streamer.MAX_FETCHING);
+    const requests = [];
+    for (let i = 0; i < flat.length; i += 4) {
+      requests.push({ id: flat[i], start: flat[i + 1], end: flat[i + 2], deflated: flat[i + 3] !== 0 });
     }
+    requests.sort((a, b) => a.start - b.start);
+    let run = [];
+    for (const request of requests) {
+      const last = run[run.length - 1];
+      if (last && (request.start - last.end > Streamer.MERGE_GAP_BYTES
+        || request.end - run[0].start > Streamer.MERGE_MAX_BYTES)) {
+        this.#fetchRun(run);
+        run = [];
+      }
+      run.push(request);
+    }
+    if (run.length > 0) this.#fetchRun(run);
   }
 
-  async #fetchOne(id, start, end, deflated) {
+  async #fetchRun(run) {
+    const start = run[0].start;
+    const end = run[run.length - 1].end;
+    let stored;
     try {
-      const stored = await this.#file.read(start, end);
-      this.#viewer.deliver(id, deflated ? await inflate(stored) : stored);
+      stored = await this.#file.read(start, end);
     } catch (error) {
       console.warn(`Could not fetch part of the scene, and will retry: ${error.message ?? error}`);
-      setTimeout(() => this.#viewer.request_failed(id), Streamer.RETRY_MS);
+      for (const request of run) {
+        setTimeout(() => this.#viewer.request_failed(request.id), Streamer.RETRY_MS);
+      }
+      return;
+    }
+    for (const request of run) this.#unpack(request, stored.subarray(request.start - start, request.end - start));
+  }
+
+  async #unpack(request, stored) {
+    try {
+      this.#viewer.deliver(request.id, request.deflated ? await inflate(stored) : stored);
+    } catch (error) {
+      console.warn(`Could not unpack part of the scene, and will retry: ${error.message ?? error}`);
+      setTimeout(() => this.#viewer.request_failed(request.id), Streamer.RETRY_MS);
     }
   }
 }
