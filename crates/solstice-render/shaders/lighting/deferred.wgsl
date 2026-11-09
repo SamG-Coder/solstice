@@ -6,6 +6,7 @@
 #include "common/scene.wgsl"
 #include "sky/bodies.wgsl"
 #include "lighting/sun_shadow.wgsl"
+#include "lighting/specular_aa.wgsl"
 
 @group(0) @binding(0) var albedo_tex: texture_2d<f32>;
 @group(0) @binding(1) var normal_tex: texture_2d<f32>;
@@ -140,7 +141,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let albedo_cavity = textureLoad(albedo_tex, pixel, 0);
     let packed = textureLoad(normal_tex, pixel, 0);
     let normal = oct_decode(packed.xy);
-    let roughness = packed.z;
+    let roughness = antialiased_roughness(normal_tex, depth_tex, pixel, normal, depth, packed.z);
     let metallic = packed.w;
     let world = reconstruct_world(frame, center, depth);
     let to_camera = frame.camera_position - world;

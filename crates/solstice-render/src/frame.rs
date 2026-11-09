@@ -93,6 +93,22 @@ impl Environment {
             self.sun_illuminance
         }
     }
+
+    /// How far it is day: 1 under a sun well up, 0 by night and from when the sun reaches the
+    /// horizon, so that dusk is as dark as night makes it.
+    pub fn day(&self) -> f32 {
+        let step = |low: f32, high: f32, x: f32| {
+            let t = ((x - low) / (high - low)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let daylight = self.daylight();
+        if daylight <= 0.0 {
+            return 0.0;
+        }
+        // A tenth of a radian or so up, the sun lights the ground as it does all day. The
+        // moon, which lights the night from `sun_direction` too, gives a 2500th of the sun.
+        step(0.0, 0.2, self.sun_direction.y) * step(0.01, 0.5, self.sun_illuminance / daylight)
+    }
 }
 
 impl Default for Environment {
@@ -307,6 +323,49 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} is missing from the WGSL"));
             assert_eq!(member.offset as usize, offset, "{name}");
         }
+    }
+
+    /// Exposure reaches further into the dark by day than by night, so what counts as day decides
+    /// whether a night is brightened to grey. Only a sun that is up counts: not the moon, which
+    /// lights the scene from `sun_direction` too, nor lamps under no sun at all.
+    #[test]
+    fn it_is_day_only_under_a_sun_that_is_up() {
+        let noon = Environment::default();
+        assert_eq!(noon.day(), 1.0);
+        let at = |height: f32| Environment {
+            sun_direction: Vec3::new(1.0 - height * height, height, 0.0).normalize(),
+            ..Environment::default()
+        };
+        assert_eq!(at(0.0).day(), 0.0, "the sun on the horizon");
+        assert_eq!(at(-0.2).day(), 0.0, "the sun below it");
+        let mut previous = 0.0;
+        for step in 0..=30 {
+            let day = at(step as f32 * 0.01).day();
+            assert!(day >= previous, "it grew less day as the sun rose");
+            previous = day;
+        }
+        assert_eq!(previous, 1.0, "a sun 17 degrees up");
+        let moonlit = Environment {
+            sun_illuminance: 10.0 / 2500.0,
+            daylight_illuminance: 10.0,
+            ..noon
+        };
+        assert_eq!(moonlit.day(), 0.0, "a moon high in the sky");
+        let lamplit = Environment {
+            sun_illuminance: 0.0,
+            daylight_illuminance: 1500.0,
+            ..noon
+        };
+        assert_eq!(lamplit.day(), 0.0, "no sun at all");
+        let nothing = Environment {
+            sun_illuminance: 0.0,
+            ..noon
+        };
+        assert_eq!(
+            nothing.day(),
+            0.0,
+            "no sun and no daylight to compare it with"
+        );
     }
 
     #[test]

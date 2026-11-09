@@ -93,7 +93,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     for (var r = 0u; r < INDIRECT_RAYS; r++) {
         let direction = cosine_sample(r2_sequence(params.frame * INDIRECT_RAYS + r, seed), basis);
         let hit = trace_volume(origin, direction, voxel, 320.0, 32u);
-        gathered += select(sky_radiance(direction), hit.radiance, hit.hit);
+        gathered += select(miss_radiance(hit, direction, sky_radiance(direction)), hit.radiance, hit.hit);
     }
     // With cosine-weighted rays, irradiance is pi times the mean radiance.
     irradiance += gathered / f32(INDIRECT_RAYS) * PI;

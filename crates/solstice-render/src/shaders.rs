@@ -87,6 +87,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "sky/milky_way_bake.wgsl",
     "sky/bodies.wgsl",
     "lighting/sun_shadow.wgsl",
+    "lighting/specular_aa.wgsl",
     "lighting/light_tiles_common.wgsl",
     "lighting/light_shadows_common.wgsl",
     "lighting/deferred.wgsl",

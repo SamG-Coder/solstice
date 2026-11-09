@@ -1750,6 +1750,41 @@ fn twilight_fades_steadily_into_night() {
     }
 }
 
+/// Something dim fills the view: a room lit through its windows, as far as exposure knows. By day
+/// the eye adapts to it and sees it plainly. By night the same dimness is the night, and stays
+/// dark: exposure reaching as far by night would turn every night grey.
+#[test]
+fn a_dim_room_is_seen_plainly_by_day_and_night_stays_dark() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 64;
+    // A black wall glowing faintly, ten stops and more below sunlit ground and three below where
+    // exposure stops by night, with the sun behind it and no sky to light or mirror in it.
+    let mut scene = wall(0.0);
+    scene.materials[0].emissive = [0.0006; 3];
+    let day = Environment {
+        sun_direction: Vec3::new(0.0, 0.7, -0.7).normalize(),
+        sky_intensity: 0.0,
+        ..Default::default()
+    };
+    // The moon stands where the sun did, at a 2500th of its light.
+    let night = Environment {
+        sun_illuminance: day.sun_illuminance / 2500.0,
+        daylight_illuminance: day.sun_illuminance,
+        ..day
+    };
+    let seen = |environment: &Environment| {
+        let mut stage = Stage::new(&gpu, &scene, RendererSettings::default(), size);
+        stage.frames(&gpu, &Camera::default(), environment, 30);
+        mean_brightness(&stage.pixels(&gpu))
+    };
+    let (by_day, by_night) = (seen(&day), seen(&night));
+    assert!(by_day > 90.0, "the room by day is {by_day}");
+    assert!(
+        by_night < by_day * 0.6,
+        "the night is brightened to {by_night}, against {by_day} by day"
+    );
+}
+
 #[test]
 fn the_moon_is_drawn_without_a_dark_halo() {
     let Some(gpu) = request_gpu() else { return };
@@ -1844,6 +1879,31 @@ fn render_sea(
     quality: Quality,
     size: u32,
 ) -> Vec<u8> {
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        ..Default::default()
+    };
+    render_sea_under(
+        gpu,
+        camera,
+        (ocean, sea_level),
+        debug,
+        quality,
+        size,
+        &environment,
+    )
+}
+
+/// `render_sea` for a `sea`, its ocean's name and its level, under `environment`.
+fn render_sea_under(
+    gpu: &Gpu,
+    camera: &Camera,
+    (ocean, sea_level): (&str, f32),
+    debug: DebugView,
+    quality: Quality,
+    size: u32,
+    environment: &Environment,
+) -> Vec<u8> {
     let errors: Arc<Mutex<Vec<String>>> = Default::default();
     let sink = errors.clone();
     gpu.device
@@ -1858,14 +1918,10 @@ fn render_sea(
     let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
     renderer.set_ocean(Some(Ocean::by_name(ocean).unwrap()), 0.0);
     renderer.set_sea_level(sea_level);
-    let environment = Environment {
-        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
-        ..Default::default()
-    };
     let target = test_target(gpu, size);
     let view = target.create_view(&Default::default());
     for _ in 0..30 {
-        renderer.render(gpu, camera, &environment, &view, (size, size), 1.0 / 60.0);
+        renderer.render(gpu, camera, environment, &view, (size, size), 1.0 / 60.0);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
@@ -1993,6 +2049,14 @@ fn the_bed_shows_through_shallow_water_and_not_through_deep() {
     // water the floor shows bright; under 30 m the water absorbs what it reflects, and the
     // sea is dark. Water that hid its bed at any depth, or showed it at every depth, fails.
     let size = 64;
+    // Daylight is set well above what either view measures, so exposure stays at its darkest
+    // limit for both. Left to follow each picture it brings the deep sea up to middle grey, and
+    // the two then differ by where exposure stops, not by what the water hides.
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        daylight_illuminance: 4000.0,
+        ..Default::default()
+    };
     let brightness = |depth: f32| {
         let camera = Camera {
             position: Vec3::new(40.0, depth + 4.0, 0.0),
@@ -2000,14 +2064,14 @@ fn the_bed_shows_through_shallow_water_and_not_through_deep() {
             pitch: -1.3,
             ..Default::default()
         };
-        let pixels = render_sea(
+        let pixels = render_sea_under(
             &gpu,
             &camera,
-            "ocean",
-            depth,
+            ("ocean", depth),
             DebugView::Lit,
             Quality::High,
             size,
+            &environment,
         );
         // The middle of the view, clear of the sun's highlight at the edges.
         let mut sum = 0.0;

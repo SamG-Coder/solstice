@@ -92,6 +92,7 @@ impl ScreenGi {
             .texture()
             .storage_texture(FORMAT)
             .texture_unfilterable()
+            .texture()
             .build(gpu, "reflections");
 
         let trace_module = shaders::module(&gpu.device, "gi/probe_trace.wgsl");
@@ -236,6 +237,7 @@ impl ScreenGi {
                     tex(&reflections[1 - parity].view),
                     tex(&reflections[parity].view),
                     tex(&depth_pyramid.view),
+                    tex(&diffuse[parity].view),
                 ],
             )
         };

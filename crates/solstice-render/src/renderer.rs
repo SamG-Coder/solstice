@@ -1153,6 +1153,7 @@ impl Renderer {
             self.frame_index,
             delta_seconds,
             environment.daylight(),
+            environment.day(),
             passthrough,
         );
 

@@ -51,7 +51,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let voxel = volume_params.levels[level].w;
     let origin = world + normal * voxel * 1.5;
     let hit = trace_volume(origin, direction, voxel * 0.5, 320.0, 40u);
-    var radiance = select(sky_radiance(direction), hit.radiance, hit.hit);
+    var radiance = select(miss_radiance(hit, direction, sky_radiance(direction)), hit.radiance, hit.hit);
     var t = select(1000.0, hit.t, hit.hit);
     if screen.hit {
         // Near the screen edge, blend towards the volume so probes do not pop.

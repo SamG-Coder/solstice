@@ -59,6 +59,14 @@ minutes.
   scene doesn't describe.
 - Non-square textures, 348 of the 4,418, are resampled by nearest block.
 
+## Indoors
+
+The throne room has no lamps that light it: what is seen there is sunlight that came in through the doors and bounced, about eleven stops below the ground outside. Three things went wrong there that the smaller scenes never showed.
+
+- **It was drawn four stops too dark.** Exposure stopped following the picture seven stops below sunlit ground, the limit that keeps night dark and not grey. Under a sun that is well up it now goes five stops further (`Environment::day`, `DARKEST_BY_DAY` in `post.rs`), fading back to the old limit as the sun nears the horizon, so dusk, night and moonlight are as they were.
+- **White patches lay at the foot of each step.** A reflection's ray counts as hitting only what it is closing in on, which its first sample can't tell. One starting at the foot of a riser, among the floor's voxels and below the middle of them, saw itself only leaving them, went through the floor and out under the scene, and brought back the sky. A ray that starts beside a surface other than its own has now hit it (`met_at_once` in `gi/reflections.wgsl`), a ray that leaves the volume pointing well down brings nothing where there is no sea, and one that runs out of steps among surfaces brings the light of the nearest (`miss_radiance`).
+- **White dots lay on the columns and doors.** One ray in many finds a window, two thousand times brighter than the room. A reflection sample was allowed several times the light around it, and a pixel seen for the first time anything at all. It is now held to about the light arriving there plus what has built up, new pixels too, and what is truly brighter builds up over a few frames.
+
 ## Cards
 
 Cards are drawn after the lit scene and water, and before particles (`src/cards.rs`,
