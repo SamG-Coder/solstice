@@ -364,6 +364,79 @@ fn requested_bytes(loaded: &LoadedScene, request: &StreamRequest) -> Vec<u8> {
     .concat()
 }
 
+/// A scene whose big tables arrive in parts, as a browser loads one too large for its memory,
+/// must draw exactly what the same scene does with them in its manifest.
+#[test]
+fn a_scene_whose_tables_arrive_separately_draws_the_same() {
+    let Some(gpu) = request_gpu() else { return };
+    let scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&sphere(7), &BuildOptions::default())],
+        materials: vec![Material::default()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    assert!(loaded.scene.pinned_pages > 0);
+    const SIZE: u32 = 128;
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 1.8),
+        near: 0.05,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let draw = |renderer: &mut Renderer| {
+        let target = test_target(&gpu, SIZE);
+        let view = target.create_view(&Default::default());
+        let mut queue = Vec::new();
+        for _ in 0..80 {
+            pump(renderer, &loaded, &mut queue, 8);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        read_pixels(&gpu, &target, SIZE)
+    };
+
+    let mut whole = Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, generous_budget());
+    let expected = draw(&mut whole);
+
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut small = loaded.scene.clone();
+    small.external = Some(solstice_asset::paged::ExternalTables {
+        clusters: small.clusters.len() as u64,
+        pinned_bytes: small.pinned_data.len() as u64,
+    });
+    small.clusters.clear();
+    small.pinned_data.clear();
+    let mut split = Renderer::streaming(&gpu, &small, FORMAT, settings, generous_budget());
+    // In two parts, to cross a boundary as a real load does.
+    let records: &[u8] = solstice_asset::file::cluster_bytes(&loaded.scene.clusters);
+    let middle = loaded.scene.clusters.len() / 2 * 48;
+    split.upload_clusters(&gpu, 0, &records[..middle]);
+    split.upload_clusters(&gpu, (middle / 48) as u32, &records[middle..]);
+    for page in 0..loaded.scene.pinned_pages {
+        split.install_pinned(&gpu, page, loaded.scene.pinned_page(page));
+    }
+    split.finish_external_tables(&gpu);
+    let actual = draw(&mut split);
+    assert!(
+        errors.lock().unwrap().is_empty(),
+        "{:?}",
+        errors.lock().unwrap()
+    );
+    assert_eq!(actual, expected);
+}
+
 /// The scene starts with only its coarsest pages and fills in slowly. Every frame along the way
 /// must cover the whole sphere, with detail only ever being added.
 #[test]

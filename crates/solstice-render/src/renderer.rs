@@ -351,11 +351,30 @@ impl Renderer {
         let plan = choose_tiers(gpu, paged, budget.texture_bytes);
         let scene = GpuScene::new(gpu, paged, slots, None, Some(plan));
         let mut streamer = Streamer::new(gpu, paged, slots, Some(plan), scene.regions);
-        for page in 0..paged.pinned_pages {
-            streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
+        if paged.external.is_none() {
+            for page in 0..paged.pinned_pages {
+                streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
+            }
+            streamer.flush(gpu, &scene);
         }
-        streamer.flush(gpu, &scene);
         Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&paged.sea)
+    }
+
+    /// For a scene that keeps its tables outside its manifest: takes a run of cluster records.
+    /// All of them must arrive, and then all the pinned pages, before the first frame.
+    pub fn upload_clusters(&mut self, gpu: &Gpu, first: u32, bytes: &[u8]) {
+        self.streamer
+            .upload_clusters(gpu, &self.scene, first, bytes);
+    }
+
+    /// For a scene that keeps its tables outside its manifest: takes a pinned page, in order.
+    pub fn install_pinned(&mut self, gpu: &Gpu, page: u32, data: &[u8]) {
+        self.streamer.install_now(gpu, &self.scene, page, data);
+    }
+
+    /// Writes what the pinned pages changed. Call after the last of them.
+    pub fn finish_external_tables(&mut self, gpu: &Gpu) {
+        self.streamer.flush(gpu, &self.scene);
     }
 
     /// Gives the renderer the scene's sea, if it has one.

@@ -3,6 +3,7 @@
 //! ```text
 //! bake [--quality draft|web|high] [--output FILE]
 //! bake --gltf MODEL.glb [--fit METRES] [--ground] [--texture-size N] [--output FILE]
+//! bake --web-split SCENE.solstice --output SCENE.web
 //! bake --large-gltf SCENE.gltf [--region X,Y,Z,RADIUS] [--no-textures] [--glow STRENGTH] [--texture-size N] [--output FILE]
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
 //! bake --gallery [--texture-size N] [--output FILE]
@@ -32,7 +33,7 @@ mod scene_file;
 use scene::Quality;
 use solstice_asset::SceneAsset;
 use solstice_import::{import_gltf, ImportOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 struct Options {
@@ -58,10 +59,53 @@ struct Options {
     grass: Vec<PathBuf>,
     /// A scene too large for memory, baked straight to the output.
     large_gltf: Option<PathBuf>,
+    /// A baked scene to write the browser's file for.
+    web_split: Option<PathBuf>,
     large: solstice_import::streamed::LargeOptions,
     /// A character to check, and its rig's role file.
     check_character: Option<PathBuf>,
     roles: Option<PathBuf>,
+}
+
+/// Writes the file a browser reads for a scene too large for its memory: the manifest without
+/// its cluster records and pinned pages, which follow it uncompressed for the page to hand over
+/// in parts. The scene's other pages stay in the scene file.
+fn web_split(path: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    use solstice_asset::file;
+    use solstice_asset::paged::ExternalTables;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut input = std::fs::File::open(path)?;
+    let mut head = [0; file::HEADER_BYTES];
+    input.read_exact(&mut head)?;
+    let header = file::decode_header(&head)?;
+    input.seek(SeekFrom::Start(header.manifest_offset))?;
+    let mut packed = vec![0; header.manifest_bytes as usize];
+    input.read_exact(&mut packed)?;
+    let manifest = file::inflate(&packed)?;
+    drop(packed);
+    let mut scene =
+        file::decode_manifest(&manifest, header.manifest_offset + header.manifest_bytes)?;
+    drop(manifest);
+    let clusters = std::mem::take(&mut scene.clusters);
+    let pinned = std::mem::take(&mut scene.pinned_data);
+    scene.external = Some(ExternalTables {
+        clusters: clusters.len() as u64,
+        pinned_bytes: pinned.len() as u64,
+    });
+    let start = file::encode_header_and_manifest(&scene);
+    let mut out = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(output)?);
+    out.write_all(&start)?;
+    out.write_all(file::cluster_bytes(&clusters))?;
+    out.write_all(&pinned)?;
+    out.flush()?;
+    println!(
+        "wrote {}: manifest {:.1} MB, {} clusters, {:.1} MB of pinned pages",
+        output.display(),
+        start.len() as f64 / 1e6,
+        clusters.len(),
+        pinned.len() as f64 / 1e6,
+    );
+    Ok(())
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -80,6 +124,7 @@ fn parse_args() -> Result<Options, String> {
         species: Vec::new(),
         grass: Vec::new(),
         large_gltf: None,
+        web_split: None,
         large: Default::default(),
         check_character: None,
         roles: None,
@@ -102,6 +147,7 @@ fn parse_args() -> Result<Options, String> {
             "--roles" => options.roles = Some(PathBuf::from(value()?)),
             "--gltf" => options.gltf = Some(PathBuf::from(value()?)),
             "--large-gltf" => options.large_gltf = Some(PathBuf::from(value()?)),
+            "--web-split" => options.web_split = Some(PathBuf::from(value()?)),
             "--no-textures" => options.large.textures = false,
             "--glow" => {
                 options.large.glow_strength =
@@ -242,6 +288,9 @@ fn main() -> Result<(), String> {
         return check_character(path, options.roles.as_ref());
     }
     let start = Instant::now();
+    if let Some(path) = &options.web_split {
+        return web_split(path, &options.output).map_err(|e| e.to_string());
+    }
     if let Some(path) = &options.large_gltf {
         return bake_large(path, &options, start);
     }

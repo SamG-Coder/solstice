@@ -218,12 +218,17 @@ class SceneFile {
   bytesFetched = 0;
   #whole = null;
   #etag = null;
+  #url;
+
+  constructor(url) {
+    this.#url = url;
+  }
 
   async read(start, end, signal) {
     if (this.#whole) return this.#whole.subarray(start, end);
-    const response = await fetch(sceneUrl, { headers: { Range: `bytes=${start}-${end - 1}` }, signal });
+    const response = await fetch(this.#url, { headers: { Range: `bytes=${start}-${end - 1}` }, signal });
     if (!response.ok) {
-      throw new Error(`Could not load ${sceneUrl} (HTTP ${response.status}).`);
+      throw new Error(`Could not load ${this.#url} (HTTP ${response.status}).`);
     }
     if (response.status === 200) {
       this.#whole = await downloadWhole(response);
@@ -355,6 +360,60 @@ function compact(n) {
   return String(n);
 }
 
+/// Hands over tables too large for a browser's memory a part at a time, each going on to the GPU.
+async function loadExternalTables(viewer, tables, start) {
+  const sizes = viewer.external_tables();
+  if (sizes.length === 0) return;
+  const [clusterCount, pinnedBytes] = sizes;
+  const CHUNK = 64 * 1048576;
+  const RECORD = 48;
+  const clusterBytes = clusterCount * RECORD;
+  const total = clusterBytes + pinnedBytes;
+  let done = 0;
+  const report = (what) => {
+    el("progress").hidden = false;
+    el("progress").value = done / total;
+    el("message").textContent = `${what}: ${(done / 1e9).toFixed(1)} of ${(total / 1e9).toFixed(1)} GB`;
+  };
+  // Lets the GPU process catch up, so uploads don't pile up in memory.
+  const breathe = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  const perChunk = Math.floor(CHUNK / RECORD);
+  for (let first = 0; first < clusterCount; first += perChunk) {
+    const count = Math.min(perChunk, clusterCount - first);
+    const at = start + first * RECORD;
+    viewer.upload_clusters(first, await readWithRetries(tables, at, at + count * RECORD));
+    done += count * RECORD;
+    report("Loading clusters");
+    await breathe();
+  }
+
+  const pageSizes = viewer.pinned_sizes();
+  const pinnedStart = start + clusterBytes;
+  let page = 0;
+  let at = 0;
+  while (page < pageSizes.length) {
+    let end = at;
+    let last = page;
+    while (last < pageSizes.length && (end === at || end + pageSizes[last] - at <= CHUNK)) {
+      end += pageSizes[last];
+      last++;
+    }
+    const bytes = await readWithRetries(tables, pinnedStart + at, pinnedStart + end);
+    let inside = 0;
+    for (; page < last; page++) {
+      viewer.install_pinned(page, bytes.subarray(inside, inside + pageSizes[page]));
+      inside += pageSizes[page];
+    }
+    done += end - at;
+    at = end;
+    report("Loading the scene's base");
+    await breathe();
+  }
+  viewer.finish_external_tables();
+  el("progress").hidden = true;
+}
+
 async function main() {
   if (!navigator.gpu) {
     fail("This browser does not support WebGPU. Try a recent version of Chrome or Edge.");
@@ -368,21 +427,28 @@ async function main() {
   }
   await init();
   el("message").textContent = "Loading scene…";
-  const file = new SceneFile();
-  const [manifestOffset, manifestBytes] = read_header(await file.read(0, header_bytes()));
+  const file = new SceneFile(sceneUrl);
+  // ?split reads the manifest from NAME.web, which leaves out the tables too large to hold in a
+  // browser's memory and carries them after the manifest. Pages still come from NAME.solstice.
+  const tables = params.has("split") ? new SceneFile(`${sceneBase}${sceneName}.web`) : file;
+  const [manifestOffset, manifestBytes] = read_header(await tables.read(0, header_bytes()));
   const manifestEnd = manifestOffset + manifestBytes;
-  const manifest = await inflate(await file.read(manifestOffset, manifestEnd));
+  const manifest = await inflate(await tables.read(manifestOffset, manifestEnd));
+  const [pagesOffset, pagesManifestBytes] = tables === file
+    ? [manifestOffset, manifestBytes]
+    : read_header(await file.read(0, header_bytes()));
   el("message").textContent = "Preparing the GPU…";
 
   [canvas.width, canvas.height] = canvasSize();
   const viewer = await WebViewer.create(
     canvas,
     manifest,
-    manifestEnd,
+    pagesOffset + pagesManifestBytes,
     geometryBudget,
     textureBudget,
     params.has("unpack-textures"),
   );
+  await loadExternalTables(viewer, tables, manifestEnd);
   const streamer = new Streamer(viewer, file);
 
   const camera = params.get("camera")?.split(",").map(Number);

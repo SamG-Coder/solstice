@@ -60,6 +60,9 @@ pub struct WebViewer {
     instance_poses: Vec<u32>,
     #[cfg(feature = "gameplay")]
     play: Option<crate::play::PlayMode>,
+    /// See [`WebViewer::external_tables`].
+    external_tables: Option<Vec<f64>>,
+    pinned_sizes: Vec<u32>,
     /// What scripts logged, and errors, for the page to take.
     #[cfg(feature = "gameplay")]
     messages: Vec<crate::play::Message>,
@@ -82,6 +85,18 @@ impl WebViewer {
     ) -> Result<WebViewer, JsValue> {
         let scene = file::decode_manifest(&manifest, data_offset as u64).map_err(error_string)?;
         drop(manifest);
+        let external_tables = scene
+            .external
+            .map(|tables| vec![tables.clusters as f64, tables.pinned_bytes as f64]);
+        let pinned_sizes: Vec<u32> = scene
+            .external
+            .map(|_| {
+                scene.pages[..scene.pinned_pages as usize]
+                    .iter()
+                    .map(|page| page.raw_bytes() as u32)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let (width, height) = (canvas.width().max(1), canvas.height().max(1));
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -133,6 +148,8 @@ impl WebViewer {
             camera: FlyCamera::new(initial_camera(scene.viewpoint)),
             clock: DayClock::new(TimeOfDay::default(), DEFAULT_DAY_SECONDS),
             gpu_errors,
+            external_tables,
+            pinned_sizes,
             gameplay: scene.gameplay,
             #[cfg(feature = "gameplay")]
             collision: scene.collision,
@@ -153,6 +170,33 @@ impl WebViewer {
             #[cfg(feature = "gameplay")]
             messages: Vec::new(),
         })
+    }
+
+    /// For a scene whose tables come separately: how many cluster records and how many bytes
+    /// of pinned pages. Empty for any other scene.
+    pub fn external_tables(&self) -> Vec<f64> {
+        self.external_tables.clone().unwrap_or_default()
+    }
+
+    /// The size in bytes of each pinned page of such a scene, in order.
+    pub fn pinned_sizes(&self) -> Vec<u32> {
+        self.pinned_sizes.clone()
+    }
+
+    /// Takes a run of such a scene's cluster records, starting at record `first`.
+    pub fn upload_clusters(&mut self, first: f64, bytes: &[u8]) {
+        self.renderer
+            .upload_clusters(&self.gpu, first as u32, bytes);
+    }
+
+    /// Takes one of such a scene's pinned pages, in order.
+    pub fn install_pinned(&mut self, page: u32, bytes: &[u8]) {
+        self.renderer.install_pinned(&self.gpu, page, bytes);
+    }
+
+    /// Call when all of such a scene's tables have been handed over.
+    pub fn finish_external_tables(&mut self) {
+        self.renderer.finish_external_tables(&self.gpu);
     }
 
     /// What to fetch next, as a flat array with four numbers per request: its id, the first

@@ -85,7 +85,7 @@ pub struct Streamer {
     sets: Vec<ClusterSet>,
     generated: Vec<u32>,
     /// The GPU's cluster records. An uninstalled cluster's offsets are local to its page.
-    clusters: Vec<PackedCluster>,
+    clusters: ClusterCopy,
     residency: Residency,
     /// Page data that has come but hasn't gone to the GPU.
     arrived: HashMap<u32, Vec<u8>>,
@@ -104,6 +104,50 @@ pub struct Streamer {
     /// Whether what's installed changed since cached views last refreshed.
     changed_since_refresh: bool,
     frames_since_refresh: u32,
+}
+
+/// Where in a [`PackedCluster`] the fields that change as pages come and go begin: its vertex
+/// and triangle offsets and its counts.
+const OFFSETS_IN_CLUSTER: u64 = std::mem::offset_of!(PackedCluster, vertex_offset) as u64;
+
+/// The host's copy of the cluster records, which installing pages changes.
+enum ClusterCopy {
+    Whole(Vec<PackedCluster>),
+    /// Only what changes, for a scene too large to hold every record in memory.
+    Offsets(Vec<[u32; 3]>),
+}
+
+impl ClusterCopy {
+    /// A cluster's vertex offset, triangle offset and counts.
+    fn offsets_mut(&mut self, cluster: u32) -> [&mut u32; 3] {
+        match self {
+            Self::Whole(records) => {
+                let record = &mut records[cluster as usize];
+                [
+                    &mut record.vertex_offset,
+                    &mut record.triangle_offset,
+                    &mut record.counts,
+                ]
+            }
+            Self::Offsets(offsets) => {
+                let [vertex, triangle, counts] = &mut offsets[cluster as usize];
+                [vertex, triangle, counts]
+            }
+        }
+    }
+}
+
+/// Which buffer a cluster's record is in, and where in it.
+fn cluster_place(scene: &GpuScene, chunk: u32, cluster: u32) -> (&wgpu::Buffer, u64) {
+    if cluster < chunk {
+        (&scene.clusters, u64::from(cluster))
+    } else {
+        let more = scene
+            .clusters_more
+            .as_ref()
+            .expect("a chunk means a second binding");
+        (more, u64::from(cluster - chunk))
+    }
 }
 
 impl Streamer {
@@ -130,7 +174,10 @@ impl Streamer {
             pages: scene.pages.clone(),
             sets: scene.sets.clone(),
             generated: scene.generated.clone(),
-            clusters: scene.clusters.clone(),
+            clusters: match scene.external {
+                Some(tables) => ClusterCopy::Offsets(vec![[0; 3]; tables.clusters as usize]),
+                None => ClusterCopy::Whole(scene.clusters.clone()),
+            },
             residency,
             regions,
             arrived: HashMap::new(),
@@ -272,6 +319,38 @@ impl Streamer {
         &self.residency
     }
 
+    /// Takes a run of cluster records of a scene that keeps them outside its manifest, starting
+    /// at record `first`, a whole number of records long. They go straight to the GPU.
+    pub fn upload_clusters(&mut self, gpu: &Gpu, scene: &GpuScene, first: u32, bytes: &[u8]) {
+        let record = std::mem::size_of::<PackedCluster>();
+        let ClusterCopy::Offsets(offsets) = &mut self.clusters else {
+            panic!("only a scene with external tables takes its clusters later");
+        };
+        let chunk = self.regions.map_or(u32::MAX, |r| r.cluster_chunk);
+        let count = (bytes.len() / record) as u32;
+        let in_first = chunk.saturating_sub(first).min(count) as usize;
+        let (head, tail) = bytes.split_at(in_first * record);
+        if !head.is_empty() {
+            gpu.queue
+                .write_buffer(&scene.clusters, u64::from(first) * record as u64, head);
+        }
+        if !tail.is_empty() {
+            let more = scene
+                .clusters_more
+                .as_ref()
+                .expect("a chunk means a second binding");
+            let at = first.max(chunk) - chunk;
+            gpu.queue
+                .write_buffer(more, u64::from(at) * record as u64, tail);
+        }
+        for (place, raw) in offsets[first as usize..]
+            .iter_mut()
+            .zip(bytes.chunks_exact(record))
+        {
+            *place = bytemuck::pod_read_unaligned(&raw[OFFSETS_IN_CLUSTER as usize..]);
+        }
+    }
+
     /// Installs a page at once, which must have all its dependencies. For scene setup.
     pub fn install_now(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32, data: &[u8]) {
         let slot = self.residency.install_now(page);
@@ -346,14 +425,14 @@ impl Streamer {
         for index in info.first_set..info.first_set + info.set_count {
             let set = self.sets[index as usize];
             for c in set.first_cluster..set.first_cluster + set.cluster_count {
-                let cluster = &mut self.clusters[c as usize];
-                cluster.vertex_offset += vertex_base;
-                cluster.triangle_offset += triangle_base;
+                let [vertex_offset, triangle_offset, _] = self.clusters.offsets_mut(c);
+                *vertex_offset += vertex_base;
+                *triangle_offset += triangle_base;
                 self.dirty_clusters.push(c);
             }
             for g in set.first_generated..set.first_generated + set.generated_count {
                 let parent = self.generated[g as usize];
-                self.clusters[parent as usize].counts &= !CLUSTER_CHILDREN_MISSING;
+                *self.clusters.offsets_mut(parent)[2] &= !CLUSTER_CHILDREN_MISSING;
                 self.dirty_clusters.push(parent);
             }
             write_node_flags(gpu, scene, set.leaf_node, NODE_LEAF | NODE_INSTALLED | page);
@@ -370,13 +449,13 @@ impl Streamer {
             let set = self.sets[index as usize];
             // The GPU can't reach these any more, so only this copy needs changing.
             for c in set.first_cluster..set.first_cluster + set.cluster_count {
-                let cluster = &mut self.clusters[c as usize];
-                cluster.vertex_offset -= vertex_base;
-                cluster.triangle_offset -= triangle_base;
+                let [vertex_offset, triangle_offset, _] = self.clusters.offsets_mut(c);
+                *vertex_offset -= vertex_base;
+                *triangle_offset -= triangle_base;
             }
             for g in set.first_generated..set.first_generated + set.generated_count {
                 let parent = self.generated[g as usize];
-                self.clusters[parent as usize].counts |= CLUSTER_CHILDREN_MISSING;
+                *self.clusters.offsets_mut(parent)[2] |= CLUSTER_CHILDREN_MISSING;
                 self.dirty_clusters.push(parent);
             }
             write_node_flags(gpu, scene, set.leaf_node, NODE_LEAF | page);
@@ -387,13 +466,30 @@ impl Streamer {
     pub fn flush(&mut self, gpu: &Gpu, scene: &GpuScene) {
         let chunk = self.regions.map_or(u32::MAX, |r| r.cluster_chunk);
         let bytes = std::mem::size_of::<PackedCluster>() as u64;
+        let records = match &self.clusters {
+            ClusterCopy::Whole(records) => records,
+            ClusterCopy::Offsets(offsets) => {
+                self.dirty_clusters.sort_unstable();
+                self.dirty_clusters.dedup();
+                for &c in &self.dirty_clusters {
+                    let (buffer, record) = cluster_place(scene, chunk, c);
+                    gpu.queue.write_buffer(
+                        buffer,
+                        record * bytes + OFFSETS_IN_CLUSTER,
+                        bytemuck::cast_slice(&offsets[c as usize]),
+                    );
+                }
+                self.dirty_clusters.clear();
+                return;
+            }
+        };
         for (first, last) in merged_runs(&mut self.dirty_clusters) {
             if first < chunk {
                 let end = last.min(chunk - 1);
                 gpu.queue.write_buffer(
                     &scene.clusters,
                     u64::from(first) * bytes,
-                    bytemuck::cast_slice(&self.clusters[first as usize..=end as usize]),
+                    bytemuck::cast_slice(&records[first as usize..=end as usize]),
                 );
             }
             if last >= chunk {
@@ -404,7 +500,7 @@ impl Streamer {
                         .as_ref()
                         .expect("a chunk means a second binding"),
                     u64::from(start - chunk) * bytes,
-                    bytemuck::cast_slice(&self.clusters[start as usize..=last as usize]),
+                    bytemuck::cast_slice(&records[start as usize..=last as usize]),
                 );
             }
         }
