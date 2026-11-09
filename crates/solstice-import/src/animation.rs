@@ -2,8 +2,8 @@
 //!
 //! A clip's file need not hold a mesh or a skin: a Blender armature exported on its own is enough.
 //! Every node in it is a bone. Where a file's rig differs from the character's, a role file on
-//! each side says which bones play each part, and [`retarget`] carries each bone's rotations
-//! across in its rest frame, so a difference in rest pose cancels out, and scales the pelvis's
+//! each side says which bones play each part, and [`retarget`] lines up the two rigs' limbs at
+//! rest, then carries each bone's rotations across in its rest frame, and scales the pelvis's
 //! travel by the ratio of leg lengths, so feet don't slide (docs/gameplay.md, Retargeting).
 
 use crate::character::Roles;
@@ -244,6 +244,77 @@ fn leg_length(skeleton: &Skeleton, roles: &Roles) -> Option<f32> {
     Some(at(pelvis.first()?)?.distance(at(leg.last()?)?))
 }
 
+/// What turns each of the target's limbs, at rest, to lie along the source's. Rigs differ most in
+/// how they rest their limbs, one with its arms in a T and one with them down and the elbows bent,
+/// and carrying a bone's turn from rest to rest would keep that difference in every pose: a slight
+/// outward lean of the legs at rest stands a character with its feet far apart. So each limb's
+/// bones are lined up with the source's first, and whatever is at the end of the limb, the hand
+/// with its fingers or the toe, goes with the last of them. A collarbone isn't lined up: it would
+/// drag the shoulder away from where the mesh has it.
+fn limb_alignment(
+    map: &[Option<usize>],
+    target: &Skeleton,
+    target_roles: &Roles,
+    target_rest: &[Vec3],
+    source_rest: &[Vec3],
+) -> Vec<Quat> {
+    let number = |name: &String| target.bones.iter().position(|bone| bone.name == *name);
+    let chain_of = |role: &str| {
+        target_roles
+            .roles
+            .iter()
+            .find(|(r, _)| r == role)
+            .map(|c| &c.1)
+    };
+    let mut out = vec![Quat::IDENTITY; target.bones.len()];
+    // Lines up the bones of a chain from its `first`, and returns what its last bone gets.
+    let mut line_up = |chain: &[String], first: usize| {
+        let mut last = Quat::IDENTITY;
+        for pair in chain[first..].windows(2) {
+            let (Some(bone), Some(next)) = (number(&pair[0]), number(&pair[1])) else {
+                continue;
+            };
+            let (Some(source), Some(source_next)) = (map[bone], map[next]) else {
+                continue;
+            };
+            let from = (target_rest[next] - target_rest[bone]).normalize_or_zero();
+            let to = (source_rest[source_next] - source_rest[source]).normalize_or_zero();
+            if from != Vec3::ZERO && to != Vec3::ZERO {
+                last = Quat::from_rotation_arc(from, to);
+                out[bone] = last;
+            }
+        }
+        if let Some(bone) = chain.last().and_then(&number) {
+            out[bone] = last;
+        }
+        last
+    };
+    let mut hands = [(Quat::IDENTITY, "l"), (Quat::IDENTITY, "r")];
+    for (hand, side) in &mut hands {
+        if let Some(arm) = chain_of(&format!("arm_{side}")) {
+            // The upper arm, the lower arm and the hand, with or without a collarbone before them.
+            if let Some(first) = arm.len().checked_sub(3) {
+                *hand = line_up(arm, first);
+            }
+        }
+        if let Some(leg) = chain_of(&format!("leg_{side}")) {
+            line_up(leg, 0);
+        }
+    }
+    for (hand, side) in hands {
+        let fingers = ["thumb", "index", "middle", "ring", "pinky"];
+        let chains = fingers
+            .iter()
+            .filter_map(|f| chain_of(&format!("{f}_{side}")));
+        for name in chains.flatten() {
+            if let Some(bone) = number(name) {
+                out[bone] = hand;
+            }
+        }
+    }
+    out
+}
+
 /// Carries a clip from one rig onto another, by the two rigs' role files.
 pub fn retarget(
     source: &Skeleton,
@@ -310,6 +381,13 @@ pub fn retarget(
         world_positions(source, &source_rest.rotations, &source_rest.translations);
     let target_rest_positions =
         world_positions(target, &target_rest.rotations, &target_rest.translations);
+    let aligned = limb_alignment(
+        &map,
+        target,
+        target_roles,
+        &target_rest_positions,
+        &source_rest_positions,
+    );
 
     let mut out = Frames::default();
     for (rotations, translations) in frames.rotations.iter().zip(&frames.translations) {
@@ -325,6 +403,7 @@ pub fn retarget(
             let world_rotation = match map[bone_index] {
                 // What the source bone did, relative to its own rest, applied to this bone's rest.
                 Some(s) => ((world[s] * source_rest_world[s].inverse())
+                    * aligned[bone_index]
                     * target_rest_world[bone_index])
                     .normalize(),
                 None => (parent * target_rest.rotations[bone_index]).normalize(),
@@ -472,6 +551,72 @@ mod tests {
         let path = folder.join("c.gltf");
         std::fs::write(&path, json).unwrap();
         path
+    }
+
+    /// A collarbone, an arm of upper, lower and hand, and a finger, the arm held out along +X or
+    /// hanging at an angle, its elbow bent.
+    fn armed(hanging: bool) -> Skeleton {
+        let bone = |name: &str, parent, translation: Vec3, rotation: Quat| Bone {
+            name: name.to_owned(),
+            parent,
+            translation,
+            rotation,
+            inverse_bind: glam::Mat4::IDENTITY,
+            center: Vec3::ZERO,
+            radius: 0.0,
+        };
+        let down = if hanging {
+            Quat::from_rotation_z(-0.9)
+        } else {
+            Quat::IDENTITY
+        };
+        let bend = if hanging {
+            Quat::from_rotation_y(-0.7)
+        } else {
+            Quat::IDENTITY
+        };
+        let along = Vec3::X * 0.3;
+        Skeleton {
+            bones: vec![
+                bone("root", None, Vec3::ZERO, Quat::IDENTITY),
+                bone("clavicle", Some(0), Vec3::Y, Quat::IDENTITY),
+                bone("upper", Some(1), Vec3::X * 0.1, down),
+                bone("lower", Some(2), along, bend),
+                bone("hand", Some(3), along, Quat::IDENTITY),
+                bone("finger", Some(4), Vec3::X * 0.1, Quat::IDENTITY),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_rig_resting_its_arms_differently_is_lined_up_with_the_clips() {
+        let roles =
+            Roles::parse("root root\narm_l clavicle upper lower hand\nindex_l finger\n").unwrap();
+        let (source, target) = (armed(false), armed(true));
+        // The source standing at its rest: arms straight out along +X.
+        let rest = Pose::rest(&source);
+        let frames = Frames {
+            rotations: vec![rest.rotations],
+            translations: vec![rest.translations],
+        };
+        let out = retarget(&source, &roles, &target, &roles, &frames);
+        let mut places: Vec<(Vec3, Quat)> = Vec::new();
+        for (i, bone) in target.bones.iter().enumerate() {
+            let (p, r) = bone
+                .parent
+                .map_or((Vec3::ZERO, Quat::IDENTITY), |p| places[p as usize]);
+            places.push((p + r * out.translations[0][i], r * out.rotations[0][i]));
+        }
+        // Each arm bone lies along the source's, and the finger stays in line with the hand.
+        for (bone, next) in [(2, 3), (3, 4), (4, 5)] {
+            let along = (places[next].0 - places[bone].0).normalize();
+            assert!(
+                along.dot(Vec3::X) > 0.999,
+                "bone {bone} points along {along}"
+            );
+        }
+        // The collarbone is left where it was: the shoulder stays put.
+        assert!((places[2].0 - Vec3::new(0.1, 1.0, 0.0)).length() < 1.0e-5);
     }
 
     #[test]
