@@ -48,6 +48,10 @@ pub struct Residency {
     fetching: u32,
     /// Pages that wanted loading but found no room in the pool at the last plan.
     starved: u32,
+    /// What the last plan wanted and could not start yet, most wanted last.
+    queue: Vec<u32>,
+    /// Slots the last plan found reclaimable, which is slow to work out.
+    reclaimable_at_plan: u32,
 }
 
 impl Residency {
@@ -74,6 +78,8 @@ impl Residency {
             arrived: BTreeSet::new(),
             fetching: 0,
             starved: 0,
+            queue: Vec::new(),
+            reclaimable_at_plan: 0,
         }
     }
 
@@ -146,16 +152,36 @@ impl Residency {
             .collect();
         wanted.sort_by_key(|&page| (std::cmp::Reverse(priority[page as usize]), page));
 
-        let room = (self.free_slots.len() as u32 + self.reclaimable(frame))
-            .saturating_sub(self.in_transit());
-        let can_fetch = room.min(max_fetching.saturating_sub(self.fetching)) as usize;
+        self.reclaimable_at_plan = self.reclaimable(frame);
+        let room = self.room();
         self.starved = (wanted.len() as u32).saturating_sub(room);
-        wanted.truncate(can_fetch);
-        for &page in &wanted {
-            self.states[page as usize] = State::Fetching;
+        wanted.reverse();
+        self.queue = wanted;
+        self.refill(max_fetching)
+    }
+
+    /// Starts fetching more of what the last plan wanted, as earlier fetches finish. Requests
+    /// come back from the GPU only every few frames, and between them the pipeline would
+    /// otherwise run dry.
+    pub fn refill(&mut self, max_fetching: u32) -> Vec<u32> {
+        let can_fetch = self.room().min(max_fetching.saturating_sub(self.fetching));
+        let mut started = Vec::new();
+        while (started.len() as u32) < can_fetch {
+            let Some(page) = self.queue.pop() else {
+                break;
+            };
+            if self.states[page as usize] == State::Absent {
+                self.states[page as usize] = State::Fetching;
+                started.push(page);
+            }
         }
-        self.fetching += wanted.len() as u32;
-        wanted
+        self.fetching += started.len() as u32;
+        started
+    }
+
+    /// How many more pages could be brought in without running out of slots.
+    fn room(&self) -> u32 {
+        (self.free_slots.len() as u32 + self.reclaimable_at_plan).saturating_sub(self.in_transit())
     }
 
     /// Installed pages that could be evicted, now or once what depends on them has gone.
@@ -287,6 +313,32 @@ impl Residency {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fetches_keep_coming_between_read_backs() {
+        // Six independent pages, of which only two can be fetched at once.
+        let mut residency = Residency::new(vec![Vec::new(); 6], 0, 6);
+        let mut requests = vec![10u32; 6];
+        requests[5] = 90;
+        let first = residency.plan(1, &requests, 2);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0], 5, "most wanted first");
+
+        assert!(residency.refill(2).is_empty(), "the limit still holds");
+        assert!(residency.arrived(first[0]));
+        let more = residency.refill(2);
+        assert_eq!(more.len(), 1, "a finished fetch makes room for the next");
+        assert!(!first.contains(&more[0]));
+
+        // A new plan replaces what was queued, and nothing is fetched twice.
+        let next = residency.plan(2, &requests, 8);
+        let everything: Vec<u32> = first.iter().chain(&more).chain(&next).copied().collect();
+        let mut unique = everything.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), everything.len());
+        assert_eq!(unique.len(), 6);
+    }
+
     use super::*;
 
     /// A small DAG: page 0 is pinned, 1 and 2 hang off it, 3 needs both, 4 needs 2.
