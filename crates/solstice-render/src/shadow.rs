@@ -391,22 +391,22 @@ impl ShadowMaps {
         });
         // A cascade is still good while it is fitted as it would be now, for the light it was
         // drawn with, and that light is near enough to where the light is now.
-        let current: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
-            !self.outdated[cascade]
-                && self.drawn[cascade].is_some_and(|drawn| {
-                    drawn.light.angle_between(sun_direction) <= LIGHT_LAG[cascade]
-                        && drawn.view_proj == fit(cascade, drawn.light).0
-                        && drawn.lod_threshold == lod_threshold
-                        && drawn.eye_lod_scale == eye_lod_scale
-                        && drawn.covers(&slice_corners(
-                            camera,
-                            aspect,
-                            nearest[cascade],
-                            SPLITS[cascade],
-                        ))
-                })
+        let fitted: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
+            self.drawn[cascade].is_some_and(|drawn| {
+                drawn.light.angle_between(sun_direction) <= LIGHT_LAG[cascade]
+                    && drawn.view_proj == fit(cascade, drawn.light).0
+                    && drawn.lod_threshold == lod_threshold
+                    && drawn.eye_lod_scale == eye_lod_scale
+                    && drawn.covers(&slice_corners(
+                        camera,
+                        aspect,
+                        nearest[cascade],
+                        SPLITS[cascade],
+                    ))
+            })
         });
-        let stale = current.map(|current| !current);
+        let stale: [bool; CASCADE_COUNT] =
+            std::array::from_fn(|cascade| self.outdated[cascade] || !fitted[cascade]);
         // What is redrawn is redrawn for the light as it is now.
         let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] =
             std::array::from_fn(|cascade| fit(cascade, sun_direction));
@@ -479,13 +479,15 @@ impl ShadowMaps {
 
         // Movable instances go through each cascade's view as it stands, drawn this frame or
         // before, so that the two maps line up. A cascade is touched when one of them lies in
-        // its view and could shadow its slice. A stale cascade waiting its turn has receiver
-        // planes that may no longer hold the slice, so until it is redrawn its view alone
-        // decides, as before.
+        // its view and could shadow its slice. A cascade waiting its turn to be fitted again has
+        // receiver planes that may no longer hold the slice, so until it is redrawn its view
+        // alone decides. One waiting only for finer geometry is fitted as it was: were it
+        // taken for touched, every page's coming would have the movable drawn into cascades
+        // they cast nothing on, at those cascades' detail, and their pages asked for.
         let moving_due: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
             let (_, radius) = self.extents[cascade];
             let view_proj = self.data.view_proj[cascade];
-            let receivers_current = due[cascade] || !stale[cascade];
+            let receivers_current = due[cascade] || fitted[cascade];
             self.drawn[cascade].is_some_and(|drawn| {
                 moving.iter().any(|&sphere| {
                     cascade_touches(view_proj, radius, sphere)
