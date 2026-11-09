@@ -9,7 +9,10 @@
 
 pub mod animation;
 pub mod character;
+pub mod ktx2;
 mod material;
+pub mod meshopt;
+pub mod streamed;
 
 use glam::{Mat3, Mat4, Vec2, Vec3};
 use gltf::{buffer, Document, Node, Primitive};
@@ -99,10 +102,10 @@ struct Placement {
 /// Identifies a mesh to build. Mirrored placements need the opposite winding to stay
 /// front-facing, so the same primitive may have to be built twice.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct MeshKey {
-    mesh: usize,
-    primitive: usize,
-    mirrored: bool,
+pub(crate) struct MeshKey {
+    pub(crate) mesh: usize,
+    pub(crate) primitive: usize,
+    pub(crate) mirrored: bool,
 }
 
 /// Imports the file at `path`.
@@ -630,7 +633,22 @@ fn measure_influences(skeleton: &mut Skeleton, meshes: &[(Mesh, Option<Vec<Packe
     }
 }
 
-fn read_primitive(primitive: &Primitive<'_>, buffers: &[buffer::Data], mirrored: bool) -> Mesh {
+/// A normal as a file gives it, or straight up if it gives none: some exporters write zero
+/// normals for degenerate triangles, and those cannot be encoded.
+fn read_normal(normal: [f32; 3]) -> Vec3 {
+    let normal = Vec3::from(normal);
+    if normal.length_squared() > 1.0e-12 {
+        normal
+    } else {
+        Vec3::Y
+    }
+}
+
+pub(crate) fn read_primitive(
+    primitive: &Primitive<'_>,
+    buffers: &[buffer::Data],
+    mirrored: bool,
+) -> Mesh {
     let reader = primitive.reader(|b| Some(&buffers[b.index()].0));
     let positions: Vec<[f32; 3]> = reader
         .read_positions()
@@ -644,7 +662,7 @@ fn read_primitive(primitive: &Primitive<'_>, buffers: &[buffer::Data], mirrored:
         .enumerate()
         .map(|(i, &position)| Vertex {
             position: Vec3::from(position),
-            normal: normals.as_ref().map_or(Vec3::Y, |n| Vec3::from(n[i])),
+            normal: normals.as_ref().map_or(Vec3::Y, |n| read_normal(n[i])),
             uv: uvs
                 .as_ref()
                 .map_or(Vec2::ZERO, |uv| uv_transform.apply(Vec2::from(uv[i]))),
@@ -715,7 +733,7 @@ fn ground_height(min_y: f32, max_y: f32) -> f32 {
 
 /// An axis-aligned box that starts out empty.
 #[derive(Clone, Copy, Debug)]
-struct Bounds {
+pub(crate) struct Bounds {
     min: Vec3,
     max: Vec3,
 }
@@ -770,7 +788,7 @@ fn root_transform(bounds: &Bounds, fit_size: Option<f32>) -> Mat4 {
 }
 
 /// A three-quarter view from which the whole model is visible.
-fn frame_bounds(bounds: &Bounds) -> Viewpoint {
+pub(crate) fn frame_bounds(bounds: &Bounds) -> Viewpoint {
     /// Angular radius the model's bounding sphere fills. Models rarely fill their sphere,
     /// so this exceeds half the vertical field of view and they still fit.
     const FRAMING_HALF_ANGLE: f32 = 0.62;

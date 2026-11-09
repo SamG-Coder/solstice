@@ -3,6 +3,7 @@
 //! ```text
 //! bake [--quality draft|web|high] [--output FILE]
 //! bake --gltf MODEL.glb [--fit METRES] [--ground] [--texture-size N] [--output FILE]
+//! bake --large-gltf SCENE.gltf [--region X,Y,Z,RADIUS] [--no-textures] [--texture-size N] [--output FILE]
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
 //! bake --gallery [--texture-size N] [--output FILE]
 //! bake --forest [--texture-size N] [--output FILE]
@@ -55,6 +56,9 @@ struct Options {
     species: Vec<PathBuf>,
     /// Grass files to add to the row of grass.
     grass: Vec<PathBuf>,
+    /// A scene too large for memory, baked straight to the output.
+    large_gltf: Option<PathBuf>,
+    large: solstice_import::streamed::LargeOptions,
     /// A character to check, and its rig's role file.
     check_character: Option<PathBuf>,
     roles: Option<PathBuf>,
@@ -75,6 +79,8 @@ fn parse_args() -> Result<Options, String> {
         plants: false,
         species: Vec::new(),
         grass: Vec::new(),
+        large_gltf: None,
+        large: Default::default(),
         check_character: None,
         roles: None,
     };
@@ -95,6 +101,19 @@ fn parse_args() -> Result<Options, String> {
             "--check-character" => options.check_character = Some(PathBuf::from(value()?)),
             "--roles" => options.roles = Some(PathBuf::from(value()?)),
             "--gltf" => options.gltf = Some(PathBuf::from(value()?)),
+            "--large-gltf" => options.large_gltf = Some(PathBuf::from(value()?)),
+            "--no-textures" => options.large.textures = false,
+            "--region" => {
+                let text = value()?;
+                let numbers = text
+                    .split(',')
+                    .map(|n| n.parse::<f32>().map_err(|e| format!("--region: {e}")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let [x, y, z, radius] = numbers[..] else {
+                    return Err("--region takes X,Y,Z,RADIUS".to_owned());
+                };
+                options.large.region = Some((glam::Vec3::new(x, y, z), radius));
+            }
             "--fit" => {
                 let metres = value()?.parse().map_err(|e| format!("--fit: {e}"))?;
                 options.import.fit_size = Some(metres);
@@ -105,6 +124,7 @@ fn parse_args() -> Result<Options, String> {
                     .parse()
                     .map_err(|e| format!("--texture-size: {e}"))?;
                 options.import.texture_size = size;
+                options.large.texture_size = size;
                 options.scene_texture_size = Some(size);
             }
             "--raw-textures" => options.raw_textures = true,
@@ -160,6 +180,37 @@ fn load_scene(options: &Options) -> Result<SceneAsset, String> {
     Ok(imported.scene)
 }
 
+/// Bakes a scene too large to hold in memory.
+fn bake_large(path: &std::path::Path, options: &Options, start: Instant) -> Result<(), String> {
+    println!("baking {} from disk...", path.display());
+    let mut report = solstice_import::streamed::bake_large(path, &options.output, &options.large)?;
+    report.warnings.sort();
+    report.warnings.dedup();
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
+    println!(
+        "{} meshes, {} instances, {} unique triangles, {} instanced triangles",
+        report.meshes, report.instances, report.unique_triangles, report.instanced_triangles,
+    );
+    println!(
+        "{} clusters, {} pages, {} texture layers; building {:.1}s, paging {:.1}s, textures {:.1}s",
+        report.clusters,
+        report.pages,
+        report.texture_layers,
+        report.build_seconds,
+        report.page_seconds,
+        report.texture_seconds,
+    );
+    println!(
+        "wrote {} ({:.1} MB) in {:.1}s",
+        options.output.display(),
+        report.file_bytes as f64 / 1.0e6,
+        start.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
 /// Checks a character file, and fails if anything is wrong with it.
 fn check_character(path: &std::path::Path, roles: Option<&PathBuf>) -> Result<(), String> {
     use solstice_import::character::{check_character, Roles};
@@ -186,6 +237,9 @@ fn main() -> Result<(), String> {
         return check_character(path, options.roles.as_ref());
     }
     let start = Instant::now();
+    if let Some(path) = &options.large_gltf {
+        return bake_large(path, &options, start);
+    }
     let mut scene = load_scene(&options)?;
     if options.show_collision {
         scene = collision_view::collision_scene(&scene)?;

@@ -792,3 +792,293 @@ fn import_records_named_nodes_as_parts() {
         "the whole model keeps its layout"
     );
 }
+
+/// Writes a flat grid dense enough to need pages of its own, optionally with its node instanced
+/// by the transforms in `instances`.
+fn write_grid(dir: &TempDir, instances: Option<&[([f32; 3], [f32; 3])]>) -> PathBuf {
+    const CELLS: u32 = 64;
+    let mut bin = Vec::new();
+    for z in 0..=CELLS {
+        for x in 0..=CELLS {
+            for value in [x as f32, ((x * z) as f32 * 0.37).sin(), z as f32] {
+                bin.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    let positions_len = bin.len();
+    let vertex = |x: u32, z: u32| z * (CELLS + 1) + x;
+    for z in 0..CELLS {
+        for x in 0..CELLS {
+            for index in [
+                vertex(x, z),
+                vertex(x, z + 1),
+                vertex(x + 1, z),
+                vertex(x + 1, z),
+                vertex(x, z + 1),
+                vertex(x + 1, z + 1),
+            ] {
+                bin.extend_from_slice(&index.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(dir.0.join("model.bin"), &bin).unwrap();
+    let (extension, extra_buffers, extra_views, extra_accessors) = match instances {
+        None => (String::new(), String::new(), String::new(), String::new()),
+        Some(instances) => {
+            let mut nodes = Vec::new();
+            for (translation, _) in instances {
+                nodes.extend(translation.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            let translations_len = nodes.len();
+            for (_, scale) in instances {
+                nodes.extend(scale.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            std::fs::write(dir.0.join("instances.bin"), &nodes).unwrap();
+            let count = instances.len();
+            (
+                r#", "extensions": {"EXT_mesh_gpu_instancing": {"attributes": {"TRANSLATION": 2, "SCALE": 3}}}"#.to_owned(),
+                format!(r#", {{"uri": "instances.bin", "byteLength": {}}}"#, nodes.len()),
+                format!(
+                    r#", {{"buffer": 1, "byteOffset": 0, "byteLength": {translations_len}}},
+                       {{"buffer": 1, "byteOffset": {translations_len}, "byteLength": {translations_len}}}"#
+                ),
+                format!(
+                    r#", {{"bufferView": 2, "componentType": 5126, "count": {count}, "type": "VEC3"}},
+                       {{"bufferView": 3, "componentType": 5126, "count": {count}, "type": "VEC3"}}"#
+                ),
+            )
+        }
+    };
+    let json = format!(
+        r#"{{
+        "asset": {{"version": "2.0"}},
+        "scene": 0,
+        "scenes": [{{"nodes": [0]}}],
+        "nodes": [{{"mesh": 0, "translation": [1, 0, 0]{extension}}}],
+        "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1}}]}}],
+        "buffers": [{{"uri": "model.bin", "byteLength": {total}}}{extra_buffers}],
+        "bufferViews": [
+            {{"buffer": 0, "byteOffset": 0, "byteLength": {positions_len}}},
+            {{"buffer": 0, "byteOffset": {positions_len}, "byteLength": {indices_len}}}
+            {extra_views}
+        ],
+        "accessors": [
+            {{"bufferView": 0, "componentType": 5126, "count": {vertices}, "type": "VEC3",
+              "min": [0, -1, 0], "max": [{cells}, 1, {cells}]}},
+            {{"bufferView": 1, "componentType": 5125, "count": {indices}, "type": "SCALAR"}}
+            {extra_accessors}
+        ]
+    }}"#,
+        total = bin.len(),
+        indices_len = bin.len() - positions_len,
+        vertices = (CELLS + 1) * (CELLS + 1),
+        indices = CELLS * CELLS * 6,
+        cells = CELLS as f32,
+    );
+    let path = dir.0.join("model.gltf");
+    std::fs::write(&path, json).unwrap();
+    path
+}
+
+fn large_options() -> streamed::LargeOptions {
+    streamed::LargeOptions {
+        textures: false,
+        min_free_bytes: 0,
+        ..Default::default()
+    }
+}
+
+/// The disk-backed path must give what the ordinary one gives, whatever it does along the way.
+#[test]
+fn a_bake_from_disk_matches_one_from_memory() {
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    // A mirrored copy has the opposite winding, so it is a second mesh to build.
+    let text = std::fs::read_to_string(&path).unwrap().replacen(
+        r#""scenes": [{"nodes": [0]}],
+        "nodes": ["#,
+        r#""scenes": [{"nodes": [0, 1]}],
+        "nodes": [{"mesh": 0, "scale": [-1, 1, 1]}, "#,
+        1,
+    );
+    assert!(text.contains("[0, 1]"));
+    std::fs::write(&path, text).unwrap();
+    let memory = import(&path).scene;
+    let memory = solstice_asset::file::decode(&solstice_asset::file::encode(
+        &solstice_builder::paginate(&memory),
+    ))
+    .unwrap();
+
+    let output = dir.0.join("out.solstice");
+    let report = streamed::bake_large(&path, &output, &large_options()).unwrap();
+    let bytes = std::fs::read(&output).unwrap();
+    assert_eq!(report.file_bytes, bytes.len() as u64);
+    let disk = solstice_asset::file::decode(&bytes).unwrap();
+
+    assert_eq!(disk.scene.meshes.len(), 2);
+    assert!(
+        disk.scene.pages.len() > disk.scene.pinned_pages as usize,
+        "this test needs pages that aren't pinned"
+    );
+    assert_eq!(disk.scene.clusters, memory.scene.clusters);
+    assert_eq!(disk.scene.nodes, memory.scene.nodes);
+    assert_eq!(disk.scene.sets, memory.scene.sets);
+    assert_eq!(disk.scene.generated, memory.scene.generated);
+    assert_eq!(disk.scene.pinned_pages, memory.scene.pinned_pages);
+    assert_eq!(disk.scene.pinned_data, memory.scene.pinned_data);
+    assert_eq!(disk.pages, memory.pages);
+    let placed = |scene: &solstice_asset::paged::PagedScene| -> Vec<(u32, u32, Mat4)> {
+        scene
+            .instances
+            .iter()
+            .map(|i| (i.mesh, i.material, i.transform))
+            .collect()
+    };
+    assert_eq!(placed(&disk.scene), placed(&memory.scene));
+    assert_eq!(disk.scene.viewpoint, memory.scene.viewpoint);
+    assert_eq!(disk.scene.source_triangles, memory.scene.source_triangles);
+    assert_eq!(disk.scene.unique_triangles, memory.scene.unique_triangles);
+
+    let names: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.ends_with(".tmp")),
+        "temporary files are gone: {names:?}"
+    );
+}
+
+/// `EXT_mesh_gpu_instancing`: each copy's transform goes inside the node's own.
+#[test]
+fn instanced_nodes_become_one_instance_per_copy() {
+    let dir = TempDir::new();
+    let copies = [
+        ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+        ([10.0, 0.0, 0.0], [2.0, 2.0, 2.0]),
+        ([0.0, 5.0, 0.0], [1.0, 1.0, 1.0]),
+    ];
+    let path = write_grid(&dir, Some(&copies));
+    let output = dir.0.join("out.solstice");
+    let report = streamed::bake_large(&path, &output, &large_options()).unwrap();
+    assert_eq!(report.instances, 3);
+    assert_eq!(report.meshes, 1, "copies share their mesh");
+    let scene = solstice_asset::file::decode(&std::fs::read(&output).unwrap())
+        .unwrap()
+        .scene;
+    let origin = |i: usize| scene.instances[i].transform.w_axis.truncate();
+    assert_eq!(origin(0), Vec3::new(1.0, 0.0, 0.0));
+    assert_eq!(origin(1), Vec3::new(11.0, 0.0, 0.0));
+    assert_eq!(origin(2), Vec3::new(1.0, 5.0, 0.0));
+    assert_eq!(scene.instances[1].transform.x_axis.x, 2.0);
+}
+
+/// A bake that would fill the drive stops before starting, and leaves nothing behind.
+#[test]
+fn a_bake_stops_when_the_drive_is_short_of_room() {
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let output = dir.0.join("out.solstice");
+    let options = streamed::LargeOptions {
+        min_free_bytes: u64::MAX,
+        ..large_options()
+    };
+    let error = streamed::bake_large(&path, &output, &options).unwrap_err();
+    assert!(error.contains("stopping"), "{error}");
+    assert!(!output.exists());
+}
+
+#[test]
+fn a_large_bake_refuses_a_texture_size_that_cannot_be_halved() {
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let options = streamed::LargeOptions {
+        texture_size: 1000,
+        ..large_options()
+    };
+    let error = streamed::bake_large(&path, dir.0.join("out.solstice"), &options).unwrap_err();
+    assert!(error.contains("power of two"), "{error}");
+}
+
+/// A binary glTF's data is in its own file, which the large path would otherwise read as zeros.
+#[test]
+fn a_large_bake_refuses_binary_gltf() {
+    let dir = TempDir::new();
+    let mut json = br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}"#.to_vec();
+    json.resize(json.len().next_multiple_of(4), b' ');
+    let bin = [0u8; 4];
+    let mut glb = Vec::new();
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    let path = dir.0.join("model.glb");
+    std::fs::write(&path, glb).unwrap();
+    let error =
+        streamed::bake_large(&path, dir.0.join("out.solstice"), &large_options()).unwrap_err();
+    assert!(error.contains("binary glTF"), "{error}");
+}
+
+/// A missing texture must be found before the hours of building, not after.
+#[test]
+fn a_large_bake_checks_its_textures_first() {
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let patched = text.replacen(
+        r#""scene": 0,"#,
+        r#""scene": 0,
+        "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+        "textures": [{"source": 0}],
+        "images": [{"uri": "missing.ktx2"}],"#,
+        1,
+    );
+    let patched = patched.replacen(r#""indices": 1}"#, r#""indices": 1, "material": 0}"#, 1);
+    std::fs::write(&path, patched).unwrap();
+    let options = streamed::LargeOptions {
+        textures: true,
+        ..large_options()
+    };
+    let output = dir.0.join("out.solstice");
+    let error = streamed::bake_large(&path, &output, &options).unwrap_err();
+    assert!(error.contains("missing.ktx2"), "{error}");
+    assert!(!output.exists());
+}
+
+/// The drive running out partway through stops the bake and clears up, not only at the start.
+#[test]
+fn a_bake_stops_when_the_drive_fills_up_on_the_way() {
+    fn filling(_: &Path) -> Option<u64> {
+        static LOOKS: AtomicU32 = AtomicU32::new(0);
+        // Plenty at the start and for the warning's look, then nothing.
+        Some(if LOOKS.fetch_add(1, Ordering::Relaxed) < 2 {
+            u64::MAX
+        } else {
+            0
+        })
+    }
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let output = dir.0.join("out.solstice");
+    let options = streamed::LargeOptions {
+        min_free_bytes: 1,
+        free_space: filling,
+        check_every_bytes: 1,
+        ..large_options()
+    };
+    let error = streamed::bake_large(&path, &output, &options).unwrap_err();
+    assert!(error.contains("stopping"), "{error}");
+    let names: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.starts_with("out.solstice")),
+        "nothing is left: {names:?}"
+    );
+}

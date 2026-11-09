@@ -10,9 +10,10 @@ solstice-anim.workspace = true
 solstice-asset.workspace = true
 solstice-builder.workspace = true
 glam.workspace = true
-gltf = { version = "1.4", features = ["KHR_texture_transform"] }
+gltf = { version = "1.4", features = ["KHR_texture_transform", "extensions"] }
 rayon.workspace = true
+ruzstd = "0.9"
+bytemuck.workspace = true
 
 [dev-dependencies]
-bytemuck = { workspace = true }
 png = "0.17"
