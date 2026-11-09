@@ -14,7 +14,7 @@ use crate::scene::{
 };
 use crate::Gpu;
 use feedback::RequestFeedback;
-use residency::{Install, Residency};
+use residency::{Residency, Step};
 use solstice_asset::gpu::{CLUSTER_CHILDREN_MISSING, NODE_INSTALLED, NODE_LEAF};
 use solstice_asset::paged::{
     upper_mip_count, ClusterSet, PageInfo, PagedScene, BASE_TEXTURE_EDGE, PAGE_VERTICES, PAGE_WORDS,
@@ -513,28 +513,17 @@ impl Streamer {
     fn install_waiting(&mut self, gpu: &Gpu, scene: &GpuScene, limit: u32) {
         self.arrived
             .retain(|&page, _| self.residency.is_waiting(page));
-        for _ in 0..limit {
-            let install = self.residency.next_install(self.frame);
-            // Even if nothing could install: the pages let go are no longer on the GPU's books.
-            for released in self.residency.take_released() {
-                self.apply_eviction(gpu, scene, released);
+        for step in self.residency.install_ready(self.frame, limit) {
+            match step {
+                Step::Evict(page) => self.apply_eviction(gpu, scene, page),
+                Step::Install { page, slot } => {
+                    let (data, clusters) = self
+                        .arrived
+                        .remove(&page)
+                        .expect("a page installs only after its data arrived");
+                    self.apply_install(gpu, scene, page, slot, &data, &clusters);
+                }
             }
-            let Some(Install {
-                page,
-                slot,
-                evicted,
-            }) = install
-            else {
-                break;
-            };
-            if let Some(victim) = evicted {
-                self.apply_eviction(gpu, scene, victim);
-            }
-            let (data, clusters) = self
-                .arrived
-                .remove(&page)
-                .expect("a page installs only after its data arrived");
-            self.apply_install(gpu, scene, page, slot, &data, &clusters);
         }
         // Only what a kept view asked for changes what it would draw: its level of detail is
         // its own, and it asks for every page of it each time it is drawn.

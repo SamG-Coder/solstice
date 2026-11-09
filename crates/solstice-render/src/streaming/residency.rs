@@ -37,6 +37,15 @@ enum State {
     Installed(u32),
 }
 
+/// One change to what is on the GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A page left its slot.
+    Evict(u32),
+    /// A page went into a slot.
+    Install { page: u32, slot: u32 },
+}
+
 /// A page moved onto the GPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Install {
@@ -300,10 +309,16 @@ impl Residency {
     /// otherwise run dry.
     pub fn refill(&mut self, max_fetching: u32) -> Vec<u32> {
         let (mut free, mut room) = self.room();
-        let can_fetch = room
-            .iter()
-            .sum::<u32>()
-            .min(max_fetching.saturating_sub(self.fetching));
+        // The host holds the data of every page that has come and waits to go in, and a pool
+        // slow to make room would let them pile up without end: once as many wait as may be
+        // fetched at once, no more are fetched until some have gone in.
+        let can_fetch = if self.arrived.len() as u32 >= max_fetching {
+            0
+        } else {
+            room.iter()
+                .sum::<u32>()
+                .min(max_fetching.saturating_sub(self.fetching))
+        };
         let mut started = Vec::new();
         while (started.len() as u32) < can_fetch {
             let Some(page) = self.queue.pop() else {
@@ -422,26 +437,86 @@ impl Residency {
     }
 
     /// Finds the next page ready to install, and gives it a slot, evicting if it must. Returns
-    /// `None` when nothing can install this frame. Coarsest pages go first.
+    /// `None` when nothing can install this frame. Coarsest pages go first. A band with no slot
+    /// to give holds back only its own pages.
     pub fn next_install(&mut self, frame: u32) -> Option<Install> {
-        let page = self.arrived.iter().copied().find(|&page| {
-            self.dependencies[page as usize]
+        let mut stuck = 0u32;
+        loop {
+            let page = self
+                .arrived
+                .iter()
+                .copied()
+                .find(|&page| self.can_install(page, stuck))?;
+            let band = usize::from(self.bands[page as usize]);
+            let Some((slot, evicted)) = self.take_slot(frame, band) else {
+                stuck |= 1 << band;
+                continue;
+            };
+            self.settle(page, slot, frame);
+            return Some(Install {
+                page,
+                slot,
+                evicted,
+            });
+        }
+    }
+
+    /// Installs the arrived pages that can go in, coarsest first, at most `limit` of them, in
+    /// one look over them. Returns what changed on the GPU, in the order to make the changes:
+    /// a slot's old page leaves before its new one arrives. The pages [`Self::take_released`]
+    /// would give are among them.
+    pub fn install_ready(&mut self, frame: u32, limit: u32) -> Vec<Step> {
+        let mut steps = Vec::new();
+        let mut installed = 0;
+        let mut stuck = 0u32;
+        // In order, so a page's parents, which have lower ids, are in before its turn comes.
+        let waiting: Vec<u32> = self.arrived.iter().copied().collect();
+        for page in waiting {
+            if installed == limit {
+                break;
+            }
+            if !self.can_install(page, stuck) {
+                continue;
+            }
+            let band = usize::from(self.bands[page as usize]);
+            let slot = self.take_slot(frame, band);
+            steps.extend(self.released.drain(..).map(Step::Evict));
+            let Some((slot, evicted)) = slot else {
+                stuck |= 1 << band;
+                continue;
+            };
+            steps.extend(evicted.map(Step::Evict));
+            self.settle(page, slot, frame);
+            steps.push(Step::Install { page, slot });
+            installed += 1;
+        }
+        steps
+    }
+
+    /// Whether an arrived page's parents are in, and its band isn't among the `stuck`.
+    fn can_install(&self, page: u32, stuck: u32) -> bool {
+        stuck & (1 << self.bands[page as usize]) == 0
+            && self.dependencies[page as usize]
                 .iter()
                 .all(|&d| self.is_installed(d))
-        })?;
-        let band = usize::from(self.bands[page as usize]);
-        let (slot, evicted) = match self.free_slots[band].pop() {
-            Some(slot) => (slot, None),
-            None => {
-                let victim = self.victim_making_room(frame, band)?;
-                let State::Installed(slot) = self.states[victim as usize] else {
-                    unreachable!("victims are installed");
-                };
-                self.remove(victim);
-                self.reclaimable_at_plan[band] = self.reclaimable_at_plan[band].saturating_sub(1);
-                (slot, Some(victim))
-            }
+    }
+
+    /// A slot of `band` for a page to go into, and the page that left it, if one had to.
+    fn take_slot(&mut self, frame: u32, band: usize) -> Option<(u32, Option<u32>)> {
+        if let Some(slot) = self.free_slots[band].pop() {
+            return Some((slot, None));
+        }
+        let victim = self.victim_making_room(frame, band)?;
+        let State::Installed(slot) = self.states[victim as usize] else {
+            unreachable!("victims are installed");
         };
+        self.remove(victim);
+        self.reclaimable_at_plan[band] = self.reclaimable_at_plan[band].saturating_sub(1);
+        Some((slot, Some(victim)))
+    }
+
+    /// Records an arrived page as installed in `slot`.
+    fn settle(&mut self, page: u32, slot: u32, frame: u32) {
         self.arrived.remove(&page);
         self.place(page, slot);
         let asked = std::mem::take(&mut self.awaited[page as usize]);
@@ -451,11 +526,6 @@ impl Residency {
             let until = frame.saturating_add(HOLD_FRAMES);
             self.last_wanted[page as usize] = self.last_wanted[page as usize].max(until);
         }
-        Some(Install {
-            page,
-            slot,
-            evicted,
-        })
     }
 
     /// Installs a page at once, whatever its state. Its dependencies must be installed.
@@ -610,6 +680,46 @@ mod tests {
             [2, 1],
             "the child and then its parent, in the same frame"
         );
+    }
+
+    /// A band with nothing to let go holds back its own pages, and no other band's.
+    #[test]
+    fn a_band_with_no_room_does_not_hold_up_the_others() {
+        // Pages 0 and 1 belong in the first band, which has one slot; page 2 in the second.
+        let mut residency = Residency::with_bands(vec![vec![]; 3], 0, vec![0, 0, 1], &[1, 1]);
+        residency.plan(1, &[10, 0, 0], 8);
+        residency.arrived(0);
+        assert!(residency.next_install(1).is_some());
+
+        // Page 0 is still wanted, so page 1 has nowhere to go; page 2 has its own band's slot.
+        for page in [1, 2] {
+            residency.mark_fetching(page);
+            residency.arrived(page);
+        }
+        residency.plan(2, &[10, 10, 10], 8);
+        assert_eq!(
+            residency.install_ready(2, 8),
+            [Step::Install { page: 2, slot: 1 }],
+            "the second band's page goes in past the first band's, which waits"
+        );
+        assert!(residency.is_waiting(1));
+        assert_eq!(residency.next_install(2), None);
+    }
+
+    /// Once as many pages wait to go in as may be fetched at once, no more are fetched.
+    #[test]
+    fn pages_waiting_to_go_in_hold_back_fetching() {
+        let mut residency = Residency::new(vec![vec![]; 6], 0, 6);
+        assert_eq!(residency.plan(1, &[10; 6], 2), [0, 1]);
+        residency.arrived(0);
+        residency.arrived(1);
+        assert_eq!(
+            residency.refill(2),
+            [],
+            "two wait to go in: no more are fetched"
+        );
+        assert!(residency.next_install(1).is_some());
+        assert_eq!(residency.refill(2), [2, 3], "one went in: fetching goes on");
     }
 
     /// A page takes an empty slot of another band before it makes a page of its own leave.
@@ -819,6 +929,7 @@ mod tests {
         let first = residency.plan(1, &[10; 6], 1);
         assert_eq!(first.len(), 1);
         residency.arrived(first[0]);
+        assert!(residency.next_install(1).is_some());
 
         // Now only one other page is wanted, so the rest of the old queue must not be fetched.
         let wanted = (first[0] + 1) % 6;
