@@ -82,7 +82,7 @@ The whole map runs in the browser, served locally. A browser has 4 GiB of memory
 bake --web-split zorah.solstice --output zorah.web
 ```
 
-Put `zorah.solstice` and `zorah.web` in `dist/assets/`, serve `dist/` with `scripts/serve.py` and open `?scene=zorah&split&geometry-mb=10000&texture-mb=1000`. The file version doesn't change, and the native viewer refuses the `.web` file.
+Put `zorah.solstice` and `zorah.web` in `dist/assets/`, serve `dist/` with `scripts/serve.py` and open `?scene=zorah&split`. A scene read in parts gets 10,000 MiB for geometry and 1,000 MiB for textures unless `geometry-mb` and `texture-mb` say otherwise: with the page's usual 128 and 64 it holds only the pages it can never drop, and looks low-poly under blurred textures. The file version doesn't change, and the native viewer refuses the `.web` file.
 
 - **Cluster records come and go with their pages.** The `.web` file holds them in the order pages do, so a page's records are one run of it. The GPU has a block of records for each pool slot, 187 for Zorah, the most any of its pages has, and a leaf node is pointed at its set's place there when its page installs. That is 0.7 GB of GPU memory for a pool of 80,000 pages, where the whole table is 3.05 GB, and it leaves room for about 16,000 more pages. Such a scene can't be skinned, as bone lists go by a cluster's number.
 - **Up to eight pools.** A pool address keeps its band in its top three bits, above 2^29 words, which is one binding. Three pools are by level of detail and the rest are spare, bound only as far as the budget needs: 10,000 MiB is five. The masked rasterizers then bind 13 storage buffers, of Chrome's 16.
