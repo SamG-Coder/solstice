@@ -2,6 +2,7 @@
 
 use super::culling::{CullWork, ViewSlots};
 use crate::gpu::{Gpu, LayoutBuilder};
+use crate::regions::RegionPlan;
 use crate::scene::GpuScene;
 use crate::shaders;
 
@@ -162,8 +163,8 @@ fn visibility_pipeline(
 }
 
 impl Rasterizer {
-    pub fn new(gpu: &Gpu, has_masked: bool, skinned: bool) -> Self {
-        let raster_layout = LayoutBuilder::new()
+    pub fn new(gpu: &Gpu, has_masked: bool, skinned: bool, regions: Option<RegionPlan>) -> Self {
+        let mut raster_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT)
             .uniform_dynamic()
             .storage_read()
@@ -171,15 +172,20 @@ impl Rasterizer {
             .storage_read()
             .storage_read()
             .storage_read()
-            .texture_unfilterable()
-            .build(gpu, "raster");
+            .texture_unfilterable();
+        if regions.is_some() {
+            // The second cluster binding, and the pool's middle and far bands.
+            raster_layout = raster_layout.storage_read().storage_read().storage_read();
+        }
+        let raster_layout = raster_layout.build(gpu, "raster");
         let vis_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT)
             .storage_write()
             .storage_write()
             .build(gpu, "visibility");
 
-        let software_module = shaders::module_for(&gpu.device, "vg/raster_sw.wgsl", skinned);
+        let software_module =
+            shaders::module_for(&gpu.device, "vg/raster_sw.wgsl", skinned, regions);
         let software = gpu.compute_pipeline(
             "software raster",
             &software_module,
@@ -188,7 +194,7 @@ impl Rasterizer {
         );
 
         let hardware_module =
-            shaders::module_for(&gpu.device, "vg/raster_hw_fragment.wgsl", skinned);
+            shaders::module_for(&gpu.device, "vg/raster_hw_fragment.wgsl", skinned, regions);
         let hardware = visibility_pipeline(
             gpu,
             "hardware raster",
@@ -204,7 +210,8 @@ impl Rasterizer {
             .visibility(wgpu::ShaderStages::FRAGMENT)
             .storage_read()
             .build(gpu, "software depth merge");
-        let depth_module = shaders::module_for(&gpu.device, "vg/raster_sw_depth.wgsl", skinned);
+        let depth_module =
+            shaders::module_for(&gpu.device, "vg/raster_sw_depth.wgsl", skinned, regions);
         let software_depth = gpu.compute_pipeline(
             "software depth raster",
             &depth_module,
@@ -263,10 +270,15 @@ impl Rasterizer {
                 .sampler()
                 .build(gpu, "masked raster");
             let software_module =
-                shaders::module_for(&gpu.device, "vg/raster_sw_masked.wgsl", skinned);
-            let depth_module =
-                shaders::module_for(&gpu.device, "vg/raster_sw_depth_masked.wgsl", skinned);
-            let module = shaders::module_for(&gpu.device, "vg/raster_hw_masked.wgsl", skinned);
+                shaders::module_for(&gpu.device, "vg/raster_sw_masked.wgsl", skinned, regions);
+            let depth_module = shaders::module_for(
+                &gpu.device,
+                "vg/raster_sw_depth_masked.wgsl",
+                skinned,
+                regions,
+            );
+            let module =
+                shaders::module_for(&gpu.device, "vg/raster_hw_masked.wgsl", skinned, regions);
             Masked {
                 software: gpu.compute_pipeline(
                     "masked software raster",
@@ -401,10 +413,8 @@ impl Rasterizer {
         work: &CullWork,
     ) -> RasterBindings {
         RasterBindings {
-            group: gpu.bind_group(
-                "raster",
-                &self.raster_layout,
-                &[
+            group: {
+                let mut resources = vec![
                     slots.binding(),
                     scene.instances.as_entire_binding(),
                     scene.clusters.as_entire_binding(),
@@ -412,8 +422,16 @@ impl Rasterizer {
                     work.visible.as_entire_binding(),
                     work.state().as_entire_binding(),
                     wgpu::BindingResource::TextureView(&scene.skins.bones_view),
-                ],
-            ),
+                ];
+                if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
+                    resources.extend([
+                        more.as_entire_binding(),
+                        scene.triangles.as_entire_binding(),
+                        far.as_entire_binding(),
+                    ]);
+                }
+                gpu.bind_group("raster", &self.raster_layout, &resources)
+            },
             mask: self.masked.as_ref().map(|masked| {
                 gpu.bind_group(
                     "masked raster",

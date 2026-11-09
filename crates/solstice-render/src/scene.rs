@@ -6,6 +6,7 @@
 
 use crate::gpu::Gpu;
 use crate::motion::{FrameChanges, InstanceTable};
+use crate::regions::RegionPlan;
 use crate::skin::{pose_addresses, GpuSkins, NO_BONES};
 use crate::streaming::textures::TierPlan;
 use bytemuck::{Pod, Zeroable};
@@ -149,8 +150,15 @@ pub struct GpuScene {
     /// The page pool, seen as vertices. See [`Self::triangles`].
     pub vertices: wgpu::Buffer,
     /// The page pool again, seen as triangles. Each slot holds a page's vertices and then its
-    /// triangles, and cluster records hold offsets into the two views.
+    /// triangles, and cluster records hold offsets into the two views. In a scene too large for
+    /// one binding (see [`RegionPlan`]) this is instead the middle band's own buffer.
     pub triangles: wgpu::Buffer,
+    /// For a scene too large for one binding: how it is divided.
+    pub regions: Option<RegionPlan>,
+    /// The cluster records past the first binding's, if the scene has regions.
+    pub clusters_more: Option<wgpu::Buffer>,
+    /// The far band's page pool, if the scene has regions.
+    pub pool_far: Option<wgpu::Buffer>,
     pub materials: wgpu::Buffer,
     pub lights: wgpu::Buffer,
     pub textures: TextureArrays,
@@ -202,17 +210,44 @@ impl GpuScene {
             ..Default::default()
         });
 
-        let pool = gpu.storage_buffer(
-            "page pool",
-            u64::from(slots.max(1)) * PAGE_BYTES as u64,
-            wgpu::BufferUsages::COPY_DST,
-        );
+        let regions = RegionPlan::decide(&gpu.limits, scene, slots);
+        let pool_of = |label: &str, slots: u32| {
+            gpu.storage_buffer(
+                label,
+                u64::from(slots.max(1)) * PAGE_BYTES as u64,
+                wgpu::BufferUsages::COPY_DST,
+            )
+        };
+        let (pool, middle, far) = match regions {
+            Some(plan) => (
+                pool_of("page pool, near", plan.band_slots[0]),
+                pool_of("page pool, middle", plan.band_slots[1]),
+                Some(pool_of("page pool, far", plan.band_slots[2])),
+            ),
+            None => {
+                let pool = pool_of("page pool", slots);
+                (pool.clone(), pool, None)
+            }
+        };
+        let (clusters, clusters_more) = match regions {
+            Some(plan) => {
+                let (first, rest) = scene.clusters.split_at(plan.cluster_chunk as usize);
+                (
+                    gpu.storage_buffer_init("clusters", first),
+                    Some(gpu.storage_buffer_init("clusters, more", rest)),
+                )
+            }
+            None => (gpu.storage_buffer_init("clusters", &scene.clusters), None),
+        };
         Self {
             instances: gpu.storage_buffer_init("instances", &instances),
             nodes: gpu.storage_buffer_init("nodes", &scene.nodes),
-            clusters: gpu.storage_buffer_init("clusters", &scene.clusters),
-            vertices: pool.clone(),
-            triangles: pool,
+            clusters,
+            vertices: pool,
+            triangles: middle,
+            regions,
+            clusters_more,
+            pool_far: far,
             materials: gpu.storage_buffer_init("materials", &materials),
             lights: gpu.storage_buffer_init("lights", &scene.lights),
             textures,
@@ -228,6 +263,28 @@ impl GpuScene {
             source_triangles: scene.source_triangles,
             unique_triangles: scene.unique_triangles,
         }
+    }
+
+    /// The buffer holding a band of the page pool.
+    pub fn pool(&self, band: usize) -> &wgpu::Buffer {
+        match band {
+            0 => &self.vertices,
+            1 => &self.triangles,
+            _ => self
+                .pool_far
+                .as_ref()
+                .expect("only scenes with regions have a far band"),
+        }
+    }
+
+    /// Bytes of GPU memory in cluster records and page pools.
+    pub fn geometry_bytes(&self) -> (u64, u64) {
+        let more = self.clusters_more.as_ref().map_or(0, wgpu::Buffer::size);
+        let pools = match &self.pool_far {
+            Some(far) => self.vertices.size() + self.triangles.size() + far.size(),
+            None => self.vertices.size(),
+        };
+        (self.clusters.size() + more, pools)
     }
 
     /// Applies this frame's changes to instances and uploads them. Returns what changed, so that

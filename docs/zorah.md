@@ -49,3 +49,9 @@ minutes.
 - Emissive textures (73 materials) are ignored, and only the emissive factor is used.
 - The one `BLEND` material is drawn opaque.
 - Non-square textures, 348 of the 4,418, are resampled by nearest block.
+
+## Viewing it
+
+The full scene's cluster table and the page pool it wants are each over wgpu's 2 GiB binding limit, so `viewer --stream --geometry-budget-mb N` splits them between bindings for such a scene (`crates/solstice-render/src/regions.rs`): cluster records in two, and the pool in three by how simplified a page is. **This path is supported only natively on x64 with an RTX 5080.** It needs 11 storage buffers per stage. Scenes that fit in single bindings don't use it, and compile the same shaders with the same limits as before.
+
+To run the renderer's GPU tests through this path on small scenes: `SOLSTICE_FORCE_REGIONS=1 cargo test -p solstice-render --test gpu`.

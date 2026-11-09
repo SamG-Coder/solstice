@@ -799,6 +799,12 @@ mod native {
                 streaming.evictions,
                 streaming.starved,
             );
+            if let Some([near, middle, far]) = streaming.bands {
+                println!(
+                    "bands: near {}/{}, middle {}/{}, far {}/{}",
+                    near.0, near.1, middle.0, middle.1, far.0, far.1
+                );
+            }
             let memory = renderer.scene_bytes();
             println!(
                 "scene memory: {:.1} MiB of records, {:.1} MiB of pages, {:.1} MiB of textures | textures: {}, {} at middle, {} at top",

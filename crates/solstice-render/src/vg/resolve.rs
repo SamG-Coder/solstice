@@ -3,6 +3,7 @@
 use super::culling::CullWork;
 use super::raster::VisibilityBuffer;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
+use crate::regions::RegionPlan;
 use crate::scene::GpuScene;
 use crate::shaders;
 
@@ -56,8 +57,13 @@ pub struct ResolveBindings {
 
 impl Resolve {
     /// `wetness` is the layout of the third bind group, from [`crate::ocean::waterline`].
-    pub fn new(gpu: &Gpu, wetness: &wgpu::BindGroupLayout, skinned: bool) -> Self {
-        let data_layout = LayoutBuilder::new()
+    pub fn new(
+        gpu: &Gpu,
+        wetness: &wgpu::BindGroupLayout,
+        skinned: bool,
+        regions: Option<RegionPlan>,
+    ) -> Self {
+        let mut data_layout = LayoutBuilder::new()
             .uniform()
             .storage_read()
             .storage_read()
@@ -67,8 +73,12 @@ impl Resolve {
             .storage_read()
             .storage_read()
             .storage_read()
-            .texture_unfilterable()
-            .build(gpu, "resolve data");
+            .texture_unfilterable();
+        if regions.is_some() {
+            // The second cluster binding and the pool's far band.
+            data_layout = data_layout.storage_read().storage_read();
+        }
+        let data_layout = data_layout.build(gpu, "resolve data");
         let output_layout = LayoutBuilder::new()
             .storage_texture(ALBEDO_FORMAT)
             .storage_texture(NORMAL_FORMAT)
@@ -86,7 +96,7 @@ impl Resolve {
             .texture_array()
             .texture_array()
             .build(gpu, "resolve output");
-        let module = shaders::module_for(&gpu.device, "vg/resolve.wgsl", skinned);
+        let module = shaders::module_for(&gpu.device, "vg/resolve.wgsl", skinned, regions);
         Self {
             pipeline: gpu.compute_pipeline(
                 "resolve",
@@ -109,10 +119,8 @@ impl Resolve {
         gbuffer: &GBuffer,
     ) -> ResolveBindings {
         ResolveBindings {
-            data: gpu.bind_group(
-                "resolve data",
-                &self.data_layout,
-                &[
+            data: {
+                let mut resources = vec![
                     frame.as_entire_binding(),
                     visibility.depth.as_entire_binding(),
                     visibility.ids.as_entire_binding(),
@@ -123,8 +131,12 @@ impl Resolve {
                     scene.triangles.as_entire_binding(),
                     scene.materials.as_entire_binding(),
                     wgpu::BindingResource::TextureView(&scene.skins.bones_view),
-                ],
-            ),
+                ];
+                if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
+                    resources.extend([more.as_entire_binding(), far.as_entire_binding()]);
+                }
+                gpu.bind_group("resolve data", &self.data_layout, &resources)
+            },
             output: gpu.bind_group(
                 "resolve output",
                 &self.output_layout,
