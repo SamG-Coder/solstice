@@ -20,6 +20,14 @@ pub const PROTECTED_FRAMES_LARGE: u32 = 10;
 /// Frames an unpacked page may wait for a slot, unwanted, before it is thrown away.
 const ARRIVED_PATIENCE_FRAMES: u32 = 120;
 
+/// Frames a page stays safe after a view kept from frame to frame asked for it, or after it came
+/// for one. Such a view asks only when it is redrawn, and a page's coming makes it redraw: were
+/// the page let go in between, the redraw would ask for it again, and never stop.
+pub const HOLD_FRAMES: u32 = 240;
+
+/// Frames for which a page's coming is news to the kept views that asked for it.
+const AWAIT_FRAMES: u32 = 3600;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Absent,
@@ -75,6 +83,14 @@ pub struct Residency {
     victims_frame: u32,
     /// Pages let go by another band, whose records the caller must update.
     released: Vec<u32>,
+    /// The frame, plus one, at which a view kept from frame to frame last asked for each page
+    /// while it wasn't installed. 0 for never.
+    awaited: Vec<u32>,
+    /// Which kinds of kept view asked then, a bit for each.
+    awaited_by: Vec<u8>,
+    /// The kinds of kept view for which such a page has installed since
+    /// [`Self::take_awaited_arrival`].
+    awaited_arrival: u8,
 }
 
 impl Residency {
@@ -144,6 +160,9 @@ impl Residency {
             victims: vec![Vec::new(); band_slots.len()],
             victims_frame: 0,
             released: Vec::new(),
+            awaited: vec![0; count],
+            awaited_by: vec![0; count],
+            awaited_arrival: 0,
         }
     }
 
@@ -181,22 +200,67 @@ impl Residency {
     /// `requests` holds, per page, 0 if unseen, [`REQUEST_KEEP`] if occluded, and otherwise a
     /// priority, higher for more visible error.
     pub fn plan(&mut self, frame: u32, requests: &[u32], max_fetching: u32) -> Vec<u32> {
+        self.plan_holding(frame, requests, &[], max_fetching)
+    }
+
+    /// As [`Self::plan`], with the pages that views kept from frame to frame asked for: for
+    /// each kind of such view, up to eight, a bit per page in `held`. Such a view asks only when
+    /// it is redrawn, so its pages are kept for [`HOLD_FRAMES`], and their coming is reported,
+    /// by kind, by [`Self::take_awaited_arrival`].
+    pub fn plan_holding(
+        &mut self,
+        frame: u32,
+        requests: &[u32],
+        held: &[&[u32]],
+        max_fetching: u32,
+    ) -> Vec<u32> {
         let count = self.states.len();
         let mut priority = vec![0u32; count];
         priority[..count.min(requests.len())]
             .copy_from_slice(&requests[..count.min(requests.len())]);
+        let mut hold = vec![0u8; if held.is_empty() { 0 } else { count }];
+        for (kind, words) in held.iter().enumerate() {
+            for (index, &word) in words.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    if let Some(page) = hold.get_mut(index * 32 + bits.trailing_zeros() as usize) {
+                        *page |= 1 << kind;
+                    }
+                    bits &= bits - 1;
+                }
+            }
+        }
 
         // Parents have lower ids, so one pass downwards carries wants all the way up. A parent
         // is at least as wanted as any child, as it must arrive first.
         for page in (0..count).rev() {
             let wanted = priority[page];
-            if wanted == 0 {
+            let held = hold.get(page).copied().unwrap_or(0);
+            if wanted == 0 && held == 0 {
                 continue;
             }
-            self.last_wanted[page] = frame;
+            // Not simply this frame: a hold reaches past it.
+            self.last_wanted[page] = self.last_wanted[page].max(frame);
+            if held != 0 {
+                self.last_wanted[page] = frame.saturating_add(HOLD_FRAMES);
+                if !self.is_installed(page as u32) {
+                    let fresh = frame.saturating_sub(self.awaited[page].saturating_sub(1))
+                        <= AWAIT_FRAMES
+                        && self.awaited[page] != 0;
+                    self.awaited_by[page] = if fresh {
+                        self.awaited_by[page] | held
+                    } else {
+                        held
+                    };
+                    self.awaited[page] = frame.saturating_add(1);
+                }
+            }
             for index in 0..self.dependencies[page].len() {
                 let dependency = self.dependencies[page][index] as usize;
                 priority[dependency] = priority[dependency].max(wanted);
+                if held != 0 {
+                    hold[dependency] |= held;
+                }
             }
         }
 
@@ -224,7 +288,7 @@ impl Residency {
         wanted.sort_by_key(|&page| (std::cmp::Reverse(priority[page as usize]), page));
 
         self.reclaimable_at_plan = self.reclaimable(frame);
-        let room: u32 = self.room().iter().sum();
+        let room: u32 = self.room().1.iter().sum();
         self.starved = (wanted.len() as u32).saturating_sub(room);
         wanted.reverse();
         self.queue = wanted;
@@ -235,7 +299,7 @@ impl Residency {
     /// come back from the GPU only every few frames, and between them the pipeline would
     /// otherwise run dry.
     pub fn refill(&mut self, max_fetching: u32) -> Vec<u32> {
-        let mut room = self.room();
+        let (mut free, mut room) = self.room();
         let can_fetch = room
             .iter()
             .sum::<u32>()
@@ -250,16 +314,22 @@ impl Residency {
             }
             // Its own pool first, and otherwise whichever has the most to spare: a pool lends
             // only what it has free or isn't using, so no pool's wanted pages are pushed out.
+            // An empty slot anywhere comes before one that a page must leave: what isn't wanted
+            // now is often wanted again soon, by a view that is only drawn now and then.
             let home = usize::from(self.home_bands[page as usize]);
-            let band = if room[home] > 0 {
+            let most = |of: &[u32]| (0..of.len()).max_by_key(|&band| of[band]).unwrap_or(home);
+            let band = if free[home] > 0 {
+                home
+            } else if free[most(&free)] > 0 {
+                most(&free)
+            } else if room[home] > 0 {
                 home
             } else {
-                (0..room.len())
-                    .max_by_key(|&band| room[band])
-                    .unwrap_or(home)
+                most(&room)
             };
             if room[band] > 0 {
                 room[band] -= 1;
+                free[band] = free[band].saturating_sub(1);
                 self.bands[page as usize] = band as u8;
                 self.states[page as usize] = State::Fetching;
                 self.fetching_by_band[band] += 1;
@@ -270,18 +340,25 @@ impl Residency {
         started
     }
 
-    /// How many more pages could be brought into each band without running out of slots.
-    fn room(&self) -> Vec<u32> {
-        let mut arrived = vec![0; self.free_slots.len()];
+    /// How many more pages could be brought into each band: into slots that are empty, and in
+    /// all, counting the slots of pages that could leave.
+    fn room(&self) -> (Vec<u32>, Vec<u32>) {
+        let mut coming = self.fetching_by_band.clone();
         for &page in &self.arrived {
-            arrived[usize::from(self.bands[page as usize])] += 1;
+            coming[usize::from(self.bands[page as usize])] += 1;
         }
-        (0..self.free_slots.len())
+        let bands = 0..self.free_slots.len();
+        let free = bands
+            .clone()
+            .map(|band| (self.free_slots[band].len() as u32).saturating_sub(coming[band]))
+            .collect();
+        let all = bands
             .map(|band| {
                 (self.free_slots[band].len() as u32 + self.reclaimable_at_plan[band])
-                    .saturating_sub(self.fetching_by_band[band] + arrived[band])
+                    .saturating_sub(coming[band])
             })
-            .collect()
+            .collect();
+        (free, all)
     }
 
     /// Installed pages of each band that could be evicted, now or once what depends on them has
@@ -367,6 +444,13 @@ impl Residency {
         };
         self.arrived.remove(&page);
         self.place(page, slot);
+        let asked = std::mem::take(&mut self.awaited[page as usize]);
+        if asked != 0 && frame.saturating_sub(asked - 1) <= AWAIT_FRAMES {
+            // Kept until the views that asked have been redrawn with it, and asked again.
+            self.awaited_arrival |= self.awaited_by[page as usize];
+            let until = frame.saturating_add(HOLD_FRAMES);
+            self.last_wanted[page as usize] = self.last_wanted[page as usize].max(until);
+        }
         Some(Install {
             page,
             slot,
@@ -421,6 +505,12 @@ impl Residency {
     /// Pages let go since the last call to make room in another band.
     pub fn take_released(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.released)
+    }
+
+    /// The kinds of view kept from frame to frame, a bit for each, that asked for a page that
+    /// has installed since the last call: those views should be redrawn.
+    pub fn take_awaited_arrival(&mut self) -> u8 {
+        std::mem::take(&mut self.awaited_arrival)
     }
 
     /// A page to evict from `band`. A page held only by children in other bands can't go, and
@@ -496,9 +586,10 @@ mod tests {
     /// Evicting a page frees its parent to go as well, without another look over the pages.
     #[test]
     fn a_parent_can_follow_its_last_child_out_in_one_frame() {
-        // A chain, 0 <- 1 <- 2, in one slot-starved band, with two more pages wanted.
+        // A chain, 0 <- 1 <- 2, in one slot-starved band, with two more pages wanted and no
+        // slot free anywhere.
         let deps = vec![vec![], vec![0], vec![1], vec![], vec![]];
-        let mut residency = Residency::with_bands(deps, 0, vec![0; 5], &[3, 1]);
+        let mut residency = Residency::with_bands(deps, 0, vec![0; 5], &[3, 0]);
         residency.plan(1, &[10, 10, 10, 0, 0], 8);
         for page in 0..3 {
             residency.arrived(page);
@@ -518,6 +609,66 @@ mod tests {
             evicted,
             [2, 1],
             "the child and then its parent, in the same frame"
+        );
+    }
+
+    /// A page takes an empty slot of another band before it makes a page of its own leave.
+    #[test]
+    fn an_empty_slot_elsewhere_comes_before_evicting() {
+        let mut residency = Residency::with_bands(vec![vec![]; 3], 0, vec![0; 3], &[2, 1]);
+        residency.plan(1, &[10, 10, 0], 8);
+        residency.arrived(0);
+        residency.arrived(1);
+        while residency.next_install(1).is_some() {}
+
+        // Long after, with nothing asking for the first two.
+        let frame = PROTECTED_FRAMES + 10;
+        assert_eq!(residency.plan(frame, &[0, 0, 10], 8), [2]);
+        residency.arrived(2);
+        let install = residency.next_install(frame).expect("there is a slot");
+        assert_eq!(install.evicted, None, "the other band had a slot");
+        assert_eq!(residency.installed_count(), 3);
+    }
+
+    /// What a view kept from frame to frame asks for is held past the usual protection, and
+    /// its coming is reported, once.
+    #[test]
+    fn a_held_page_is_kept_and_its_coming_reported() {
+        let mut residency = Residency::new(vec![vec![], vec![0], vec![]], 0, 2);
+        // Page 1 is held, by the second kind of view; its parent, page 0, is held with it.
+        assert_eq!(
+            residency.plan_holding(1, &[0, 10, 0], &[&[], &[0b10]], 8),
+            [0, 1]
+        );
+        residency.arrived(0);
+        residency.arrived(1);
+        assert_eq!(residency.take_awaited_arrival(), 0);
+        while residency.next_install(2).is_some() {}
+        assert_eq!(
+            residency.take_awaited_arrival(),
+            0b10,
+            "for the kind that asked"
+        );
+        assert_eq!(residency.take_awaited_arrival(), 0, "reported once");
+
+        // Something else wants in, after the usual protection but within the hold: no room.
+        let frame = 2 + PROTECTED_FRAMES + 5;
+        residency.plan(frame, &[0, 0, 10], 8);
+        assert!(!residency.is_installed(2));
+        assert_eq!(residency.installed_count(), 2);
+
+        // After the hold, the held pages make way.
+        let frame = 2 + HOLD_FRAMES + PROTECTED_FRAMES + 5;
+        assert_eq!(residency.plan(frame, &[0, 0, 10], 8), [2]);
+        residency.arrived(2);
+        assert_eq!(
+            residency.next_install(frame).and_then(|i| i.evicted),
+            Some(1)
+        );
+        assert_eq!(
+            residency.take_awaited_arrival(),
+            0,
+            "nothing kept asked for this one"
         );
     }
 

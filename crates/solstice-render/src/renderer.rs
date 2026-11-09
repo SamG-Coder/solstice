@@ -21,7 +21,9 @@ use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT, MOVING_SLOTS};
 use crate::sky::Sky;
-use crate::streaming::{choose_tiers, StreamRequest, Streamer, StreamingStats};
+use crate::streaming::{
+    choose_tiers, StreamRequest, Streamer, StreamingStats, HOLD_SHADOWS, HOLD_VOXELS,
+};
 use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, InstanceFilter, PassView, RasterBindings,
     Rasterizer, Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
@@ -501,7 +503,9 @@ impl Renderer {
         settings: RendererSettings,
     ) -> Self {
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
-        let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
+        let mut view_slots = ViewSlots::new(gpu, SLOT_COUNT);
+        let hold = streamer.hold_bases();
+        view_slots.hold_requests = [hold[HOLD_SHADOWS], hold[HOLD_VOXELS]];
 
         let cull = CullPipelines::new(gpu, scene.has_skins, scene.regions);
         let masked_capacity = if scene.has_masked {
@@ -518,12 +522,15 @@ impl Renderer {
             masked_capacity,
             streamer.requests_buffer(),
         );
+        // A scene too large for one binding has more in its farthest shadow cascade, at its
+        // coarsest, than the usual lists hold, and what they drop leaves holes in the shadows.
+        let aux_scale = if scene.regions.is_some() { 2 } else { 1 };
         let aux_work = CullWork::new(
             gpu,
             &cull,
             "aux cull",
-            AUX_QUEUE_CAPACITY,
-            AUX_VISIBLE_CAPACITY,
+            AUX_QUEUE_CAPACITY * aux_scale,
+            AUX_VISIBLE_CAPACITY * aux_scale,
             masked_capacity,
             streamer.requests_buffer(),
         );
@@ -836,18 +843,19 @@ impl Renderer {
         self.streamer.update(gpu, &self.scene);
         let changes = self.scene.update_instances(gpu);
         let streamed = self.streamer.should_refresh_cached_views();
-        if streamed {
+        let shadows_streamed = streamed & (1 << HOLD_SHADOWS) != 0;
+        if shadows_streamed {
             self.shadows.mark_stale();
         }
         if changes.shadows_changed {
             self.shadows.mark_stale_now();
         }
-        if streamed || changes.shadows_changed {
+        if shadows_streamed || changes.shadows_changed {
             if let Some(water) = &mut self.water {
                 water.seabed.mark_stale();
             }
         }
-        if streamed || changes.gi_changed {
+        if streamed & (1 << HOLD_VOXELS) != 0 || changes.gi_changed {
             self.volume.mark_stale();
         }
 
@@ -867,6 +875,9 @@ impl Renderer {
             0.5 * render_size.1 as f32 * camera.projection(aspect).y_axis.y,
             &self.scene.instance_table.moving_spheres(),
         );
+        // A cascade and a level of voxels each cost several times a frame to redraw: not both
+        // on one frame.
+        self.volume.hold_off = shadow_work.due.contains(&true);
         let volume_work = self
             .volume
             .prepare(gpu, &self.view_slots, SLOT_VOXEL, camera.position);
@@ -1368,7 +1379,8 @@ impl Renderer {
             eye_light: Vec3::Y,
             masked_lists: 1,
             prefetch_radius: self.settings.prefetch_radius,
-            _pad_prefetch: [0; 3],
+            hold_requests: 0,
+            _pad_prefetch: [0; 2],
         };
         self.view_slots.write(
             gpu,

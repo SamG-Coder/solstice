@@ -73,10 +73,19 @@ fn lookup_reach(texel: f32) -> f32 {
 /// Half a pixel at the far end of the last cascade, at 720p, in metres.
 const JITTER_REACH: f32 = 0.35;
 
+/// How far the light may move, in radians, before each cascade is redrawn for it. A shadow
+/// moves by its caster's height times this, which for casters tens of metres off is about a
+/// texel of each cascade, and the far cascades' texels are large: they keep the light they were
+/// drawn with through several of its steps, where redrawing all four at every step is most of
+/// what moving light costs. The nearest follows every step.
+const LIGHT_LAG: [f32; CASCADE_COUNT] = [0.0, 1.3e-3, 3.0e-3, 6.5e-3];
+
 /// What a cascade was drawn with, to tell when it has gone stale.
 #[derive(Clone, Copy, PartialEq)]
 struct Drawn {
     view_proj: Mat4,
+    /// Towards the light it was drawn for.
+    light: Vec3,
     lod_threshold: f32,
     eye_lod_scale: f32,
     /// The receiver planes its casters were culled with, `receiver_count` of them in use.
@@ -362,14 +371,14 @@ impl ShadowMaps {
         eye_lod_scale: f32,
         moving: &[(Vec3, f32)],
     ) -> ShadowWork {
-        let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] = std::array::from_fn(|cascade| {
+        let fit = |cascade: usize, light: Vec3| {
             let near = if cascade == 0 {
                 camera.near
             } else {
                 SPLITS[cascade - 1]
             };
-            fit_cascade(camera, aspect, sun_direction, near, SPLITS[cascade])
-        });
+            fit_cascade(camera, aspect, light, near, SPLITS[cascade])
+        };
         // Where each cascade's receivers begin: where the previous cascade's start to dither
         // into it, since the lookup blends across the last of each cascade.
         let nearest: [f32; CASCADE_COUNT] = std::array::from_fn(|cascade| match cascade {
@@ -377,10 +386,13 @@ impl ShadowMaps {
             1 => SPLITS[0] * BLEND_START,
             _ => SPLITS[cascade - 2] + (SPLITS[cascade - 1] - SPLITS[cascade - 2]) * BLEND_START,
         });
-        let stale: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
-            self.outdated[cascade]
-                || !self.drawn[cascade].is_some_and(|drawn| {
-                    drawn.view_proj == fits[cascade].0
+        // A cascade is still good while it is fitted as it would be now, for the light it was
+        // drawn with, and that light is near enough to where the light is now.
+        let current: [bool; CASCADE_COUNT] = std::array::from_fn(|cascade| {
+            !self.outdated[cascade]
+                && self.drawn[cascade].is_some_and(|drawn| {
+                    drawn.light.angle_between(sun_direction) <= LIGHT_LAG[cascade]
+                        && drawn.view_proj == fit(cascade, drawn.light).0
                         && drawn.lod_threshold == lod_threshold
                         && drawn.eye_lod_scale == eye_lod_scale
                         && drawn.covers(&slice_corners(
@@ -391,6 +403,10 @@ impl ShadowMaps {
                         ))
                 })
         });
+        let stale = current.map(|current| !current);
+        // What is redrawn is redrawn for the light as it is now.
+        let fits: [(Mat4, Vec3, f32); CASCADE_COUNT] =
+            std::array::from_fn(|cascade| fit(cascade, sun_direction));
         let never_drawn: [bool; CASCADE_COUNT] =
             std::array::from_fn(|cascade| self.drawn[cascade].is_none());
         let mut due = choose_due(stale, never_drawn, &mut self.next_far_cascade);
@@ -447,6 +463,7 @@ impl ShadowMaps {
             self.software_stamp += 1;
             self.drawn[cascade] = Some(Drawn {
                 view_proj,
+                light: sun_direction,
                 lod_threshold,
                 eye_lod_scale,
                 receivers: view.receiver_planes,
@@ -994,6 +1011,7 @@ mod tests {
             .shadowing(&planes, light);
         Drawn {
             view_proj,
+            light,
             lod_threshold: 1.0,
             eye_lod_scale: 1.0,
             receivers: view.receiver_planes,
@@ -1058,6 +1076,7 @@ mod tests {
         // widening alone.
         let drawn = Drawn {
             view_proj: Mat4::IDENTITY,
+            light: Vec3::Y,
             lod_threshold: 1.0,
             eye_lod_scale: 1.0,
             receivers: receiver_planes(&camera, aspect, near, SPLITS[3], 0.0),

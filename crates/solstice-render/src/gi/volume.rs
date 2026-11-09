@@ -26,6 +26,8 @@ const LIGHT_SCHEDULE: [u32; 8] = [0, 1, 0, 2, 0, 3, 0, 4];
 /// How much of a rebuild's distance field to compute per frame. Spreading it keeps one level's
 /// move from becoming one long frame. It takes three frames, too short to see.
 const FLOOD_PASSES_PER_FRAME: usize = 6;
+/// The most frames in a row a rebuild waits for other heavy drawing.
+const MAX_HELD_OFF: u32 = 8;
 
 /// Twin of `VolumeParams` in `common/environment.wgsl`.
 #[repr(C)]
@@ -121,6 +123,11 @@ pub struct GiVolume {
     outdated: [bool; LEVEL_COUNT],
     /// A change that came while levels were still outdated, to start over once they are done.
     refresh_waiting: bool,
+    /// Set for a frame that already has heavy drawing to do, such as a shadow cascade: no
+    /// level starts to rebuild on it, as voxelizing one costs several times a frame.
+    pub hold_off: bool,
+    /// Frames in a row that rebuilding has been held off.
+    held_off: u32,
 }
 
 /// What [`GiVolume::prepare`] decided should happen this frame.
@@ -409,6 +416,8 @@ impl GiVolume {
             pending: None,
             outdated: [false; LEVEL_COUNT],
             refresh_waiting: false,
+            hold_off: false,
+            held_off: 0,
         }
     }
 
@@ -439,7 +448,10 @@ impl GiVolume {
                 );
             }
         } else {
-            if self.pending.is_none() {
+            // Held off for a few frames at most, so that the voxels can't fall far behind.
+            let hold_off = std::mem::take(&mut self.hold_off) && self.held_off < MAX_HELD_OFF;
+            self.held_off = if hold_off { self.held_off + 1 } else { 0 };
+            if self.pending.is_none() && !hold_off {
                 self.pending = choose_rebuild(&self.levels, camera_position)
                     .or_else(|| self.choose_outdated());
                 if let Some(pending) = self.pending {

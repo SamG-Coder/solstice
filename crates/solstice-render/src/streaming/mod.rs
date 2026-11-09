@@ -106,12 +106,17 @@ pub struct Streamer {
     feedback: RequestFeedback,
     /// The latest requests read back, not yet planned for.
     fresh_requests: Option<Vec<u32>>,
+    /// Whether the requests on the GPU have been copied for reading, and so can start again.
+    /// Until then they gather: a view kept from frame to frame asks on the one frame it is
+    /// redrawn, which a copy made every few frames would otherwise usually miss.
+    requests_copied: bool,
     slot_count: u32,
     data_offset: u64,
     textures: Option<TextureStreamer>,
     evictions: u64,
-    /// Whether what's installed changed since cached views last refreshed.
-    changed_since_refresh: bool,
+    /// The kinds of cached view, a bit for each, that pages they asked for have come for since
+    /// cached views last refreshed.
+    changed_since_refresh: u8,
     frames_since_refresh: u32,
     last_plan_frame: u32,
 }
@@ -283,16 +288,19 @@ impl Streamer {
             frame: 0,
             feedback: RequestFeedback::new(
                 gpu,
-                (scene.pages.len() + scene.base_textures.len()) as u32,
+                (scene.pages.len()
+                    + HOLD_KINDS * hold_words(scene.pages.len())
+                    + scene.base_textures.len()) as u32,
             ),
             fresh_requests: None,
+            requests_copied: true,
             slot_count,
             data_offset: scene.data_offset,
             textures: plan
                 .filter(|_| !scene.base_textures.is_empty())
                 .map(|plan| TextureStreamer::new(scene, plan)),
             evictions: 0,
-            changed_since_refresh: false,
+            changed_since_refresh: 0,
             frames_since_refresh: 0,
             last_plan_frame: 0,
         }
@@ -303,17 +311,27 @@ impl Streamer {
         self.feedback.buffer()
     }
 
-    /// Clears the requests for this frame's culling, and finishes textures that are complete.
+    /// Where in the requests the bits begin that each kind of view kept from frame to frame
+    /// sets, one per page it asks for. See [`crate::vg::culling::PassView::hold_requests`].
+    pub fn hold_bases(&self) -> [u32; HOLD_KINDS] {
+        let pages = self.pages.len();
+        std::array::from_fn(|kind| (pages + kind * hold_words(pages)) as u32)
+    }
+
+    /// Clears the requests once they have been copied for reading, and finishes textures that
+    /// are complete.
     pub fn begin_frame(&mut self, gpu: &Gpu, scene: &GpuScene, encoder: &mut wgpu::CommandEncoder) {
-        encoder.clear_buffer(self.feedback.buffer(), 0, None);
+        if std::mem::take(&mut self.requests_copied) {
+            encoder.clear_buffer(self.feedback.buffer(), 0, None);
+        }
         if let Some(textures) = &mut self.textures {
             textures.begin_frame(gpu, scene, encoder);
         }
     }
 
-    /// Queues a copy of this frame's requests, if the last copy has been dealt with.
+    /// Queues a copy of the requests since the last one, if that has been dealt with.
     pub fn capture_requests(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        self.feedback.capture(encoder);
+        self.requests_copied = self.feedback.capture(encoder);
     }
 
     /// Starts reading back requests captured this frame. Call after submitting.
@@ -401,15 +419,14 @@ impl Streamer {
         }
     }
 
-    /// Whether shadows and GI should redraw now, because finer geometry has arrived. They
-    /// keep what they have otherwise, so this also says when they last changed.
-    pub fn should_refresh_cached_views(&mut self) -> bool {
-        if !self.changed_since_refresh || self.frames_since_refresh < REFRESH_INTERVAL_FRAMES {
-            return false;
+    /// Which kinds of cached view should redraw now, because geometry they asked for has
+    /// arrived: a bit for each of the `HOLD_` kinds. They keep what they have otherwise.
+    pub fn should_refresh_cached_views(&mut self) -> u8 {
+        if self.changed_since_refresh == 0 || self.frames_since_refresh < REFRESH_INTERVAL_FRAMES {
+            return 0;
         }
-        self.changed_since_refresh = false;
         self.frames_since_refresh = 0;
-        true
+        std::mem::take(&mut self.changed_since_refresh)
     }
 
     pub fn stats(&self) -> StreamingStats {
@@ -448,9 +465,16 @@ impl Streamer {
         self.apply_install(gpu, scene, page, slot, data, clusters);
     }
 
-    /// Records one frame's requests, and returns the pages the host should start fetching.
+    /// Records the requests read back, and returns the pages the host should start fetching.
     fn plan(&mut self, requests: &[u32], max_fetching: u32) -> Vec<u32> {
-        self.residency.plan(self.frame, requests, max_fetching)
+        let pages = self.pages.len().min(requests.len());
+        let words = hold_words(pages);
+        let held: [&[u32]; HOLD_KINDS] = std::array::from_fn(|kind| {
+            let start = (pages + kind * words).min(requests.len());
+            &requests[start..(start + words).min(requests.len())]
+        });
+        self.residency
+            .plan_holding(self.frame, &requests[..pages], &held, max_fetching)
     }
 
     /// Takes an unpacked page from the host. It installs once its parents are in and there's
@@ -506,13 +530,15 @@ impl Streamer {
             if let Some(victim) = evicted {
                 self.apply_eviction(gpu, scene, victim);
             }
-            self.changed_since_refresh = true;
             let (data, clusters) = self
                 .arrived
                 .remove(&page)
                 .expect("a page installs only after its data arrived");
             self.apply_install(gpu, scene, page, slot, &data, &clusters);
         }
+        // Only what a kept view asked for changes what it would draw: its level of detail is
+        // its own, and it asks for every page of it each time it is drawn.
+        self.changed_since_refresh |= self.residency.take_awaited_arrival();
         self.flush(gpu, scene);
     }
 
@@ -669,6 +695,19 @@ impl Streamer {
         }
         self.dirty_clusters.clear();
     }
+}
+
+/// The kinds of view kept from frame to frame, whose requests are told apart: a page that came
+/// for the shadow maps is no reason to draw the voxels again, which costs far more.
+pub const HOLD_KINDS: usize = 2;
+/// The sun's shadow cascades, and the map of the seabed.
+pub const HOLD_SHADOWS: usize = 0;
+/// The GI's voxels.
+pub const HOLD_VOXELS: usize = 1;
+
+/// How many words hold a bit for each of this many pages.
+fn hold_words(pages: usize) -> usize {
+    pages.div_ceil(32)
 }
 
 /// Chooses tier sizes for a scene, on this GPU, within a budget in bytes.

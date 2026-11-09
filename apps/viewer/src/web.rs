@@ -280,6 +280,27 @@ impl WebViewer {
         self.renderer.stats().streaming.starved
     }
 
+    /// What the shadow cascade last redrawn drew: clusters, triangles, and clusters that found
+    /// no room in its lists, which leave holes in the shadows.
+    pub fn shadow_load(&self) -> Vec<u32> {
+        let stats = self.renderer.stats();
+        vec![
+            stats.shadow_clusters,
+            stats.shadow_triangles,
+            stats.shadow_dropped,
+        ]
+    }
+
+    /// For a scene with several pools: the pages in each and its size, a pair per pool.
+    pub fn page_pools(&self) -> Vec<u32> {
+        let bands = self.renderer.stats().streaming.bands;
+        bands
+            .iter()
+            .flatten()
+            .flat_map(|&(installed, slots)| [installed, slots])
+            .collect()
+    }
+
     /// Layers sharpened beyond the base tier, as middle and top counts.
     pub fn texture_layers_sharp(&self) -> Vec<u32> {
         let streaming = self.renderer.stats().streaming;

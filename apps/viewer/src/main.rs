@@ -698,7 +698,8 @@ mod native {
 
     fn create_instance() -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            // WGPU_BACKEND picks another, such as dx12, which is what Chrome draws with on Windows.
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         })
     }
@@ -743,6 +744,11 @@ mod native {
 
         let start = Instant::now();
         let mut slowest = 0.0_f32;
+        // What each section of the frame took, in all and at most: a redraw of a cached view
+        // costs one frame in many, which the last frame's times alone seldom show.
+        let mut slowest_sections = [0.0_f32; solstice_render::profiler::SECTIONS.len()];
+        let mut summed_sections = [0.0_f32; solstice_render::profiler::SECTIONS.len()];
+        let mut timed_frames = 0u32;
         let mut last_time = Instant::now();
         let mut camera = options
             .camera
@@ -784,6 +790,13 @@ mod native {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             if frame > 10 {
                 slowest = slowest.max(last_time.elapsed().as_secs_f32());
+                if let Some(times) = renderer.section_times() {
+                    timed_frames += 1;
+                    for (index, ms) in times.into_iter().enumerate() {
+                        slowest_sections[index] = slowest_sections[index].max(ms);
+                        summed_sections[index] += ms;
+                    }
+                }
             }
             last_time = Instant::now();
         }
@@ -873,6 +886,25 @@ mod native {
                 parts.join(", "),
                 times.iter().sum::<f32>()
             );
+            let listed = |times: [f32; solstice_render::profiler::SECTIONS.len()]| {
+                let parts: Vec<String> = solstice_render::profiler::SECTIONS
+                    .iter()
+                    .zip(times)
+                    .filter(|(_, ms)| *ms >= 0.005)
+                    .map(|(name, ms)| format!("{name} {ms:.2}"))
+                    .collect();
+                format!(
+                    "{} | total {:.2}",
+                    parts.join(", "),
+                    times.iter().sum::<f32>()
+                )
+            };
+            let frames = timed_frames.max(1) as f32;
+            println!(
+                "gpu ms on average: {}",
+                listed(summed_sections.map(|ms| ms / frames))
+            );
+            println!("gpu ms at most: {}", listed(slowest_sections));
         }
 
         let errors = errors.lock().expect("error sink");

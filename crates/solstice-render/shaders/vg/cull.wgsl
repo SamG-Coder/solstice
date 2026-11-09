@@ -61,8 +61,9 @@ const SOFTWARE_MAX_DIAMETER_TEXELS: f32 = 16.0;
 @group(1) @binding(1) var<storage, read_write> queue: array<QueueEntry>;
 @group(1) @binding(2) var<storage, read_write> retry: array<QueueEntry>;
 @group(1) @binding(3) var<storage, read_write> visible: array<VisibleCluster>;
-// Per page: 0 if not reached this frame, else how much it is wanted. See `residency.rs`.
-// From the end, per texture layer: the edge a texture must have to look sharp in this frame.
+// Per page: 0 if not reached since the array was last read, else how much it is wanted. See
+// `residency.rs`. Then a bit per page, set by the views kept from frame to frame that asked.
+// From the end, per texture layer: the edge a texture must have to look sharp.
 @group(1) @binding(4) var<storage, read_write> page_requests: array<atomic<u32>>;
 
 fn push_queue(entry: QueueEntry) {
@@ -401,6 +402,10 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     let weight = select(1.0, REQUEST_ORTHO_WEIGHT, view.is_ortho != 0u);
     let wanted = min(parent_pixels, REQUEST_MAX_PIXELS) * weight * REQUEST_PER_PIXEL;
     atomicMax(&page_requests[page], REQUEST_LOWEST_LOAD + u32(wanted));
+    if view.hold_requests != 0u {
+        // A view kept from frame to frame asks only now, as it is drawn.
+        atomicOr(&page_requests[view.hold_requests + (page >> 5u)], 1u << (page & 31u));
+    }
     if (node.is_leaf & NODE_INSTALLED) == 0u {
         return;
     }

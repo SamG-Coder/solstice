@@ -43,6 +43,9 @@ struct PassView {
     // For the camera's own view of a streamed scene: how far around the camera pages are asked
     // for that it isn't facing, at a coarser level of detail. 0 for none.
     prefetch_radius: f32,
+    // For a view kept from frame to frame, in a streamed scene: where in the page requests the
+    // bits begin that it sets, one for each page it asks for. 0 for none.
+    hold_requests: u32,
 }
 
 // Twins of `InstanceFilter` in vg/culling.rs.

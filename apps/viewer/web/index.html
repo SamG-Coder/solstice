@@ -612,6 +612,9 @@ async function main() {
   const startTime = params.get("time")?.split(":").map(Number);
   if (startTime?.every(Number.isFinite)) viewer.set_time(startTime[0] + (startTime[1] ?? 0) / 60);
   if (params.has("day-length")) el("day-length").value = params.get("day-length");
+  // A scene read in parts is far heavier than any other, and every step of the sun redraws its
+  // shadows: there, time stands still unless asked to pass.
+  else if (params.has("split")) el("day-length").value = "0";
   const applyDayLength = () => viewer.set_day_length(Number(el("day-length").value));
   el("day-length").addEventListener("change", applyDayLength);
   applyDayLength();
@@ -726,12 +729,23 @@ async function main() {
   // It never steps back up: oscillating between presets is worse than either one.
   const LEVELS = ["high", "medium", "low"];
   const TARGET_FPS = 28;
+  const LOADING_PAGES_PER_REPORT = 200;
   let autoLevel = 0;
   let slowReports = 0;
   let ignoreReports = 4;
   const autoOption = el("quality").querySelector('[value="auto"]');
+  let pagesAtReport = 0;
   const adaptQuality = (fps) => {
     if (el("quality").value !== "auto" || autoLevel === LEVELS.length - 1) return;
+    // While geometry pours in, the frame rate says how fast the scene loads, not how fast it
+    // draws: a lower quality would outlast the loading it was chosen for.
+    const pages = viewer.pages_installed() + viewer.pages_evicted();
+    const loading = pages - pagesAtReport > LOADING_PAGES_PER_REPORT;
+    pagesAtReport = pages;
+    if (loading) {
+      slowReports = 0;
+      return;
+    }
     if (ignoreReports > 0) {
       ignoreReports -= 1;
       return;

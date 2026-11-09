@@ -56,7 +56,13 @@ pub struct PassView {
     /// For the camera's own view of a streamed scene: how far around the camera pages are asked
     /// for that it isn't facing, at a coarser level of detail. 0 for none.
     pub prefetch_radius: f32,
-    pub _pad_prefetch: [u32; 3],
+    /// For a view kept from frame to frame, in a streamed scene: where in the page requests the
+    /// bits begin that it sets, one for each page it asks for, or 0 for none. Such a view asks
+    /// only on the frames it is redrawn, so what it asks for is told apart from what the camera
+    /// asks for every frame: held longer, and the view redrawn when it comes. [`ViewSlots`]
+    /// fills this in.
+    pub hold_requests: u32,
+    pub _pad_prefetch: [u32; 2],
 }
 
 /// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
@@ -129,7 +135,8 @@ impl PassView {
             eye_light: Vec3::Y,
             masked_lists: 0,
             prefetch_radius: 0.0,
-            _pad_prefetch: [0; 3],
+            hold_requests: 0,
+            _pad_prefetch: [0; 2],
         }
     }
 
@@ -183,20 +190,31 @@ const _: () = assert!(std::mem::size_of::<PassView>() <= SLOT_STRIDE as usize);
 /// A uniform buffer holding several [`PassView`]s, selected by dynamic offset.
 pub struct ViewSlots {
     pub buffer: wgpu::Buffer,
+    /// See [`PassView::hold_requests`]: what views kept from frame to frame are given, those
+    /// of static instances and then those of the GI's.
+    pub hold_requests: [u32; 2],
 }
 
 impl ViewSlots {
     pub fn new(gpu: &Gpu, count: u32) -> Self {
         Self {
             buffer: gpu.uniform_buffer("view slots", u64::from(count * SLOT_STRIDE)),
+            hold_requests: [0; 2],
         }
     }
 
     pub fn write(&self, gpu: &Gpu, slot: u32, view: &PassView) {
+        let mut view = *view;
+        // The views kept from frame to frame are those that leave out what may move.
+        if view.instance_filter == InstanceFilter::Static as u32 {
+            view.hold_requests = self.hold_requests[0];
+        } else if view.instance_filter == InstanceFilter::Gi as u32 {
+            view.hold_requests = self.hold_requests[1];
+        }
         gpu.queue.write_buffer(
             &self.buffer,
             u64::from(Self::offset(slot)),
-            bytemuck::bytes_of(view),
+            bytemuck::bytes_of(&view),
         );
     }
 
@@ -647,6 +665,7 @@ mod tests {
                 eye_light,
                 masked_lists,
                 prefetch_radius,
+                hold_requests,
             ]
         );
     }

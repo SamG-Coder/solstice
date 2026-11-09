@@ -53,16 +53,19 @@ impl RequestFeedback {
         &self.buffer
     }
 
-    /// Queues a copy of this frame's requests, unless an earlier one is still on its way.
-    pub fn capture(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    /// Queues a copy of the requests so far, unless an earlier one is still on its way. Returns
+    /// whether it did.
+    pub fn capture(&mut self, encoder: &mut wgpu::CommandEncoder) -> bool {
         if self.shared.mapped.swap(false, Ordering::AcqRel) {
             self.consume_mapped_data();
             self.shared.busy.store(false, Ordering::Release);
         }
-        if !self.shared.busy.load(Ordering::Acquire) {
+        let free = !self.shared.busy.load(Ordering::Acquire);
+        if free {
             encoder.copy_buffer_to_buffer(&self.buffer, 0, &self.staging, 0, self.size);
             self.shared.copied.store(true, Ordering::Release);
         }
+        free
     }
 
     fn consume_mapped_data(&mut self) {
