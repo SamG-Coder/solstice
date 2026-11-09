@@ -23,7 +23,8 @@ pub struct ScreenGi {
     /// One per entry of `PROBE_RAY_OPTIONS`.
     trace: [wgpu::ComputePipeline; 2],
     project: [wgpu::ComputePipeline; 2],
-    filter: wgpu::ComputePipeline,
+    /// The probes' blend with their neighbours, in passes of growing reach.
+    filter: [wgpu::ComputePipeline; 2],
     integrate: wgpu::ComputePipeline,
     reflect: wgpu::ComputePipeline,
     depth_pyramid: DepthPyramidBuilder,
@@ -36,7 +37,8 @@ pub struct ScreenGiBindings {
     pub reflections: [Target; 2],
     trace_groups: [wgpu::BindGroup; 2],
     project_group: wgpu::BindGroup,
-    filter_group: wgpu::BindGroup,
+    /// One per filter pass: each reads what the pass before it wrote.
+    filter_groups: [wgpu::BindGroup; 2],
     integrate_groups: [wgpu::BindGroup; 2],
     reflect_groups: [wgpu::BindGroup; 2],
     depth_pyramid: DepthPyramid,
@@ -119,12 +121,14 @@ impl ScreenGi {
                     &[("PROBE_RAYS", f64::from(rays))],
                 )
             }),
-            filter: gpu.compute_pipeline(
-                "probe filter",
-                &project_module,
-                "filter_spatial",
-                &[&project_layout, environment_layout],
-            ),
+            filter: ["filter_spatial", "filter_wide"].map(|entry| {
+                gpu.compute_pipeline(
+                    "probe filter",
+                    &project_module,
+                    entry,
+                    &[&project_layout, environment_layout],
+                )
+            }),
             integrate: gpu.compute_pipeline(
                 "probe integrate",
                 &integrate_module,
@@ -169,9 +173,11 @@ impl ScreenGi {
 
         let atlas = Target::new(gpu, "probe atlas", atlas_size, FORMAT, none);
         let probe_bytes = u64::from(grid_size.0) * u64::from(grid_size.1) * PROBE_BYTES;
-        let probes_raw = gpu.storage_buffer("probes raw", probe_bytes, wgpu::BufferUsages::empty());
-        let probes =
-            gpu.storage_buffer("probes filtered", probe_bytes, wgpu::BufferUsages::empty());
+        // Projection writes the first, and each filter pass the one it does not read: after two
+        // passes the result is back in the first.
+        let probes = gpu.storage_buffer("probes", probe_bytes, wgpu::BufferUsages::empty());
+        let probes_scratch =
+            gpu.storage_buffer("probes scratch", probe_bytes, wgpu::BufferUsages::empty());
         let diffuse = [
             Target::new(gpu, "gi diffuse 0", size, FORMAT, none),
             Target::new(gpu, "gi diffuse 1", size, FORMAT, none),
@@ -244,8 +250,11 @@ impl ScreenGi {
 
         ScreenGiBindings {
             trace_groups: [trace_group(0), trace_group(1)],
-            project_group: project_bindings(&probes, &probes_raw),
-            filter_group: project_bindings(&probes_raw, &probes),
+            project_group: project_bindings(&probes_scratch, &probes),
+            filter_groups: [
+                project_bindings(&probes, &probes_scratch),
+                project_bindings(&probes_scratch, &probes),
+            ],
             integrate_groups: [integrate_group(0), integrate_group(1)],
             reflect_groups: [reflect_group(0), reflect_group(1)],
             depth_pyramid,
@@ -295,9 +304,11 @@ impl ScreenGi {
         pass.set_bind_group(0, &bindings.project_group, &[]);
         pass.dispatch_workgroups(grid.0, grid.1, 1);
 
-        pass.set_pipeline(&self.filter);
-        pass.set_bind_group(0, &bindings.filter_group, &[]);
-        pass.dispatch_workgroups(grid.0, grid.1, 1);
+        for (pipeline, group) in self.filter.iter().zip(&bindings.filter_groups) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(grid.0, grid.1, 1);
+        }
 
         pass.set_pipeline(&self.integrate);
         pass.set_bind_group(0, &bindings.integrate_groups[parity], &[]);
