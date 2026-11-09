@@ -389,7 +389,7 @@ fn decode_cards(bytes: &[u8]) -> Result<Cards, DecodeError> {
         if mip_count > 32 {
             return Err(DecodeError::BadCards);
         }
-        let mut read = |r: &mut Reader<'_>| -> Result<Vec<Vec<u8>>, DecodeError> {
+        let read = |r: &mut Reader<'_>| -> Result<Vec<Vec<u8>>, DecodeError> {
             (0..mip_count)
                 .map(|_| r.slice::<u8>().map_err(bad))
                 .collect()

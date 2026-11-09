@@ -1040,8 +1040,8 @@ fn build_cards(
                 image
             }
         };
-        if !buffers.contains_key(&source.mesh) {
-            buffers.insert(source.mesh, load_mesh_buffers(document, &mesh, folder)?);
+        if let std::collections::hash_map::Entry::Vacant(slot) = buffers.entry(source.mesh) {
+            slot.insert(load_mesh_buffers(document, &mesh, folder)?);
         }
         let geometry = read_primitive(&primitive, &buffers[&source.mesh], false);
         let first_vertex = cards.vertices.len() as u32;
