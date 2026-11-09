@@ -118,7 +118,8 @@ fn decode_group(
 /// Decodes a stream of mode `ATTRIBUTES` into `out`, which holds a whole number of elements of
 /// `stride` bytes.
 pub fn decode_attributes(out: &mut [u8], stride: usize, data: &[u8]) -> Result<(), DecodeError> {
-    if stride == 0 || stride % 4 != 0 || stride > 256 || out.len() % stride != 0 {
+    if stride == 0 || !stride.is_multiple_of(4) || stride > 256 || !out.len().is_multiple_of(stride)
+    {
         return Err(DecodeError::Unsupported(format!(
             "attribute stride {stride}"
         )));
@@ -213,7 +214,10 @@ fn write_index(out: &mut [u8], stride: usize, index: usize, value: u32) {
 
 /// Decodes a stream of mode `TRIANGLES` into `out`, as indices of `stride` bytes.
 pub fn decode_triangles(out: &mut [u8], stride: usize, data: &[u8]) -> Result<(), DecodeError> {
-    if (stride != 2 && stride != 4) || out.len() % stride != 0 || out.len() / stride % 3 != 0 {
+    if (stride != 2 && stride != 4)
+        || !out.len().is_multiple_of(stride)
+        || !(out.len() / stride).is_multiple_of(3)
+    {
         return Err(DecodeError::Unsupported(format!(
             "triangle stride {stride}"
         )));
@@ -365,7 +369,7 @@ pub fn decode_triangles(out: &mut [u8], stride: usize, data: &[u8]) -> Result<()
 /// Decodes a stream of mode `INDICES` into `out`, as indices of `stride` bytes.
 pub fn decode_indices(out: &mut [u8], stride: usize, data: &[u8]) -> Result<(), DecodeError> {
     const TAIL: usize = 4;
-    if (stride != 2 && stride != 4) || out.len() % stride != 0 {
+    if (stride != 2 && stride != 4) || !out.len().is_multiple_of(stride) {
         return Err(DecodeError::Unsupported(format!("index stride {stride}")));
     }
     match data.first() {
@@ -518,7 +522,7 @@ mod tests {
                 let mut header = vec![0u8; groups.div_ceil(4)];
                 let mut body = Vec::new();
                 for (group, deltas) in deltas.iter().enumerate() {
-                    let mode = if deltas.iter().all(|&d| d == 0) && turn % 2 == 0 {
+                    let mode = if deltas.iter().all(|&d| d == 0) && turn.is_multiple_of(2) {
                         0
                     } else {
                         1 + turn % 3
@@ -650,7 +654,7 @@ mod tests {
 
     #[test]
     fn damaged_streams_are_refused_not_panicked_on() {
-        let source: Vec<u8> = (0..4096u32).map(|i| (i * i >> 3) as u8).collect();
+        let source: Vec<u8> = (0..4096u32).map(|i| ((i * i) >> 3) as u8).collect();
         let attributes = encode_attributes(&source, 16);
         let mut out = vec![0u8; source.len()];
         for length in 0..attributes.len() {

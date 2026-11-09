@@ -78,6 +78,9 @@ pub struct LargeReport {
     pub warnings: Vec<String>,
 }
 
+/// A built mesh: which of the meshes to build it was, and where its geometry is in the spill.
+type FinishedMesh = (usize, VirtualMesh, (u64, u64));
+
 /// One placement of a primitive.
 struct Placement {
     source: MeshKey,
@@ -556,8 +559,7 @@ fn bake_inner(
         at: 0,
         since_check: 0,
     });
-    let finished: Mutex<Vec<(usize, VirtualMesh, (u64, u64))>> =
-        Mutex::new(Vec::with_capacity(keys.len()));
+    let finished: Mutex<Vec<FinishedMesh>> = Mutex::new(Vec::with_capacity(keys.len()));
     let done = Mutex::new(0u64);
     let build_options = BuildOptions::default();
     work.par_iter()
@@ -684,7 +686,6 @@ fn bake_inner(
         }
     });
     flush(&mut pending, &mut failure, &mut placed);
-    drop(flush);
     if let Some(error) = failure {
         return Err(error);
     }
