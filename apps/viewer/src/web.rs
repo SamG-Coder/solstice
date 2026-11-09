@@ -49,6 +49,15 @@ pub struct WebViewer {
     collision_data_offset: u64,
     #[cfg(feature = "gameplay")]
     collision_pieces: Vec<Vec<u8>>,
+    /// What animated actors need from the scene.
+    #[cfg(feature = "gameplay")]
+    skeletons: Vec<solstice_asset::Skeleton>,
+    #[cfg(feature = "gameplay")]
+    clips: Vec<solstice_asset::Clip>,
+    #[cfg(feature = "gameplay")]
+    poses: Vec<u32>,
+    #[cfg(feature = "gameplay")]
+    instance_poses: Vec<u32>,
     #[cfg(feature = "gameplay")]
     play: Option<crate::play::PlayMode>,
     /// What scripts logged, and errors, for the page to take.
@@ -131,6 +140,14 @@ impl WebViewer {
             collision_data_offset: scene.data_offset,
             #[cfg(feature = "gameplay")]
             collision_pieces: Vec::new(),
+            #[cfg(feature = "gameplay")]
+            skeletons: scene.skeletons,
+            #[cfg(feature = "gameplay")]
+            clips: scene.clips,
+            #[cfg(feature = "gameplay")]
+            poses: scene.poses,
+            #[cfg(feature = "gameplay")]
+            instance_poses: scene.instance_poses,
             #[cfg(feature = "gameplay")]
             play: None,
             #[cfg(feature = "gameplay")]
@@ -496,9 +513,19 @@ impl WebViewer {
             Some(index) => Some(index.decode(&pieces).map_err(error_string)?),
             None => None,
         };
-        let play =
-            crate::play::PlayMode::start(&mut self.renderer, &self.gameplay, collision.as_ref())
-                .map_err(|errors| JsValue::from_str(&errors.join("\n")))?;
+        let animation = solstice_game::animation::AnimationAssets {
+            skeletons: &self.skeletons,
+            clips: &self.clips,
+            poses: &self.poses,
+            instance_poses: &self.instance_poses,
+        };
+        let play = crate::play::PlayMode::start(
+            &mut self.renderer,
+            &self.gameplay,
+            collision.as_ref(),
+            &animation,
+        )
+        .map_err(|errors| JsValue::from_str(&errors.join("\n")))?;
         self.play = Some(play);
         Ok(())
     }

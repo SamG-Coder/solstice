@@ -33,6 +33,7 @@ pub mod renderer;
 pub mod scene;
 pub mod shaders;
 pub mod shadow;
+pub mod skin;
 pub mod sky;
 pub mod streaming;
 pub mod time_of_day;

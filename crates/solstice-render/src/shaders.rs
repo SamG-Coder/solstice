@@ -17,6 +17,8 @@ macro_rules! shader_table {
 pub const SOURCES: &[(&str, &str)] = shader_table![
     "common/math.wgsl",
     "common/scene.wgsl",
+    "common/skin.wgsl",
+    "common/skin_vertex.wgsl",
     "common/frame.wgsl",
     "common/wetness.wgsl",
     "common/brdf.wgsl",
@@ -205,6 +207,28 @@ pub fn module(device: &wgpu::Device, path: &str) -> wgpu::ShaderModule {
     })
 }
 
+/// The line in `common/skin.wgsl` that turns skinning on.
+const SKINNING_ON: &str = "const SKINNING: bool = true;";
+
+/// The source of an entry point that places vertices, for a scene with or without anything
+/// skinned. Without, skinning is compiled out, so that scene costs what it did before skinning.
+pub fn expand_for(path: &str, skinned: bool) -> String {
+    let source = expand(path);
+    if skinned {
+        return source;
+    }
+    assert!(source.contains(SKINNING_ON), "{path} doesn't skin");
+    source.replace(SKINNING_ON, "const SKINNING: bool = false;")
+}
+
+/// Compiles an entry-point file that places vertices: see [`expand_for`].
+pub fn module_for(device: &wgpu::Device, path: &str, skinned: bool) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(path),
+        source: wgpu::ShaderSource::Wgsl(expand_for(path, skinned).into()),
+    })
+}
+
 /// How naga lays out a struct, for tests that check a Rust twin matches it byte for byte: its
 /// size, and each member's name and offset in order. `path` is an entry point that includes
 /// the struct.
@@ -274,6 +298,31 @@ mod tests {
             .filter_map(|path| validate(path).err())
             .collect();
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Every shader `module_for` is used on, in the form scenes with nothing skinned get.
+    #[test]
+    fn shaders_with_skinning_compiled_out_are_valid() {
+        for path in [
+            "vg/cull.wgsl",
+            "vg/raster_sw.wgsl",
+            "vg/raster_hw_fragment.wgsl",
+            "vg/raster_sw_depth.wgsl",
+            "vg/raster_sw_masked.wgsl",
+            "vg/raster_sw_depth_masked.wgsl",
+            "vg/raster_hw_masked.wgsl",
+            "vg/resolve.wgsl",
+        ] {
+            let source = expand_for(path, false);
+            let module = naga::front::wgsl::parse_str(&source).expect("the shader parses");
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+            assert!(source.contains("const SKINNING: bool = false;"), "{path}");
+        }
     }
 
     /// Operators WGSL will not mix without parentheses: a bitwise operator with any other

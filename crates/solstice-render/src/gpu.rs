@@ -303,6 +303,14 @@ impl LayoutBuilder {
         )
     }
 
+    /// An unsigned integer 2D texture, such as `rgba32uint`.
+    pub fn texture_uint(self) -> Self {
+        self.texture_of(
+            wgpu::TextureSampleType::Uint,
+            wgpu::TextureViewDimension::D2,
+        )
+    }
+
     pub fn texture_array(self) -> Self {
         self.texture_of(
             wgpu::TextureSampleType::Float { filterable: true },

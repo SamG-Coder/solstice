@@ -162,7 +162,7 @@ fn visibility_pipeline(
 }
 
 impl Rasterizer {
-    pub fn new(gpu: &Gpu, has_masked: bool) -> Self {
+    pub fn new(gpu: &Gpu, has_masked: bool, skinned: bool) -> Self {
         let raster_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT)
             .uniform_dynamic()
@@ -171,6 +171,7 @@ impl Rasterizer {
             .storage_read()
             .storage_read()
             .storage_read()
+            .texture_unfilterable()
             .build(gpu, "raster");
         let vis_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT)
@@ -178,7 +179,7 @@ impl Rasterizer {
             .storage_write()
             .build(gpu, "visibility");
 
-        let software_module = shaders::module(&gpu.device, "vg/raster_sw.wgsl");
+        let software_module = shaders::module_for(&gpu.device, "vg/raster_sw.wgsl", skinned);
         let software = gpu.compute_pipeline(
             "software raster",
             &software_module,
@@ -186,7 +187,8 @@ impl Rasterizer {
             &[&raster_layout, &vis_layout],
         );
 
-        let hardware_module = shaders::module(&gpu.device, "vg/raster_hw_fragment.wgsl");
+        let hardware_module =
+            shaders::module_for(&gpu.device, "vg/raster_hw_fragment.wgsl", skinned);
         let hardware = visibility_pipeline(
             gpu,
             "hardware raster",
@@ -202,7 +204,7 @@ impl Rasterizer {
             .visibility(wgpu::ShaderStages::FRAGMENT)
             .storage_read()
             .build(gpu, "software depth merge");
-        let depth_module = shaders::module(&gpu.device, "vg/raster_sw_depth.wgsl");
+        let depth_module = shaders::module_for(&gpu.device, "vg/raster_sw_depth.wgsl", skinned);
         let software_depth = gpu.compute_pipeline(
             "software depth raster",
             &depth_module,
@@ -260,9 +262,11 @@ impl Rasterizer {
                 .texture_array()
                 .sampler()
                 .build(gpu, "masked raster");
-            let software_module = shaders::module(&gpu.device, "vg/raster_sw_masked.wgsl");
-            let depth_module = shaders::module(&gpu.device, "vg/raster_sw_depth_masked.wgsl");
-            let module = shaders::module(&gpu.device, "vg/raster_hw_masked.wgsl");
+            let software_module =
+                shaders::module_for(&gpu.device, "vg/raster_sw_masked.wgsl", skinned);
+            let depth_module =
+                shaders::module_for(&gpu.device, "vg/raster_sw_depth_masked.wgsl", skinned);
+            let module = shaders::module_for(&gpu.device, "vg/raster_hw_masked.wgsl", skinned);
             Masked {
                 software: gpu.compute_pipeline(
                     "masked software raster",
@@ -407,6 +411,7 @@ impl Rasterizer {
                     scene.vertices.as_entire_binding(),
                     work.visible.as_entire_binding(),
                     work.state().as_entire_binding(),
+                    wgpu::BindingResource::TextureView(&scene.skins.bones_view),
                 ],
             ),
             mask: self.masked.as_ref().map(|masked| {

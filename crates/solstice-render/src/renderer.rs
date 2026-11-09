@@ -401,7 +401,7 @@ impl Renderer {
     /// frame, with its shadow drawn separately, and so costs more; a static one is drawn into
     /// views kept from frame to frame. Either change redraws those views once. Set an instance
     /// movable before it starts moving, for example when a scene loads, to have that happen at
-    /// a quiet moment.
+    /// a quiet moment. A skinned instance can't be made static, and is refused.
     pub fn set_instance_movable(&mut self, instance: u32, movable: bool) -> bool {
         self.scene.instance_table.set_movable(instance, movable)
     }
@@ -410,7 +410,8 @@ impl Renderer {
     /// leaves it out (the default). Movable instances are left out because the voxels are kept
     /// from frame to frame, and would hold them where they were. Something that moves only a
     /// little, such as a ship riding at anchor, is better kept in: its shade and the light it
-    /// bounces, and its reflection in the water, would otherwise be missing.
+    /// bounces, and its reflection in the water, would otherwise be missing. A skinned instance
+    /// is refused: the voxels are drawn without poses.
     pub fn set_instance_stays_in_gi(&mut self, instance: u32, stays: bool) -> bool {
         self.scene.instance_table.set_stays_in_gi(instance, stays)
     }
@@ -431,6 +432,29 @@ impl Renderer {
         self.scene.instance_table.transform(instance)
     }
 
+    /// How many poses the scene can hold at once: one for each placed character.
+    pub fn pose_count(&self) -> u32 {
+        self.scene.skins.pose_count()
+    }
+
+    /// The skeleton of a pose.
+    pub fn pose_skeleton(&self, pose: u32) -> Option<&solstice_asset::Skeleton> {
+        self.scene.skins.skeleton(pose)
+    }
+
+    /// Poses a character from the next frame on: `bones` are its bones' places in the mesh's own
+    /// space, in the skeleton's order, with no scale. Returns false, and does nothing, if the
+    /// pose doesn't exist, or `bones` is not as long as its skeleton.
+    pub fn set_pose(&mut self, pose: u32, bones: &[Mat4]) -> bool {
+        self.scene.skins.set(pose, bones, false)
+    }
+
+    /// Poses a character as a jump rather than a motion, as for a respawn: it shows no motion
+    /// getting there. Otherwise as [`Self::set_pose`].
+    pub fn place_pose(&mut self, pose: u32, bones: &[Mat4]) -> bool {
+        self.scene.skins.set(pose, bones, true)
+    }
+
     /// An instance's bounding sphere in the world, as its centre and radius.
     pub fn instance_bounds(&self, instance: u32) -> Option<(Vec3, f32)> {
         self.scene.instance_table.world_sphere(instance)
@@ -446,7 +470,7 @@ impl Renderer {
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
         let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
 
-        let cull = CullPipelines::new(gpu);
+        let cull = CullPipelines::new(gpu, scene.has_skins);
         let masked_capacity = if scene.has_masked {
             MASKED_VISIBLE_CAPACITY
         } else {
@@ -470,7 +494,7 @@ impl Renderer {
             masked_capacity,
             streamer.requests_buffer(),
         );
-        let rasterizer = Rasterizer::new(gpu, scene.has_masked);
+        let rasterizer = Rasterizer::new(gpu, scene.has_masked, scene.has_skins);
 
         // Views without occlusion culling never read the pyramid, but a binding is required.
         let no_hzb = Target::new(
@@ -529,7 +553,7 @@ impl Renderer {
         );
         Self {
             settings,
-            resolve: Resolve::new(gpu, waterline.resolve_layout()),
+            resolve: Resolve::new(gpu, waterline.resolve_layout(), scene.has_skins),
             waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),

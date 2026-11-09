@@ -7,6 +7,8 @@
 
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
+#include "common/skin.wgsl"
+#include "common/skin_vertex.wgsl"
 #include "common/frame.wgsl"
 #include "common/wetness.wgsl"
 
@@ -19,6 +21,11 @@
 @group(0) @binding(6) var<storage, read> vertices: array<PackedVertex>;
 @group(0) @binding(7) var<storage, read> triangles: array<u32>;
 @group(0) @binding(8) var<storage, read> materials: array<Material>;
+@group(0) @binding(9) var bone_texture: texture_2d<f32>;
+
+fn load_vertex(index: u32) -> PackedVertex {
+    return vertices[index];
+}
 
 @group(1) @binding(0) var out_albedo: texture_storage_2d<rgba8unorm, write>;
 @group(1) @binding(1) var out_normal: texture_storage_2d<rgba16float, write>;
@@ -165,9 +172,34 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let v1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
     let v2 = vertices[cluster.vertex_offset + ((packed >> 16u) & 0xffu)];
 
-    let local0 = decode_position(instance, v0);
-    let local1 = decode_position(instance, v1);
-    let local2 = decode_position(instance, v2);
+    var local0 = decode_position(instance, v0);
+    var local1 = decode_position(instance, v1);
+    var local2 = decode_position(instance, v2);
+    var normal0 = decode_normal(v0);
+    var normal1 = decode_normal(v1);
+    var normal2 = decode_normal(v2);
+    // Where this frame's corners were last frame, in the mesh's own space.
+    var before0 = local0;
+    var before1 = local1;
+    var before2 = local2;
+    if instance_skinned(instance) {
+        let corners = vec3u(packed & 0xffu, (packed >> 8u) & 0xffu, (packed >> 16u) & 0xffu);
+        let skin0 = vertex_skin(cluster, corners.x);
+        let skin1 = vertex_skin(cluster, corners.y);
+        let skin2 = vertex_skin(cluster, corners.z);
+        let now0 = skin_rows(instance.bones, skin0, false);
+        let now1 = skin_rows(instance.bones, skin1, false);
+        let now2 = skin_rows(instance.bones, skin2, false);
+        before0 = skin_point(skin_rows(instance.bones, skin0, true), local0);
+        before1 = skin_point(skin_rows(instance.bones, skin1, true), local1);
+        before2 = skin_point(skin_rows(instance.bones, skin2, true), local2);
+        local0 = skin_point(now0, local0);
+        local1 = skin_point(now1, local1);
+        local2 = skin_point(now2, local2);
+        normal0 = normalize(skin_direction(now0, normal0));
+        normal1 = normalize(skin_direction(now1, normal1));
+        normal2 = normalize(skin_direction(now2, normal2));
+    }
     let world0 = transform_point(instance, local0);
     let world1 = transform_point(instance, local1);
     let world2 = transform_point(instance, local2);
@@ -198,9 +230,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     var normal = normalize(interp3(
         b,
-        transform_normal(instance, decode_normal(v0)),
-        transform_normal(instance, decode_normal(v1)),
-        transform_normal(instance, decode_normal(v2)),
+        transform_normal(instance, normal0),
+        transform_normal(instance, normal1),
+        transform_normal(instance, normal2),
     ));
     // Seen from behind, a two-sided surface is lit as its other side.
     let face = cross(world1 - world0, world2 - world0);
@@ -258,7 +290,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     normal = wet.normal;
 
     // Motion, in UV units from this pixel to where it was last frame.
-    let local = interp3(b, local0, local1, local2);
+    let local = interp3(b, before0, before1, before2);
     let prev_world = transform_point_prev(instance, local);
     let prev_clip = frame.prev_view_proj * vec4f(prev_world, 1.0);
     let current_clip = frame.unjittered_view_proj * vec4f(world, 1.0);

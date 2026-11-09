@@ -2,6 +2,8 @@
 
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
+#include "common/skin.wgsl"
+#include "common/skin_vertex.wgsl"
 #include "vg/pass_view.wgsl"
 
 @group(0) @binding(0) var<uniform> view: PassView;
@@ -12,6 +14,7 @@
 @group(0) @binding(3) var<storage, read> pool: array<u32>;
 @group(0) @binding(4) var<storage, read> visible: array<VisibleCluster>;
 @group(0) @binding(5) var<storage, read> state: CullStateRead;
+@group(0) @binding(6) var bone_texture: texture_2d<f32>;
 
 fn load_vertex(index: u32) -> PackedVertex {
     let word = index * 4u;

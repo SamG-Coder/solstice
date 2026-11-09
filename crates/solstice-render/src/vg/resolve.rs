@@ -56,7 +56,7 @@ pub struct ResolveBindings {
 
 impl Resolve {
     /// `wetness` is the layout of the third bind group, from [`crate::ocean::waterline`].
-    pub fn new(gpu: &Gpu, wetness: &wgpu::BindGroupLayout) -> Self {
+    pub fn new(gpu: &Gpu, wetness: &wgpu::BindGroupLayout, skinned: bool) -> Self {
         let data_layout = LayoutBuilder::new()
             .uniform()
             .storage_read()
@@ -67,6 +67,7 @@ impl Resolve {
             .storage_read()
             .storage_read()
             .storage_read()
+            .texture_unfilterable()
             .build(gpu, "resolve data");
         let output_layout = LayoutBuilder::new()
             .storage_texture(ALBEDO_FORMAT)
@@ -85,7 +86,7 @@ impl Resolve {
             .texture_array()
             .texture_array()
             .build(gpu, "resolve output");
-        let module = shaders::module(&gpu.device, "vg/resolve.wgsl");
+        let module = shaders::module_for(&gpu.device, "vg/resolve.wgsl", skinned);
         Self {
             pipeline: gpu.compute_pipeline(
                 "resolve",
@@ -121,6 +122,7 @@ impl Resolve {
                     scene.vertices.as_entire_binding(),
                     scene.triangles.as_entire_binding(),
                     scene.materials.as_entire_binding(),
+                    wgpu::BindingResource::TextureView(&scene.skins.bones_view),
                 ],
             ),
             output: gpu.bind_group(

@@ -174,6 +174,19 @@ mod native {
             }
         }
 
+        fn animation(&self) -> solstice_game::animation::AnimationAssets<'_> {
+            let paged = match self {
+                Self::Loaded(loaded) => &loaded.scene,
+                Self::Streamed(paged) => paged,
+            };
+            solstice_game::animation::AnimationAssets {
+                skeletons: &paged.skeletons,
+                clips: &paged.clips,
+                poses: &paged.poses,
+                instance_poses: &paged.instance_poses,
+            }
+        }
+
         fn renderer(
             &self,
             gpu: &Gpu,
@@ -289,7 +302,7 @@ mod native {
         if collision.is_none() {
             log::warn!("this scene has no collision: rebake it to walk on it");
         }
-        match PlayMode::start(renderer, files, collision.as_ref()) {
+        match PlayMode::start(renderer, files, collision.as_ref(), &scene.animation()) {
             Ok(play) => {
                 log::info!(
                     "playing: {} instances move, scripts {}",

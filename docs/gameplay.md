@@ -881,6 +881,35 @@ as hair cards keep their source vertices' skins. Scene files gain an optional `S
 older files and readers are unaffected. The importer keeps a skin only when asked
 (`ImportOptions::skinned`); otherwise a skinned model is still imported unposed, as before.
 
+**As built (step 7, the renderer).** `Renderer::set_pose(pose, bones)` sits beside
+`move_instance`, and `place_pose` beside `place_instance`. Once a frame, before culling, the rows
+of the bone texture that changed are uploaded.
+
+- **Bones and lists are in textures, not storage buffers.** Culling, rasterizing and resolve are
+  each at WebGPU's limit of eight storage buffers per stage. The bone texture is `rgba32float`, 1024
+  texels wide, this frame's matrices in its top half and last frame's in its bottom half, for motion
+  vectors. The list texture is `rgba32uint`, one texel a skinned cluster.
+- **Every path that places a vertex goes through `skin_rows`** (`common/skin.wgsl`): both
+  rasterizers, opaque and cut-out, the shadow passes, and resolve. So a shared vertex lands on the
+  same bit wherever it is drawn. A scene with nothing skinned has that compiled out of its shaders
+  (`shaders::module_for`), since even the test of `Instance.bones` showed in resolve; in a scene
+  with characters, rigid instances pay for that one test.
+- **A cluster's bounds in a pose** are the union of its bind sphere moved by each of its bones. The
+  two kinds of cluster that can't use that are the ones with too many bones to list, and nodes of the
+  hierarchy, which have no lists at all. Those use the whole instance's reach: how far the pose
+  carries anything (`Instance.lod_margin`, in the mesh's units, worked out on the CPU from each
+  bone's own sphere). A bone's sphere is measured around its source vertices, so vertices that
+  thinning has moved out, as on hair cards, can lie slightly beyond it; only those two kinds of
+  sphere could be short, by at most about twice the cluster's LOD error, a pixel or two on screen.
+- **LOD spheres grow by that same margin, for the whole instance,** so that both sides of a LOD
+  choice see the same sphere and the cut stays watertight in any pose.
+- A skinned instance is always movable: drawn afresh each frame, in no cached view, and left out of
+  the GI voxels as other moving things are. Asking for it to go static or stay in the voxels is
+  refused.
+- The first pose given to a character, and a `place_pose`, show no motion. A pose that wasn't
+  updated last frame settles, so a character that stops stops showing motion. Distant characters,
+  posed every few frames, show motion only on the frames they are posed.
+
 ### The animation runtime
 
 `solstice-anim`, on the CPU, in Rust:
@@ -943,8 +972,8 @@ the way actors do.
 - Animated characters update every frame within 15 m of the camera, every second frame to 40 m,
   every fourth to 90 m, and every eighth beyond that.
 - `scenes/walker.txt` is the smallest scene with an animated actor. It needs
-  `tools/blender/make_character.py` and `tools/blender/make_clips.py` run first. Nothing draws a
-  skinned character yet; that is step 7's renderer work, which also wires play mode in the viewers.
+  `tools/blender/make_character.py` and `tools/blender/make_clips.py` run first. Play it with
+  `viewer target/walker.solstice --play`, or `?scene=walker&play` on the web page.
 
 ## Gameplay and the world around it
 
