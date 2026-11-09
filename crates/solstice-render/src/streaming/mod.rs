@@ -307,17 +307,19 @@ impl Streamer {
         self.arrived
             .retain(|&page, _| self.residency.is_waiting(page));
         for _ in 0..limit {
+            let install = self.residency.next_install(self.frame);
+            // Even if nothing could install: the pages let go are no longer on the GPU's books.
+            for released in self.residency.take_released() {
+                self.apply_eviction(gpu, scene, released);
+            }
             let Some(Install {
                 page,
                 slot,
                 evicted,
-            }) = self.residency.next_install(self.frame)
+            }) = install
             else {
                 break;
             };
-            for released in self.residency.take_released() {
-                self.apply_eviction(gpu, scene, released);
-            }
             if let Some(victim) = evicted {
                 self.apply_eviction(gpu, scene, victim);
             }

@@ -18,8 +18,8 @@ use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
 
 /// How many pools a scene that needs regions has.
 pub const BANDS: usize = 3;
-/// Storage buffers per stage the heaviest pass binds when regions are on.
-pub const REQUIRED_STORAGE_BUFFERS: u32 = 10;
+/// Storage buffers per stage the heaviest pass binds when regions are on: the masked rasterizers.
+pub const REQUIRED_STORAGE_BUFFERS: u32 = 11;
 /// Set to force regions on any scene, so that tests can exercise this path.
 const FORCE_VARIABLE: &str = "SOLSTICE_FORCE_REGIONS";
 
@@ -80,11 +80,13 @@ impl RegionPlan {
              {REQUIRED_STORAGE_BUFFERS} storage buffers per stage, but this device offers {}",
             limits.max_storage_buffers_per_shader_stage
         );
+        let clusters = scene.clusters.len() as u32;
         let cluster_chunk = if forced {
             // Half each, so that a small scene uses both bindings.
-            (scene.clusters.len() as u32).div_ceil(2).max(1)
+            clusters.div_ceil(2)
         } else {
-            (limit / CLUSTER_BYTES) as u32
+            // A scene may need regions only for its pool, and have fewer records than this.
+            ((limit / CLUSTER_BYTES) as u32).min(clusters)
         };
         assert!(
             scene.clusters.len() as u64 <= u64::from(cluster_chunk) * 2,
@@ -320,6 +322,39 @@ mod tests {
             pinned_pages: pinned,
             ..Default::default()
         }
+    }
+
+    /// A pool over the limit doesn't mean a cluster table over it.
+    #[test]
+    fn a_large_pool_with_few_clusters_leaves_the_second_binding_empty() {
+        use solstice_asset::gpu::PackedCluster;
+        if std::env::var_os(FORCE_VARIABLE).is_some() {
+            return;
+        }
+        let mut scene = scene(&[ROOT_ROUND, 1, 5, 9], 1);
+        scene.clusters = vec![PackedCluster::default(); 10];
+        let limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 1 << 31,
+            max_buffer_size: 1 << 31,
+            max_storage_buffers_per_shader_stage: REQUIRED_STORAGE_BUFFERS,
+            ..Default::default()
+        };
+        // 40,000 slots of 128 KiB is 5 GiB, over the limit, but only ten clusters.
+        let plan = RegionPlan::decide(&limits, &scene, 40_000).expect("the pool needs regions");
+        assert_eq!(plan.cluster_chunk, 10);
+    }
+
+    #[test]
+    fn a_scene_within_every_limit_has_no_regions() {
+        if std::env::var_os(FORCE_VARIABLE).is_some() {
+            return;
+        }
+        let limits = wgpu::Limits {
+            max_storage_buffer_binding_size: 1 << 31,
+            max_buffer_size: 1 << 31,
+            ..Default::default()
+        };
+        assert_eq!(RegionPlan::decide(&limits, &scene(&[1], 0), 100), None);
     }
 
     #[test]
