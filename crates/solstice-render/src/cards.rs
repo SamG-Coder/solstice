@@ -146,6 +146,9 @@ impl Cards {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            // A card's picture can be far from the card's shape: Zorah's flames are an image
+            // eight times taller than it is wide, on a card wider than it is tall.
+            anisotropy_clamp: 16,
             ..Default::default()
         });
         let images = source
