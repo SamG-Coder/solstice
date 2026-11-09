@@ -24,8 +24,66 @@ struct Item {
     cluster_base: u32,
 }
 
+/// Supplies the vertices and triangles of the clusters being paged, which may not be in memory.
+pub trait ClusterStore {
+    /// Appends a cluster's records, found at these offsets within its mesh.
+    fn read(&mut self, mesh: u32, range: ClusterRange, out: &mut ClusterRecords);
+}
+
+/// Where one cluster's records are within its mesh.
+#[derive(Clone, Copy, Debug)]
+pub struct ClusterRange {
+    pub first_vertex: usize,
+    pub vertices: usize,
+    pub first_triangle: usize,
+    pub triangles: usize,
+}
+
+/// The records of the page being filled.
+#[derive(Default)]
+pub struct ClusterRecords {
+    pub vertices: Vec<PackedVertex>,
+    pub triangles: Vec<u32>,
+}
+
+/// Reads clusters from the meshes of a scene held in memory.
+struct InMemory<'a>(&'a [VirtualMesh]);
+
+impl ClusterStore for InMemory<'_> {
+    fn read(&mut self, mesh: u32, range: ClusterRange, out: &mut ClusterRecords) {
+        let mesh = &self.0[mesh as usize];
+        out.vertices
+            .extend_from_slice(&mesh.vertices[range.first_vertex..][..range.vertices]);
+        out.triangles
+            .extend_from_slice(&mesh.triangles[range.first_triangle..][..range.triangles]);
+    }
+}
+
 /// Divides `scene` into pages. Textures split into the base levels and those above.
 pub fn paginate(scene: &SceneAsset) -> LoadedScene {
+    let mut pages = Vec::new();
+    let mut out = paginate_from(scene, &mut InMemory(&scene.meshes), &mut |page| {
+        pages.push(page)
+    });
+    let upper_textures = split_textures(scene, &mut out);
+    LoadedScene {
+        scene: out,
+        pages,
+        upper_textures,
+        collision: crate::collision::build_collision(scene),
+    }
+}
+
+/// Divides the meshes of `scene` into pages, without ever holding their vertices and triangles
+/// together: `store` supplies them a cluster at a time, and `sink` receives each page that is not
+/// pinned, in order. Meshes may have left their `vertices` and `triangles` empty.
+///
+/// Textures and collision are left to the caller, which may not want them in memory either.
+pub fn paginate_from(
+    scene: &SceneAsset,
+    store: &mut dyn ClusterStore,
+    sink: &mut dyn FnMut(Vec<u8>),
+) -> PagedScene {
     let mut out = PagedScene {
         materials: scene.materials.clone(),
         instances: scene.instances.clone(),
@@ -102,9 +160,7 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
     // Coarsest first. The roots lead, as `ROOT_ROUND` is the largest round.
     items.sort_by_key(|item| (std::cmp::Reverse(item.round), item.mesh, item.curve));
 
-    let mut pages: Vec<Vec<u8>> = Vec::new();
-    let mut vertices: Vec<PackedVertex> = Vec::new();
-    let mut triangles: Vec<u32> = Vec::new();
+    let mut records = ClusterRecords::default();
     let mut current = PageInfo::default();
     let mut current_round = None;
     for item in &items {
@@ -130,31 +186,28 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
             ..Default::default()
         };
         if current_round.is_some_and(|round| round != item.round) || raw.raw_bytes() > PAGE_BYTES {
-            finish_page(
-                &mut out,
-                &mut pages,
-                &mut current,
-                &mut vertices,
-                &mut triangles,
-            );
+            finish_page(&mut out, &mut records, &mut current, current_round, sink);
         }
         current_round = Some(item.round);
 
         for c in range {
             let cluster = *local(c);
-            let (v, t) = (
-                cluster.vertex_offset as usize,
-                cluster.triangle_offset as usize,
-            );
             let packed = &mut out.clusters[c as usize];
-            packed.vertex_offset = vertices.len() as u32;
-            packed.triangle_offset = triangles.len() as u32;
-            let records = cluster.vertex_records(skinned) as usize;
-            vertices.extend_from_slice(&mesh.vertices[v..v + records]);
-            triangles.extend_from_slice(&mesh.triangles[t..t + cluster.triangle_count() as usize]);
+            packed.vertex_offset = records.vertices.len() as u32;
+            packed.triangle_offset = records.triangles.len() as u32;
+            store.read(
+                item.mesh,
+                ClusterRange {
+                    first_vertex: cluster.vertex_offset as usize,
+                    vertices: cluster.vertex_records(skinned) as usize,
+                    first_triangle: cluster.triangle_offset as usize,
+                    triangles: cluster.triangle_count() as usize,
+                },
+                &mut records,
+            );
         }
-        current.vertex_count = vertices.len() as u32;
-        current.triangle_count = triangles.len() as u32;
+        current.vertex_count = records.vertices.len() as u32;
+        current.triangle_count = records.triangles.len() as u32;
         current.set_count += 1;
         out.sets.push(ClusterSet {
             page: out.pages.len() as u32,
@@ -165,13 +218,7 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
         }
     }
     if current.set_count > 0 {
-        finish_page(
-            &mut out,
-            &mut pages,
-            &mut current,
-            &mut vertices,
-            &mut triangles,
-        );
+        finish_page(&mut out, &mut records, &mut current, current_round, sink);
     }
 
     // Nothing is installed yet: leaves know their page, and generated clusters stand in for
@@ -182,34 +229,30 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
     for &cluster in &out.generated {
         out.clusters[cluster as usize].counts |= CLUSTER_CHILDREN_MISSING;
     }
-
-    let pinned = out.pinned_pages as usize;
-    out.pinned_data = pages[..pinned].concat();
-    let upper_textures = split_textures(scene, &mut out);
-    LoadedScene {
-        scene: out,
-        pages: pages.split_off(pinned),
-        upper_textures,
-        collision: crate::collision::build_collision(scene),
-    }
+    out
 }
 
 fn finish_page(
     out: &mut PagedScene,
-    pages: &mut Vec<Vec<u8>>,
+    records: &mut ClusterRecords,
     current: &mut PageInfo,
-    vertices: &mut Vec<PackedVertex>,
-    triangles: &mut Vec<u32>,
+    round: Option<u32>,
+    sink: &mut dyn FnMut(Vec<u8>),
 ) {
     let mut bytes = Vec::with_capacity(current.raw_bytes());
-    bytes.extend_from_slice(bytemuck::cast_slice(vertices));
-    bytes.extend_from_slice(bytemuck::cast_slice(triangles));
-    pages.push(bytes);
+    bytes.extend_from_slice(bytemuck::cast_slice(&records.vertices));
+    bytes.extend_from_slice(bytemuck::cast_slice(&records.triangles));
+    // The roots lead, so pinned pages are the first of them.
+    if round == Some(ROOT_ROUND) {
+        out.pinned_data.extend_from_slice(&bytes);
+    } else {
+        sink(bytes);
+    }
     current.first_set = out.sets.len() as u32 - current.set_count;
     out.pages.push(*current);
     *current = PageInfo::default();
-    vertices.clear();
-    triangles.clear();
+    records.vertices.clear();
+    records.triangles.clear();
 }
 
 /// Finds the hierarchy leaf of each sibling set.

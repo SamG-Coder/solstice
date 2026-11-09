@@ -1,0 +1,51 @@
+# Zorah: NVIDIA's large scene
+
+Solstice can bake [Zorah](https://github.com/nvpro-samples/vk_lod_clusters/blob/main/docs/scenes.md),
+the glTF export of NVIDIA's RTX Kit sample shown at GDC 2025, which is far larger than anything
+else this engine has read: 3.31 billion unique triangles, 18.9 billion with instancing, 2,812
+meshes and 1,514 materials with 4,418 textures.
+
+## Credit and licence
+
+The Zorah scene is © 2025-2026 NVIDIA Corporation & Affiliates, released under the MIT licence,
+whose text is in the archive's `LICENSE` file. Its environment map, `pizzo_pernice_4k.hdr`, is by
+Andreas Mischok, from Poly Haven (CC0). The scene is not stored in this repository, and no bake of
+it is published.
+
+## Getting it
+
+`python scripts/fetch-zorah.py DIR` downloads 75 GB and unpacks 83 GB, with the download resuming
+if it is interrupted.
+
+## Baking it
+
+```
+bake --large-gltf SCENE.gltf [--region X,Y,Z,RADIUS] [--no-textures] [--texture-size N] --output FILE
+```
+
+`--large-gltf` works from disk, one mesh at a time, for scenes too large to hold in memory
+(`crates/solstice-import/src/streamed.rs`). It builds meshes in parallel with a limit on the
+triangles in flight, spills each mesh's vertices and triangles to a temporary file, cuts pages from
+that, and writes the usual scene file: the format is unchanged, and the viewer reads it with
+`--stream`. It stops cleanly if the output's drive falls below 50 GiB free, and removes its
+temporary files however it ends.
+
+It reads two extensions that `--gltf` does not need for ordinary files:
+`EXT_meshopt_compression`, decoded in `meshopt.rs` to the specification's bitstream, and
+`EXT_mesh_gpu_instancing`.
+
+Textures are KTX2 in BC7 and BC5, zstd-compressed per level, which is what the renderer stores, so
+`ktx2.rs` copies their blocks. A square level is an exact copy. Other shapes take the nearest
+block. Normal maps have their green channel inverted in the blocks.
+
+`--region` bakes only what lies within a radius of a point, which is how to try the scene quickly.
+A radius of 5 m around NVIDIA's opening camera is 88 million unique triangles, baked in about 11
+minutes.
+
+## What it does not reproduce yet
+
+- An alpha cut-off other than 0.5 is drawn at 0.5, since changing it means editing BC7 blocks.
+  111 materials use 0.333, so foliage is a little thinner than it should be.
+- Emissive textures (73 materials) are ignored, and only the emissive factor is used.
+- The one `BLEND` material is drawn opaque.
+- Non-square textures, about 9% of them, are resampled by nearest block.

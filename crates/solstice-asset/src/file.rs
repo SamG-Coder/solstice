@@ -178,6 +178,29 @@ pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
     out
 }
 
+/// Deflates a page as [`encode`] does, for writers that lay out the data area themselves.
+pub fn deflate_page(raw: &[u8]) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL)
+}
+
+/// The start of a file: its header and manifest, for a writer that has placed every page and
+/// texture level itself, with offsets into the data area that follows. A scene too large to hold
+/// in memory is written this way.
+pub fn encode_header_and_manifest(scene: &PagedScene) -> Vec<u8> {
+    let manifest = miniz_oxide::deflate::compress_to_vec(&encode_manifest(scene), DEFLATE_LEVEL);
+    let header = Header {
+        magic: MAGIC,
+        version: VERSION,
+        _pad: 0,
+        manifest_offset: HEADER_BYTES as u64,
+        manifest_bytes: manifest.len() as u64,
+    };
+    let mut out = Vec::with_capacity(HEADER_BYTES + manifest.len());
+    out.extend_from_slice(bytemuck::bytes_of(&header));
+    out.extend_from_slice(&manifest);
+    out
+}
+
 fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     let mut w = Writer::default();
     w.slice(&scene.clusters);
