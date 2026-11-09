@@ -152,7 +152,9 @@ pub struct PagedScene {
 
 /// The sizes of the tables a scene's manifest leaves out: a browser has 4 GiB of memory to work
 /// in, and a scene like Zorah has 5 GiB of these alone. They follow the manifest in a file of
-/// their own, the cluster records and then the pinned pages, for the host to hand over in parts.
+/// their own: the cluster records in the order pages hold them, each page's sets in turn, and
+/// then the pinned pages. The host hands over a page's records with the page, so that only the
+/// records of pages on the GPU are ever held.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExternalTables {
     pub clusters: u64,
@@ -160,6 +162,23 @@ pub struct ExternalTables {
 }
 
 impl PagedScene {
+    /// How many cluster records a page's sets hold.
+    pub fn page_cluster_count(&self, page: u32) -> u32 {
+        let info = &self.pages[page as usize];
+        self.sets[info.first_set as usize..(info.first_set + info.set_count) as usize]
+            .iter()
+            .map(|set| set.cluster_count)
+            .sum()
+    }
+
+    /// The most cluster records any one page holds.
+    pub fn max_page_clusters(&self) -> u32 {
+        (0..self.pages.len() as u32)
+            .map(|page| self.page_cluster_count(page))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// How many cluster records the scene has, wherever they are.
     pub fn cluster_count(&self) -> usize {
         self.external

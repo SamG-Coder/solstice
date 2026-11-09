@@ -238,19 +238,28 @@ impl GpuScene {
                 (pool.clone(), pool, None, Vec::new())
             }
         };
+        assert!(
+            scene.external.is_none() || scene.skeletons.is_empty(),
+            "a scene that keeps its cluster records outside its manifest can't be skinned"
+        );
         let empty = |label: &str, records: u64| {
             let bytes = records * std::mem::size_of::<solstice_asset::PackedCluster>() as u64;
             gpu.storage_buffer(label, bytes, wgpu::BufferUsages::COPY_DST)
         };
-        let (clusters, clusters_more) = match (regions, scene.external) {
-            (Some(plan), Some(tables)) => {
-                let first = u64::from(plan.cluster_chunk);
+        // Such a scene has records only for the pages in its pool, a block for each slot.
+        let resident = scene.external.map(|_| {
+            let total = regions.map_or(slots, |plan| plan.band_slots.iter().sum());
+            u64::from(total) * u64::from(scene.max_page_clusters().max(1))
+        });
+        let (clusters, clusters_more) = match (regions, resident) {
+            (Some(plan), Some(total)) => {
+                let first = total.min(u64::from(plan.cluster_chunk));
                 (
                     empty("clusters", first),
-                    Some(empty("clusters, more", tables.clusters - first)),
+                    Some(empty("clusters, more", total - first)),
                 )
             }
-            (None, Some(tables)) => (empty("clusters", tables.clusters), None),
+            (None, Some(total)) => (empty("clusters", total), None),
             (Some(plan), None) => {
                 let (first, rest) = scene.clusters.split_at(plan.cluster_chunk as usize);
                 (

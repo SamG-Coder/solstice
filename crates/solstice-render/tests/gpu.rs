@@ -344,8 +344,58 @@ fn pump(
     for _ in 0..per_frame.min(queue.len()) {
         // Popping the newest first delivers children before their parents.
         let request = queue.pop().unwrap();
-        renderer.deliver(request.id, requested_bytes(loaded, &request));
+        let data = requested_bytes(loaded, &request);
+        match request.clusters {
+            Some((start, end)) => {
+                let records = ordered_clusters(loaded)[start as usize..end as usize].to_vec();
+                renderer.deliver_page(request.id, data, records)
+            }
+            None => renderer.deliver(request.id, data),
+        };
     }
+}
+
+/// A scene's cluster records as the browser's file has them: each page's sets in turn.
+fn ordered_clusters(loaded: &LoadedScene) -> Vec<u8> {
+    let scene = &loaded.scene;
+    let ordered: Vec<solstice_asset::PackedCluster> = scene
+        .sets
+        .iter()
+        .flat_map(|set| {
+            let range =
+                set.first_cluster as usize..(set.first_cluster + set.cluster_count) as usize;
+            scene.clusters[range].iter().copied()
+        })
+        .collect();
+    solstice_asset::file::cluster_bytes(&ordered).to_vec()
+}
+
+/// A streaming renderer for a scene as a browser loads one too large for its memory: its cluster
+/// records and pinned pages arrive apart from its manifest, and records only with their pages.
+fn split_renderer(
+    gpu: &Gpu,
+    loaded: &LoadedScene,
+    settings: RendererSettings,
+    budget: StreamingBudget,
+) -> Renderer {
+    let mut small = loaded.scene.clone();
+    small.external = Some(solstice_asset::paged::ExternalTables {
+        clusters: small.clusters.len() as u64,
+        pinned_bytes: small.pinned_data.len() as u64,
+    });
+    small.clusters.clear();
+    small.pinned_data.clear();
+    let mut renderer = Renderer::streaming(gpu, &small, FORMAT, settings, budget);
+    let records = ordered_clusters(loaded);
+    let mut at = 0;
+    for page in 0..loaded.scene.pinned_pages {
+        let bytes = loaded.scene.page_cluster_count(page) as usize * 48;
+        let data = loaded.scene.pinned_page(page);
+        renderer.install_pinned(gpu, page, data, &records[at..at + bytes]);
+        at += bytes;
+    }
+    renderer.finish_external_tables(gpu);
+    renderer
 }
 
 /// What a request's bytes come to once unpacked, from a scene in memory.
@@ -411,23 +461,7 @@ fn a_scene_whose_tables_arrive_separately_draws_the_same() {
         .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
             sink.lock().unwrap().push(error.to_string());
         }));
-    let mut small = loaded.scene.clone();
-    small.external = Some(solstice_asset::paged::ExternalTables {
-        clusters: small.clusters.len() as u64,
-        pinned_bytes: small.pinned_data.len() as u64,
-    });
-    small.clusters.clear();
-    small.pinned_data.clear();
-    let mut split = Renderer::streaming(&gpu, &small, FORMAT, settings, generous_budget());
-    // In two parts, to cross a boundary as a real load does.
-    let records: &[u8] = solstice_asset::file::cluster_bytes(&loaded.scene.clusters);
-    let middle = loaded.scene.clusters.len() / 2 * 48;
-    split.upload_clusters(&gpu, 0, &records[..middle]);
-    split.upload_clusters(&gpu, (middle / 48) as u32, &records[middle..]);
-    for page in 0..loaded.scene.pinned_pages {
-        split.install_pinned(&gpu, page, loaded.scene.pinned_page(page));
-    }
-    split.finish_external_tables(&gpu);
+    let mut split = split_renderer(&gpu, &loaded, settings, generous_budget());
     let actual = draw(&mut split);
     assert!(
         errors.lock().unwrap().is_empty(),
@@ -535,6 +569,75 @@ fn a_small_pool_evicts_what_is_out_of_view_and_shows_no_holes() {
         ..generous_budget()
     };
     let mut renderer = Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, budget);
+    let target = test_target(&gpu, SIZE);
+    let view = target.create_view(&Default::default());
+
+    let mut queue = Vec::new();
+    for (visit, x) in [0.0, APART, 0.0, APART].into_iter().enumerate() {
+        let camera = Camera {
+            position: Vec3::new(x, 0.0, DISTANCE),
+            fov_y: 50.0_f32.to_radians(),
+            near: 0.05,
+            ..Default::default()
+        };
+        for frame in 0..90 {
+            pump(&mut renderer, &loaded, &mut queue, 4);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            let streaming = renderer.stats().streaming;
+            assert!(streaming.installed <= slots, "the pool overflowed");
+            if frame % 8 == 0 {
+                let pixels = read_pixels(&gpu, &target, SIZE);
+                let holes = holes_in_sphere(&pixels, SIZE, DISTANCE, camera.fov_y);
+                assert_eq!(holes, 0, "visit {visit}, frame {frame}");
+            }
+        }
+    }
+    // Forced regions divide this small pool between three bands, none of which then overflows.
+    // How bands evict is covered by the residency tests.
+    if std::env::var_os("SOLSTICE_FORCE_REGIONS").is_none() {
+        assert!(
+            renderer.stats().streaming.evictions > 0,
+            "the second sphere should have pushed out the first"
+        );
+    }
+}
+
+/// The same, for a scene whose cluster records come and go with its pages.
+#[test]
+fn a_small_pool_of_a_split_scene_evicts_and_shows_no_holes() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(7), &BuildOptions::default());
+    const APART: f32 = 100.0;
+    let scene = SceneAsset {
+        meshes: vec![mesh.clone(), mesh],
+        materials: vec![white_material()],
+        instances: vec![
+            instance(0, Mat4::IDENTITY),
+            instance(1, Mat4::from_translation(Vec3::X * APART)),
+        ],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    const SIZE: u32 = 256;
+    const DISTANCE: f32 = 1.6;
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+
+    // Room for the coarsest pages and a part of what one close view needs.
+    let pinned = loaded.scene.pinned_pages;
+    let slots = pinned + 10;
+    assert!(slots < loaded.scene.pages.len() as u32);
+    let budget = StreamingBudget {
+        geometry_bytes: u64::from(slots) * solstice_asset::paged::PAGE_BYTES as u64,
+        ..generous_budget()
+    };
+    let mut renderer = split_renderer(&gpu, &loaded, settings, budget);
     let target = test_target(&gpu, SIZE);
     let view = target.create_view(&Default::default());
 

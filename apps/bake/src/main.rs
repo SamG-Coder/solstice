@@ -86,6 +86,9 @@ fn web_split(path: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error
     let mut scene =
         file::decode_manifest(&manifest, header.manifest_offset + header.manifest_bytes)?;
     drop(manifest);
+    if !scene.skeletons.is_empty() {
+        return Err("a scene with skinned meshes can't be split".into());
+    }
     let clusters = std::mem::take(&mut scene.clusters);
     let pinned = std::mem::take(&mut scene.pinned_data);
     scene.external = Some(ExternalTables {
@@ -95,7 +98,11 @@ fn web_split(path: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error
     let start = file::encode_header_and_manifest(&scene);
     let mut out = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(output)?);
     out.write_all(&start)?;
-    out.write_all(file::cluster_bytes(&clusters))?;
+    // In the order pages hold them, so that a page's records are one run of the file.
+    for set in &scene.sets {
+        let range = set.first_cluster as usize..(set.first_cluster + set.cluster_count) as usize;
+        out.write_all(file::cluster_bytes(&clusters[range]))?;
+    }
     out.write_all(&pinned)?;
     out.flush()?;
     println!(

@@ -106,7 +106,16 @@ impl RegionPlan {
     pub fn decide(limits: &wgpu::Limits, scene: &PagedScene, slots: u32) -> Option<Self> {
         let forced = std::env::var_os(FORCE_VARIABLE).is_some();
         let limit = binding_bytes(limits);
-        let cluster_bytes = scene.cluster_count() as u64 * CLUSTER_BYTES;
+        // A scene that keeps its records outside its manifest has them only for the pages in its
+        // pool, a block of the most a page can have for each slot.
+        let stride = scene
+            .external
+            .map(|_| u64::from(scene.max_page_clusters().max(1)));
+        let cluster_count = |slots: u32| match stride {
+            Some(stride) => u64::from(slots.min(scene.pages.len() as u32)) * stride,
+            None => scene.clusters.len() as u64,
+        };
+        let cluster_bytes = cluster_count(slots) * CLUSTER_BYTES;
         let pool_bytes = u64::from(slots) * PAGE_BYTES as u64;
         if !forced && cluster_bytes <= limit && pool_bytes <= limit {
             return None;
@@ -119,18 +128,21 @@ impl RegionPlan {
              {needed} storage buffers per stage, but this device offers {}",
             limits.max_storage_buffers_per_shader_stage
         );
-        let clusters = scene.cluster_count() as u32;
+        let clusters = match stride {
+            Some(stride) => u64::from(band_slots.iter().sum::<u32>()) * stride,
+            None => scene.clusters.len() as u64,
+        };
         let cluster_chunk = if forced {
             // Half each, so that a small scene uses both bindings.
-            clusters.div_ceil(2)
+            clusters.div_ceil(2) as u32
         } else {
             // A scene may need regions only for its pool, and have fewer records than this.
-            ((limit / CLUSTER_BYTES) as u32).min(clusters)
+            (limit / CLUSTER_BYTES).min(clusters) as u32
         };
         assert!(
-            scene.cluster_count() as u64 <= u64::from(cluster_chunk) * 2,
-            "this scene has {} clusters, more than two bindings of {cluster_chunk} can hold",
-            scene.cluster_count()
+            clusters <= u64::from(cluster_chunk) * 2,
+            "this scene has {clusters} cluster records to hold, more than two bindings of \
+             {cluster_chunk} can"
         );
         Some(Self {
             cluster_chunk,

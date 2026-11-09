@@ -49,7 +49,7 @@ const GLOW_TAG: [u8; 4] = *b"GLOW";
 /// The optional section holding the transparent glowing cards, written only if there are any.
 const CARD_TAG: [u8; 4] = *b"CARD";
 /// The optional section that says a manifest leaves out its clusters and pinned pages.
-const EXTERNAL_TAG: [u8; 4] = *b"EXTN";
+const EXTERNAL_TAG: [u8; 4] = *b"EXTP";
 /// In a skin section's mesh list: a mesh that isn't skinned.
 const NO_BONE_LISTS: i32 = i32::MIN;
 

@@ -327,7 +327,7 @@ impl Renderer {
             scene.regions,
         );
         for page in 0..loaded.scene.pages.len() as u32 {
-            streamer.install_now(gpu, &scene, page, loaded.page(page));
+            streamer.install_now(gpu, &scene, page, loaded.page(page), &[]);
         }
         streamer.flush(gpu, &scene);
         Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&loaded.scene.sea)
@@ -353,23 +353,24 @@ impl Renderer {
         let mut streamer = Streamer::new(gpu, paged, slots, Some(plan), scene.regions);
         if paged.external.is_none() {
             for page in 0..paged.pinned_pages {
-                streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
+                streamer.install_now(gpu, &scene, page, paged.pinned_page(page), &[]);
             }
             streamer.flush(gpu, &scene);
         }
         Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&paged.sea)
     }
 
-    /// For a scene that keeps its tables outside its manifest: takes a run of cluster records.
-    /// All of them must arrive, and then all the pinned pages, before the first frame.
-    pub fn upload_clusters(&mut self, gpu: &Gpu, first: u32, bytes: &[u8]) {
+    /// For a scene that keeps its tables outside its manifest: takes a pinned page and its
+    /// cluster records, in order. All must arrive before the first frame.
+    pub fn install_pinned(&mut self, gpu: &Gpu, page: u32, data: &[u8], clusters: &[u8]) {
         self.streamer
-            .upload_clusters(gpu, &self.scene, first, bytes);
+            .install_now(gpu, &self.scene, page, data, clusters);
     }
 
-    /// For a scene that keeps its tables outside its manifest: takes a pinned page, in order.
-    pub fn install_pinned(&mut self, gpu: &Gpu, page: u32, data: &[u8]) {
-        self.streamer.install_now(gpu, &self.scene, page, data);
+    /// As [`Self::deliver`], for a page of such a scene: with its cluster records, which
+    /// [`StreamRequest::clusters`] says where to find.
+    pub fn deliver_page(&mut self, id: u32, data: Vec<u8>, clusters: Vec<u8>) -> bool {
+        self.streamer.deliver_page(id, data, clusters)
     }
 
     /// Writes what the pinned pages changed. Call after the last of them.
