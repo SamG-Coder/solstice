@@ -3,6 +3,6 @@ name walker
 mesh ../../target/characters/keeper.glb 1 yaw=180
 animation keeper.anim
 script walker.star
-property speed float 1.4
+property speed float 1.0
 property pause float 2.0
 character 0.3 1.7
