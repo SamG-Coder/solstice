@@ -47,6 +47,10 @@ pub struct LargeOptions {
     pub min_free_bytes: u64,
     /// How many source triangles may be in memory at once, which bounds the memory used.
     pub triangles_in_flight: u64,
+    /// How to read the free space on a drive, or `None` if it can't be found out.
+    pub free_space: fn(&Path) -> Option<u64>,
+    /// How much may be written between looks at the free space.
+    pub check_every_bytes: u64,
 }
 
 impl Default for LargeOptions {
@@ -57,6 +61,8 @@ impl Default for LargeOptions {
             region: None,
             min_free_bytes: 50 << 30,
             triangles_in_flight: 120_000_000,
+            free_space: free_bytes,
+            check_every_bytes: 8 << 30,
         }
     }
 }
@@ -114,6 +120,26 @@ impl Budget {
     }
 }
 
+/// Budget held by one mesh's build. Dropped however the build ends: a thread that panics would
+/// otherwise hold its share forever, and everything waiting for budget would never wake.
+struct Held<'a> {
+    budget: &'a Budget,
+    taken: u64,
+    failed: &'a Mutex<Option<String>>,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // The lock is only ever held briefly, and never while building.
+            if let Ok(mut failed) = self.failed.lock() {
+                failed.get_or_insert_with(|| "a build thread panicked".to_owned());
+            }
+        }
+        self.budget.give_back(self.taken);
+    }
+}
+
 /// How much is free on the drive that holds `path`, or `None` if that can't be found out.
 fn free_bytes(path: &Path) -> Option<u64> {
     let absolute = std::path::absolute(path).ok()?;
@@ -150,8 +176,9 @@ fn free_bytes(path: &Path) -> Option<u64> {
 }
 
 /// Fails if the drive is running out, so that a bake cannot fill it.
-fn check_free(path: &Path, minimum: u64) -> Result<(), String> {
-    match free_bytes(path) {
+fn check_free(path: &Path, options: &LargeOptions, extra: u64) -> Result<(), String> {
+    let minimum = options.min_free_bytes.saturating_add(extra);
+    match (options.free_space)(path) {
         Some(free) if free < minimum => Err(format!(
             "stopping: only {:.1} GiB free on the output drive, the limit is {:.1} GiB",
             free as f64 / (1u64 << 30) as f64,
@@ -509,9 +536,15 @@ fn bake_inner(
         return Err("binary glTF is not supported for large scenes".to_owned());
     }
     let document = gltf.document;
-    check_free(output, options.min_free_bytes)?;
+    check_free(output, options, 0)?;
 
     let mut report = LargeReport::default();
+    if (options.free_space)(output).is_none() {
+        report.warnings.push(
+            "the free space on the output drive can't be read, so the bake won't stop if it runs out"
+                .to_owned(),
+        );
+    }
     let buffers = read_instance_buffers(&document, folder)?;
     let mut walk = Walk {
         document: &document,
@@ -654,9 +687,9 @@ fn bake_inner(
                 let written = (v.len() + t.len()) as u64;
                 spill.at = triangle_base + t.len() as u64;
                 spill.since_check += written;
-                if spill.since_check > 8 << 30 {
+                if spill.since_check >= options.check_every_bytes {
                     spill.since_check = 0;
-                    check_free(output, options.min_free_bytes)?;
+                    check_free(output, options, 0)?;
                 }
                 (vertex_base, triangle_base)
             };
@@ -681,8 +714,17 @@ fn bake_inner(
                     return;
                 };
                 let taken = budget.take(item.2);
+                let held = Held {
+                    budget: &budget,
+                    taken,
+                    failed: &failed,
+                };
+                // Something else may have failed during the wait for budget.
+                if failed.lock().expect("failed").is_some() {
+                    return;
+                }
                 let result = build(item);
-                budget.give_back(taken);
+                drop(held);
                 if let Err(error) = result {
                     failed.lock().expect("failed").get_or_insert(error);
                     return;
@@ -750,9 +792,9 @@ fn bake_inner(
             since_check += page.len() as u64;
             data.write_all(&page).map_err(|e| e.to_string())?;
         }
-        if since_check > 8 << 30 {
+        if since_check >= options.check_every_bytes {
             since_check = 0;
-            check_free(output, options.min_free_bytes)?;
+            check_free(output, options, 0)?;
         }
         Ok::<(), String>(())
     };
@@ -800,10 +842,7 @@ fn bake_inner(
     let head = encode_header_and_manifest(&paged);
     report.file_bytes = head.len() as u64 + data_at;
     // What is about to be written has to fit above the limit, as it isn't checked along the way.
-    check_free(
-        output,
-        options.min_free_bytes.saturating_add(report.file_bytes),
-    )?;
+    check_free(output, options, report.file_bytes)?;
     // Under another name until it is whole, so a failure can't leave half a scene in its place.
     let mut file = BufWriter::with_capacity(
         1 << 22,
@@ -819,10 +858,18 @@ fn bake_inner(
 }
 
 fn triangles_of(mesh: &gltf::Mesh<'_>, primitive: usize) -> u64 {
-    mesh.primitives()
-        .nth(primitive)
-        .and_then(|p| p.indices())
-        .map_or(0, |indices| indices.count() as u64 / 3)
+    let Some(primitive) = mesh.primitives().nth(primitive) else {
+        return 0;
+    };
+    let count = primitive.indices().map_or_else(
+        || {
+            primitive
+                .get(&gltf::Semantic::Positions)
+                .map_or(0, |positions| positions.count())
+        },
+        |indices| indices.count(),
+    );
+    count as u64 / 3
 }
 
 /// Which images make up one texture layer.
@@ -1078,7 +1125,7 @@ fn write_textures(
                 (group + 1) * LAYERS_AT_ONCE,
                 keys.len()
             );
-            check_free(output, options.min_free_bytes)?;
+            check_free(output, options, 0)?;
         }
     }
     paged.base_textures = base;

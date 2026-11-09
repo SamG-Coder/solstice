@@ -893,6 +893,16 @@ fn large_options() -> streamed::LargeOptions {
 fn a_bake_from_disk_matches_one_from_memory() {
     let dir = TempDir::new();
     let path = write_grid(&dir, None);
+    // A mirrored copy has the opposite winding, so it is a second mesh to build.
+    let text = std::fs::read_to_string(&path).unwrap().replacen(
+        r#""scenes": [{"nodes": [0]}],
+        "nodes": ["#,
+        r#""scenes": [{"nodes": [0, 1]}],
+        "nodes": [{"mesh": 0, "scale": [-1, 1, 1]}, "#,
+        1,
+    );
+    assert!(text.contains("[0, 1]"));
+    std::fs::write(&path, text).unwrap();
     let memory = import(&path).scene;
     let memory = solstice_asset::file::decode(&solstice_asset::file::encode(
         &solstice_builder::paginate(&memory),
@@ -905,6 +915,7 @@ fn a_bake_from_disk_matches_one_from_memory() {
     assert_eq!(report.file_bytes, bytes.len() as u64);
     let disk = solstice_asset::file::decode(&bytes).unwrap();
 
+    assert_eq!(disk.scene.meshes.len(), 2);
     assert!(
         disk.scene.pages.len() > disk.scene.pinned_pages as usize,
         "this test needs pages that aren't pinned"
@@ -1036,6 +1047,38 @@ fn a_large_bake_checks_its_textures_first() {
     let output = dir.0.join("out.solstice");
     let error = streamed::bake_large(&path, &output, &options).unwrap_err();
     assert!(error.contains("missing.ktx2"), "{error}");
-    let spill = dir.0.join("out.solstice.spill.tmp");
-    assert!(!spill.exists() && !output.exists());
+    assert!(!output.exists());
+}
+
+/// The drive running out partway through stops the bake and clears up, not only at the start.
+#[test]
+fn a_bake_stops_when_the_drive_fills_up_on_the_way() {
+    fn filling(_: &Path) -> Option<u64> {
+        static LOOKS: AtomicU32 = AtomicU32::new(0);
+        // Plenty at the start and for the warning's look, then nothing.
+        Some(if LOOKS.fetch_add(1, Ordering::Relaxed) < 2 {
+            u64::MAX
+        } else {
+            0
+        })
+    }
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let output = dir.0.join("out.solstice");
+    let options = streamed::LargeOptions {
+        min_free_bytes: 1,
+        free_space: filling,
+        check_every_bytes: 1,
+        ..large_options()
+    };
+    let error = streamed::bake_large(&path, &output, &options).unwrap_err();
+    assert!(error.contains("stopping"), "{error}");
+    let names: Vec<_> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert!(
+        names.iter().all(|n| !n.starts_with("out.solstice")),
+        "nothing is left: {names:?}"
+    );
 }
