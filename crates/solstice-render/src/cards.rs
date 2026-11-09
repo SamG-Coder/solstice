@@ -46,6 +46,36 @@ fn back_to_front(centers: impl Iterator<Item = Vec3>, camera: Vec3) -> Vec<usize
     order
 }
 
+/// What a scene's cards are drawn from: their vertices with what is the same for each card, in
+/// one buffer of their own, and where each card's are in it.
+fn gather(source: &solstice_asset::Cards) -> (Vec<GpuVertex>, Vec<Item>) {
+    let mut vertices = Vec::with_capacity(source.vertices.len());
+    let mut items = Vec::with_capacity(source.cards.len());
+    for card in &source.cards {
+        let range = card.first_vertex as usize..(card.first_vertex + card.vertex_count) as usize;
+        let positions = source.vertices[range.clone()]
+            .iter()
+            .map(|v| Vec3::from(v.position));
+        let center = positions.sum::<Vec3>() / card.vertex_count.max(1) as f32;
+        let phase = phase_of(center);
+        let first_vertex = vertices.len() as u32;
+        vertices.extend(source.vertices[range].iter().map(|v| GpuVertex {
+            position: v.position,
+            opacity: card.opacity,
+            emissive: card.emissive,
+            phase,
+            uv: v.uv,
+        }));
+        items.push(Item {
+            first_vertex,
+            vertex_count: card.vertex_count,
+            image: card.image,
+            center,
+        });
+    }
+    (vertices, items)
+}
+
 /// A number from a card's place in the world, so that neighbours don't flicker together.
 fn phase_of(center: Vec3) -> f32 {
     let wave = (center.x * 12.9898 + center.z * 78.233).sin() * 43_758.547;
@@ -100,34 +130,15 @@ impl Cards {
             .device
             .features()
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
-        if scene.cards.cards.is_empty() || !block {
+        if scene.cards.cards.is_empty() {
+            return None;
+        }
+        if !block {
+            log::warn!("this GPU can't read block-compressed cards, so they aren't drawn");
             return None;
         }
         let source = &scene.cards;
-        let mut vertices = Vec::with_capacity(source.vertices.len());
-        let mut items = Vec::with_capacity(source.cards.len());
-        for card in &source.cards {
-            let range =
-                card.first_vertex as usize..(card.first_vertex + card.vertex_count) as usize;
-            let positions = source.vertices[range.clone()]
-                .iter()
-                .map(|v| Vec3::from(v.position));
-            let center = positions.sum::<Vec3>() / card.vertex_count.max(1) as f32;
-            let phase = phase_of(center);
-            vertices.extend(source.vertices[range].iter().map(|v| GpuVertex {
-                position: v.position,
-                opacity: card.opacity,
-                emissive: card.emissive,
-                phase,
-                uv: v.uv,
-            }));
-            items.push(Item {
-                first_vertex: card.first_vertex,
-                vertex_count: card.vertex_count,
-                image: card.image,
-                center,
-            });
-        }
+        let (vertices, items) = gather(source);
 
         let stages = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT;
         let frame_layout = LayoutBuilder::new()
@@ -301,6 +312,33 @@ mod tests {
             [0, 2, 1],
             "seen from the other end"
         );
+    }
+
+    /// A file may keep its cards' vertices in any order, or leave some out.
+    #[test]
+    fn each_card_is_drawn_from_where_its_vertices_went() {
+        use solstice_asset::{Card, CardVertex, Cards};
+        let at = |x: f32| CardVertex {
+            position: [x, 0.0, 0.0],
+            uv: [0.0; 2],
+        };
+        let card = |first_vertex: u32| Card {
+            first_vertex,
+            vertex_count: 3,
+            ..Default::default()
+        };
+        let source = Cards {
+            vertices: (0..9).map(|i| at(i as f32)).collect(),
+            cards: vec![card(6), card(3)],
+            images: Vec::new(),
+        };
+        let (vertices, items) = gather(&source);
+        assert_eq!(vertices.len(), 6);
+        assert_eq!(items[0].first_vertex, 0);
+        assert_eq!(items[1].first_vertex, 3);
+        assert_eq!(vertices[0].position[0], 6.0);
+        assert_eq!(vertices[3].position[0], 3.0);
+        assert_eq!(items[0].center.x, 7.0);
     }
 
     #[test]

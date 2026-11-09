@@ -925,8 +925,8 @@ impl LayerTable {
     }
 }
 
-/// Most emissive maps a scene keeps. An array holds at least this many layers on any GPU.
-const MOST_GLOW_MAPS: usize = 2048;
+/// Most emissive maps a scene keeps: as many layers as WebGPU promises an array can have.
+const MOST_GLOW_MAPS: usize = 256;
 /// Edge of the emissive maps. They are soft light, so this is plenty.
 const GLOW_EDGE: u32 = 512;
 

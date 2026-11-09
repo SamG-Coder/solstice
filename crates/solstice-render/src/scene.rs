@@ -317,7 +317,11 @@ fn upload_glow_maps(gpu: &Gpu, scene: &PagedScene) -> Option<wgpu::TextureView> 
         .device
         .features()
         .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
-    if !block || scene.glow.layers.is_empty() {
+    if scene.glow.layers.is_empty() {
+        return None;
+    }
+    if !block || scene.glow.layers.len() as u32 > gpu.limits.max_texture_array_layers {
+        log::warn!("this GPU can't hold the scene's emissive maps, so its materials glow evenly");
         return None;
     }
     let (edge, layers) = (scene.glow.edge, &scene.glow.layers);
