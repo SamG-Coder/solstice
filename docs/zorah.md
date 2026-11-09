@@ -77,6 +77,16 @@ The public export has basins and no water: no mesh, material or node of it descr
 
 A pond is a level sheet of still, clear water, shaded as the sea's is, with what it reflects and what is seen through it. Nothing is drawn or simulated for it: one pass over the lit scene finds where each pixel's view ray meets a pond. A basin's own walls hide the sheet's edges. A scene with a sea draws the sea and not its ponds, and a scene with neither makes none of this.
 
+## Doors
+
+The export's doors are shut, and nothing in it says they open. `scenes/zorah/` is a game for the scene that opens them (docs/gameplay.md, *A game from a folder*): the throne room's door from the courtyard, its great gate at the far end, the courtyard's gate, and the seven small gates in the garden walls. It is played without a bake, `--game scenes/zorah` natively and `&game=zorah` on the page, where *Play* starts it. Fly up to a doorway and press **F**, or click: its leaves swing open, and shut when used again.
+
+- **Each leaf is an actor at its hinge** (`door.actor`, `door.star`), turning the instances the scene already draws for it, which its line in `scene.game` names. The numbers are those of the bake of `zorah_textured_public.v1`, found with `viewer --instances-near`, and are good only for that bake.
+- **Near is measured from the camera,** which scripts read as `viewer()`. Zorah is baked without collision, so there is no floor to walk on and nobody to walk: the camera is flown, and E and Q stay its up and down.
+- **A leaf is drawn as things that move are** from the moment the game starts: afresh each frame, with its own shadows, and out of the GI's voxels. The 20 leaves are 378 instances. Their shadows are drawn every frame whether or not a door is moving, which costs about 3 ms a frame natively beside the throne room's doors and half a millisecond in the courtyard and the garden, where the shadows kept from frame to frame cost 0.2.
+- **The entrance door's stone panel sinks into the threshold.** It is one mesh across both leaves, two instances by its materials and not by its halves, so it can swing with neither. `door.actor` has a `slide` for such a part: how far it moves aside as the doorway opens. Baking the panel as two halves would let it swing.
+- **Not done:** nothing stops the camera at a shut door, doors make no sound, and walking needs the scene's collision, which means baking it again.
+
 ## Cards
 
 Cards are drawn after the lit scene and water, and before particles (`src/cards.rs`,

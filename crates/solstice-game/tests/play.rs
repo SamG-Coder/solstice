@@ -792,3 +792,98 @@ fn an_animated_actor_with_no_skeleton_says_so() {
         .unwrap_err();
     assert!(errors[0].contains("no skeleton"), "{errors:?}");
 }
+
+const DOOR_ACTOR: &str = include_str!("../../../scenes/zorah/door.actor");
+const DOOR: &str = include_str!("../../../scenes/zorah/door.star");
+const DOOR_INPUT: &str = include_str!("../../../scenes/zorah/zorah.input");
+
+/// Runs a game for some seconds with a key down from the start, and says where each instance
+/// was last drawn.
+fn after(play: &mut Play, key: Option<&str>, seconds: f64) -> HashMap<u32, Mat4> {
+    let mut placed = HashMap::new();
+    let mut devices = Devices::new();
+    if let Some(key) = key {
+        devices.key(key, true);
+    }
+    let steps = (seconds / STEP_SECONDS).ceil() as usize;
+    for step in 0..steps {
+        if step == 1 {
+            if let Some(key) = key {
+                devices.key(key, false);
+            }
+        }
+        play.frame(STEP_SECONDS, &mut devices, |id, at| {
+            placed.insert(id, at);
+        });
+    }
+    placed
+}
+
+#[test]
+fn a_doorway_given_to_a_scene_opens_for_whoever_is_watching_from_near_it() {
+    // Two leaves the scene already draws, hinged either side of a doorway two metres wide.
+    let scene = files(&[
+        (
+            GAME_FILE,
+            "input zorah.input\n\
+             actor door.actor 20 0 1 0 middle=20,0,0 swing=90 reach=5 seconds=1 instances=2+1\n\
+             actor door.actor 20 0 -1 0 middle=20,0,0 swing=-90 reach=5 seconds=1 instances=3+1\n",
+        ),
+        ("door.actor", DOOR_ACTOR),
+        ("door.star", DOOR),
+        ("zorah.input", DOOR_INPUT),
+    ]);
+    assert!(solstice_game::missing_files(&scene).is_empty());
+    // Each leaf reaches from its hinge to the middle.
+    let baked = |id: u32| match id {
+        2 => Some(Mat4::from_translation(Vec3::new(20.0, 1.0, 0.5))),
+        3 => Some(Mat4::from_translation(Vec3::new(20.0, 1.0, -0.5))),
+        _ => None,
+    };
+    let mut play = Play::load(&scene, baked, None).unwrap();
+    assert!(!play.has_player());
+    let shut = after(&mut play, None, 0.1);
+    assert!(close(shut[&2], baked(2).unwrap()) && close(shut[&3], baked(3).unwrap()));
+
+    // From across the courtyard nothing answers, and the flying camera's own key is not it.
+    play.set_viewer(Vec3::new(60.0, 3.0, 0.0));
+    assert!(after(&mut play, Some("KeyF"), 1.5).is_empty());
+    play.set_viewer(Vec3::new(23.0, 9.0, 1.0));
+    assert!(after(&mut play, Some("KeyE"), 1.5).is_empty());
+
+    // From near, however high, both leaves swing a quarter turn about their own hinges.
+    let open = after(&mut play, Some("KeyF"), 1.5);
+    for (id, hinge, swing) in [(2, 1.0, 90_f32), (3, -1.0, -90_f32)] {
+        let hinge = Mat4::from_translation(Vec3::new(20.0, 0.0, hinge));
+        let turned = hinge * Mat4::from_rotation_y(swing.to_radians()) * hinge.inverse();
+        assert!(
+            close(open[&id], turned * baked(id).unwrap()),
+            "{id}: {:?}",
+            open[&id]
+        );
+    }
+    // Both open the same way, into the room at -X, and used again they shut.
+    assert!(open[&2].w_axis.x < 19.6 && open[&3].w_axis.x < 19.6);
+    let shut = after(&mut play, Some("KeyF"), 1.5);
+    assert!(close(shut[&2], baked(2).unwrap()) && close(shut[&3], baked(3).unwrap()));
+    assert!(play.take_messages().is_empty());
+}
+
+#[test]
+fn zorahs_doors_are_placed_so_that_the_game_loads() {
+    let scene = files(&[
+        (GAME_FILE, include_str!("../../../scenes/zorah/scene.game")),
+        ("door.actor", DOOR_ACTOR),
+        ("door.star", DOOR),
+        ("zorah.input", DOOR_INPUT),
+    ]);
+    assert!(solstice_game::missing_files(&scene).is_empty());
+    // Its bake has this many instances; each may be one leaf's only.
+    let play = Play::load(&scene, |id| (id < 43_069).then_some(Mat4::IDENTITY), None).unwrap();
+    let mut instances: Vec<u32> = play.instances().collect();
+    let count = instances.len();
+    instances.sort_unstable();
+    instances.dedup();
+    assert_eq!(instances.len(), count, "an instance is on two leaves");
+    assert_eq!(count, 2 * 6 + 2 + 2 * 120 + 2 * 21 + 7 * 12);
+}
