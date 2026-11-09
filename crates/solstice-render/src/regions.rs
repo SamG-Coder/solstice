@@ -123,8 +123,11 @@ impl RegionPlan {
 fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
     let cap = (limit / PAGE_BYTES as u64) as u32;
     let mut pages = [0u32; BANDS];
-    for band in page_bands(scene, cap) {
+    // Each band's pinned pages must have slots, whichever band they ended up in.
+    let mut pinned = [0u32; BANDS];
+    for (page, band) in page_bands(scene, cap).into_iter().enumerate() {
         pages[band as usize] += 1;
+        pinned[band as usize] += u32::from((page as u32) < scene.pinned_pages);
     }
     if slots >= scene.pages.len() as u32 {
         // Everything is on the GPU, so each band holds just its own.
@@ -137,7 +140,7 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
     // A page can't install before the coarser pages it depends on, and the far band's pages are
     // the top of every chain: drawing detail anywhere needs them first. So it comes first, and
     // the rest of the budget is shared.
-    let far = pages[2].min((slots / 2).max(scene.pinned_pages + 1)).max(1);
+    let far = pages[2].min((slots / 2).max(pinned[2] + 1)).max(1);
     let rest = slots.saturating_sub(far);
     let near = rest / 2;
     let wanted = [near, rest - near, far];
@@ -145,7 +148,15 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
     // No band gets more than it has pages for or one binding can hold, and what that leaves over
     // goes to whichever can use it.
     let room = pages.map(|count| count.min(cap));
-    let mut given: [u32; BANDS] = std::array::from_fn(|band| wanted[band].min(room[band]));
+    let mut given: [u32; BANDS] =
+        std::array::from_fn(|band| wanted[band].max(pinned[band]).min(room[band]));
+    // Raising a band to its pinned pages can overdraw the budget: the others pay, nearest first.
+    let mut over = given.iter().sum::<u32>().saturating_sub(slots);
+    for band in 0..BANDS {
+        let spare = over.min(given[band] - pinned[band].min(given[band]));
+        given[band] -= spare;
+        over -= spare;
+    }
     let mut left = slots.saturating_sub(given.iter().sum());
     for band in 0..BANDS {
         let more = left.min(room[band] - given[band]);
@@ -394,6 +405,22 @@ mod tests {
             slots[1] >= 3,
             "the middle band can hold its pinned pages: {slots:?}"
         );
+    }
+
+    /// The smallest pool the renderer makes holds just the pinned pages, wherever they are.
+    #[test]
+    fn every_band_holds_its_pinned_pages_at_the_smallest_budget() {
+        let mut rounds = vec![ROOT_ROUND; 7];
+        rounds.extend([9, 9, 5, 1, 1]);
+        let scene = scene(&rounds, 7);
+        let cap = 5 * PAGE_BYTES as u64;
+        let slots = band_slots(&scene, 7, cap);
+        assert_eq!(slots[2], 5, "{slots:?}");
+        assert_eq!(slots[1], 2, "{slots:?}");
+        let bands = page_bands(&scene, 5);
+        let deps = vec![Vec::new(); bands.len()];
+        // Panics if a band can't hold its pinned pages.
+        crate::streaming::residency::Residency::with_bands(deps, 7, bands, &slots);
     }
 
     #[test]
