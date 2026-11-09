@@ -48,4 +48,4 @@ minutes.
   111 materials use 0.333, so foliage is a little thinner than it should be.
 - Emissive textures (73 materials) are ignored, and only the emissive factor is used.
 - The one `BLEND` material is drawn opaque.
-- Non-square textures, about 9% of them, are resampled by nearest block.
+- Non-square textures, 348 of the 4,418, are resampled by nearest block.

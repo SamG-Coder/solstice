@@ -62,8 +62,9 @@ impl ClusterStore for InMemory<'_> {
 /// Divides `scene` into pages. Textures split into the base levels and those above.
 pub fn paginate(scene: &SceneAsset) -> LoadedScene {
     let mut pages = Vec::new();
-    let mut out = paginate_from(scene, &mut InMemory(&scene.meshes), &mut |page| {
-        pages.push(page)
+    let Ok(mut out) = paginate_from(scene, &mut InMemory(&scene.meshes), &mut |page| {
+        pages.push(page);
+        Ok::<(), std::convert::Infallible>(())
     });
     let upper_textures = split_textures(scene, &mut out);
     LoadedScene {
@@ -76,14 +77,15 @@ pub fn paginate(scene: &SceneAsset) -> LoadedScene {
 
 /// Divides the meshes of `scene` into pages, without ever holding their vertices and triangles
 /// together: `store` supplies them a cluster at a time, and `sink` receives each page that is not
-/// pinned, in order. Meshes may have left their `vertices` and `triangles` empty.
+/// pinned, in order. Meshes may have left their `vertices` and `triangles` empty. An error from
+/// `sink` stops the work and is returned.
 ///
 /// Textures and collision are left to the caller, which may not want them in memory either.
-pub fn paginate_from(
+pub fn paginate_from<E>(
     scene: &SceneAsset,
     store: &mut dyn ClusterStore,
-    sink: &mut dyn FnMut(Vec<u8>),
-) -> PagedScene {
+    sink: &mut dyn FnMut(Vec<u8>) -> Result<(), E>,
+) -> Result<PagedScene, E> {
     let mut out = PagedScene {
         materials: scene.materials.clone(),
         instances: scene.instances.clone(),
@@ -186,7 +188,7 @@ pub fn paginate_from(
             ..Default::default()
         };
         if current_round.is_some_and(|round| round != item.round) || raw.raw_bytes() > PAGE_BYTES {
-            finish_page(&mut out, &mut records, &mut current, current_round, sink);
+            finish_page(&mut out, &mut records, &mut current, current_round, sink)?;
         }
         current_round = Some(item.round);
 
@@ -218,7 +220,7 @@ pub fn paginate_from(
         }
     }
     if current.set_count > 0 {
-        finish_page(&mut out, &mut records, &mut current, current_round, sink);
+        finish_page(&mut out, &mut records, &mut current, current_round, sink)?;
     }
 
     // Nothing is installed yet: leaves know their page, and generated clusters stand in for
@@ -229,16 +231,16 @@ pub fn paginate_from(
     for &cluster in &out.generated {
         out.clusters[cluster as usize].counts |= CLUSTER_CHILDREN_MISSING;
     }
-    out
+    Ok(out)
 }
 
-fn finish_page(
+fn finish_page<E>(
     out: &mut PagedScene,
     records: &mut ClusterRecords,
     current: &mut PageInfo,
     round: Option<u32>,
-    sink: &mut dyn FnMut(Vec<u8>),
-) {
+    sink: &mut dyn FnMut(Vec<u8>) -> Result<(), E>,
+) -> Result<(), E> {
     let mut bytes = Vec::with_capacity(current.raw_bytes());
     bytes.extend_from_slice(bytemuck::cast_slice(&records.vertices));
     bytes.extend_from_slice(bytemuck::cast_slice(&records.triangles));
@@ -246,13 +248,14 @@ fn finish_page(
     if round == Some(ROOT_ROUND) {
         out.pinned_data.extend_from_slice(&bytes);
     } else {
-        sink(bytes);
+        sink(bytes)?;
     }
     current.first_set = out.sets.len() as u32 - current.set_count;
     out.pages.push(*current);
     *current = PageInfo::default();
     records.vertices.clear();
     records.triangles.clear();
+    Ok(())
 }
 
 /// Finds the hierarchy leaf of each sibling set.

@@ -5,7 +5,7 @@
 //! recent edges and vertices. Filters are not implemented, and a file that uses one is refused
 //! rather than read wrongly.
 
-use gltf::{buffer, Document};
+use gltf::buffer;
 
 /// Why a compressed buffer view could not be decoded.
 #[derive(Debug, PartialEq, Eq)]
@@ -400,19 +400,8 @@ pub fn decode_indices(out: &mut [u8], stride: usize, data: &[u8]) -> Result<(), 
     Ok(())
 }
 
-/// Decompresses every compressed buffer view of `document` into its place in `buffers`, which
-/// must already hold the compressed buffers and room for the views' uncompressed data.
-pub fn decompress_views(
-    document: &Document,
-    buffers: &mut [buffer::Data],
-) -> Result<(), DecodeError> {
-    for view in document.views() {
-        decompress_view(&view, buffers)?;
-    }
-    Ok(())
-}
-
-/// Decompresses one buffer view into its place in `buffers`, if it is compressed.
+/// Decompresses one buffer view into its place in `buffers`, if it is compressed. `buffers` must
+/// already hold the compressed buffer and room for the view's uncompressed data.
 pub fn decompress_view(
     view: &buffer::View<'_>,
     buffers: &mut [buffer::Data],
@@ -442,23 +431,31 @@ pub fn decompress_view(
         return Err(DecodeError::Unsupported(format!("filter {filter}")));
     }
     let size = stride.checked_mul(count).ok_or(DecodeError::Malformed)?;
-    let compressed = buffers
-        .get(source)
-        .and_then(|b| b.get(offset..offset.checked_add(length)?))
-        .ok_or(DecodeError::Malformed)?;
-    let mut decoded = vec![0u8; size];
-    match mode {
-        Some("ATTRIBUTES") => decode_attributes(&mut decoded, stride, compressed)?,
-        Some("TRIANGLES") => decode_triangles(&mut decoded, stride, compressed)?,
-        Some("INDICES") => decode_indices(&mut decoded, stride, compressed)?,
-        other => return Err(DecodeError::Unsupported(format!("mode {other:?}"))),
+    let target = view.buffer().index();
+    if target == source {
+        return Err(DecodeError::Malformed);
     }
-    buffers
-        .get_mut(view.buffer().index())
-        .and_then(|b| b.0.get_mut(view.offset()..view.offset().checked_add(size)?))
-        .ok_or(DecodeError::Malformed)?
-        .copy_from_slice(&decoded);
-    Ok(())
+    // Moved out while decoding, so the output goes straight to where it belongs.
+    let mut output = std::mem::take(&mut buffers.get_mut(target).ok_or(DecodeError::Malformed)?.0);
+    let result = (|| {
+        let out = view
+            .offset()
+            .checked_add(size)
+            .and_then(|end| output.get_mut(view.offset()..end))
+            .ok_or(DecodeError::Malformed)?;
+        let compressed = buffers
+            .get(source)
+            .and_then(|b| b.get(offset..offset.checked_add(length)?))
+            .ok_or(DecodeError::Malformed)?;
+        match mode {
+            Some("ATTRIBUTES") => decode_attributes(out, stride, compressed),
+            Some("TRIANGLES") => decode_triangles(out, stride, compressed),
+            Some("INDICES") => decode_indices(out, stride, compressed),
+            other => Err(DecodeError::Unsupported(format!("mode {other:?}"))),
+        }
+    })();
+    buffers[target].0 = output;
+    result
 }
 
 #[cfg(test)]

@@ -30,6 +30,20 @@ pub const BLOCK_BYTES: usize = 16;
 /// Texels along a block's edge.
 const BLOCK_EDGE: u32 = 4;
 
+/// Reads only a file's format, to check what a long bake will need before starting it.
+pub fn read_format(path: &std::path::Path) -> Result<u32, String> {
+    let mut header = [0u8; HEADER_BYTES];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .map_err(|e| e.to_string())?;
+    if header[..MAGIC.len()] != MAGIC {
+        return Err("not a KTX2 file".to_owned());
+    }
+    Ok(u32::from_le_bytes(
+        header[12..16].try_into().expect("four bytes"),
+    ))
+}
+
 /// An opened KTX2 file.
 #[derive(Debug)]
 pub struct Ktx2 {

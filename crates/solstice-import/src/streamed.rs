@@ -13,7 +13,7 @@
 //! need. If the drive holding the output runs low, the bake stops and cleans up.
 
 use crate::ktx2::{self, Ktx2};
-use crate::material::is_invisible;
+use crate::material::{is_invisible, map_transforms};
 use crate::meshopt::decompress_view;
 use crate::{frame_bounds, read_primitive, Bounds, MeshKey};
 use glam::{Mat3, Mat4, Quat, Vec3};
@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
@@ -257,6 +258,7 @@ struct Walk<'a> {
     placements: Vec<Placement>,
     bounds: Bounds,
     left_out: usize,
+    warnings: Vec<String>,
 }
 
 impl Walk<'_> {
@@ -285,7 +287,19 @@ impl Walk<'_> {
         world: Mat4,
         mirrored: bool,
     ) {
-        if primitive.mode() != gltf::mesh::Mode::Triangles || is_invisible(&primitive.material()) {
+        if primitive.mode() != gltf::mesh::Mode::Triangles {
+            self.warnings.push(format!(
+                "mesh {}: a primitive of mode {:?} was skipped: only triangle lists are supported",
+                mesh.index(),
+                primitive.mode()
+            ));
+            return;
+        }
+        if is_invisible(&primitive.material()) {
+            let name = primitive.material().name().unwrap_or("unnamed").to_owned();
+            self.warnings.push(format!(
+                "material '{name}': its alpha is below its cut-off everywhere, so what uses it is left out"
+            ));
             return;
         }
         let box_ = primitive.bounding_box();
@@ -350,6 +364,36 @@ impl ClusterStore for SpillStore {
     }
 }
 
+/// Reads the buffers that instance attributes are in, leaving the rest empty.
+fn read_instance_buffers(document: &Document, folder: &Path) -> Result<Vec<buffer::Data>, String> {
+    let mut wanted = vec![false; document.buffers().count()];
+    for node in document.nodes() {
+        let attributes = node
+            .extension_value("EXT_mesh_gpu_instancing")
+            .and_then(|extension| extension.get("attributes"))
+            .and_then(gltf::json::Value::as_object);
+        for accessor in attributes.into_iter().flat_map(|a| a.values()) {
+            let view = accessor
+                .as_u64()
+                .and_then(|index| document.accessors().nth(index as usize))
+                .and_then(|accessor| accessor.view());
+            if let Some(view) = view {
+                wanted[view.buffer().index()] = true;
+            }
+        }
+    }
+    document
+        .buffers()
+        .map(|buffer| {
+            if wanted[buffer.index()] {
+                read_buffer(&buffer, folder)
+            } else {
+                Ok(buffer::Data(Vec::new()))
+            }
+        })
+        .collect()
+}
+
 /// Reads the buffers one mesh needs, and decompresses its data.
 fn load_mesh_buffers(
     document: &Document,
@@ -378,7 +422,14 @@ fn load_mesh_buffers(
     };
     for view in &views {
         load(view.buffer().index(), &mut buffers)?;
-        if let Some(extension) = view.extension_value("EXT_meshopt_compression") {
+        let compressed = view.extension_value("EXT_meshopt_compression");
+        if compressed.is_none() && matches!(view.buffer().source(), buffer::Source::Bin) {
+            return Err(format!(
+                "mesh {}: an uncompressed view is in a buffer with no file",
+                mesh.index()
+            ));
+        }
+        if let Some(extension) = compressed {
             let source = extension
                 .get("buffer")
                 .and_then(gltf::json::Value::as_u64)
@@ -395,7 +446,7 @@ fn load_mesh_buffers(
     Ok(buffers)
 }
 
-/// A buffer's bytes: from its file, or room for a compressed view's output if it has no file.
+/// A buffer's bytes: from its file, or room for compressed views' output if it has no file.
 fn read_buffer(buffer: &gltf::Buffer<'_>, folder: &Path) -> Result<buffer::Data, String> {
     match buffer.source() {
         buffer::Source::Uri(uri) => {
@@ -415,15 +466,23 @@ pub fn bake_large(
     options: &LargeOptions,
 ) -> Result<LargeReport, String> {
     let (path, output) = (path.as_ref(), output.as_ref());
+    if !options.texture_size.is_power_of_two() {
+        return Err(format!(
+            "texture size {} is not a power of two",
+            options.texture_size
+        ));
+    }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let spill_path = with_suffix(output, ".spill.tmp");
     let data_path = with_suffix(output, ".data.tmp");
-    let result = bake_inner(path, output, &spill_path, &data_path, options);
+    let final_path = with_suffix(output, ".final.tmp");
+    let result = bake_inner(path, output, &spill_path, &data_path, &final_path, options);
     // Whether it worked or not, these must not be left taking up the drive.
     let _ = std::fs::remove_file(&spill_path);
     let _ = std::fs::remove_file(&data_path);
+    let _ = std::fs::remove_file(&final_path);
     result
 }
 
@@ -438,25 +497,22 @@ fn bake_inner(
     output: &Path,
     spill_path: &Path,
     data_path: &Path,
+    final_path: &Path,
     options: &LargeOptions,
 ) -> Result<LargeReport, String> {
     let folder = path.parent().unwrap_or(Path::new("."));
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let document = Gltf::from_slice_without_validation(&bytes)
-        .map_err(|e| format!("{}: {e}", path.display()))?
-        .document;
+    let gltf = Gltf::from_slice_without_validation(&bytes)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     drop(bytes);
+    if gltf.blob.is_some() {
+        return Err("binary glTF is not supported for large scenes".to_owned());
+    }
+    let document = gltf.document;
     check_free(output, options.min_free_bytes)?;
 
     let mut report = LargeReport::default();
-    // Instance attributes are not compressed, and nothing else in these buffers is read here.
-    let buffers: Vec<buffer::Data> = document
-        .buffers()
-        .map(|buffer| match buffer.source() {
-            buffer::Source::Uri(uri) if uri.ends_with(".nodes.bin") => read_buffer(&buffer, folder),
-            _ => Ok(buffer::Data(Vec::new())),
-        })
-        .collect::<Result<_, _>>()?;
+    let buffers = read_instance_buffers(&document, folder)?;
     let mut walk = Walk {
         document: &document,
         buffers: &buffers,
@@ -464,6 +520,7 @@ fn bake_inner(
         placements: Vec::new(),
         bounds: Bounds::default(),
         left_out: 0,
+        warnings: Vec::new(),
     };
     let scene = document
         .default_scene()
@@ -476,8 +533,10 @@ fn bake_inner(
         placements,
         bounds,
         left_out,
+        warnings,
         ..
     } = walk;
+    report.warnings.extend(warnings);
     if placements.is_empty() {
         return Err("nothing to draw in that region".to_owned());
     }
@@ -514,6 +573,9 @@ fn bake_inner(
             transform: placement.transform,
         });
     }
+
+    // A problem with a texture should cost seconds, not the hours of building that come first.
+    check_images(&document, folder, &layers.keys)?;
 
     let mut by_source: HashMap<usize, Vec<usize>> = HashMap::new();
     for (index, key) in keys.iter().enumerate() {
@@ -562,63 +624,85 @@ fn bake_inner(
     let finished: Mutex<Vec<FinishedMesh>> = Mutex::new(Vec::with_capacity(keys.len()));
     let done = Mutex::new(0u64);
     let build_options = BuildOptions::default();
-    work.par_iter()
-        .try_for_each(|(mesh, built, triangles)| -> Result<(), String> {
-            let taken = budget.take(*triangles);
-            let result = (|| -> Result<(), String> {
-                let source = document
-                    .meshes()
-                    .nth(*mesh)
-                    .expect("from walking this file");
-                let buffers = load_mesh_buffers(&document, &source, folder)?;
-                for &index in built {
-                    let key = keys[index];
-                    let primitive = source
-                        .primitives()
-                        .nth(key.primitive)
-                        .expect("from walking this file");
-                    let geometry = read_primitive(&primitive, &buffers, key.mirrored);
-                    let mut virtual_mesh = build_virtual_mesh(&geometry, &build_options);
-                    drop(geometry);
-                    let vertices = std::mem::take(&mut virtual_mesh.vertices);
-                    let triangles = std::mem::take(&mut virtual_mesh.triangles);
-                    let bases = {
-                        let mut spill = spill.lock().expect("spill");
-                        let vertex_base = spill.at;
-                        let v: &[u8] = bytemuck::cast_slice(&vertices);
-                        let t: &[u8] = bytemuck::cast_slice(&triangles);
-                        spill.file.write_all(v).map_err(|e| e.to_string())?;
-                        let triangle_base = vertex_base + v.len() as u64;
-                        spill.file.write_all(t).map_err(|e| e.to_string())?;
-                        let written = (v.len() + t.len()) as u64;
-                        spill.at = triangle_base + t.len() as u64;
-                        spill.since_check += written;
-                        if spill.since_check > 8 << 30 {
-                            spill.since_check = 0;
-                            check_free(output, options.min_free_bytes)?;
-                        }
-                        (vertex_base, triangle_base)
-                    };
-                    finished
-                        .lock()
-                        .expect("finished")
-                        .push((index, virtual_mesh, bases));
+    let next = AtomicUsize::new(0);
+    let failed: Mutex<Option<String>> = Mutex::new(None);
+    let build = |(mesh, built, _): &(usize, Vec<usize>, u64)| -> Result<(), String> {
+        let source = document
+            .meshes()
+            .nth(*mesh)
+            .expect("from walking this file");
+        let buffers = load_mesh_buffers(&document, &source, folder)?;
+        for &index in built {
+            let key = keys[index];
+            let primitive = source
+                .primitives()
+                .nth(key.primitive)
+                .expect("from walking this file");
+            let geometry = read_primitive(&primitive, &buffers, key.mirrored);
+            let mut virtual_mesh = build_virtual_mesh(&geometry, &build_options);
+            drop(geometry);
+            let vertices = std::mem::take(&mut virtual_mesh.vertices);
+            let triangles = std::mem::take(&mut virtual_mesh.triangles);
+            let bases = {
+                let mut spill = spill.lock().expect("spill");
+                let vertex_base = spill.at;
+                let v: &[u8] = bytemuck::cast_slice(&vertices);
+                let t: &[u8] = bytemuck::cast_slice(&triangles);
+                spill.file.write_all(v).map_err(|e| e.to_string())?;
+                let triangle_base = vertex_base + v.len() as u64;
+                spill.file.write_all(t).map_err(|e| e.to_string())?;
+                let written = (v.len() + t.len()) as u64;
+                spill.at = triangle_base + t.len() as u64;
+                spill.since_check += written;
+                if spill.since_check > 8 << 30 {
+                    spill.since_check = 0;
+                    check_free(output, options.min_free_bytes)?;
                 }
-                Ok(())
-            })();
-            budget.give_back(taken);
-            result?;
-            let mut done = done.lock().expect("done");
-            *done += triangles;
-            let share = *done as f64 / total.max(1) as f64 * 100.0;
-            if (*done - triangles) * 50 / total.max(1) != *done * 50 / total.max(1) {
-                println!(
-                    "built {share:.0}% in {:.0}s",
-                    built_start.elapsed().as_secs_f32()
-                );
-            }
-            Ok(())
-        })?;
+                (vertex_base, triangle_base)
+            };
+            finished
+                .lock()
+                .expect("finished")
+                .push((index, virtual_mesh, bases));
+        }
+        Ok(())
+    };
+    // Plain threads, not rayon's: a thread waiting for the budget must not be a rayon worker. A
+    // worker waiting inside a mesh's own parallel build can pick up another job, and if that job
+    // then waits for budget on the same stack, nothing underneath it can ever finish.
+    let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failed.lock().expect("failed").is_some() {
+                    return;
+                }
+                let Some(item) = work.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                    return;
+                };
+                let taken = budget.take(item.2);
+                let result = build(item);
+                budget.give_back(taken);
+                if let Err(error) = result {
+                    failed.lock().expect("failed").get_or_insert(error);
+                    return;
+                }
+                let triangles = item.2;
+                let mut done = done.lock().expect("done");
+                *done += triangles;
+                if (*done - triangles) * 50 / total.max(1) != *done * 50 / total.max(1) {
+                    println!(
+                        "built {:.0}% in {:.0}s",
+                        *done as f64 / total.max(1) as f64 * 100.0,
+                        built_start.elapsed().as_secs_f32()
+                    );
+                }
+            });
+        }
+    });
+    if let Some(error) = failed.into_inner().expect("failed") {
+        return Err(error);
+    }
     report.build_seconds = built_start.elapsed().as_secs_f32();
     let mut spill = spill.into_inner().expect("spill");
     spill.file.flush().map_err(|e| e.to_string())?;
@@ -656,39 +740,30 @@ fn bake_inner(
     let mut placed: Vec<(u64, u32)> = Vec::new();
     let mut data_at = 0u64;
     let mut pending: Vec<Vec<u8>> = Vec::new();
-    let mut failure: Option<String> = None;
     let mut since_check = 0u64;
-    let mut flush =
-        |pending: &mut Vec<Vec<u8>>, failure: &mut Option<String>, placed: &mut Vec<(u64, u32)>| {
-            let packed: Vec<Vec<u8>> = pending.par_iter().map(|raw| deflate_page(raw)).collect();
-            pending.clear();
-            for page in packed {
-                placed.push((data_at, page.len() as u32));
-                data_at += page.len() as u64;
-                since_check += page.len() as u64;
-                if failure.is_none() {
-                    if let Err(error) = data.write_all(&page) {
-                        *failure = Some(error.to_string());
-                    }
-                }
-            }
-            if since_check > 8 << 30 && failure.is_none() {
-                since_check = 0;
-                if let Err(error) = check_free(output, options.min_free_bytes) {
-                    *failure = Some(error);
-                }
-            }
-        };
+    let mut flush = |pending: &mut Vec<Vec<u8>>, placed: &mut Vec<(u64, u32)>| {
+        let packed: Vec<Vec<u8>> = pending.par_iter().map(|raw| deflate_page(raw)).collect();
+        pending.clear();
+        for page in packed {
+            placed.push((data_at, page.len() as u32));
+            data_at += page.len() as u64;
+            since_check += page.len() as u64;
+            data.write_all(&page).map_err(|e| e.to_string())?;
+        }
+        if since_check > 8 << 30 {
+            since_check = 0;
+            check_free(output, options.min_free_bytes)?;
+        }
+        Ok::<(), String>(())
+    };
     let mut paged = paginate_from(&scene, &mut store, &mut |page| {
         pending.push(page);
         if pending.len() >= 1024 {
-            flush(&mut pending, &mut failure, &mut placed);
+            flush(&mut pending, &mut placed)?;
         }
-    });
-    flush(&mut pending, &mut failure, &mut placed);
-    if let Some(error) = failure {
-        return Err(error);
-    }
+        Ok::<(), String>(())
+    })?;
+    flush(&mut pending, &mut placed)?;
     let pinned = paged.pinned_pages as usize;
     if paged.pages.len() - pinned != placed.len() {
         return Err("the pages written do not match the pages counted".to_owned());
@@ -722,15 +797,24 @@ fn bake_inner(
     // The spill has done its job, and the final file needs the room.
     std::fs::remove_file(spill_path).map_err(|e| e.to_string())?;
 
-    check_free(output, options.min_free_bytes)?;
     let head = encode_header_and_manifest(&paged);
-    let mut file =
-        BufWriter::with_capacity(1 << 22, File::create(output).map_err(|e| e.to_string())?);
+    report.file_bytes = head.len() as u64 + data_at;
+    // What is about to be written has to fit above the limit, as it isn't checked along the way.
+    check_free(
+        output,
+        options.min_free_bytes.saturating_add(report.file_bytes),
+    )?;
+    // Under another name until it is whole, so a failure can't leave half a scene in its place.
+    let mut file = BufWriter::with_capacity(
+        1 << 22,
+        File::create(final_path).map_err(|e| e.to_string())?,
+    );
     file.write_all(&head).map_err(|e| e.to_string())?;
     let mut source = File::open(data_path).map_err(|e| e.to_string())?;
     std::io::copy(&mut source, &mut file).map_err(|e| e.to_string())?;
     file.flush().map_err(|e| e.to_string())?;
-    report.file_bytes = head.len() as u64 + data_at;
+    drop(file);
+    std::fs::rename(final_path, output).map_err(|e| e.to_string())?;
     Ok(report)
 }
 
@@ -790,7 +874,28 @@ fn convert_material(
             "material '{name}': emissive texture is ignored, only its factor is used"
         ));
     }
+    if source.occlusion_texture().is_some() {
+        warnings.push(format!("material '{name}': its occlusion map is ignored"));
+    }
     let pbr = source.pbr_metallic_roughness();
+    let sets = [
+        pbr.base_color_texture().map(|t| t.tex_coord()),
+        pbr.metallic_roughness_texture().map(|t| t.tex_coord()),
+        source.normal_texture().map(|t| t.tex_coord()),
+    ];
+    if sets.iter().flatten().any(|&set| set != 0) {
+        warnings.push(format!(
+            "material '{name}': only the first UV set is supported"
+        ));
+    }
+    if map_transforms(&source)
+        .windows(2)
+        .any(|pair| pair[0] != pair[1])
+    {
+        warnings.push(format!(
+            "material '{name}': its maps use different texture transforms, only the first is applied"
+        ));
+    }
     let [er, eg, eb] = source.emissive_factor();
     let image = |texture: gltf::Texture<'_>| texture.source().index();
     let base_color = pbr.base_color_texture().map(|t| image(t.texture()));
@@ -829,6 +934,42 @@ fn convert_material(
     }
 }
 
+/// The formats a layer's colour map may be in.
+const COLOR_FORMATS: [u32; 2] = [ktx2::BC7_SRGB, ktx2::BC7_UNORM];
+/// The formats a layer's normal and surface maps may be in.
+const DATA_FORMATS: [u32; 1] = [ktx2::BC5_UNORM];
+
+fn image_path(document: &Document, image: usize, folder: &Path) -> Result<PathBuf, String> {
+    let source = document.images().nth(image).ok_or("no such image")?;
+    let gltf::image::Source::Uri { uri, .. } = source.source() else {
+        return Err("large scenes keep their images in files".to_owned());
+    };
+    Ok(folder.join(uri))
+}
+
+/// Checks that every image the layers use is there and in a format this can copy.
+fn check_images(document: &Document, folder: &Path, keys: &[LayerKey]) -> Result<(), String> {
+    let check = |image: usize, formats: &[u32]| -> Result<(), String> {
+        let path = image_path(document, image, folder)?;
+        let format = ktx2::read_format(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if formats.contains(&format) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{}: format {format} is not one this reads",
+                path.display()
+            ))
+        }
+    };
+    keys.par_iter().try_for_each(|key| {
+        check(key.base_color, &COLOR_FORMATS)?;
+        for image in [key.normal, key.metallic_roughness].into_iter().flatten() {
+            check(image, &DATA_FORMATS)?;
+        }
+        Ok(())
+    })
+}
+
 /// Opens one of a scene's images, which must be a KTX2 file of one of these formats.
 fn open_image(
     document: &Document,
@@ -836,11 +977,7 @@ fn open_image(
     folder: &Path,
     formats: &[u32],
 ) -> Result<Ktx2, String> {
-    let source = document.images().nth(image).ok_or("no such image")?;
-    let gltf::image::Source::Uri { uri, .. } = source.source() else {
-        return Err("large scenes keep their images in files".to_owned());
-    };
-    let path = folder.join(uri);
+    let path = image_path(document, image, folder)?;
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let texture = Ktx2::parse(bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     if !formats.contains(&texture.format) {
@@ -860,13 +997,8 @@ fn compose_layer(
     key: LayerKey,
     size: u32,
 ) -> Result<TextureLayer, String> {
-    let color_mips = open_image(
-        document,
-        key.base_color,
-        folder,
-        &[ktx2::BC7_SRGB, ktx2::BC7_UNORM],
-    )?
-    .fit_square(size)?;
+    let color_mips =
+        open_image(document, key.base_color, folder, &COLOR_FORMATS)?.fit_square(size)?;
     let levels = color_mips.len() as u32;
     let flat = |red: u8, green: u8| -> Vec<Vec<u8>> {
         (0..levels)
@@ -876,7 +1008,7 @@ fn compose_layer(
     let normal_mips = match key.normal {
         Some(image) => {
             let mut levels =
-                open_image(document, image, folder, &[ktx2::BC5_UNORM])?.fit_square(size)?;
+                open_image(document, image, folder, &DATA_FORMATS)?.fit_square(size)?;
             // glTF's green points towards decreasing V, and the renderer's derives its frame
             // from the direction of increasing V.
             for level in &mut levels {
@@ -887,7 +1019,7 @@ fn compose_layer(
         None => flat(128, 128),
     };
     let material_mips = match key.metallic_roughness {
-        Some(image) => open_image(document, image, folder, &[ktx2::BC5_UNORM])?.fit_square(size)?,
+        Some(image) => open_image(document, image, folder, &DATA_FORMATS)?.fit_square(size)?,
         None => flat(128, 255),
     };
     Ok(TextureLayer {

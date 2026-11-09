@@ -833,11 +833,11 @@ fn write_grid(dir: &TempDir, instances: Option<&[([f32; 3], [f32; 3])]>) -> Path
             for (_, scale) in instances {
                 nodes.extend(scale.iter().flat_map(|v| v.to_le_bytes()));
             }
-            std::fs::write(dir.0.join("model.nodes.bin"), &nodes).unwrap();
+            std::fs::write(dir.0.join("instances.bin"), &nodes).unwrap();
             let count = instances.len();
             (
                 r#", "extensions": {"EXT_mesh_gpu_instancing": {"attributes": {"TRANSLATION": 2, "SCALE": 3}}}"#.to_owned(),
-                format!(r#", {{"uri": "model.nodes.bin", "byteLength": {}}}"#, nodes.len()),
+                format!(r#", {{"uri": "instances.bin", "byteLength": {}}}"#, nodes.len()),
                 format!(
                     r#", {{"buffer": 1, "byteOffset": 0, "byteLength": {translations_len}}},
                        {{"buffer": 1, "byteOffset": {translations_len}, "byteLength": {translations_len}}}"#
@@ -975,4 +975,67 @@ fn a_bake_stops_when_the_drive_is_short_of_room() {
     let error = streamed::bake_large(&path, &output, &options).unwrap_err();
     assert!(error.contains("stopping"), "{error}");
     assert!(!output.exists());
+}
+
+#[test]
+fn a_large_bake_refuses_a_texture_size_that_cannot_be_halved() {
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let options = streamed::LargeOptions {
+        texture_size: 1000,
+        ..large_options()
+    };
+    let error = streamed::bake_large(&path, dir.0.join("out.solstice"), &options).unwrap_err();
+    assert!(error.contains("power of two"), "{error}");
+}
+
+/// A binary glTF's data is in its own file, which the large path would otherwise read as zeros.
+#[test]
+fn a_large_bake_refuses_binary_gltf() {
+    let dir = TempDir::new();
+    let mut json = br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}"#.to_vec();
+    json.resize(json.len().next_multiple_of(4), b' ');
+    let bin = [0u8; 4];
+    let mut glb = Vec::new();
+    glb.extend_from_slice(b"glTF");
+    glb.extend_from_slice(&2u32.to_le_bytes());
+    glb.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
+    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"JSON");
+    glb.extend_from_slice(&json);
+    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+    glb.extend_from_slice(b"BIN\0");
+    glb.extend_from_slice(&bin);
+    let path = dir.0.join("model.glb");
+    std::fs::write(&path, glb).unwrap();
+    let error =
+        streamed::bake_large(&path, dir.0.join("out.solstice"), &large_options()).unwrap_err();
+    assert!(error.contains("binary glTF"), "{error}");
+}
+
+/// A missing texture must be found before the hours of building, not after.
+#[test]
+fn a_large_bake_checks_its_textures_first() {
+    let dir = TempDir::new();
+    let path = write_grid(&dir, None);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let patched = text.replacen(
+        r#""scene": 0,"#,
+        r#""scene": 0,
+        "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+        "textures": [{"source": 0}],
+        "images": [{"uri": "missing.ktx2"}],"#,
+        1,
+    );
+    let patched = patched.replacen(r#""indices": 1}"#, r#""indices": 1, "material": 0}"#, 1);
+    std::fs::write(&path, patched).unwrap();
+    let options = streamed::LargeOptions {
+        textures: true,
+        ..large_options()
+    };
+    let output = dir.0.join("out.solstice");
+    let error = streamed::bake_large(&path, &output, &options).unwrap_err();
+    assert!(error.contains("missing.ktx2"), "{error}");
+    let spill = dir.0.join("out.solstice.spill.tmp");
+    assert!(!spill.exists() && !output.exists());
 }

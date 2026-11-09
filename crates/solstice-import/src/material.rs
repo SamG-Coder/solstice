@@ -53,7 +53,7 @@ fn to_uv_transform(transform: Option<gltf::texture::TextureTransform<'_>>) -> Uv
 
 /// The transforms of a material's maps. Only colour and metallic-roughness can report one
 /// through the glTF crate, so normal and occlusion maps are assumed to match them.
-fn map_transforms(material: &gltf::Material<'_>) -> Vec<UvTransform> {
+pub(crate) fn map_transforms(material: &gltf::Material<'_>) -> Vec<UvTransform> {
     let pbr = material.pbr_metallic_roughness();
     let mut transforms = Vec::new();
     if let Some(t) = pbr.base_color_texture() {
