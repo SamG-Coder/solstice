@@ -18,6 +18,7 @@ solstice-render = { path = "crates/solstice-render" }
 solstice-game = { path = "crates/solstice-game" }
 solstice-script = { path = "crates/solstice-script" }
 solstice-world = { path = "crates/solstice-world" }
+solstice-vehicle = { path = "crates/solstice-vehicle" }
 # Pure Rust, MIT. The GPU compressor and its wgpu dependency are left out.
 block_compression = { version = "0.11", default-features = false, features = ["bc15", "bc7"] }
 bytemuck = { version = "1", features = ["derive"] }

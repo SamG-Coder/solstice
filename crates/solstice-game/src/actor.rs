@@ -11,6 +11,7 @@
 //! collider box 3.9 3.5 0.2 at 0 1.75 0 # what it bumps into, placed relative to the actor
 //! character 0.3 1.8                    # walks, as a capsule of this radius and height
 //! animation keeper.anim                 # a skinned mesh's state machine, relative to this file
+//! vehicle gt.vehicle                    # a car, by its numbers, relative to this file
 //! ```
 //!
 //! `mesh PATH SCALE yaw=DEGREES` turns the model about its own origin, as a character made
@@ -19,6 +20,10 @@
 //! its own origin. A collider
 //! is `box SX SY SZ` or `capsule RADIUS HEIGHT`, then optionally `at X Y Z`, then `sensor`, which
 //! blocks nothing and reports what enters and leaves it, or `dynamic MASS`, which physics moves.
+//!
+//! `vehicle PATH` makes the actor a car, driven by `solstice-vehicle` on the numbers in that
+//! file; `vehicle PATH manual` leaves changing gear to the driver. With a `camera`, it is the
+//! car the player drives. Its mesh's wheels are the pieces whose own origins are at its hubs.
 //!
 //! Paths are relative to the actor file. The mesh is placed by the bake, wherever the scene
 //! places the actor, and moves with it. Every line but `name` may be left out.
@@ -155,6 +160,17 @@ pub struct ActorFile {
     pub character: Option<Character>,
     /// A state machine for a skinned mesh, relative to the actor file.
     pub animation: Option<String>,
+    /// Makes it a car: its `.vehicle` file, relative to the actor file.
+    pub vehicle: Option<Vehicle>,
+}
+
+/// A car's numbers, and who changes gear.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Vehicle {
+    /// A `.vehicle` file, relative to the actor file.
+    pub path: String,
+    /// Whether the gearbox changes gear by itself.
+    pub automatic: bool,
 }
 
 /// Names `self` already has in a script, which a property can't take.
@@ -219,6 +235,7 @@ impl ActorFile {
             collider: None,
             character: None,
             animation: None,
+            vehicle: None,
         };
         for (line, words) in lines(text) {
             let error = |message: String| FileError { line, message };
@@ -339,10 +356,22 @@ impl ActorFile {
                     }
                     actor.character = Some(Character { radius, height });
                 }
+                "vehicle" => {
+                    once(actor.vehicle.is_some())?;
+                    let automatic = match values {
+                        [_] => true,
+                        [_, "manual"] => false,
+                        _ => return Err(error("expected `vehicle PATH [manual]`".to_owned())),
+                    };
+                    actor.vehicle = Some(Vehicle {
+                        path: values[0].to_owned(),
+                        automatic,
+                    });
+                }
                 other => {
                     return Err(error(format!(
                         "unknown line `{other}`: an actor file has name, mesh, script, property, \
-                         camera, collider, character and animation lines"
+                         camera, collider, character, animation and vehicle lines"
                     )))
                 }
             }
@@ -355,6 +384,18 @@ impl ActorFile {
             return Err(FileError {
                 line: 1,
                 message: "an actor is a collider or a character, not both".to_owned(),
+            });
+        }
+        if actor.vehicle.is_some() && (actor.collider.is_some() || actor.character.is_some()) {
+            return Err(FileError {
+                line: 1,
+                message: "a vehicle has its own body: it takes no collider or character".to_owned(),
+            });
+        }
+        if actor.vehicle.is_some() && actor.animation.is_some() {
+            return Err(FileError {
+                line: 1,
+                message: "a vehicle is not animated".to_owned(),
             });
         }
         Ok(actor)
@@ -415,6 +456,10 @@ impl ActorFile {
         }
         if let Some(character) = &self.character {
             let _ = writeln!(text, "character {} {}", character.radius, character.height);
+        }
+        if let Some(vehicle) = &self.vehicle {
+            let manual = if vehicle.automatic { "" } else { " manual" };
+            let _ = writeln!(text, "vehicle {}{manual}", vehicle.path);
         }
         text
     }

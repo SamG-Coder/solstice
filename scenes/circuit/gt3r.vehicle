@@ -1,0 +1,46 @@
+# A Porsche 911 GT3 R of the 992 generation: the numbers its behaviour follows from.
+#
+# From Porsche Motorsport's published data: a 4,194 cc flat six behind the rear axle making up
+# to 416 kW (565 PS), a six-speed sequential gearbox, a wheelbase of 2,507 mm, 2,039 mm wide at
+# the front axle and 2,050 mm at the rear, and 1,250 kg before the driver and fuel. What Porsche
+# doesn't publish (spring rates, the torque curve's shape, downforce) is set to what the class
+# runs, and checked by driving it: crates/solstice-vehicle/tests/gt3r.rs.
+
+mass 1330                          # with its driver and fuel
+inertia 1650 1800 520              # pitch, yaw, roll
+centre 0 0.4 0.226                 # 59% of its weight on the rear axle
+body 1.96 0.95 4.55 at 0 0.67 0
+
+front at=1.2535 track=1.70 radius=0.34 inertia=1.5 driven=no
+front spring=110000 bump=6800 rebound=10000 bar=38000 travel=0.065,0.075 roll_centre=0.03
+front brake=3100 grip=1
+rear at=1.2535 track=1.72 radius=0.355 inertia=2.0 driven=yes
+rear spring=179000 bump=10400 rebound=14500 bar=16000 travel=0.07,0.08 roll_centre=0.08
+rear brake=2500 grip=1.07          # the rear tyres are wider, and carry more
+
+engine idle=1100 limit=9250 inertia=0.11 friction=30,0.01
+torque 1500 290
+torque 2000 330
+torque 3000 390
+torque 4000 440
+torque 5000 480
+torque 6000 500
+torque 6500 505
+torque 7000 500
+torque 7500 492
+torque 8000 482
+torque 8400 473                    # 416 kW here
+torque 8800 448
+torque 9250 415
+torque 9600 360
+
+gears 3.34 2.5 1.95 1.58 1.31 1.113
+final 3.9
+reverse 3
+gearbox shift=0.05 efficiency=0.93 clutch=900
+diff preload=80 power=0.5 coast=0.35
+
+aero drag=0.95 downforce=2.1 balance=0.36
+steering lock=26 ackermann=0.6
+geometry anti_dive=0.25 anti_squat=0.35
+assists abs=yes traction=yes stability=yes

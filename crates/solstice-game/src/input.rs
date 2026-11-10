@@ -61,6 +61,45 @@ interact key KeyE
 interact mouse left
 interact gamepad west
 interact touch tap
+# Driving: W and S or the arrows for the pedals, A and D to steer; the triggers and the left
+# stick; or a thumb on the left of the screen. E and Q, or the bumpers, change gear.
+throttle key KeyW
+throttle key ArrowUp
+throttle gamepad r2
+throttle touch stick_y -1
+brake key KeyS
+brake key ArrowDown
+brake gamepad l2
+brake touch stick_y
+steer key KeyD
+steer key ArrowRight
+steer key KeyA -1
+steer key ArrowLeft -1
+steer gamepad left_x
+steer touch stick_x
+handbrake key Space
+handbrake gamepad east
+shift_up key KeyE
+shift_up gamepad r1
+shift_down key KeyQ
+shift_down gamepad l1
+reset key KeyR
+reset gamepad north
+camera key KeyC
+camera gamepad select
+look_back key KeyB
+look_back gamepad r3
+# The right stick looks round the car, and tips the view up over it or down behind it; so do
+# J and L, and I and K.
+look_round gamepad right_x
+look_round key KeyL
+look_round key KeyJ -1
+look_over gamepad right_y
+look_over key KeyI
+look_over key KeyK -1
+# P hands the car to a driver of its own, round the circuit, and takes it back.
+autopilot key KeyP
+autopilot gamepad start
 ";
 
 /// A kind of input device.

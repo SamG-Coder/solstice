@@ -13,12 +13,13 @@ use crate::surface::{Shade, Surface, TILE_METRES};
 use glam::Vec3;
 
 /// Every surface in the library, by name.
-pub const NAMES: [&str; 19] = [
+pub const NAMES: [&str; 20] = [
     "sand",
     "wet_sand",
     "dirt",
     "dried_mud",
     "gravel",
+    "asphalt",
     "grass",
     "moss",
     "forest_floor",
@@ -43,6 +44,7 @@ pub fn by_name(name: &str, seed: u32) -> Option<Surface> {
         "dirt" => dirt(seed),
         "dried_mud" => dried_mud(seed),
         "gravel" => gravel(seed),
+        "asphalt" => asphalt(seed),
         "grass" => grass(seed),
         "moss" => moss(seed),
         "forest_floor" => forest_floor(seed),
@@ -448,6 +450,58 @@ pub fn gravel(seed: u32) -> Surface {
                 color: mix(color, tone(0.16, 0.135, 0.105), dust) * (0.25 + contact * 0.75),
                 roughness: 0.72 + id * 0.15,
                 cavity: 0.2 + contact * 0.8,
+            }
+        },
+    )
+}
+
+/// A race track's asphalt: crushed stone rolled flat in black bitumen. Close to, a fine speckle
+/// of grey chips with their tops worn level; from a car, an even dark grey that is lighter
+/// where traffic has polished the stone.
+pub fn asphalt(seed: u32) -> Surface {
+    let tile_metres = TILE_METRES;
+    let chips = Stones {
+        period: 300,
+        seed: seed + 400,
+        radius: 0.0075,
+        tile_metres,
+        coverage: 1.0,
+    };
+    let fines = Stones {
+        period: 420,
+        seed: seed + 401,
+        radius: 0.0045,
+        tile_metres,
+        coverage: 1.0,
+    };
+    let wear = fbm(4, 4, seed + 402);
+    let grain = fbm(240, 2, seed + 403);
+    let tint = fbm(7, 3, seed + 404).unit();
+    Surface::shaped(
+        move |u, v| {
+            let mut top = fines.sample(u, v);
+            let chip = chips.sample(u, v);
+            if chip.height > top.height {
+                top = chip;
+            }
+            // Rolled: no stone stands more than a couple of millimetres above the binder.
+            let height = top.height.min(0.0022) + grain.at(u, v) * 0.0002;
+            (height, if top.height > 0.0 { top.id } else { -1.0 })
+        },
+        move |u, v, id, relief| {
+            let worn = 0.5 + wear.at(u, v) * 0.5;
+            if id < 0.0 {
+                return Shade {
+                    color: tone(0.022, 0.022, 0.024),
+                    roughness: 0.9,
+                    cavity: 0.45,
+                };
+            }
+            let stone = mix(tone(0.07, 0.07, 0.075), tone(0.15, 0.147, 0.142), id);
+            Shade {
+                color: stone * (0.86 + tint.at(u, v) * 0.28) * (0.9 + worn * 0.16),
+                roughness: 0.8 + id * 0.1 - worn * 0.05,
+                cavity: 0.55 + smoothstep(-0.001, 0.0, relief.medium) * 0.45,
             }
         },
     )
