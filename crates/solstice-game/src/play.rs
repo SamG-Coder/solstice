@@ -124,17 +124,23 @@ impl Play {
         let scene = file(GAME_FILE)
             .ok_or_else(|| vec![format!("the scene's gameplay has no {GAME_FILE}")])?;
         let scene = SceneGame::parse(scene).map_err(|e| vec![format!("{GAME_FILE}: {e}")])?;
+        // Whether any actor is a car: only then are the built-in driving actions read.
+        let cars = scene.actors.iter().any(|line| {
+            file(&line.file)
+                .and_then(|text| ActorFile::parse(text).ok())
+                .is_some_and(|actor| actor.vehicle.is_some())
+        });
         let map = match &scene.input {
-            None => InputMap::default(),
+            None => InputMap::built_in(cars),
             Some(name) => match file(name).map(|text| InputMap::parse(text)) {
                 Some(Ok(map)) => map,
                 Some(Err(e)) => {
                     errors.push(format!("{name}: {e}"));
-                    InputMap::default()
+                    InputMap::built_in(cars)
                 }
                 None => {
                     errors.push(format!("{name}: missing from the scene's gameplay"));
-                    InputMap::default()
+                    InputMap::built_in(cars)
                 }
             },
         };
@@ -385,6 +391,8 @@ impl Play {
             let fallen = circuit.as_ref().is_some_and(|track| {
                 world.entities.get::<&Transform>(entity).is_ok_and(|at| {
                     let place = track.locate(at.translation, last_at);
+                    // Kept as the next step's hint, or every step searches the whole lap.
+                    last_at = Some(place.sample);
                     at.translation.y < track.samples[place.sample].position.y - drive::FALLEN
                 })
             });
@@ -498,6 +506,11 @@ impl Play {
     /// The player's car's instruments as of the latest frame, if the player drives a car.
     pub fn hud(&self) -> Option<&Hud> {
         self.hud.as_ref()
+    }
+
+    /// Whether the player is a car, whose instruments [`Play::hud`] has while it is driven.
+    pub fn drives(&self) -> bool {
+        self.player.as_ref().is_some_and(|player| player.car)
     }
 
     /// Gives every animated actor its skeleton and clips, from what the scene holds. Returns every
@@ -631,8 +644,13 @@ impl Play {
                 continue;
             };
             let world = global.interpolated(steps.alpha);
-            // A car's wheels, between the last two steps as the car is.
-            let rolled = entities.get::<&Wheels>(drawn.entity).ok().map(|wheels| {
+            // A car's wheels, between the last two steps as the car is. Only a car's instances
+            // name wheels, so nothing else looks for them.
+            let car = drawn.wheels.iter().any(Option::is_some);
+            let wheels = car
+                .then(|| entities.get::<&Wheels>(drawn.entity).ok())
+                .flatten();
+            let rolled = wheels.map(|wheels| {
                 std::array::from_fn(|index| {
                     let (before, now) = (&wheels.before[index], &wheels.now[index]);
                     (
@@ -661,6 +679,10 @@ impl Play {
             drawn.rolled = rolled;
         }
 
+        if flying {
+            // The car is not being driven, and its instruments go with the player.
+            self.hud = None;
+        }
         let player = self.player.as_ref().filter(|_| !flying)?;
         let world = entities
             .get::<&GlobalTransform>(player.entity)
@@ -677,16 +699,15 @@ impl Play {
             let shot = self
                 .chase
                 .frame(world, telemetry.speed, look, seconds as f32);
-            self.hud = Some(Hud {
+            // Filled in place each frame: the lap's times are copied into what the last frame
+            // had, and the track's name is set once.
+            let hud = self.hud.get_or_insert_with(|| Hud {
                 telemetry,
-                limit: car.vehicle.spec().engine.limit,
-                throttle: car.controls.throttle,
-                brake: car.controls.brake,
-                steer: car.controls.steer,
-                lap: entities
-                    .get::<&Lap>(player.entity)
-                    .ok()
-                    .map(|lap| (*lap).clone()),
+                limit: 0.0,
+                throttle: 0.0,
+                brake: 0.0,
+                steer: 0.0,
+                lap: None,
                 track: self
                     .track
                     .as_ref()
@@ -694,6 +715,17 @@ impl Play {
                     .unwrap_or_default(),
                 view: self.chase.view,
             });
+            hud.telemetry = telemetry;
+            hud.limit = car.vehicle.spec().engine.limit;
+            hud.throttle = car.controls.throttle;
+            hud.brake = car.controls.brake;
+            hud.steer = car.controls.steer;
+            hud.view = self.chase.view;
+            match (entities.get::<&Lap>(player.entity).ok(), &mut hud.lap) {
+                (Some(lap), Some(shown)) => shown.clone_from(&lap),
+                (Some(lap), shown) => *shown = Some((*lap).clone()),
+                (None, shown) => *shown = None,
+            }
             return Some(View {
                 position: shot.position,
                 yaw: shot.yaw,
@@ -760,6 +792,10 @@ impl Play {
         }
         for text in self.race_log.borrow_mut().drain(..) {
             self.messages.push_back(Message { error: false, text });
+        }
+        // What the physics finds wrong while playing, not only while loading.
+        for text in self.physics.borrow_mut().warnings.drain(..) {
+            self.messages.push_back(Message { error: true, text });
         }
         let dropped = host.take_dropped();
         if dropped > 0 {

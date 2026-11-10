@@ -35,11 +35,11 @@ fn drift(body: &Body) -> f32 {
 #[test]
 fn the_file_is_the_car_it_says() {
     let spec = spec();
-    assert!((spec.wheelbase() - 2.507).abs() < 1.0e-4);
+    assert!((spec.wheelbase() - 2.5).abs() < 1.0e-4);
     let (power, rpm) = spec.engine.peak_power();
-    assert!((410.0e3..422.0e3).contains(&power), "{} kW", power / 1000.0);
+    assert!((390.0e3..410.0e3).contains(&power), "{} kW", power / 1000.0);
     assert!((8000.0..8800.0).contains(&rpm));
-    assert_eq!(spec.engine.limit, 9250.0);
+    assert_eq!(spec.engine.limit, 9000.0);
     assert_eq!(spec.gearbox.gears.len(), 6);
     let rear = 1.0 - spec.front_weight();
     assert!(

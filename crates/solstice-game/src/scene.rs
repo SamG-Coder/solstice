@@ -190,9 +190,9 @@ impl SceneGame {
 
 /// The files a scene's gameplay names that `files` lacks, each once, in the order named: for
 /// a viewer that is handed a game a file at a time, to ask for the rest. [`GAME_FILE`] is the
-/// first, then the input actions and actor files it names, then each actor's script and
-/// animation. A file that can't be read names nothing: loading the game says what is wrong
-/// with it.
+/// first, then the input actions, track and actor files it names, then each actor's script,
+/// animation and vehicle. A file that can't be read names nothing: loading the game says what
+/// is wrong with it.
 pub fn missing_files(files: &[GameFile]) -> Vec<String> {
     let file = |name: &str| files.iter().find(|f| f.name == name).map(|f| &*f.text);
     let mut named = Vec::new();
@@ -201,11 +201,13 @@ pub fn missing_files(files: &[GameFile]) -> Vec<String> {
         Some(Err(_)) => {}
         Some(Ok(scene)) => {
             named.extend(scene.input);
+            named.extend(scene.track);
             for line in scene.actors {
                 let actor = file(&line.file).map(ActorFile::parse);
                 named.push(line.file.clone());
                 if let Some(Ok(actor)) = actor {
-                    let relative = actor.script.iter().chain(&actor.animation);
+                    let vehicle = actor.vehicle.as_ref().map(|vehicle| &vehicle.path);
+                    let relative = actor.script.iter().chain(&actor.animation).chain(vehicle);
                     named.extend(relative.map(|name| resolve(&line.file, name)));
                 }
             }
@@ -355,13 +357,34 @@ animation ../door.anim
 ",
         ));
         files.push(file(
+            "cars/car.actor",
+            "name car
+vehicle car.vehicle
+",
+        ));
+        files[0].text.push_str(
+            "track ring.track
+actor cars/car.actor 0 0 0 0
+",
+        );
+        files.push(file(
             "keys.input",
             "interact key KeyF
 ",
         ));
-        assert_eq!(missing_files(&files), ["doors/door.star", "door.anim"]);
+        assert_eq!(
+            missing_files(&files),
+            [
+                "ring.track",
+                "doors/door.star",
+                "door.anim",
+                "cars/car.vehicle"
+            ]
+        );
         files.push(file("doors/door.star", ""));
         files.push(file("door.anim", ""));
+        files.push(file("ring.track", ""));
+        files.push(file("cars/car.vehicle", ""));
         assert!(missing_files(&files).is_empty());
         // A file with a mistake names nothing: loading the game reports it.
         files[0].text = "actor".to_owned();

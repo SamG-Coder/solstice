@@ -1089,9 +1089,10 @@ Built for a racing game on the engine,
 - **The camera** follows the player's car. `camera` steps through four views behind it, each
   further out, and two on it. `look_round` and `look_over`, the right stick, swing it round
   the car and tip it over; `look_back` is the mirror.
-- **Input actions** for all this are among the built-in ones: `throttle`, `brake`, `steer`,
-  `handbrake`, `shift_up`, `shift_down`, `reset`, `camera`, `look_back`, `look_round`,
-  `look_over`, and `autopilot`, which hands the car to a driver of its own that follows the
+- **Input actions** for all this are among the built-in ones in a scene with a car among its
+  actors; a scene without one leaves them out, so its keys press nothing more. They are
+  `throttle`, `brake`, `steer`, `handbrake`, `shift_up`, `shift_down`, `reset`, `camera`,
+  `look_back`, `look_round`, `look_over`, and `autopilot`, which hands the car to a driver of its own that follows the
   track's centre line at a speed the bends ahead allow. That is for showing a circuit off,
   and for trying one headless: `viewer SCENE --play --press autopilot@40 --frames 5000`.
 - **Building one.** `circuit SIZE` in a scene file builds a whole circuit from the scene's

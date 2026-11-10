@@ -506,12 +506,15 @@ impl VehicleSpec {
 
     /// Whether a car can be made of these numbers, or why not. Numbers come from files, and a
     /// car with no mass, or wheels inside each other, would send the simulation to infinity.
+    /// Each number is also held to what some road vehicle, from a kart to a lorry, could have:
+    /// a body a kilometre long or a feather's mass hands the physics engine nonsense it can
+    /// panic on, or leaves a car that freezes with no word of why.
     pub fn check(&self) -> Result<(), String> {
-        let positive = |name: &str, value: f32| {
-            if value.is_finite() && value > 0.0 {
+        let within = |name: &str, value: f32, low: f32, high: f32| {
+            if value.is_finite() && value > 0.0 && (low..=high).contains(&value) {
                 Ok(())
             } else {
-                Err(format!("{name} must be above 0, not {value}"))
+                Err(format!("{name} must be from {low} to {high}, not {value}"))
             }
         };
         let share = |name: &str, value: f32| {
@@ -521,47 +524,59 @@ impl VehicleSpec {
                 Err(format!("{name} is a share, between 0 and 1, not {value}"))
             }
         };
-        positive("mass", self.mass)?;
+        within("mass", self.mass, 50.0, 100_000.0)?;
         for (name, value) in [
             ("pitch inertia", self.inertia.x),
             ("yaw inertia", self.inertia.y),
             ("roll inertia", self.inertia.z),
+        ] {
+            within(name, value, 1.0, 1.0e7)?;
+        }
+        for (name, value) in [
             ("the body's width", self.body_size.x),
             ("the body's height", self.body_size.y),
             ("the body's length", self.body_size.z),
         ] {
-            positive(name, value)?;
+            within(name, value, 0.1, 30.0)?;
         }
-        if !self.centre.is_finite() || !self.body_at.is_finite() {
-            return Err("the centre of mass and the body's middle must be numbers".into());
+        let near = |at: Vec3| at.is_finite() && at.abs().max_element() <= 30.0;
+        if !near(self.centre) || !near(self.body_at) {
+            return Err(
+                "the centre of mass and the body's middle must be within 30 m of the car".into(),
+            );
         }
         for (name, axle) in [("front", &self.front), ("rear", &self.rear)] {
-            for (what, value) in [
-                ("at", axle.at),
-                ("track", axle.track),
-                ("radius", axle.radius),
-                ("inertia", axle.inertia),
-                ("spring", axle.spring),
-                ("travel up", axle.travel_up),
-                ("travel down", axle.travel_down),
-                ("grip", axle.grip),
+            for (what, value, low, high) in [
+                ("at", axle.at, 0.05, 15.0),
+                ("track", axle.track, 0.2, 5.0),
+                ("radius", axle.radius, 0.05, 2.0),
+                ("inertia", axle.inertia, 0.01, 1000.0),
+                ("spring", axle.spring, 1000.0, 1.0e7),
+                ("travel up", axle.travel_up, 0.005, 1.0),
+                ("travel down", axle.travel_down, 0.005, 1.0),
+                ("grip", axle.grip, 0.1, 3.0),
             ] {
-                positive(&format!("{name} {what}"), value)?;
+                within(&format!("{name} {what}"), value, low, high)?;
             }
-            for (what, value) in [
-                ("bump", axle.bump),
-                ("rebound", axle.rebound),
-                ("bar", axle.bar),
-                ("brake", axle.brake),
-                ("roll_centre", axle.roll_centre),
+            for (what, value, high) in [
+                ("bump", axle.bump, 1.0e6),
+                ("rebound", axle.rebound, 1.0e6),
+                ("bar", axle.bar, 1.0e7),
+                ("brake", axle.brake, 1.0e5),
+                ("roll_centre", axle.roll_centre, 2.0),
             ] {
-                if !value.is_finite() || value < 0.0 {
-                    return Err(format!("{name} {what} can't be below 0, not {value}"));
+                if !(0.0..=high).contains(&value) {
+                    return Err(format!(
+                        "{name} {what} must be from 0 to {high}, not {value}"
+                    ));
                 }
             }
         }
         if self.centre.z <= -self.front.at || self.centre.z >= self.rear.at {
             return Err("the centre of mass must be between the axles".into());
+        }
+        if self.front.brake + self.rear.brake <= 0.0 {
+            return Err("a car needs brakes on at least one axle".into());
         }
         if !self.front.driven && !self.rear.driven {
             return Err("one axle must be driven".into());
@@ -570,15 +585,27 @@ impl VehicleSpec {
             return Err("four-wheel drive isn't built yet: drive one axle".into());
         }
         let tyre = &self.tyre;
-        for (name, value) in [
-            ("tyre grip along", tyre.grip_long),
-            ("tyre grip across", tyre.grip_lat),
-            ("the tyre's peak slip ratio", tyre.peak_ratio),
-            ("the tyre's peak slip angle", tyre.peak_angle),
-            ("the tyre's nominal load", tyre.nominal_load),
-            ("the tyre's relaxation length", tyre.relaxation),
+        for (name, value, low, high) in [
+            ("tyre grip along", tyre.grip_long, 0.1, 5.0),
+            ("tyre grip across", tyre.grip_lat, 0.1, 5.0),
+            ("the tyre's peak slip ratio", tyre.peak_ratio, 0.01, 0.5),
+            (
+                "the tyre's nominal load",
+                tyre.nominal_load,
+                100.0,
+                100_000.0,
+            ),
+            ("the tyre's relaxation length", tyre.relaxation, 0.01, 5.0),
         ] {
-            positive(name, value)?;
+            within(name, value, low, high)?;
+        }
+        // The tyre's curve is built from the angle's tangent, which turns over past 90 degrees;
+        // no tyre grips best beyond about 15.
+        let peak = tyre.peak_angle.to_degrees();
+        if !(0.5..=30.0).contains(&peak) {
+            return Err(format!(
+                "the tyre's peak slip angle is from 0.5 to 30 degrees, not {peak}"
+            ));
         }
         for (name, (c, e)) in [("along", tyre.shape_long), ("across", tyre.shape_lat)] {
             if !(c > 1.0 && c < 2.0 && e < 1.0 && e.is_finite()) {
@@ -597,13 +624,19 @@ impl VehicleSpec {
         if engine.torque.windows(2).any(|pair| pair[1].0 <= pair[0].0) {
             return Err("the `torque` points must rise in rpm".into());
         }
-        if engine.torque.iter().any(|p| !p.1.is_finite() || p.1 < 0.0) {
-            return Err("a `torque` point can't be below 0".into());
+        if engine
+            .torque
+            .iter()
+            .any(|p| !(0.0..=100_000.0).contains(&p.1))
+        {
+            return Err("a `torque` point is from 0 to 100,000 N m".into());
         }
-        positive("engine idle", engine.idle)?;
-        positive("engine inertia", engine.inertia)?;
-        if engine.limit <= engine.idle * 1.5 {
-            return Err("the engine's limit must be well above its idle".into());
+        within("engine idle", engine.idle, 100.0, 20_000.0)?;
+        within("engine inertia", engine.inertia, 0.001, 100.0)?;
+        if engine.limit <= engine.idle * 1.5 || engine.limit > 30_000.0 {
+            return Err(
+                "the engine's limit must be well above its idle, and at most 30,000".into(),
+            );
         }
         if engine.friction.0 < 0.0 || engine.friction.1 < 0.0 {
             return Err("engine friction can't be below 0".into());
@@ -613,14 +646,14 @@ impl VehicleSpec {
             return Err("a gearbox has one to ten gears".into());
         }
         for &ratio in &gearbox.gears {
-            positive("a gear's ratio", ratio)?;
+            within("a gear's ratio", ratio, 0.1, 50.0)?;
         }
         if gearbox.gears.windows(2).any(|pair| pair[1] >= pair[0]) {
             return Err("each gear must be taller than the one below: a smaller ratio".into());
         }
-        positive("the final drive", gearbox.final_drive)?;
-        positive("the reverse ratio", gearbox.reverse)?;
-        positive("the clutch's torque", gearbox.clutch)?;
+        within("the final drive", gearbox.final_drive, 0.1, 50.0)?;
+        within("the reverse ratio", gearbox.reverse, 0.1, 50.0)?;
+        within("the clutch's torque", gearbox.clutch, 1.0, 1.0e6)?;
         if !(0.0..=1.0).contains(&gearbox.shift_seconds) {
             return Err("a shift takes between 0 and 1 seconds".into());
         }
@@ -632,8 +665,9 @@ impl VehicleSpec {
             return Err("the diff's preload can't be below 0, nor its power lock above 1".into());
         }
         share("the diff's coast lock", diff.coast)?;
-        if self.aero.drag < 0.0 || self.aero.downforce < 0.0 {
-            return Err("drag and downforce can't be below 0".into());
+        let aero = 0.0..=50.0;
+        if !aero.contains(&self.aero.drag) || !aero.contains(&self.aero.downforce) {
+            return Err("drag and downforce are from 0 to 50".into());
         }
         share("aero balance", self.aero.balance)?;
         if !(self.steering_lock > 0.0 && self.steering_lock < 1.2) {
@@ -859,6 +893,32 @@ mod tests {
         assert!((500.0..620.0).contains(&downforce), "{downforce} kg");
     }
 
+    /// Numbers no road vehicle has, each of which once loaded and then panicked the physics
+    /// engine, froze the car, or slid it off sideways.
+    #[test]
+    fn numbers_no_car_has_are_mistakes() {
+        let refused: [fn(&mut VehicleSpec); 9] = [
+            |s| s.body_size = Vec3::splat(1.0e30),
+            |s| s.mass = 1.0e-30,
+            |s| s.inertia.y = 1.0e-6,
+            |s| s.tyre.peak_angle = 120_f32.to_radians(),
+            |s| s.front.radius = 1.0e20,
+            |s| s.centre.z = 1.0e9,
+            |s| (s.front.brake, s.rear.brake) = (0.0, 0.0),
+            |s| s.engine.limit = 1.0e9,
+            |s| s.aero.downforce = 1.0e9,
+        ];
+        for (index, change) in refused.iter().enumerate() {
+            let mut spec = VehicleSpec::gt();
+            change(&mut spec);
+            assert!(spec.check().is_err(), "change {index} was accepted");
+            assert!(
+                VehicleSpec::parse(&spec.to_text()).is_err(),
+                "change {index} was read from a file"
+            );
+        }
+    }
+
     #[test]
     fn torque_is_read_between_its_points() {
         let engine = VehicleSpec::gt().engine;
@@ -907,7 +967,7 @@ mod tests {
             ("front spring", 1, "KEY=VALUE"),
             ("front springs=3", 1, "no `springs`"),
             ("front travel=0.1", 1, "comma"),
-            ("mass 0", 1, "mass must be above 0"),
+            ("mass 0", 1, "mass must be from 50"),
             ("gears 3 2 2.5", 1, "taller"),
             ("torque 1000 300", 1, "two `torque` points"),
             ("torque 2000 300\ntorque 1000 300", 1, "rise in rpm"),

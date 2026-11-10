@@ -48,6 +48,8 @@ pub(crate) struct CarStep {
     /// The velocity and spin its body was given, to carry it to where the step ends.
     carried: Vec3,
     turned: Vec3,
+    /// Whether its dynamics have once failed, and been said to.
+    failed: bool,
 }
 
 /// The scene, as a wheel finds it.
@@ -196,8 +198,23 @@ impl Physics {
                 car.controls = controls;
             }
             if !(body.position.is_finite() && body.velocity.is_finite() && body.spin.is_finite()) {
-                self.warnings
-                    .push("a car's dynamics gave no answer for a step, which was skipped".into());
+                // Its wheels and engine may hold the same nonsense, so the car starts again from
+                // rest where it is, and is said to have once rather than every step.
+                let failed = self.cars.get(&entity).is_some_and(|step| step.failed);
+                if !failed {
+                    self.warnings.push(
+                        "a car's dynamics gave no answer for a step, so it was stopped".into(),
+                    );
+                }
+                car.vehicle = Vehicle::new(car.vehicle.spec().clone(), GRAVITY);
+                let rigid = self.bodies.get_mut(handle).expect("found above");
+                rigid.set_linvel(Vector::ZERO, true);
+                rigid.set_angvel(Vector::ZERO, true);
+                let step = CarStep {
+                    failed: true,
+                    ..CarStep::default()
+                };
+                self.cars.insert(entity, step);
                 continue;
             }
             let centre = car.vehicle.spec().centre;
@@ -208,6 +225,7 @@ impl Physics {
                 spin: body.spin,
                 carried: moved / dt,
                 turned: (body.rotation * before.rotation.inverse()).to_scaled_axis() / dt,
+                failed: self.cars.get(&entity).is_some_and(|step| step.failed),
             };
             let rigid = self.bodies.get_mut(handle).expect("found above");
             rigid.set_linvel(to_vector(step.carried), true);

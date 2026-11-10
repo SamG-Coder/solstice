@@ -820,6 +820,11 @@ impl WebViewer {
         values
     }
 
+    /// Whether the player is a car, so the page asks for [`WebViewer::hud`] only then.
+    pub fn drives(&self) -> bool {
+        self.play.as_ref().is_some_and(|play| play.play.drives())
+    }
+
     /// The name of the circuit the player's car is on, or nothing.
     pub fn hud_track(&self) -> String {
         self.play

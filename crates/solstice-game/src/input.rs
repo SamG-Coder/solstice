@@ -61,6 +61,10 @@ interact key KeyE
 interact mouse left
 interact gamepad west
 interact touch tap
+";
+
+/// The built-in actions for driving, which a scene whose player can be a car has as well.
+pub const DRIVING_INPUT: &str = "\
 # Driving: W and S or the arrows for the pedals, A and D to steer; the triggers and the left
 # stick; or a thumb on the left of the screen. E and Q, or the bumpers, change gear.
 throttle key KeyW
@@ -166,7 +170,19 @@ pub struct InputMap {
 
 impl Default for InputMap {
     fn default() -> Self {
-        Self::parse(DEFAULT_INPUT).expect("the built-in actions read")
+        Self::built_in(true)
+    }
+}
+
+impl InputMap {
+    /// The built-in actions, with those for driving if `driving`. A scene with no car leaves
+    /// them out, so its keys don't also press pedals it hasn't got.
+    pub fn built_in(driving: bool) -> Self {
+        let text = match driving {
+            true => format!("{DEFAULT_INPUT}{DRIVING_INPUT}"),
+            false => DEFAULT_INPUT.to_owned(),
+        };
+        Self::parse(&text).expect("the built-in actions read")
     }
 }
 

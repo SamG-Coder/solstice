@@ -70,8 +70,6 @@ pub struct Track {
 /// How many samples either side of a hint are searched for the nearest: enough for a car at any
 /// speed between two steps, and for the wheels of one car.
 const NEARBY: usize = 16;
-/// A point further than this from where the hint says it should be is searched for afresh.
-const LOST: f32 = 60.0;
 
 impl Track {
     /// A track through these samples, closing back to the first.
@@ -116,6 +114,14 @@ impl Track {
     }
 
     /// How far round the lap each sector starts, the first at 0.
+    /// Where line `line` is, in metres round the lap: 0 is the start line, then each sector's.
+    pub fn sector_start(&self, line: usize) -> f32 {
+        match line {
+            0 => 0.0,
+            _ => self.distances[self.sectors[line - 1]],
+        }
+    }
+
     pub fn sector_starts(&self) -> Vec<f32> {
         std::iter::once(0.0)
             .chain(self.sectors.iter().map(|&sample| self.distances[sample]))
@@ -244,8 +250,15 @@ impl Track {
             }
             None => nearest(&mut (0..count)),
         };
-        if hint.is_some() && best.0 > LOST * LOST {
-            best = nearest(&mut (0..count));
+        // Where two stretches run side by side, as at a hairpin, a hint can hold on to the wrong
+        // one: a point off the road the hint found may be on another, so it is searched for
+        // afresh. Off the road is rare enough, and a lap's samples few enough, for that.
+        if hint.is_some() {
+            let found = &self.samples[best.1];
+            let road = found.half_left.max(found.half_right);
+            if best.0 > road * road {
+                best = nearest(&mut (0..count));
+            }
         }
         let (_, index, share) = best;
         let (here, next) = (&self.samples[index], &self.samples[(index + 1) % count]);
@@ -429,6 +442,50 @@ pub(crate) mod tests {
         // A hint from the other side of the lap.
         let place = track.locate(Vec3::new(0.0, 0.0, -31.0), Some(track.samples.len() / 2));
         assert!((place.along - 31.0).abs() < 0.01);
+    }
+
+    /// Two straights 30 m apart, joined by a hairpin: a car that slides from one to the other
+    /// is on the other's road, not on the grass beside the first.
+    #[test]
+    fn a_hint_lets_go_of_a_stretch_the_car_has_left() {
+        let mut centre: Vec<(Vec3, Vec3)> = Vec::new();
+        for k in 0..100 {
+            centre.push((Vec3::new(0.0, 0.0, -2.0 * k as f32), Vec3::NEG_Z));
+        }
+        for k in 0..24 {
+            let angle = std::f32::consts::PI * k as f32 / 24.0;
+            centre.push((
+                Vec3::new(15.0 - 15.0 * angle.cos(), 0.0, -200.0 - 15.0 * angle.sin()),
+                Vec3::new(angle.sin(), 0.0, -angle.cos()),
+            ));
+        }
+        for k in 0..100 {
+            centre.push((Vec3::new(30.0, 0.0, -200.0 + 2.0 * k as f32), Vec3::Z));
+        }
+        for k in 0..24 {
+            let angle = std::f32::consts::PI * k as f32 / 24.0;
+            centre.push((
+                Vec3::new(15.0 + 15.0 * angle.cos(), 0.0, 15.0 * angle.sin()),
+                Vec3::new(-angle.sin(), 0.0, angle.cos()),
+            ));
+        }
+        let samples = centre
+            .into_iter()
+            .map(|(position, forward)| Sample {
+                position,
+                left: Vec3::Y.cross(forward),
+                half_left: 6.0,
+                half_right: 6.0,
+                left_bands: vec![(Surface::Grass, 40.0)],
+                right_bands: vec![(Surface::Grass, 40.0)],
+            })
+            .collect();
+        let track = Track::new("Hairpin", samples, vec![60, 180]).unwrap();
+        let first = track.locate(Vec3::new(0.0, 0.0, -100.0), None);
+        let other = track.locate(Vec3::new(29.0, 0.0, -100.0), Some(first.sample));
+        assert_eq!(other.surface, Surface::Asphalt, "{other:?}");
+        assert!((other.offset.abs() - 1.0).abs() < 0.05, "{other:?}");
+        assert_eq!(other, track.locate(Vec3::new(29.0, 0.0, -100.0), None));
     }
 
     #[test]

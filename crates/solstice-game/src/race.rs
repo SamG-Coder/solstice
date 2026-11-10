@@ -1,8 +1,9 @@
 //! Timing laps.
 //!
 //! A lap is timed from the start line round to it again, and counts only if every sector's
-//! line was crossed in order on the way: a car that turns round, or cuts across the infield,
-//! doesn't set a time. A lap on which the car left the track with all four wheels is still
+//! line was crossed in order on the way, and at least half the lap's length was driven forwards:
+//! a car that turns round, or cuts across the infield, doesn't set a time, even on a track with
+//! no sectors. A lap on which the car left the track with all four wheels is still
 //! timed, and marked as not valid, as race control would.
 
 use crate::track::Track;
@@ -30,7 +31,7 @@ pub enum LapEvent {
 }
 
 /// One car's laps.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Lap {
     /// Laps finished.
     pub count: u32,
@@ -57,6 +58,35 @@ pub struct Lap {
     /// The sample of the track the car was last nearest.
     hint: Option<usize>,
     before: Option<f32>,
+    /// Metres driven forwards since the lap began.
+    driven: f32,
+}
+
+impl Clone for Lap {
+    fn clone(&self) -> Self {
+        let mut lap = Self {
+            splits: Vec::new(),
+            best_splits: Vec::new(),
+            ..*self
+        };
+        lap.clone_from(self);
+        lap
+    }
+
+    /// Copies into what `self` already holds, as the dashboard does every frame.
+    fn clone_from(&mut self, source: &Self) {
+        let (mut splits, mut best_splits) = (
+            std::mem::take(&mut self.splits),
+            std::mem::take(&mut self.best_splits),
+        );
+        splits.clone_from(&source.splits);
+        best_splits.clone_from(&source.best_splits);
+        *self = Self {
+            splits,
+            best_splits,
+            ..*source
+        };
+    }
 }
 
 /// Further than this between two steps is not driving: the car was put somewhere.
@@ -79,6 +109,7 @@ impl Lap {
             sector_began: 0.0,
             hint: None,
             before: None,
+            driven: 0.0,
         }
     }
 
@@ -117,17 +148,22 @@ impl Lap {
         if moved <= 0.0 || moved > JUMP {
             return events;
         }
-        let lines = track.sector_starts();
+        self.driven += moved;
         // Whether a line at `line` metres lies in the stretch just driven: after where the car
         // was, and up to where it is. A car that stops exactly on a line has crossed it, once.
         let crossed = |line: f32| {
             let ahead = (line - before).rem_euclid(length);
             ahead > 0.0 && ahead <= moved
         };
-        if !crossed(lines[self.next]) {
+        if !crossed(track.sector_start(self.next)) {
+            return events;
+        }
+        if self.next == 0 && self.current.is_some() && self.driven < length * 0.5 {
+            // Back over the line and forwards again is not a lap.
             return events;
         }
         if self.next == 0 {
+            self.driven = 0.0;
             if let Some(current) = self.current {
                 self.finish_sector(current, &mut events);
                 events.push(LapEvent::Finished {
@@ -155,7 +191,7 @@ impl Lap {
             self.sector = self.next;
             self.sector_began = current;
         }
-        self.next = (self.next + 1) % lines.len();
+        self.next = (self.next + 1) % (track.sectors.len() + 1);
         events
     }
 
@@ -262,6 +298,33 @@ mod tests {
         let events = drive(&mut lap, &track, -30.0, 30.0, 50.0);
         assert!(events.is_empty(), "{events:?}");
         assert_eq!(lap.count, 0);
+    }
+
+    #[test]
+    fn with_no_sectors_going_back_over_the_line_is_still_no_lap() {
+        let oval = oval();
+        let track = Track::new("Ring", oval.samples.clone(), Vec::new()).unwrap();
+        let length = track.length();
+        let mut lap = Lap::new(&track);
+        drive(&mut lap, &track, -20.0, 5.0, 50.0);
+        drive(&mut lap, &track, 5.0, -5.0, -50.0);
+        let events = drive(&mut lap, &track, -5.0, 5.0, 50.0);
+        assert!(events.is_empty(), "{events:?}");
+        let events = drive(&mut lap, &track, 5.0, length + 5.0, 50.0);
+        assert!(
+            matches!(
+                events[..],
+                [
+                    ..,
+                    LapEvent::Finished {
+                        lap: 1,
+                        valid: true,
+                        ..
+                    }
+                ]
+            ),
+            "{events:?}"
+        );
     }
 
     #[test]

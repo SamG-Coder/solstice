@@ -1098,8 +1098,17 @@ async function startGame(viewer, file) {
   };
   let driving = false;
   const drawDash = () => {
-    const hud = viewer.hud();
-    if (hud.length === 0) return;
+    // Only a car has instruments, and not while the player is away flying.
+    const hud = viewer.drives() ? viewer.hud() : [];
+    if (hud.length === 0) {
+      if (driving) {
+        driving = false;
+        el("dash").hidden = true;
+        el("laps").hidden = true;
+        document.body.classList.remove("driving");
+      }
+      return;
+    }
     if (!driving) {
       driving = true;
       el("dash").hidden = false;
