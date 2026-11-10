@@ -21,9 +21,9 @@ use glam::Vec3;
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const CALM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
-const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-const SCENE_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
-const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
+pub(super) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(super) const SCENE_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+pub(super) const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 
 /// The smoothest the water's surface ever is, as GGX alpha: still water is not a perfect
 /// mirror, for the drawn waves' own slopes vary across a pixel.
@@ -118,37 +118,45 @@ fn buffer(gpu: &Gpu, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wg
 
 /// The textures the water layer and pass draw into, at the render size.
 pub struct WaterTargets {
-    depth: wgpu::TextureView,
-    calm: Target,
+    /// The layer the sea's patches are drawn into: its depth, and where each pixel's water lay
+    /// on the calm sea. Still water has no need of it.
+    layer: Option<(wgpu::TextureView, Target)>,
     /// The lit scene with the water over it, its depth and its motion: what post reads.
     pub color: Target,
     pub scene_depth: Target,
     pub motion: Target,
-    size: (u32, u32),
-    generation: u64,
+    pub(super) size: (u32, u32),
+    pub(super) generation: u64,
 }
 
 impl WaterTargets {
-    pub fn new(gpu: &Gpu, size: (u32, u32)) -> Self {
+    /// Targets for water over the scene; with a `sea`, the layer its surface is drawn into too.
+    pub fn new(gpu: &Gpu, size: (u32, u32), sea: bool) -> Self {
         static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("water depth"),
-            size: wgpu::Extent3d {
-                width: size.0,
-                height: size.1,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
         let render = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let layer = sea.then(|| {
+            let depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("water depth"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            (
+                depth.create_view(&Default::default()),
+                Target::new(gpu, "water calm", size, CALM_FORMAT, render),
+            )
+        });
         Self {
-            depth: depth.create_view(&Default::default()),
-            calm: Target::new(gpu, "water calm", size, CALM_FORMAT, render),
+            layer,
             // Particles are drawn over it.
             color: Target::new(gpu, "scene with water", size, COLOR_FORMAT, render),
             // Solid particles draw their depth and motion into these two, and tests read them.
@@ -169,6 +177,11 @@ impl WaterTargets {
             size,
             generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// Whether these have the layer the sea's surface is drawn into.
+    pub fn for_sea(&self) -> bool {
+        self.layer.is_some()
     }
 }
 
@@ -449,6 +462,10 @@ impl WaterSurface {
             .groups
             .as_ref()
             .is_some_and(|(w, t, _, _)| *w == waves.generation() && *t == targets.generation);
+        let (layer_depth, calm) = targets
+            .layer
+            .as_ref()
+            .expect("targets made for a sea have its layer");
         if !fresh {
             let tex = |view| wgpu::BindingResource::TextureView(view);
             let raster = gpu.bind_group(
@@ -469,8 +486,8 @@ impl WaterSurface {
                     tex(scene.lit),
                     tex(scene.depth),
                     tex(scene.motion),
-                    tex(&targets.depth),
-                    tex(&targets.calm.view),
+                    tex(layer_depth),
+                    tex(&calm.view),
                     tex(&waves.derivatives.view),
                     tex(&waves.displacement.view),
                     wgpu::BindingResource::Sampler(&self.sampler),
@@ -494,7 +511,7 @@ impl WaterSurface {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("ocean surface"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.calm.view,
+                    view: &calm.view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -503,7 +520,7 @@ impl WaterSurface {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &targets.depth,
+                    view: layer_depth,
                     depth_ops: Some(wgpu::Operations {
                         // Reversed depth: zero is infinitely far, so no water anywhere yet.
                         load: wgpu::LoadOp::Clear(0.0),

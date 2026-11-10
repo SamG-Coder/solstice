@@ -4,13 +4,24 @@
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
-//! viewer [SCENE] --play [--scripts DIR] [--capture out.png --frames N [--press ACTION@FRAME]...
-//!        [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
+//! viewer [SCENE] --play [--fly] [--scripts DIR] [--capture out.png --frames N
+//!        [--press ACTION@FRAME]... [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
+//! viewer [SCENE] --game DIR [the same as with --play]
+//! viewer [SCENE] --instances-near x,y,z,radius
 //! ```
 //!
 //! `--play` runs the scene's game, if it has one: its actors move, the camera is the player's,
 //! and keys and the mouse are its input. Its scripts are reloaded from `--scripts` (by default
-//! `scenes`, where scene text files live) when they change on disk.
+//! `scenes`, where scene text files live) when they change on disk. **V** leaves the player
+//! standing and flies the camera from where it is, and comes back; `--fly` starts that way. The
+//! game goes on meanwhile, and still hears the keys: a door opens to the camera flown up to it.
+//!
+//! `--game DIR` plays the game in a folder in place of the one baked into the scene, if any:
+//! its `scene.game`, and the actor files, scripts and input actions that names. So a scene
+//! baked without a game, or one too big to bake again, is given one, or a new one, without a
+//! bake. Its `actor` lines name the scene's instances themselves (`instances=FIRST+COUNT`),
+//! which `--instances-near` lists: each instance placed within a radius of a point, with its
+//! mesh, material, place and yaw.
 
 #[cfg(target_arch = "wasm32")]
 fn main() {}
@@ -27,8 +38,8 @@ mod native {
     use solstice_asset::scene::Viewpoint;
     use solstice_asset::LoadedScene;
     use solstice_render::{
-        Camera, DebugView, Effect, Environment, Gpu, Ocean, Quality, Renderer, RendererSettings,
-        StreamRequest, StreamingBudget, TimeOfDay, Weather,
+        Camera, DebugView, Effect, Environment, Gpu, Ocean, Pond, Quality, Renderer,
+        RendererSettings, StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
     use solstice_viewer::bob::Bobbing;
     use solstice_viewer::play::PlayMode;
@@ -61,7 +72,7 @@ mod native {
 
     impl PageReader {
         /// Pages to read at once: enough to use the disk, few enough to stay out of the way.
-        const MAX_FETCHING: u32 = 32;
+        const MAX_FETCHING: u32 = 256;
 
         fn new(path: &Path) -> Self {
             let (finished_sender, finished) = mpsc::channel();
@@ -124,10 +135,14 @@ mod native {
         let mut packed = vec![0; header.manifest_bytes as usize];
         file.read_exact(&mut packed)?;
         let manifest = solstice_asset::file::inflate(&packed)?;
-        Ok(solstice_asset::file::decode_manifest(
+        let scene = solstice_asset::file::decode_manifest(
             &manifest,
             header.manifest_offset + header.manifest_bytes,
-        )?)
+        )?;
+        if scene.external.is_some() {
+            return Err("this is the file made for browsers: open the .solstice file".into());
+        }
+        Ok(scene)
     }
 
     /// A scene as this run holds it: all in memory, or read from disk as wanted.
@@ -165,6 +180,28 @@ mod native {
                 pieces.push(solstice_asset::file::inflate_limited(&packed, raw)?);
             }
             Ok(Some(index.decode(&pieces)?))
+        }
+
+        /// Prints the instances placed within a radius of a point, `near` being x, y, z and the
+        /// radius: what a scene's game needs to say which instances an actor moves.
+        fn list_instances(&self, near: [f32; 4]) {
+            let paged = match self {
+                Self::Loaded(loaded) => &loaded.scene,
+                Self::Streamed(paged) => paged,
+            };
+            let [x, y, z, radius] = near;
+            println!("instance  mesh  material  x y z  yaw");
+            for (id, instance) in paged.instances.iter().enumerate() {
+                let (_, rotation, at) = instance.transform.to_scale_rotation_translation();
+                if at.distance(Vec3::new(x, y, z)) > radius {
+                    continue;
+                }
+                let yaw = rotation.to_euler(glam::EulerRot::YXZ).0.to_degrees();
+                println!(
+                    "{id}  {}  {}  {:.3} {:.3} {:.3}  {yaw:.1}",
+                    instance.mesh, instance.material, at.x, at.y, at.z
+                );
+            }
         }
 
         fn gameplay(&self) -> &[solstice_asset::GameFile] {
@@ -209,6 +246,7 @@ mod native {
             if let Some(level) = options.sea_level {
                 renderer.set_sea_level(level);
             }
+            renderer.set_ponds(&options.ponds);
             spawn_effects(&mut renderer, options);
             (renderer, reader)
         }
@@ -245,6 +283,8 @@ mod native {
         /// their own bring both.
         ocean: Option<Ocean>,
         sea_level: Option<f32>,
+        /// Still water to lay over the scene: each a rectangle and the water's height.
+        ponds: Vec<Pond>,
         /// Particle effects to run, by name or file, and where.
         effects: Vec<(Effect, Vec3)>,
         /// Instances to rock as if afloat: those centred within a radius of a point across the
@@ -252,6 +292,12 @@ mod native {
         bob: Option<[f32; 5]>,
         /// Run the scene's game.
         play: bool,
+        /// Start the game flying the camera, with whoever is played left standing.
+        fly: bool,
+        /// A folder holding the game to run, in place of the scene's own.
+        game: Option<PathBuf>,
+        /// List the instances placed within a radius of a point, as x, y, z, radius, and stop.
+        instances_near: Option<[f32; 4]>,
         /// Where the scene's scripts are on disk, by the names the scene gives them, to reload
         /// them when they change.
         scripts: PathBuf,
@@ -287,7 +333,19 @@ mod native {
         if !options.play {
             return None;
         }
-        let files = scene.gameplay();
+        let side;
+        let files = match &options.game {
+            None => scene.gameplay(),
+            Some(folder) => {
+                let mut files = Vec::new();
+                if let Err(error) = read_game_files(folder, "", &mut files) {
+                    log::error!("--game {}: {error}", folder.display());
+                    return None;
+                }
+                side = files;
+                &side
+            }
+        };
         if files.is_empty() {
             log::warn!("--play: this scene has no gameplay, so there is nothing to play");
             return None;
@@ -303,12 +361,13 @@ mod native {
             log::warn!("this scene has no collision: rebake it to walk on it");
         }
         match PlayMode::start(renderer, files, collision.as_ref(), &scene.animation()) {
-            Ok(play) => {
+            Ok(mut play) => {
                 log::info!(
                     "playing: {} instances move, scripts {}",
                     play.play.instances().count(),
                     play.play.scripts().join(", ")
                 );
+                play.play.set_flying(options.fly);
                 Some(play)
             }
             Err(errors) => {
@@ -318,6 +377,26 @@ mod native {
                 None
             }
         }
+    }
+
+    /// Reads every text file in a folder, and the folders in it, as gameplay files named as a
+    /// scene's are: from the folder, with `/` between folders.
+    fn read_game_files(
+        folder: &Path,
+        prefix: &str,
+        files: &mut Vec<solstice_asset::GameFile>,
+    ) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(folder)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type()?.is_dir() {
+                read_game_files(&entry.path(), &format!("{name}/"), files)?;
+            } else if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                files.push(solstice_asset::GameFile { name, text });
+            }
+        }
+        Ok(())
     }
 
     /// Logs what a game's scripts logged, and its errors.
@@ -417,10 +496,14 @@ mod native {
             weather: Weather::default(),
             ocean: None,
             sea_level: None,
+            ponds: Vec::new(),
             clock: None,
             effects: Vec::new(),
             bob: None,
             play: false,
+            game: None,
+            fly: false,
+            instances_near: None,
             scripts: PathBuf::from("scenes"),
             presses: Vec::new(),
             holds: Vec::new(),
@@ -537,6 +620,10 @@ mod native {
                     options.sea_level =
                         Some(value()?.parse().map_err(|e| format!("--sea-level: {e}"))?);
                 }
+                "--pond" => {
+                    let ponds = Pond::parse_list(&value()?).map_err(|e| format!("--pond: {e}"))?;
+                    options.ponds.extend(ponds);
+                }
                 "--weather" => {
                     let name = value()?;
                     options.weather = match Weather::by_name(&name) {
@@ -564,6 +651,20 @@ mod native {
                 }
                 "--stream" => options.stream = true,
                 "--play" => options.play = true,
+                "--fly" => options.fly = true,
+                "--game" => {
+                    // Its scripts are watched where they were read from.
+                    let folder = PathBuf::from(value()?);
+                    options.play = true;
+                    options.scripts.clone_from(&folder);
+                    options.game = Some(folder);
+                }
+                "--instances-near" => {
+                    options.instances_near = Some(
+                        <[f32; 4]>::try_from(floats(&value()?)?)
+                            .map_err(|_| "--instances-near expects x,y,z,radius")?,
+                    );
+                }
                 "--scripts" => options.scripts = PathBuf::from(value()?),
                 "--press" => {
                     let text = value()?;
@@ -606,6 +707,14 @@ mod native {
                 }
                 "--flyover" => options.flyover = Some(PathBuf::from(value()?)),
                 "--out" => options.flyover_out = PathBuf::from(value()?),
+                "--prefetch" => {
+                    options.settings.prefetch_radius =
+                        value()?.parse().map_err(|e| format!("--prefetch: {e}"))?;
+                }
+                "--specks" => {
+                    options.settings.speck_texels =
+                        value()?.parse().map_err(|e| format!("--specks: {e}"))?;
+                }
                 "--move" => {
                     options.capture_motion =
                         value()?.parse().map_err(|e| format!("--move: {e}"))?;
@@ -665,6 +774,10 @@ mod native {
         } else {
             Source::Loaded(load_scene(&options.scene)?)
         };
+        if let Some(near) = options.instances_near {
+            scene.list_instances(near);
+            return Ok(());
+        }
         if options.flyover.is_some() {
             let Source::Loaded(scene) = &scene else {
                 return Err("flyovers load the whole scene, so they can't use --stream".into());
@@ -690,7 +803,8 @@ mod native {
 
     fn create_instance() -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            // WGPU_BACKEND picks another, such as dx12, which is what Chrome draws with on Windows.
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         })
     }
@@ -735,6 +849,11 @@ mod native {
 
         let start = Instant::now();
         let mut slowest = 0.0_f32;
+        // What each section of the frame took, in all and at most: a redraw of a cached view
+        // costs one frame in many, which the last frame's times alone seldom show.
+        let mut slowest_sections = [0.0_f32; solstice_render::profiler::SECTIONS.len()];
+        let mut summed_sections = [0.0_f32; solstice_render::profiler::SECTIONS.len()];
+        let mut timed_frames = 0u32;
         let mut last_time = Instant::now();
         let mut camera = options
             .camera
@@ -776,6 +895,13 @@ mod native {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             if frame > 10 {
                 slowest = slowest.max(last_time.elapsed().as_secs_f32());
+                if let Some(times) = renderer.section_times() {
+                    timed_frames += 1;
+                    for (index, ms) in times.into_iter().enumerate() {
+                        slowest_sections[index] = slowest_sections[index].max(ms);
+                        summed_sections[index] += ms;
+                    }
+                }
             }
             last_time = Instant::now();
         }
@@ -799,10 +925,14 @@ mod native {
                 streaming.evictions,
                 streaming.starved,
             );
-            if let Some([near, middle, far]) = streaming.bands {
+            if let Some(bands) = streaming.bands {
+                let [near, middle, far] = [bands[0], bands[1], bands[2]];
+                let spare = bands[3..]
+                    .iter()
+                    .fold((0, 0), |sum, band| (sum.0 + band.0, sum.1 + band.1));
                 println!(
-                    "bands: near {}/{}, middle {}/{}, far {}/{}",
-                    near.0, near.1, middle.0, middle.1, far.0, far.1
+                    "bands: near {}/{}, middle {}/{}, far {}/{}, spare {}/{}",
+                    near.0, near.1, middle.0, middle.1, far.0, far.1, spare.0, spare.1
                 );
             }
             let memory = renderer.scene_bytes();
@@ -861,6 +991,25 @@ mod native {
                 parts.join(", "),
                 times.iter().sum::<f32>()
             );
+            let listed = |times: [f32; solstice_render::profiler::SECTIONS.len()]| {
+                let parts: Vec<String> = solstice_render::profiler::SECTIONS
+                    .iter()
+                    .zip(times)
+                    .filter(|(_, ms)| *ms >= 0.005)
+                    .map(|(name, ms)| format!("{name} {ms:.2}"))
+                    .collect();
+                format!(
+                    "{} | total {:.2}",
+                    parts.join(", "),
+                    times.iter().sum::<f32>()
+                )
+            };
+            let frames = timed_frames.max(1) as f32;
+            println!(
+                "gpu ms on average: {}",
+                listed(summed_sections.map(|ms| ms / frames))
+            );
+            println!("gpu ms at most: {}", listed(slowest_sections));
         }
 
         let errors = errors.lock().expect("error sink");
@@ -903,11 +1052,8 @@ mod native {
             gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
             let stats = renderer.stats().streaming;
             let textures_busy = stats.texture_fetches > 0;
-            if stats.installed == before
-                && stats.in_transit == 0
-                && !textures_busy
-                && reader.is_idle()
-            {
+            // Pages may be left waiting with nowhere to go, so those don't count as busy.
+            if stats.installed == before && !textures_busy && reader.is_idle() {
                 quiet += 1;
             } else {
                 quiet = 0;
@@ -958,6 +1104,7 @@ mod native {
         if let Some(level) = options.sea_level {
             renderer.set_sea_level(level);
         }
+        renderer.set_ponds(&options.ponds);
         spawn_effects(&mut renderer, options);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),
@@ -1335,11 +1482,12 @@ mod native {
             if let Some(bob) = &mut state.bob {
                 bob.advance(&mut state.renderer, delta);
             }
-            // Playing as someone, the keys and the mouse are theirs; otherwise they fly the camera.
+            // Playing as someone, the keys and the mouse are theirs; otherwise, or having left
+            // them with V, they fly the camera.
             let playing_as_someone = state
                 .play
                 .as_ref()
-                .is_some_and(|(p, _)| p.play.has_player());
+                .is_some_and(|(p, _)| p.play.has_camera());
             if !playing_as_someone {
                 state.camera.update(
                     &CameraInput {
@@ -1428,6 +1576,12 @@ mod native {
                             if !event.repeat {
                                 let down = event.state == ElementState::Pressed;
                                 play.devices.key(&format!("{code:?}"), down);
+                                // Leaves whoever is played to fly the camera, and comes back.
+                                if down && code == KeyCode::KeyV && play.play.has_player() {
+                                    let flying = !play.play.flying();
+                                    play.play.set_flying(flying);
+                                    log::info!("{}", if flying { "flying" } else { "playing" });
+                                }
                             }
                         }
                         match event.state {

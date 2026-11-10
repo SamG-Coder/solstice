@@ -209,6 +209,64 @@ fn main(
     }
 }
 
+// Twin of SPECK_GROUP_SIZE in vg/cull_control.wgsl.
+const SPECK_GROUP_SIZE: u32 = 64u;
+
+// The specks: clusters under a voxel across, which culling sends to the hardware end of the
+// list. Each marks the voxels its bounds touch, with what its first triangle would have
+// written, and a thread does each, where `main` gives a cluster a workgroup.
+@compute @workgroup_size(SPECK_GROUP_SIZE)
+fn specks(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) groups: vec3u) {
+    let count = state.hw_count - state.hw_base;
+    for (var item = id.x; item < count; item += groups.x * SPECK_GROUP_SIZE) {
+        voxelize_speck(visible[state.opaque_end - 1u - state.hw_base - item]);
+    }
+}
+
+fn voxelize_speck(entry: VisibleCluster) {
+    let cluster = clusters[entry.cluster];
+    let instance = instances[entry.instance];
+    let material = materials[instance_material(instance)];
+    let packed = triangles[cluster.triangle_offset];
+    let vertex0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
+    let vertex1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
+    let vertex2 = vertices[cluster.vertex_offset + ((packed >> 16u) & 0xffu)];
+    let world0 = transform_point(instance, decode_position(instance, vertex0));
+    let world1 = transform_point(instance, decode_position(instance, vertex1));
+    let world2 = transform_point(instance, decode_position(instance, vertex2));
+
+    var albedo = material.base_color.rgb;
+    if material.texture_layer >= 0 {
+        let uv = decode_uv(instance, vertex0) * material.uv_scale;
+        albedo *= textureSampleLevel(color_textures, material_sampler, uv, material.texture_layer, COLOR_MIP).rgb;
+    }
+    let face = cross(world1 - world0, world2 - world0);
+    let face_length = length(face);
+    var normal = vec3f(0.0, 1.0, 0.0);
+    if face_length > 0.0 {
+        normal = face / face_length;
+    }
+    let data = VoxelData(
+        pack4x8unorm(vec4f(albedo, 1.0)),
+        pack2x16snorm(oct_encode(normal)),
+        encode_emissive(material.emissive * instance.glow),
+    );
+
+    let inv_voxel = 1.0 / params.voxel_size;
+    let center = (transform_point(instance, cluster.center) - params.origin) * inv_voxel;
+    let reach = cluster.radius * instance.max_scale * inv_voxel;
+    let low = vec3i(floor(center - reach));
+    // Under a voxel across, so two voxels each way at most.
+    let high = min(vec3i(floor(center + reach)), low + 1);
+    for (var z = low.z; z <= high.z; z++) {
+        for (var y = low.y; y <= high.y; y++) {
+            for (var x = low.x; x <= high.x; x++) {
+                write_voxel(vec3i(x, y, z), data);
+            }
+        }
+    }
+}
+
 fn voxelize_cluster_triangle(item: u32, t: u32) {
     let entry = visible[item];
     let cluster = clusters[entry.cluster];

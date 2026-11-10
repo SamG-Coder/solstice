@@ -14,7 +14,7 @@ use crate::scene::{
 };
 use crate::Gpu;
 use feedback::RequestFeedback;
-use residency::{Install, Residency};
+use residency::{Residency, Step};
 use solstice_asset::gpu::{CLUSTER_CHILDREN_MISSING, NODE_INSTALLED, NODE_LEAF};
 use solstice_asset::paged::{
     upper_mip_count, ClusterSet, PageInfo, PagedScene, BASE_TEXTURE_EDGE, PAGE_VERTICES, PAGE_WORDS,
@@ -29,6 +29,20 @@ const NODE_FLAGS_OFFSET: u64 = std::mem::offset_of!(PackedNode, is_leaf) as u64;
 const MERGE_GAP_CLUSTERS: usize = 8;
 /// Pages to install per frame. Each costs little, but many at once would be felt as a hitch.
 const INSTALLS_PER_FRAME: u32 = 32;
+/// The streamer's clock: it counts time in ticks of a sixtieth of a second, and everything here
+/// and in `residency.rs` that is measured in frames is measured in these. At sixty frames a
+/// second a frame is a tick. A host drawing two hundred frames a second would otherwise plan,
+/// and let go of what it holds, three times as often as one drawing sixty.
+const TICKS_PER_SECOND: f32 = 60.0;
+/// How many pages of a scene with pools by level of detail install in a second, at most: more
+/// than a host can fetch, shared out over the frames, so that a fast frame isn't given a slow
+/// frame's worth of uploads.
+const INSTALLS_PER_SECOND_LARGE: f32 = 9000.0;
+/// The same for a scene with pools by level of detail, for which a new view is thousands of pages.
+const INSTALLS_PER_FRAME_LARGE: u32 = 192;
+/// Frames between plans of such a scene. Each looks over more than a million pages, and new
+/// requests a frame or two later change little.
+const FRAMES_PER_PLAN_LARGE: u32 = 3;
 /// Frames between redraws of cached views, which a stream of arriving pages would otherwise
 /// make redraw constantly.
 const REFRESH_INTERVAL_FRAMES: u32 = 30;
@@ -54,6 +68,10 @@ pub struct StreamRequest {
     pub end: u64,
     /// Whether the range must be inflated before delivery.
     pub deflated: bool,
+    /// For a page of a scene that keeps its cluster records outside its manifest: where the
+    /// page's records are among them, as a range of bytes. They go with the page, to
+    /// [`crate::Renderer::deliver_page`].
+    pub clusters: Option<(u64, u64)>,
 }
 
 /// How streaming is going, for on-screen readouts and tests.
@@ -85,10 +103,10 @@ pub struct Streamer {
     sets: Vec<ClusterSet>,
     generated: Vec<u32>,
     /// The GPU's cluster records. An uninstalled cluster's offsets are local to its page.
-    clusters: Vec<PackedCluster>,
+    clusters: ClusterCopy,
     residency: Residency,
     /// Page data that has come but hasn't gone to the GPU.
-    arrived: HashMap<u32, Vec<u8>>,
+    arrived: HashMap<u32, (Vec<u8>, Vec<u8>)>,
     dirty_clusters: Vec<u32>,
     /// Pool slot of each installed page.
     slots: Vec<u32>,
@@ -97,13 +115,152 @@ pub struct Streamer {
     feedback: RequestFeedback,
     /// The latest requests read back, not yet planned for.
     fresh_requests: Option<Vec<u32>>,
+    /// Whether the requests on the GPU have been copied for reading, and so can start again.
+    /// Until then they gather: a view kept from frame to frame asks on the one frame it is
+    /// redrawn, which a copy made every few frames would otherwise usually miss.
+    requests_copied: bool,
     slot_count: u32,
     data_offset: u64,
     textures: Option<TextureStreamer>,
     evictions: u64,
-    /// Whether what's installed changed since cached views last refreshed.
-    changed_since_refresh: bool,
+    /// The kinds of cached view, a bit for each, that pages they asked for have come for since
+    /// cached views last refreshed.
+    changed_since_refresh: u8,
     frames_since_refresh: u32,
+    last_plan_frame: u32,
+    /// The part of a tick that has passed since the last whole one.
+    tick_fraction: f32,
+}
+
+/// The host's copy of the cluster records, which installing pages changes.
+enum ClusterCopy {
+    /// Every record, as the GPU has them, in a scene that holds them all.
+    Whole(Vec<PackedCluster>),
+    /// Only the records of pages on the GPU, in a scene too large to hold them all.
+    Resident(Resident),
+}
+
+/// Cluster records for only the pages on the GPU. Each pool slot has room for as many records as
+/// a page can have, at `slot * stride`, and leaf nodes are pointed there as their pages install.
+struct Resident {
+    stride: u32,
+    /// Each slot's records as the GPU has them. Empty for a slot with no page.
+    records: Vec<Vec<PackedCluster>>,
+    /// How many records come before each page's, in the order pages hold them, with one more
+    /// entry for the total.
+    page_first: Vec<u32>,
+    /// The sets by their first cluster, to find the set that holds a cluster.
+    by_cluster: Vec<u32>,
+}
+
+impl Resident {
+    fn new(scene: &PagedScene, slots: u32) -> Self {
+        let mut page_first = Vec::with_capacity(scene.pages.len() + 1);
+        let mut total = 0u32;
+        for page in 0..scene.pages.len() as u32 {
+            page_first.push(total);
+            total += scene.page_cluster_count(page);
+        }
+        page_first.push(total);
+        let mut by_cluster: Vec<u32> = (0..scene.sets.len() as u32).collect();
+        by_cluster.sort_unstable_by_key(|&set| {
+            let set = &scene.sets[set as usize];
+            (set.first_cluster, set.cluster_count)
+        });
+        Self {
+            stride: scene.max_page_clusters().max(1),
+            records: vec![Vec::new(); slots as usize],
+            page_first,
+            by_cluster,
+        }
+    }
+
+    /// The page holding a cluster, and the cluster's place among that page's records.
+    fn locate(&self, sets: &[ClusterSet], pages: &[PageInfo], cluster: u32) -> (u32, u32) {
+        let after = self
+            .by_cluster
+            .partition_point(|&set| sets[set as usize].first_cluster <= cluster);
+        let index = self.by_cluster[after - 1];
+        let set = &sets[index as usize];
+        let first_set = pages[set.page as usize].first_set;
+        let before: u32 = sets[first_set as usize..index as usize]
+            .iter()
+            .map(|earlier| earlier.cluster_count)
+            .sum();
+        (set.page, before + cluster - set.first_cluster)
+    }
+
+    /// A page's records among all of them, as a range of bytes.
+    fn byte_range(&self, page: u32) -> (u64, u64) {
+        let bytes = std::mem::size_of::<PackedCluster>() as u64;
+        (
+            u64::from(self.page_first[page as usize]) * bytes,
+            u64::from(self.page_first[page as usize + 1]) * bytes,
+        )
+    }
+
+    /// Sets or clears a flag on a cluster that is on the GPU, and notes that it changed.
+    fn mark(
+        &mut self,
+        sets: &[ClusterSet],
+        pages: &[PageInfo],
+        slots: &[u32],
+        cluster: u32,
+        missing: bool,
+        dirty: &mut Vec<u32>,
+    ) {
+        let (page, place) = self.locate(sets, pages, cluster);
+        let slot = slots[page as usize];
+        let record = self
+            .records
+            .get_mut(slot as usize)
+            .and_then(|records| records.get_mut(place as usize));
+        if let Some(record) = record {
+            if missing {
+                record.counts |= CLUSTER_CHILDREN_MISSING;
+            } else {
+                record.counts &= !CLUSTER_CHILDREN_MISSING;
+            }
+            dirty.push(slot * self.stride + place);
+        }
+    }
+}
+
+/// Writes cluster records to wherever the GPU keeps them, starting at record `first`.
+fn write_clusters(gpu: &Gpu, scene: &GpuScene, chunk: u32, first: u32, records: &[PackedCluster]) {
+    let bytes = std::mem::size_of::<PackedCluster>() as u64;
+    let head = (chunk.saturating_sub(first) as usize).min(records.len());
+    if head > 0 {
+        gpu.queue.write_buffer(
+            &scene.clusters,
+            u64::from(first) * bytes,
+            bytemuck::cast_slice(&records[..head]),
+        );
+    }
+    if head < records.len() {
+        let more = scene
+            .clusters_more
+            .as_ref()
+            .expect("a chunk means a second binding");
+        let at = first.max(chunk) - chunk;
+        gpu.queue.write_buffer(
+            more,
+            u64::from(at) * bytes,
+            bytemuck::cast_slice(&records[head..]),
+        );
+    }
+}
+
+/// Where a node's first child or cluster is. Its count and flags follow.
+const NODE_FIRST_OFFSET: u64 = std::mem::offset_of!(PackedNode, first) as u64;
+
+/// Points a leaf node at its set's records, and sets its flags.
+fn write_leaf(gpu: &Gpu, scene: &GpuScene, node: u32, first: u32, count: u32, flags: u32) {
+    gpu.queue.write_buffer(
+        &scene.nodes,
+        u64::from(node) * std::mem::size_of::<PackedNode>() as u64 + NODE_FIRST_OFFSET,
+        bytemuck::cast_slice(&[first, count, flags]),
+    );
 }
 
 impl Streamer {
@@ -130,7 +287,10 @@ impl Streamer {
             pages: scene.pages.clone(),
             sets: scene.sets.clone(),
             generated: scene.generated.clone(),
-            clusters: scene.clusters.clone(),
+            clusters: match scene.external {
+                Some(_) => ClusterCopy::Resident(Resident::new(scene, slot_count)),
+                None => ClusterCopy::Whole(scene.clusters.clone()),
+            },
             residency,
             regions,
             arrived: HashMap::new(),
@@ -139,17 +299,22 @@ impl Streamer {
             frame: 0,
             feedback: RequestFeedback::new(
                 gpu,
-                (scene.pages.len() + scene.base_textures.len()) as u32,
+                (scene.pages.len()
+                    + HOLD_KINDS * hold_words(scene.pages.len())
+                    + scene.base_textures.len()) as u32,
             ),
             fresh_requests: None,
+            requests_copied: true,
             slot_count,
             data_offset: scene.data_offset,
             textures: plan
                 .filter(|_| !scene.base_textures.is_empty())
                 .map(|plan| TextureStreamer::new(scene, plan)),
             evictions: 0,
-            changed_since_refresh: false,
+            changed_since_refresh: 0,
             frames_since_refresh: 0,
+            last_plan_frame: 0,
+            tick_fraction: 0.0,
         }
     }
 
@@ -158,17 +323,28 @@ impl Streamer {
         self.feedback.buffer()
     }
 
-    /// Clears the requests for this frame's culling, and finishes textures that are complete.
+    /// Where in the requests the bits begin that each kind of view kept from frame to frame
+    /// sets, one per page it asks for. See [`crate::vg::culling::PassView::hold_requests`].
+    pub fn hold_bases(&self) -> [u32; HOLD_KINDS] {
+        let pages = self.pages.len();
+        std::array::from_fn(|kind| (pages + kind * hold_words(pages)) as u32)
+    }
+
+    /// Clears the requests once they have been copied for reading, and finishes textures that
+    /// are complete.
     pub fn begin_frame(&mut self, gpu: &Gpu, scene: &GpuScene, encoder: &mut wgpu::CommandEncoder) {
-        encoder.clear_buffer(self.feedback.buffer(), 0, None);
+        if std::mem::take(&mut self.requests_copied) {
+            encoder.clear_buffer(self.feedback.buffer(), 0, None);
+        }
         if let Some(textures) = &mut self.textures {
             textures.begin_frame(gpu, scene, encoder);
         }
     }
 
-    /// Queues a copy of this frame's requests, if the last copy has been dealt with.
+    /// Queues a copy of the requests since the last one, if that has been dealt with: read
+    /// back, and planned for. Copying sooner would only bring requests that wait behind those.
     pub fn capture_requests(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        self.feedback.capture(encoder);
+        self.requests_copied = self.fresh_requests.is_none() && self.feedback.capture(encoder);
     }
 
     /// Starts reading back requests captured this frame. Call after submitting.
@@ -177,13 +353,31 @@ impl Streamer {
     }
 
     /// One frame's work: picks up requests read back and installs waiting pages.
-    pub fn update(&mut self, gpu: &Gpu, scene: &GpuScene) {
-        self.frame = self.frame.wrapping_add(1);
-        self.frames_since_refresh = self.frames_since_refresh.saturating_add(1);
+    ///
+    /// `delta_seconds` is the time since the last call. A host that holds time still, passing
+    /// none, is taken to draw sixty frames a second.
+    pub fn update(&mut self, gpu: &Gpu, scene: &GpuScene, delta_seconds: f32) {
+        let seconds = if delta_seconds > 0.0 {
+            delta_seconds.min(0.25)
+        } else {
+            1.0 / TICKS_PER_SECOND
+        };
+        // A little over, so that a frame of exactly a tick is never rounded down to none.
+        self.tick_fraction += seconds * TICKS_PER_SECOND;
+        let ticks = (self.tick_fraction + 1.0e-3) as u32;
+        self.tick_fraction = (self.tick_fraction - ticks as f32).max(0.0);
+        self.frame = self.frame.wrapping_add(ticks);
+        self.frames_since_refresh = self.frames_since_refresh.saturating_add(ticks);
         if let Some(requests) = self.feedback.take_latest() {
             self.fresh_requests = Some(requests);
         }
-        self.install_waiting(gpu, scene, INSTALLS_PER_FRAME);
+        let installs = if self.regions.is_some() {
+            ((seconds * INSTALLS_PER_SECOND_LARGE) as u32)
+                .clamp(INSTALLS_PER_FRAME, INSTALLS_PER_FRAME_LARGE)
+        } else {
+            INSTALLS_PER_FRAME
+        };
+        self.install_waiting(gpu, scene, installs);
         if let Some(textures) = &mut self.textures {
             textures.write_waiting(gpu, scene);
         }
@@ -192,7 +386,16 @@ impl Streamer {
     /// What to start fetching now, from the latest requests read back. At most `max_fetching`
     /// pages and a few texture levels are ever outstanding.
     pub fn take_fetches(&mut self, max_fetching: u32) -> Vec<StreamRequest> {
-        let requests = self.fresh_requests.take();
+        let due = self.regions.is_none()
+            || self.frame.wrapping_sub(self.last_plan_frame) >= FRAMES_PER_PLAN_LARGE;
+        let requests = if due {
+            self.fresh_requests.take()
+        } else {
+            None
+        };
+        if requests.is_some() {
+            self.last_plan_frame = self.frame;
+        }
         let pages = match &requests {
             Some(requests) => self.plan(requests, max_fetching),
             None => self.residency.refill(max_fetching),
@@ -206,6 +409,10 @@ impl Streamer {
                 start,
                 end: start + u64::from(info.stored_bytes),
                 deflated: true,
+                clusters: match &self.clusters {
+                    ClusterCopy::Resident(resident) => Some(resident.byte_range(page)),
+                    ClusterCopy::Whole(_) => None,
+                },
             });
         }
         if let (Some(textures), Some(requests)) = (&mut self.textures, &requests) {
@@ -238,15 +445,14 @@ impl Streamer {
         }
     }
 
-    /// Whether shadows and GI should redraw now, because finer geometry has arrived. They
-    /// keep what they have otherwise, so this also says when they last changed.
-    pub fn should_refresh_cached_views(&mut self) -> bool {
-        if !self.changed_since_refresh || self.frames_since_refresh < REFRESH_INTERVAL_FRAMES {
-            return false;
+    /// Which kinds of cached view should redraw now, because geometry they asked for has
+    /// arrived: a bit for each of the `HOLD_` kinds. They keep what they have otherwise.
+    pub fn should_refresh_cached_views(&mut self) -> u8 {
+        if self.changed_since_refresh == 0 || self.frames_since_refresh < REFRESH_INTERVAL_FRAMES {
+            return 0;
         }
-        self.changed_since_refresh = false;
         self.frames_since_refresh = 0;
-        true
+        std::mem::take(&mut self.changed_since_refresh)
     }
 
     pub fn stats(&self) -> StreamingStats {
@@ -273,27 +479,54 @@ impl Streamer {
     }
 
     /// Installs a page at once, which must have all its dependencies. For scene setup.
-    pub fn install_now(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32, data: &[u8]) {
+    pub fn install_now(
+        &mut self,
+        gpu: &Gpu,
+        scene: &GpuScene,
+        page: u32,
+        data: &[u8],
+        clusters: &[u8],
+    ) {
         let slot = self.residency.install_now(page);
-        self.apply_install(gpu, scene, page, slot, data);
+        self.apply_install(gpu, scene, page, slot, data, clusters);
     }
 
-    /// Records one frame's requests, and returns the pages the host should start fetching.
+    /// Records the requests read back, and returns the pages the host should start fetching.
     fn plan(&mut self, requests: &[u32], max_fetching: u32) -> Vec<u32> {
-        self.residency.plan(self.frame, requests, max_fetching)
+        let pages = self.pages.len().min(requests.len());
+        let words = hold_words(pages);
+        let held: [&[u32]; HOLD_KINDS] = std::array::from_fn(|kind| {
+            let start = (pages + kind * words).min(requests.len());
+            &requests[start..(start + words).min(requests.len())]
+        });
+        self.residency
+            .plan_holding(self.frame, &requests[..pages], &held, max_fetching)
     }
 
     /// Takes an unpacked page from the host. It installs once its parents are in and there's
     /// room. Returns false if the page isn't wanted any more or is the wrong size.
     pub fn deliver(&mut self, page: u32, data: Vec<u8>) -> bool {
+        self.deliver_page(page, data, Vec::new())
+    }
+
+    /// As [`Self::deliver`], with the page's cluster records, for a scene that keeps them outside
+    /// its manifest: the bytes [`StreamRequest::clusters`] names.
+    pub fn deliver_page(&mut self, page: u32, data: Vec<u8>, clusters: Vec<u8>) -> bool {
         let right_size = self
             .pages
             .get(page as usize)
             .is_some_and(|info| info.raw_bytes() == data.len());
-        if !right_size || !self.residency.arrived(page) {
+        let right_records = match &self.clusters {
+            ClusterCopy::Resident(resident) if right_size => {
+                let (start, end) = resident.byte_range(page);
+                (end - start) as usize == clusters.len()
+            }
+            _ => true,
+        };
+        if !right_size || !right_records || !self.residency.arrived(page) {
             return false;
         }
-        self.arrived.insert(page, data);
+        self.arrived.insert(page, (data, clusters));
         true
     }
 
@@ -306,34 +539,33 @@ impl Streamer {
     fn install_waiting(&mut self, gpu: &Gpu, scene: &GpuScene, limit: u32) {
         self.arrived
             .retain(|&page, _| self.residency.is_waiting(page));
-        for _ in 0..limit {
-            let install = self.residency.next_install(self.frame);
-            // Even if nothing could install: the pages let go are no longer on the GPU's books.
-            for released in self.residency.take_released() {
-                self.apply_eviction(gpu, scene, released);
+        for step in self.residency.install_ready(self.frame, limit) {
+            match step {
+                Step::Evict(page) => self.apply_eviction(gpu, scene, page),
+                Step::Install { page, slot } => {
+                    let (data, clusters) = self
+                        .arrived
+                        .remove(&page)
+                        .expect("a page installs only after its data arrived");
+                    self.apply_install(gpu, scene, page, slot, &data, &clusters);
+                }
             }
-            let Some(Install {
-                page,
-                slot,
-                evicted,
-            }) = install
-            else {
-                break;
-            };
-            if let Some(victim) = evicted {
-                self.apply_eviction(gpu, scene, victim);
-            }
-            self.changed_since_refresh = true;
-            let data = self
-                .arrived
-                .remove(&page)
-                .expect("a page installs only after its data arrived");
-            self.apply_install(gpu, scene, page, slot, &data);
         }
+        // Only what a kept view asked for changes what it would draw: its level of detail is
+        // its own, and it asks for every page of it each time it is drawn.
+        self.changed_since_refresh |= self.residency.take_awaited_arrival();
         self.flush(gpu, scene);
     }
 
-    fn apply_install(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32, slot: u32, data: &[u8]) {
+    fn apply_install(
+        &mut self,
+        gpu: &Gpu,
+        scene: &GpuScene,
+        page: u32,
+        slot: u32,
+        data: &[u8],
+        clusters: &[u8],
+    ) {
         self.slots[page as usize] = slot;
         let (band, local) = locate_slot(self.regions.as_ref(), slot);
         gpu.queue.write_buffer(
@@ -343,41 +575,105 @@ impl Streamer {
         );
         let info = self.pages[page as usize];
         let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_count);
-        for index in info.first_set..info.first_set + info.set_count {
-            let set = self.sets[index as usize];
-            for c in set.first_cluster..set.first_cluster + set.cluster_count {
-                let cluster = &mut self.clusters[c as usize];
-                cluster.vertex_offset += vertex_base;
-                cluster.triangle_offset += triangle_base;
-                self.dirty_clusters.push(c);
+        let chunk = self.regions.map_or(u32::MAX, |r| r.cluster_chunk);
+        let installed = NODE_LEAF | NODE_INSTALLED | page;
+        match &mut self.clusters {
+            ClusterCopy::Whole(records) => {
+                for index in info.first_set..info.first_set + info.set_count {
+                    let set = self.sets[index as usize];
+                    for c in set.first_cluster..set.first_cluster + set.cluster_count {
+                        let cluster = &mut records[c as usize];
+                        cluster.vertex_offset += vertex_base;
+                        cluster.triangle_offset += triangle_base;
+                        self.dirty_clusters.push(c);
+                    }
+                    for g in set.first_generated..set.first_generated + set.generated_count {
+                        let parent = self.generated[g as usize];
+                        records[parent as usize].counts &= !CLUSTER_CHILDREN_MISSING;
+                        self.dirty_clusters.push(parent);
+                    }
+                    write_node_flags(gpu, scene, set.leaf_node, installed);
+                }
             }
-            for g in set.first_generated..set.first_generated + set.generated_count {
-                let parent = self.generated[g as usize];
-                self.clusters[parent as usize].counts &= !CLUSTER_CHILDREN_MISSING;
-                self.dirty_clusters.push(parent);
+            ClusterCopy::Resident(resident) => {
+                let mut records: Vec<PackedCluster> = clusters
+                    .chunks_exact(std::mem::size_of::<PackedCluster>())
+                    .map(bytemuck::pod_read_unaligned)
+                    .collect();
+                for cluster in &mut records {
+                    cluster.vertex_offset += vertex_base;
+                    cluster.triangle_offset += triangle_base;
+                }
+                let mut first = slot * resident.stride;
+                write_clusters(gpu, scene, chunk, first, &records);
+                resident.records[slot as usize] = records;
+                for index in info.first_set..info.first_set + info.set_count {
+                    let set = self.sets[index as usize];
+                    for g in set.first_generated..set.first_generated + set.generated_count {
+                        let parent = self.generated[g as usize];
+                        resident.mark(
+                            &self.sets,
+                            &self.pages,
+                            &self.slots,
+                            parent,
+                            false,
+                            &mut self.dirty_clusters,
+                        );
+                    }
+                    write_leaf(
+                        gpu,
+                        scene,
+                        set.leaf_node,
+                        first,
+                        set.cluster_count,
+                        installed,
+                    );
+                    first += set.cluster_count;
+                }
             }
-            write_node_flags(gpu, scene, set.leaf_node, NODE_LEAF | NODE_INSTALLED | page);
         }
     }
 
     fn apply_eviction(&mut self, gpu: &Gpu, scene: &GpuScene, page: u32) {
         self.evictions += 1;
         let slot = self.slots[page as usize];
+        // Before its parents are marked, so that nothing can find this slot through the page.
+        self.slots[page as usize] = u32::MAX;
         let info = self.pages[page as usize];
         let (band, local) = locate_slot(self.regions.as_ref(), slot);
         let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_count);
+        if let ClusterCopy::Resident(resident) = &mut self.clusters {
+            resident.records[slot as usize] = Vec::new();
+        }
         for index in info.first_set..info.first_set + info.set_count {
             let set = self.sets[index as usize];
-            // The GPU can't reach these any more, so only this copy needs changing.
-            for c in set.first_cluster..set.first_cluster + set.cluster_count {
-                let cluster = &mut self.clusters[c as usize];
-                cluster.vertex_offset -= vertex_base;
-                cluster.triangle_offset -= triangle_base;
-            }
-            for g in set.first_generated..set.first_generated + set.generated_count {
-                let parent = self.generated[g as usize];
-                self.clusters[parent as usize].counts |= CLUSTER_CHILDREN_MISSING;
-                self.dirty_clusters.push(parent);
+            match &mut self.clusters {
+                ClusterCopy::Whole(records) => {
+                    // The GPU can't reach these any more, so only this copy needs changing.
+                    for c in set.first_cluster..set.first_cluster + set.cluster_count {
+                        let cluster = &mut records[c as usize];
+                        cluster.vertex_offset -= vertex_base;
+                        cluster.triangle_offset -= triangle_base;
+                    }
+                    for g in set.first_generated..set.first_generated + set.generated_count {
+                        let parent = self.generated[g as usize];
+                        records[parent as usize].counts |= CLUSTER_CHILDREN_MISSING;
+                        self.dirty_clusters.push(parent);
+                    }
+                }
+                ClusterCopy::Resident(resident) => {
+                    for g in set.first_generated..set.first_generated + set.generated_count {
+                        let parent = self.generated[g as usize];
+                        resident.mark(
+                            &self.sets,
+                            &self.pages,
+                            &self.slots,
+                            parent,
+                            true,
+                            &mut self.dirty_clusters,
+                        );
+                    }
+                }
             }
             write_node_flags(gpu, scene, set.leaf_node, NODE_LEAF | page);
         }
@@ -386,30 +682,47 @@ impl Streamer {
     /// Writes all cluster records changed since the last call.
     pub fn flush(&mut self, gpu: &Gpu, scene: &GpuScene) {
         let chunk = self.regions.map_or(u32::MAX, |r| r.cluster_chunk);
-        let bytes = std::mem::size_of::<PackedCluster>() as u64;
-        for (first, last) in merged_runs(&mut self.dirty_clusters) {
-            if first < chunk {
-                let end = last.min(chunk - 1);
-                gpu.queue.write_buffer(
-                    &scene.clusters,
-                    u64::from(first) * bytes,
-                    bytemuck::cast_slice(&self.clusters[first as usize..=end as usize]),
-                );
+        let runs = merged_runs(&mut self.dirty_clusters);
+        match &self.clusters {
+            ClusterCopy::Whole(records) => {
+                for (first, last) in runs {
+                    let run = &records[first as usize..=last as usize];
+                    write_clusters(gpu, scene, chunk, first, run);
+                }
             }
-            if last >= chunk {
-                let start = first.max(chunk);
-                gpu.queue.write_buffer(
-                    scene
-                        .clusters_more
-                        .as_ref()
-                        .expect("a chunk means a second binding"),
-                    u64::from(start - chunk) * bytes,
-                    bytemuck::cast_slice(&self.clusters[start as usize..=last as usize]),
-                );
+            ClusterCopy::Resident(resident) => {
+                for (first, last) in runs {
+                    // A run may pass from one slot's records into the next's.
+                    let mut at = first;
+                    while at <= last {
+                        let slot = at / resident.stride;
+                        let end = last.min((slot + 1) * resident.stride - 1);
+                        let records = &resident.records[slot as usize];
+                        let from = (at % resident.stride) as usize;
+                        let to = ((end % resident.stride) as usize + 1).min(records.len());
+                        if from < to {
+                            write_clusters(gpu, scene, chunk, at, &records[from..to]);
+                        }
+                        at = end + 1;
+                    }
+                }
             }
         }
         self.dirty_clusters.clear();
     }
+}
+
+/// The kinds of view kept from frame to frame, whose requests are told apart: a page that came
+/// for the shadow maps is no reason to draw the voxels again, which costs far more.
+pub const HOLD_KINDS: usize = 2;
+/// The sun's shadow cascades, and the map of the seabed.
+pub const HOLD_SHADOWS: usize = 0;
+/// The GI's voxels.
+pub const HOLD_VOXELS: usize = 1;
+
+/// How many words hold a bit for each of this many pages.
+fn hold_words(pages: usize) -> usize {
+    pages.div_ceil(32)
 }
 
 /// Chooses tier sizes for a scene, on this GPU, within a budget in bytes.
@@ -499,6 +812,7 @@ impl TextureStreamer {
                     start,
                     end,
                     deflated: false,
+                    clusters: None,
                 })
             })
             .collect()
@@ -629,10 +943,10 @@ fn locate_slot(regions: Option<&RegionPlan>, slot: u32) -> (usize, u32) {
 }
 
 /// Where a slot's vertices and triangles begin, in units of vertices and of triangle words.
-/// Triangles start right after the page's own vertices. The band goes in the top two bits, which
+/// Triangles start right after the page's own vertices. The band goes in the top three bits, which
 /// is zero in a scene with one pool.
 fn slot_bases(band: usize, local: u32, vertex_count: u32) -> (u32, u32) {
-    let band = (band as u32) << 30;
+    let band = (band as u32) << crate::regions::BAND_SHIFT;
     (
         band | (local * PAGE_VERTICES),
         band | (local * PAGE_WORDS
@@ -676,17 +990,39 @@ mod tests {
     #[test]
     fn a_band_is_carried_above_the_place_in_its_buffer() {
         let (vertices, triangles) = slot_bases(2, 3, 10);
-        assert_eq!(vertices >> 30, 2);
-        assert_eq!(vertices & 0x3fff_ffff, 3 * PAGE_VERTICES);
-        assert_eq!(triangles >> 30, 2);
-        assert_eq!(triangles & 0x3fff_ffff, 3 * PAGE_WORDS + 40);
+        use crate::regions::{BANDS, BAND_SHIFT};
+        let low = (1 << BAND_SHIFT) - 1;
+        assert_eq!(vertices >> BAND_SHIFT, 2);
+        assert_eq!(vertices & low, 3 * PAGE_VERTICES);
+        assert_eq!(triangles >> BAND_SHIFT, 2);
+        assert_eq!(triangles & low, 3 * PAGE_WORDS + 40);
+
+        // The last slot of the last band a binding can hold still fits beside its band, with
+        // vertex numbers counted in words as the shaders do.
+        let last = (crate::regions::binding_slots(&wgpu::Limits {
+            max_storage_buffer_binding_size: 2_147_483_644,
+            max_buffer_size: 1 << 31,
+            ..Default::default()
+        })) - 1;
+        let (vertices, triangles) = slot_bases(BANDS - 1, last, PAGE_VERTICES);
+        assert_eq!(vertices >> BAND_SHIFT, BANDS as u32 - 1);
+        assert!(u64::from(vertices & low) * 4 + u64::from(PAGE_WORDS) <= 1 << BAND_SHIFT);
+        assert_eq!(triangles >> BAND_SHIFT, BANDS as u32 - 1);
+
+        // A device that allows a larger binding still gets pools an address can reach into.
+        let roomy = crate::regions::binding_slots(&wgpu::Limits {
+            max_storage_buffer_binding_size: 1 << 32,
+            max_buffer_size: 1 << 33,
+            ..Default::default()
+        });
+        assert_eq!(u64::from(roomy) * u64::from(PAGE_WORDS), 1 << BAND_SHIFT);
     }
 
     #[test]
     fn slots_are_numbered_through_the_bands() {
         let plan = RegionPlan {
             cluster_chunk: 1,
-            band_slots: [2, 3, 4],
+            band_slots: [2, 3, 4, 1, 0, 0, 0, 0],
         };
         assert_eq!(locate_slot(Some(&plan), 1), (0, 1));
         assert_eq!(locate_slot(Some(&plan), 2), (1, 0));

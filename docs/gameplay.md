@@ -250,6 +250,9 @@ are the per-frame tick groups `Animation` and `Late`.
 - **Input** is the frame's values, plus the actions pressed since the last step, so a tap
   between two steps isn't lost. The per-frame groups also see the frame's own input, for a
   camera that turns even in frames with no step.
+  - It also carries where the game is watched from, the camera's place, which scripts read as
+    `viewer()`. A camera flown freely is not an actor, and belongs to no step; being input, it
+    is recorded, so a replay puts it where it was.
 - **Replays are exact on the same build and platform.** Native and web builds may round some
   maths differently, such as sines in `glam` and `libm`.
 - **Spawning and destroying** are deferred to the end of the tick group that asks for them.
@@ -458,8 +461,9 @@ def on_hour(self, hour):
     and fail natively.
   - A call keeps 100 lines of log, of up to 1,000 characters each.
 - **The API** is the one `#[starlark_module]` in `api.rs`: `vec3`, `send`, `after`, `every`,
-  `cancel`, `find`, `input`, `held`, `pressed`, `now` and `log`. Starlark's own documentation,
-  `api_reference()`, renders it for people and editors, in place of a hand-written stub.
+  `cancel`, `find`, `input`, `held`, `pressed`, `viewer`, `now` and `log`. Starlark's own
+  documentation, `api_reference()`, renders it for people and editors, in place of a hand-written
+  stub.
 - **Cost** (`tools/gameplay-bench/b_script`, 9800X3D):
   - about 1.1 to 1.3 µs a ticking actor on the web, and 1.9 to 2.4 µs natively, most of it
     setting up each call;
@@ -1086,7 +1090,28 @@ def on_hour(self, hour):
     touch: a stick under the left thumb, looking under the right, and taps. It shows what
     scripts log, and their errors, in a panel.
   - Gamepads natively are left for later: they need a crate of their own (`gilrs`).
+  - **A game from a folder.** `viewer SCENE --game DIR` plays the game in a folder in place of
+    the scene's own: its `scene.game`, and the actor files, scripts and input actions that
+    names, all named from the folder. On the web, `?game=NAME` does the same with
+    `games/NAME/` beside the page, which `scripts/build-web.sh` fills from each folder in
+    `scenes/` that has a `scene.game`. The page fetches `scene.game` to offer *Play*, and the
+    rest only to play; without `?game=` it fetches nothing.
+    - This is for scenes baked without a game, or too big to bake again: a script is changed
+      and the page reloaded. `scenes/zorah/` gives Zorah doors that open this way.
+    - Such an actor has no mesh of its own. Its line names the instances the scene already
+      draws (`instances=FIRST+COUNT`), and placed at their hinge, it turns them about it.
+      `viewer SCENE --instances-near x,y,z,radius` lists the instances near a point.
+    - Instance numbers belong to one bake. Baked again from other sources, a scene may number
+      them otherwise, and nothing checks that a game's numbers still mean what they did.
   - With actors but no player, the keys both fly the camera and reach the game.
+  - **Flying from the player.** With a player, **V** leaves them standing and flies the
+    camera from where it is, and V again puts it back at their eye. The page has a button
+    for it too, `?fly` starts that way, and so does `--fly` natively.
+    - The game goes on, and hears every key as before, except the script of the one who was
+      left: to it nothing is held or pressed, so the keys that fly the camera don't walk
+      them off. A door that opens to `viewer()` opens to the flown camera.
+    - Being away is part of each step's input, as the viewer's place is, so a replay of a
+      run with flying in it is still the same run.
   - Keys typed into the page's own controls don't reach the game.
 - **Left for later.** An actor's instances are movable from the start, so a gate that seldom
   moves still has its own shadow pass and leaves the GI voxels. Making them movable only once

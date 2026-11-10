@@ -146,9 +146,45 @@ pub struct PagedScene {
     pub glow: crate::scene::GlowMaps,
     /// Its transparent glowing cards.
     pub cards: crate::scene::Cards,
+    /// Set when `clusters` and `pinned_data` are left empty, because they come separately.
+    pub external: Option<ExternalTables>,
+}
+
+/// The sizes of the tables a scene's manifest leaves out: a browser has 4 GiB of memory to work
+/// in, and a scene like Zorah has 5 GiB of these alone. They follow the manifest in a file of
+/// their own: the cluster records in the order pages hold them, each page's sets in turn, and
+/// then the pinned pages. The host hands over a page's records with the page, so that only the
+/// records of pages on the GPU are ever held.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExternalTables {
+    pub clusters: u64,
+    pub pinned_bytes: u64,
 }
 
 impl PagedScene {
+    /// How many cluster records a page's sets hold.
+    pub fn page_cluster_count(&self, page: u32) -> u32 {
+        let info = &self.pages[page as usize];
+        self.sets[info.first_set as usize..(info.first_set + info.set_count) as usize]
+            .iter()
+            .map(|set| set.cluster_count)
+            .sum()
+    }
+
+    /// The most cluster records any one page holds.
+    pub fn max_page_clusters(&self) -> u32 {
+        (0..self.pages.len() as u32)
+            .map(|page| self.page_cluster_count(page))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// How many cluster records the scene has, wherever they are.
+    pub fn cluster_count(&self) -> usize {
+        self.external
+            .map_or(self.clusters.len(), |tables| tables.clusters as usize)
+    }
+
     /// How many mip levels each texture has above the base levels in the manifest.
     pub fn upper_mip_count(&self) -> usize {
         upper_mip_count(self.texture_size)
@@ -166,7 +202,7 @@ impl PagedScene {
     /// For each page, the other pages that must be installed before it. These hold the
     /// parents of its clusters, which have to be swappable for those clusters. Sorted.
     pub fn page_dependencies(&self) -> Vec<Vec<u32>> {
-        let mut set_page = vec![0u32; self.clusters.len()];
+        let mut set_page = vec![0u32; self.cluster_count()];
         for set in &self.sets {
             let range =
                 set.first_cluster as usize..(set.first_cluster + set.cluster_count) as usize;

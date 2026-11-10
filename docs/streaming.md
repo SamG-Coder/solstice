@@ -86,8 +86,21 @@ Each frame the CPU, with no GPU code involved so it can be unit tested:
 2. Issues up to a set number of fetches.
 3. Installs arrived pages whose parents are in, up to about 1 MB per frame to avoid hitches.
 4. When out of slots, evicts the least recently used page that has no installed dependants, is not pinned, and
-   was not touched in the last 30 frames. If nothing qualifies, the load waits. Quality drops but nothing breaks,
-   and a counter reports it.
+   was not touched in the last 30 frames.
+5. When that frees too little, a page left without a slot takes the place of the least wanted page still in,
+   while it is wanted twice as much: most wanted first, against least wanted first, and of those the
+   finest. So a full pool comes to hold what is wanted most, whatever came first. What a view only fetched
+   ahead of need, or kept though hidden, makes way for what is seen, and never outbids anything itself. The
+   factor of two keeps two pages wanted about as much from changing places for ever. Views ask by turns,
+   the shadow maps and the voxels only when they are redrawn, so a page counts as wanted as much as it was
+   asked for at most over the last 120 to 240 frames, and as much as a shadow map or the voxels asked for
+   it over their last 3600 frames of redrawing: by its last asking alone it would lose its slot at each
+   turn and take another's at the next. A page a shadow map or the voxels asked for also stands until
+   views of its kind have been redrawn for 240 frames without asking for it again, however long that
+   takes. Counted by the clock it left while its view stood still, the page that took its slot redrew the
+   view, and the view asked for it back: thousands of pages went round like that for as long as one
+   looked. A kind of view that asks for nothing for 3600 frames counts as gone, and its pages as anyone's.
+6. If nothing qualifies, the load waits. Quality drops but nothing breaks, and a counter reports it.
 
 **Shadows and GI.** Both are cached today, so they would keep the root-level shape forever. Page installs
 will mark them stale, rate-limited and using the existing cascade turn-taking. GI levels re-voxelize one at a time.
@@ -199,8 +212,9 @@ in the browser, at 102 to 110 fps, but with no controlled comparison.
 
 - **Most of the viewer's memory isn't the scene.** The rest is render targets, cull lists and the GI
   volume, which this work doesn't touch.
-- **A pool that's too small favours what came first.** Recently used pages aren't evicted, so when one
-  view wants more than the pool holds, fine pages already in stay, even if a waiting page would help more.
+- **A pool that's too small is coarse somewhere.** When one view wants more than the pool holds, the pages
+  wanted least stay out, and pages wanted within twice of each other stay as they came. `geometry-mb`
+  on the page, and `--geometry-budget-mb` natively, give the pool more room.
 - **Detail pops in with no cross-fade**, softened only by temporal accumulation.
 - **A fast flight outruns the network.** The result is coarser geometry until pages arrive, not holes.
 - **The live demo stays procedural for now.** CI bakes without scans, so putting the cove on Pages is separate work.

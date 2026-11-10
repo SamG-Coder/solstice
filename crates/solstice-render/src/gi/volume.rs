@@ -26,6 +26,8 @@ const LIGHT_SCHEDULE: [u32; 8] = [0, 1, 0, 2, 0, 3, 0, 4];
 /// How much of a rebuild's distance field to compute per frame. Spreading it keeps one level's
 /// move from becoming one long frame. It takes three frames, too short to see.
 const FLOOD_PASSES_PER_FRAME: usize = 6;
+/// The most frames in a row a rebuild waits for other heavy drawing.
+const MAX_HELD_OFF: u32 = 8;
 
 /// Twin of `VolumeParams` in `common/environment.wgsl`.
 #[repr(C)]
@@ -109,6 +111,8 @@ pub struct GiVolume {
     flood_a: wgpu::Buffer,
     levels: Vec<Level>,
     voxelize_pipeline: wgpu::ComputePipeline,
+    /// Voxelizes the clusters under a voxel across, a thread each.
+    voxelize_specks_pipeline: wgpu::ComputePipeline,
     seed_pipeline: wgpu::ComputePipeline,
     flood_pipeline: wgpu::ComputePipeline,
     light_pipeline: wgpu::ComputePipeline,
@@ -121,6 +125,13 @@ pub struct GiVolume {
     outdated: [bool; LEVEL_COUNT],
     /// A change that came while levels were still outdated, to start over once they are done.
     refresh_waiting: bool,
+    /// Set for a frame that already has heavy drawing to do, such as a shadow cascade: no
+    /// level starts to rebuild on it, as voxelizing one costs several times a frame.
+    pub hold_off: bool,
+    /// Frames in a row that rebuilding has been held off.
+    held_off: u32,
+    /// See [`crate::RendererSettings::speck_texels`].
+    pub speck_voxels: f32,
 }
 
 /// What [`GiVolume::prepare`] decided should happen this frame.
@@ -206,7 +217,9 @@ impl GiVolume {
             .sampler();
         if scene.regions.is_some() {
             // The second cluster binding and the pool's far band.
-            voxelize_layout = voxelize_layout.storage_read().storage_read();
+            for _ in 0..scene.regions.map_or(0, |plan| plan.pools() - 1) {
+                voxelize_layout = voxelize_layout.storage_read();
+            }
         }
         let voxelize_layout = voxelize_layout.build(gpu, "gi voxelize");
         let flood_layout = LayoutBuilder::new()
@@ -281,6 +294,12 @@ impl GiVolume {
                         ];
                         if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
                             resources.extend([more.as_entire_binding(), far.as_entire_binding()]);
+                            resources.extend(
+                                scene
+                                    .pool_spares
+                                    .iter()
+                                    .map(|pool| pool.as_entire_binding()),
+                            );
                         }
                         gpu.bind_group("gi voxelize", &voxelize_layout, &resources)
                     },
@@ -372,6 +391,12 @@ impl GiVolume {
                 "main",
                 &[&voxelize_layout],
             ),
+            voxelize_specks_pipeline: gpu.compute_pipeline(
+                "gi voxelize specks",
+                &voxelize_module,
+                "specks",
+                &[&voxelize_layout],
+            ),
             seed_pipeline: gpu.compute_pipeline("gi seed", &flood_module, "seed", &[&flood_layout]),
             flood_pipeline: gpu.compute_pipeline(
                 "gi flood",
@@ -401,6 +426,9 @@ impl GiVolume {
             pending: None,
             outdated: [false; LEVEL_COUNT],
             refresh_waiting: false,
+            hold_off: false,
+            held_off: 0,
+            speck_voxels: 0.0,
         }
     }
 
@@ -417,6 +445,7 @@ impl GiVolume {
         let first_build = self.levels[0].origin_voxels.is_none();
         let mut rebuild = Vec::new();
         let mut slice = None;
+        let speck_voxels = self.speck_voxels;
         if first_build {
             for (index, level) in self.levels.iter_mut().enumerate() {
                 let wanted = snapped_origin(camera_position, level.voxel_size);
@@ -428,10 +457,14 @@ impl GiVolume {
                     first_slot + index as u32,
                     wanted,
                     level.voxel_size,
+                    speck_voxels,
                 );
             }
         } else {
-            if self.pending.is_none() {
+            // Held off for a few frames at most, so that the voxels can't fall far behind.
+            let hold_off = std::mem::take(&mut self.hold_off) && self.held_off < MAX_HELD_OFF;
+            self.held_off = if hold_off { self.held_off + 1 } else { 0 };
+            if self.pending.is_none() && !hold_off {
                 self.pending = choose_rebuild(&self.levels, camera_position)
                     .or_else(|| self.choose_outdated());
                 if let Some(pending) = self.pending {
@@ -442,6 +475,7 @@ impl GiVolume {
                         first_slot + pending.level as u32,
                         pending.origin,
                         level.voxel_size,
+                        speck_voxels,
                     );
                 }
             }
@@ -665,6 +699,12 @@ impl GiVolume {
             pass.set_pipeline(&self.voxelize_pipeline);
             pass.set_bind_group(0, &self.levels[index].voxelize_group, &[]);
             pass.dispatch_workgroups_indirect(cull_work.args(), CullWork::software_args_offset());
+            // Nothing, unless the level's view draws specks.
+            pass.set_pipeline(&self.voxelize_specks_pipeline);
+            pass.dispatch_workgroups_indirect(
+                cull_work.args(),
+                CullWork::voxel_speck_args_offset(),
+            );
         }
     }
 
@@ -768,6 +808,7 @@ fn write_level_view(
     slot: u32,
     origin_voxels: IVec3,
     voxel_size: f32,
+    speck_voxels: f32,
 ) {
     let half = voxel_size * RESOLUTION as f32 * 0.5;
     let center = (origin_voxels.as_vec3() + Vec3::splat(RESOLUTION as f32 * 0.5)) * voxel_size;
@@ -781,7 +822,8 @@ fn write_level_view(
         // Half a voxel of geometric error is invisible at this resolution.
         0.5,
     )
-    .drawing(InstanceFilter::Gi);
+    .drawing(InstanceFilter::Gi)
+    .with_specks(speck_voxels);
     pass_view.allow_software = 2;
     slots.write(gpu, slot, &pass_view);
 }

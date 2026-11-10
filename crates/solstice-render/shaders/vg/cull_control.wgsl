@@ -37,7 +37,18 @@ struct Args {
     masked_draw_instance_count: u32,
     masked_draw_first_vertex: u32,
     masked_draw_first_instance: u32,
+    // Dispatch: a depth map's specks, a thread each.
+    speck_x: u32,
+    speck_y: u32,
+    speck_z: u32,
+    // Dispatch: a voxelization's specks, which are the hardware end of its list.
+    voxel_speck_x: u32,
+    voxel_speck_y: u32,
+    voxel_speck_z: u32,
 }
+
+// Must match the workgroup size of the passes that draw specks.
+const SPECK_GROUP_SIZE: u32 = 64u;
 
 const MAX_CLUSTER_TRIANGLES: u32 = 128u;
 
@@ -75,8 +86,14 @@ fn finish() {
     args.masked_draw_instance_count = atomicLoad(&state.masked_hw_count) - state.masked_hw_base;
     args.masked_draw_first_vertex = 0u;
     args.masked_draw_first_instance = 0u;
+    args.speck_x = min(groups_for(atomicLoad(&state.speck_count), SPECK_GROUP_SIZE), MAX_GROUPS);
+    args.speck_y = 1u;
+    args.speck_z = 1u;
+    args.voxel_speck_x = min(groups_for(args.draw_instance_count, SPECK_GROUP_SIZE), MAX_GROUPS);
+    args.voxel_speck_y = 1u;
+    args.voxel_speck_z = 1u;
     args.merge_vertex_count = 3u;
-    args.merge_instance_count = min(args.software_x + args.masked_software_x, 1u);
+    args.merge_instance_count = min(args.software_x + args.masked_software_x + args.speck_x, 1u);
     args.merge_first_vertex = 0u;
     args.merge_first_instance = 0u;
 }

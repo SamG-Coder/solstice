@@ -2,24 +2,29 @@
 //!
 //! wgpu limits a storage binding to 2 GiB, which a scene of billions of triangles passes twice:
 //! its cluster records, and the page pool it wants. So the cluster table is split in two, and the
-//! pool in three by level of detail: close, middle and far. A pool of its own also means far
-//! pages can't push out near ones.
+//! pool in three by level of detail, close, middle and far, and spare ones that no page calls home, taking what the others can't. A pool of its own also means far
+//! pages can't push out near ones that are wanted. A pool that has no room borrows what another
+//! has free or isn't using.
 //!
 //! Only such a scene pays for any of this. The shaders are rewritten for it as text, so a scene
 //! that fits compiles the source it always did, with the bindings and limits it always had.
 //!
-//! **Supported only natively on x64 with an RTX 5080**, the one setup these scenes are for. Other
-//! devices may work, and fail with a clear message if they offer too few storage buffers.
+//! For an RTX 5080 on x64, natively or in Chrome: the one setup these scenes are for. Other devices
+//! may work, and fail with a clear message if they offer too few storage buffers.
 //!
-//! A pool address holds its band in the top two bits, above the place within that band's buffer.
+//! A pool address holds its band in the top three bits, above the place within that band's buffer.
 //! Adding a cluster's local offset to it needs no special care, and `counts` is left alone.
 
 use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
 
-/// How many pools a scene that needs regions has.
-pub const BANDS: usize = 3;
-/// Storage buffers per stage the heaviest pass binds when regions are on: the masked rasterizers.
-pub const REQUIRED_STORAGE_BUFFERS: u32 = 11;
+/// The most pools a scene that needs regions can have: three by level of detail, and spares.
+pub const BANDS: usize = 8;
+/// A pool address holds its band above this bit: a pool of 2 GiB is 2^29 words.
+pub const BAND_SHIFT: u32 = 29;
+/// Storage buffers per stage the heaviest pass binds with this many pools: the masked rasterizers.
+pub fn required_storage_buffers(pools: usize) -> u32 {
+    8 + pools as u32
+}
 /// Set to force regions on any scene, so that tests can exercise this path.
 const FORCE_VARIABLE: &str = "SOLSTICE_FORCE_REGIONS";
 
@@ -53,10 +58,14 @@ pub fn binding_slots(limits: &wgpu::Limits) -> u32 {
     (binding_bytes(limits) / PAGE_BYTES as u64) as u32
 }
 
+/// The most one binding may hold: what the device allows, and no more than an address has bits
+/// for below its band. A browser passes on whatever limit it is given, and a pool larger than
+/// that would have its addresses run into the next band's.
 fn binding_bytes(limits: &wgpu::Limits) -> u64 {
     limits
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size)
+        .min(4 << BAND_SHIFT)
 }
 
 /// Each page's band, with `cap` the most pages one binding can hold.
@@ -83,38 +92,65 @@ pub fn page_bands(scene: &PagedScene, cap: u32) -> Vec<u8> {
         .collect()
 }
 
+/// How many pools these slots need bound: the three by level of detail, and the spares in use.
+fn pools_of(band_slots: &[u32; BANDS]) -> usize {
+    (3..BANDS)
+        .rev()
+        .find(|&band| band_slots[band] > 0)
+        .map_or(3, |band| band + 1)
+}
+
 impl RegionPlan {
+    /// How many pools the scene binds.
+    pub fn pools(&self) -> usize {
+        pools_of(&self.band_slots)
+    }
+
     /// The plan for a scene with a pool of `slots`, or `None` if it fits in single bindings.
     pub fn decide(limits: &wgpu::Limits, scene: &PagedScene, slots: u32) -> Option<Self> {
         let forced = std::env::var_os(FORCE_VARIABLE).is_some();
         let limit = binding_bytes(limits);
-        let cluster_bytes = scene.clusters.len() as u64 * CLUSTER_BYTES;
+        // A scene that keeps its records outside its manifest has them only for the pages in its
+        // pool, a block of the most a page can have for each slot.
+        let stride = scene
+            .external
+            .map(|_| u64::from(scene.max_page_clusters().max(1)));
+        let cluster_count = |slots: u32| match stride {
+            Some(stride) => u64::from(slots.min(scene.pages.len() as u32)) * stride,
+            None => scene.clusters.len() as u64,
+        };
+        let cluster_bytes = cluster_count(slots) * CLUSTER_BYTES;
         let pool_bytes = u64::from(slots) * PAGE_BYTES as u64;
         if !forced && cluster_bytes <= limit && pool_bytes <= limit {
             return None;
         }
+        let band_slots = band_slots(scene, slots, limit);
+        let needed = required_storage_buffers(pools_of(&band_slots));
         assert!(
-            limits.max_storage_buffers_per_shader_stage >= REQUIRED_STORAGE_BUFFERS,
+            limits.max_storage_buffers_per_shader_stage >= needed,
             "this scene is too large for one storage binding and needs \
-             {REQUIRED_STORAGE_BUFFERS} storage buffers per stage, but this device offers {}",
+             {needed} storage buffers per stage, but this device offers {}",
             limits.max_storage_buffers_per_shader_stage
         );
-        let clusters = scene.clusters.len() as u32;
+        let clusters = match stride {
+            Some(stride) => u64::from(band_slots.iter().sum::<u32>()) * stride,
+            None => scene.clusters.len() as u64,
+        };
         let cluster_chunk = if forced {
             // Half each, so that a small scene uses both bindings.
-            clusters.div_ceil(2)
+            clusters.div_ceil(2) as u32
         } else {
             // A scene may need regions only for its pool, and have fewer records than this.
-            ((limit / CLUSTER_BYTES) as u32).min(clusters)
+            (limit / CLUSTER_BYTES).min(clusters) as u32
         };
         assert!(
-            scene.clusters.len() as u64 <= u64::from(cluster_chunk) * 2,
-            "this scene has {} clusters, more than two bindings of {cluster_chunk} can hold",
-            scene.clusters.len()
+            clusters <= u64::from(cluster_chunk) * 2,
+            "this scene has {clusters} cluster records to hold, more than two bindings of \
+             {cluster_chunk} can"
         );
         Some(Self {
             cluster_chunk,
-            band_slots: band_slots(scene, slots, limit),
+            band_slots,
         })
     }
 }
@@ -135,7 +171,7 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
             pages.iter().all(|&count| count <= cap),
             "a band of this scene's pages can't fit in one binding"
         );
-        return pages.map(|count| count.max(1));
+        return std::array::from_fn(|band| if band >= 3 { 0 } else { pages[band].max(1) });
     }
     // A page can't install before the coarser pages it depends on, and the far band's pages are
     // the top of every chain: drawing detail anywhere needs them first. So it comes first, and
@@ -143,11 +179,14 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
     let far = pages[2].min((slots / 2).max(pinned[2] + 1)).max(1);
     let rest = slots.saturating_sub(far);
     let near = rest / 2;
-    let wanted = [near, rest - near, far];
+    let wanted: [u32; BANDS] =
+        std::array::from_fn(|band| [near, rest - near, far].get(band).copied().unwrap_or(0));
 
     // No band gets more than it has pages for or one binding can hold, and what that leaves over
     // goes to whichever can use it.
-    let room = pages.map(|count| count.min(cap));
+    // The spare bands are home to no page: they take what the others can't hold.
+    let room: [u32; BANDS] =
+        std::array::from_fn(|band| if band >= 3 { cap } else { pages[band].min(cap) });
     let mut given: [u32; BANDS] =
         std::array::from_fn(|band| wanted[band].max(pinned[band]).min(room[band]));
     // Raising a band to its pinned pages can overdraw the budget: the others pay, nearest first.
@@ -163,7 +202,14 @@ fn band_slots(scene: &PagedScene, slots: u32, limit: u64) -> [u32; BANDS] {
         given[band] += more;
         left -= more;
     }
-    given.map(|count| count.max(1))
+    // The spare band may have no slots; a scene's own bands need one to bind.
+    std::array::from_fn(|band| {
+        if band >= 3 {
+            given[band]
+        } else {
+            given[band].max(1)
+        }
+    })
 }
 
 /// Rewrites `name[...]` as `function(...)`, leaving longer names that end in `name` alone.
@@ -218,22 +264,46 @@ fn next_binding(source: &str) -> u32 {
         .map_or(0, |highest| highest + 1)
 }
 
-const POOL_WORD: &str = "
-fn pool_word(address: u32) -> u32 {
-    let word = address & 0x3fffffffu;
-    switch address >> 30u {
-        case 1u: { return pool_middle[word]; }
-        case 2u: { return pool_far[word]; }
-        default: { return pool_near[word]; }
+/// The name a band's pool has in a rewritten shader.
+fn pool_name(band: usize) -> String {
+    match band {
+        0 => "pool_near".to_owned(),
+        1 => "pool_middle".to_owned(),
+        2 => "pool_far".to_owned(),
+        spare => format!("pool_spare{}", spare - 3),
     }
 }
-";
+
+/// Reads a word of whichever pool an address is in.
+fn pool_word(pools: usize) -> String {
+    let low = (1u32 << BAND_SHIFT) - 1;
+    let mut cases = String::new();
+    for band in 1..pools {
+        cases += &format!(
+            "        case {band}u: {{ return {}[word]; }}\n",
+            pool_name(band)
+        );
+    }
+    format!(
+        "
+fn pool_word(address: u32) -> u32 {{
+    let word = address & {low}u;
+    switch address >> {BAND_SHIFT}u {{
+{cases}        default: {{ return pool_near[word]; }}
+    }}
+}}
+"
+    )
+}
 
 /// Vertex numbers to word addresses, keeping the band.
-const VERTEX_WORD: &str = "(index & 0xc0000000u) | ((index & 0x3fffffffu) * 4u)";
+fn vertex_word() -> String {
+    let low = (1u32 << BAND_SHIFT) - 1;
+    format!("(index & {}u) | ((index & {low}u) * 4u)", !low)
+}
 
-/// Rewrites an expanded shader for a scene that needs regions.
-pub fn rewrite_shader(source: &str, cluster_chunk: u32) -> String {
+/// Rewrites an expanded shader for a scene that needs regions, with this many pools.
+pub fn rewrite_shader(source: &str, cluster_chunk: u32, pools: usize) -> String {
     let mut binding = next_binding(source);
     let mut take = || {
         binding += 1;
@@ -251,10 +321,18 @@ fn cluster_at(index: u32) -> Cluster {{
 }}
 "
     );
+    let mut declare = |band: usize, extra: &mut String| {
+        *extra += &format!(
+            "@group(0) @binding({}) var<storage, read> {}: array<u32>;\n",
+            take(),
+            pool_name(band)
+        );
+    };
 
     const POOL: &str = "var<storage, read> pool: array<u32>;";
     const VERTICES: &str = "var<storage, read> vertices: array<PackedVertex>;";
     const TRIANGLES: &str = "var<storage, read> triangles: array<u32>;";
+    let vertex_word = vertex_word();
     if out.contains(POOL) {
         // One binding of words: the rasterizers.
         const WORD: &str = "let word = index * 4u;";
@@ -262,18 +340,13 @@ fn cluster_at(index: u32) -> Cluster {{
             out.contains(WORD),
             "the rasterizer's load_vertex has changed"
         );
-        out = out.replace(WORD, &format!("let word = {VERTEX_WORD};"));
+        out = out.replace(WORD, &format!("let word = {vertex_word};"));
         out = replace_indexing(&out, "pool", "pool_word");
         out = out.replace(POOL, "var<storage, read> pool_near: array<u32>;");
-        extra += &format!(
-            "@group(0) @binding({}) var<storage, read> pool_middle: array<u32>;\n",
-            take()
-        );
-        extra += &format!(
-            "@group(0) @binding({}) var<storage, read> pool_far: array<u32>;\n",
-            take()
-        );
-        extra += POOL_WORD;
+        for band in 1..pools {
+            declare(band, &mut extra);
+        }
+        extra += &pool_word(pools);
     } else if out.contains(VERTICES) {
         // A binding each for vertices and triangles, which carry the first two bands here.
         out = replace_indexing(&out, "vertices", "region_vertex");
@@ -281,15 +354,14 @@ fn cluster_at(index: u32) -> Cluster {{
         out = out.replace(VERTICES, "var<storage, read> pool_near: array<u32>;");
         assert!(out.contains(TRIANGLES), "the triangles binding has changed");
         out = out.replace(TRIANGLES, "var<storage, read> pool_middle: array<u32>;");
-        extra += &format!(
-            "@group(0) @binding({}) var<storage, read> pool_far: array<u32>;\n",
-            take()
-        );
-        extra += POOL_WORD;
+        for band in 2..pools {
+            declare(band, &mut extra);
+        }
+        extra += &pool_word(pools);
         extra += &format!(
             "
 fn region_vertex(index: u32) -> PackedVertex {{
-    let word = {VERTEX_WORD};
+    let word = {vertex_word};
     return PackedVertex(
         pool_word(word), pool_word(word + 1u), pool_word(word + 2u), pool_word(word + 3u));
 }}
@@ -366,7 +438,7 @@ mod tests {
         let limits = wgpu::Limits {
             max_storage_buffer_binding_size: 1 << 31,
             max_buffer_size: 1 << 31,
-            max_storage_buffers_per_shader_stage: REQUIRED_STORAGE_BUFFERS,
+            max_storage_buffers_per_shader_stage: required_storage_buffers(BANDS),
             ..Default::default()
         };
         // 40,000 slots of 128 KiB is 5 GiB, over the limit, but only ten clusters.
@@ -432,7 +504,7 @@ mod tests {
     #[test]
     fn a_resident_scene_gets_exactly_the_slots_it_needs() {
         let scene = scene(&[ROOT_ROUND, ROOT_ROUND, 9, 5, 4, 1, 1, 1], 2);
-        assert_eq!(band_slots(&scene, 8, 1 << 31), [4, 1, 3]);
+        assert_eq!(band_slots(&scene, 8, 1 << 31), [4, 1, 3, 0, 0, 0, 0, 0]);
     }
 
     #[test]

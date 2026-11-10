@@ -40,6 +40,15 @@ struct PassView {
     // 1 if this view sends cut-out clusters through their own lists and rasterizers; 0 if it
     // draws them with the rest, as solid or testing the mask itself.
     masked_lists: u32,
+    // For the camera's own view of a streamed scene: how far around the camera pages are asked
+    // for that it isn't facing, at a coarser level of detail. 0 for none.
+    prefetch_radius: f32,
+    // For a view kept from frame to frame, in a streamed scene: where in the page requests the
+    // bits begin that it sets, one for each page it asks for. 0 for none.
+    hold_requests: u32,
+    // For a depth map or a voxelization: clusters under this many texels or voxels across are
+    // drawn as specks, a point each. 0 for none.
+    speck_texels: f32,
 }
 
 // Twins of `InstanceFilter` in vg/culling.rs.
@@ -66,7 +75,9 @@ struct CullState {
     dropped: atomic<u32>,
     // Entries of the visible list claimed so far, from both ends together.
     reserved: atomic<u32>,
-    _pad2: u32,
+    // A depth map's specks, which fill the retry list: a view without occlusion has no other
+    // use for it.
+    speck_count: atomic<u32>,
     // The cut-out clusters' lists, which fill the end of the visible list from `opaque_end` on.
     masked_sw_count: atomic<u32>,
     masked_hw_count: atomic<u32>,
@@ -90,7 +101,7 @@ struct CullStateRead {
     triangle_count: u32,
     dropped: u32,
     reserved: u32,
-    _pad2: u32,
+    speck_count: u32,
     masked_sw_count: u32,
     masked_hw_count: u32,
     masked_sw_base: u32,

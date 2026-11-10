@@ -18,6 +18,13 @@ const BRIGHTEST_AVERAGE_PER_SUN: f32 = 0.06;
 /// night, the image darkens rather than being brightened to grey, as an eye adapted to the dark
 /// still sees night as night: about seven stops below the brightest.
 const DARKEST_AVERAGE_PER_SUN: f32 = BRIGHTEST_AVERAGE_PER_SUN / 128.0;
+/// How much further exposure adapts by day. The dark is then a room, not the night, and an eye
+/// that has walked in from the sun sees a room plainly: a hall lit through its windows measures
+/// eleven stops below the sunlit ground outside, four below where night stops. Five more stops
+/// reach it and a little beyond; a cellar with no window stays dark.
+const DARKEST_BY_DAY: f32 = 1.0 / 32.0;
+/// Matches `BINS` in `post/exposure.wgsl`.
+const EXPOSURE_BINS: u64 = 192;
 
 /// Twin of `Params` in `post/exposure.wgsl`.
 #[repr(C)]
@@ -225,7 +232,7 @@ impl PostProcess {
             ),
             histogram: gpu.storage_buffer(
                 "exposure histogram",
-                128 * 4,
+                EXPOSURE_BINS * 4,
                 wgpu::BufferUsages::empty(),
             ),
             exposure: gpu.storage_buffer("exposure", 16, wgpu::BufferUsages::empty()),
@@ -419,6 +426,7 @@ impl PostProcess {
         frame_index: u32,
         delta_seconds: f32,
         daylight_illuminance: f32,
+        day: f32,
         debug_passthrough: bool,
     ) {
         gpu.queue.write_buffer(
@@ -429,7 +437,9 @@ impl PostProcess {
                 first_frame: u32::from(frame_index == 0),
                 compensation: 1.2,
                 brightest_average: daylight_illuminance * BRIGHTEST_AVERAGE_PER_SUN,
-                darkest_average: daylight_illuminance * DARKEST_AVERAGE_PER_SUN,
+                darkest_average: daylight_illuminance
+                    * DARKEST_AVERAGE_PER_SUN
+                    * DARKEST_BY_DAY.powf(day),
                 _pad: [0.0; 3],
             }),
         );

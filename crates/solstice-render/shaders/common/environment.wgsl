@@ -67,6 +67,12 @@ const HAZE: f32 = 0.0011;
 // `color` of a surface at `world`, `distance` from the camera along `view` (towards the camera),
 // seen through the air between: distant things fade towards the sky colour behind them.
 fn aerial_perspective(color: vec3f, world: vec3f, view: vec3f, distance: f32) -> vec3f {
+    return aerial_perspective_lit(color, world, view, distance, 1.0);
+}
+
+// The same, where only `lit` of the air between is lit: under a roof the air scatters almost no
+// light towards the eye, and a room would otherwise fill with the glow of the open sky.
+fn aerial_perspective_lit(color: vec3f, world: vec3f, view: vec3f, distance: f32, lit: f32) -> vec3f {
     let transmittance = exp(-distance * HAZE);
     // How far into the haze this is: nearby haze glows with light from all around, but over a
     // long path the air takes the colour of the sky at the horizon behind the object.
@@ -86,7 +92,7 @@ fn aerial_perspective(color: vec3f, world: vec3f, view: vec3f, distance: f32) ->
     let haze_limit = luminance(clear_sky_radiance(away_from_sun)) * shade * 2.0;
     haze_color *= min(haze_limit / max(luminance(haze_color), 1.0e-4), 1.0);
     haze_color = mix(haze_color, clear_sky_radiance(toward_horizon(-view)) * shade, far);
-    return mix(haze_color, color, transmittance);
+    return mix(haze_color * lit, color, transmittance);
 }
 
 // Radiance of the sky towards `direction`, clouds included, excluding the sun disc.
@@ -166,7 +172,12 @@ fn sample_volume(p: vec3f, level: u32) -> vec4f {
 struct VolumeHit {
     hit: bool,
     t: f32,
+    // Of what was hit. Of a ray that ran out of steps, the nearest surface to where it stopped.
     radiance: vec3f,
+    // For a miss, how far the ray got away: 1 if it left the volume or went its whole length.
+    // One that ran out of steps did so among surfaces, and got away less the nearer one it
+    // stopped. See `miss_radiance`.
+    escaped: f32,
 }
 
 // How close to a surface counts as a hit for lighting, in voxels: generous, so that thin walls
@@ -200,6 +211,8 @@ fn trace_volume_levels(origin: vec3f, direction: vec3f, start: f32, max_t: f32, 
     var level = 0u;
     var measured_level = VOLUME_LEVELS;
     var previous_distance = 0.0;
+    // The last place looked at: its radiance, and its distance to a surface in voxels.
+    var last = vec4f(0.0);
     for (var step = 0u; step < max_steps && t < max_t; step++) {
         let p = origin + direction * t;
         level = volume_level_at(p, select(level, 0u, any_level));
@@ -208,6 +221,7 @@ fn trace_volume_levels(origin: vec3f, direction: vec3f, start: f32, max_t: f32, 
         }
         let voxel = volume_params.levels[level].w;
         let s = sample_volume(p, level);
+        last = vec4f(s.rgb, s.a / voxel);
         // A hit needs the ray to be closing in on a surface, measured within a single level:
         // distances from different levels are not comparable. Without this, a ray skimming away
         // from flat ground falsely hits it on changing to a coarser level, where the threshold
@@ -216,11 +230,35 @@ fn trace_volume_levels(origin: vec3f, direction: vec3f, start: f32, max_t: f32, 
         measured_level = level;
         previous_distance = s.a;
         if s.a < voxel * hit_voxels && approaching {
-            return VolumeHit(true, t, s.rgb);
+            return VolumeHit(true, t, s.rgb, 0.0);
         }
         t += max(s.a - voxel * 0.5, voxel * 0.6);
     }
-    return VolumeHit(false, t, vec3f(0.0));
+    if level >= VOLUME_LEVELS || t >= max_t {
+        return VolumeHit(false, t, vec3f(0.0), 1.0);
+    }
+    // Out of steps. A ray takes its smallest steps beside a surface, so it has spent them
+    // skimming one, or threading through many: it is among surfaces still, and likelier to end
+    // on one than to reach the sky. In the open, a few voxels from anything, it may yet.
+    return VolumeHit(false, t, last.rgb, smoothstep(1.0, 3.0, last.a));
+}
+
+// How far below the horizon a ray that left the volume points, as its direction's height, before
+// it is taken to have got under the ground, and by where it certainly has.
+const UNDERGROUND_FROM: f32 = -0.1;
+const UNDERGROUND_BY: f32 = -0.35;
+
+// What a ray that hit nothing brings back, where `sky` is what the open sky gives in its
+// direction. The sky is the answer only for a ray that got away. One that ran out of steps
+// among surfaces brings the light of the nearest: in a hall, calling that sky paints daylight
+// onto every floor a ray skims. And one that left the volume pointing well down has passed
+// under the ground, where there is no sky, unless there is a sea below to mirror it.
+fn miss_radiance(hit: VolumeHit, direction: vec3f, sky: vec3f) -> vec3f {
+    var beyond = sky;
+    if frame.sea_level <= -1.0e29 {
+        beyond *= smoothstep(UNDERGROUND_BY, UNDERGROUND_FROM, direction.y);
+    }
+    return mix(hit.radiance, beyond, hit.escaped);
 }
 
 // How far inside the outermost level `p` is: 0 at its edge, reaching 1 well inside. Rays from

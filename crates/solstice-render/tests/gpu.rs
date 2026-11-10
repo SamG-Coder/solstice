@@ -11,8 +11,8 @@ use solstice_builder::{
     Mesh, Vertex,
 };
 use solstice_render::{
-    Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Quality, Renderer, RendererSettings,
-    StreamRequest, StreamingBudget, TimeOfDay, Weather,
+    Camera, DebugView, Effect, Environment, Gpu, Ocean, Place, Pond, Quality, Renderer,
+    RendererSettings, StreamRequest, StreamingBudget, TimeOfDay, Weather,
 };
 use std::sync::{Arc, Mutex};
 
@@ -138,6 +138,8 @@ struct Run {
     /// Clusters the last shadow cascade redrawn sent to the software rasterizer.
     shadow_software_clusters: u32,
     shadow_clusters: u32,
+    /// Clusters it drew as specks.
+    shadow_specks: u32,
 }
 
 /// Renders a few frames in darkness, fails on any validation error, and reads back the result.
@@ -192,6 +194,7 @@ fn render_in(
         software_clusters: stats.software_clusters,
         shadow_software_clusters: stats.shadow_software_clusters,
         shadow_clusters: stats.shadow_clusters,
+        shadow_specks: stats.shadow_specks,
     }
 }
 
@@ -344,8 +347,58 @@ fn pump(
     for _ in 0..per_frame.min(queue.len()) {
         // Popping the newest first delivers children before their parents.
         let request = queue.pop().unwrap();
-        renderer.deliver(request.id, requested_bytes(loaded, &request));
+        let data = requested_bytes(loaded, &request);
+        match request.clusters {
+            Some((start, end)) => {
+                let records = ordered_clusters(loaded)[start as usize..end as usize].to_vec();
+                renderer.deliver_page(request.id, data, records)
+            }
+            None => renderer.deliver(request.id, data),
+        };
     }
+}
+
+/// A scene's cluster records as the browser's file has them: each page's sets in turn.
+fn ordered_clusters(loaded: &LoadedScene) -> Vec<u8> {
+    let scene = &loaded.scene;
+    let ordered: Vec<solstice_asset::PackedCluster> = scene
+        .sets
+        .iter()
+        .flat_map(|set| {
+            let range =
+                set.first_cluster as usize..(set.first_cluster + set.cluster_count) as usize;
+            scene.clusters[range].iter().copied()
+        })
+        .collect();
+    solstice_asset::file::cluster_bytes(&ordered).to_vec()
+}
+
+/// A streaming renderer for a scene as a browser loads one too large for its memory: its cluster
+/// records and pinned pages arrive apart from its manifest, and records only with their pages.
+fn split_renderer(
+    gpu: &Gpu,
+    loaded: &LoadedScene,
+    settings: RendererSettings,
+    budget: StreamingBudget,
+) -> Renderer {
+    let mut small = loaded.scene.clone();
+    small.external = Some(solstice_asset::paged::ExternalTables {
+        clusters: small.clusters.len() as u64,
+        pinned_bytes: small.pinned_data.len() as u64,
+    });
+    small.clusters.clear();
+    small.pinned_data.clear();
+    let mut renderer = Renderer::streaming(gpu, &small, FORMAT, settings, budget);
+    let records = ordered_clusters(loaded);
+    let mut at = 0;
+    for page in 0..loaded.scene.pinned_pages {
+        let bytes = loaded.scene.page_cluster_count(page) as usize * 48;
+        let data = loaded.scene.pinned_page(page);
+        renderer.install_pinned(gpu, page, data, &records[at..at + bytes]);
+        at += bytes;
+    }
+    renderer.finish_external_tables(gpu);
+    renderer
 }
 
 /// What a request's bytes come to once unpacked, from a scene in memory.
@@ -362,6 +415,120 @@ fn requested_bytes(loaded: &LoadedScene, request: &StreamRequest) -> Vec<u8> {
         upper.material_mips[mip].as_slice(),
     ]
     .concat()
+}
+
+/// A scene whose big tables arrive in parts, as a browser loads one too large for its memory,
+/// must draw exactly what the same scene does with them in its manifest.
+#[test]
+fn a_scene_whose_tables_arrive_separately_draws_the_same() {
+    let Some(gpu) = request_gpu() else { return };
+    let scene = SceneAsset {
+        meshes: vec![build_virtual_mesh(&sphere(7), &BuildOptions::default())],
+        materials: vec![Material::default()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    assert!(loaded.scene.pinned_pages > 0);
+    const SIZE: u32 = 128;
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 1.8),
+        near: 0.05,
+        ..Default::default()
+    };
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let draw = |renderer: &mut Renderer| {
+        let target = test_target(&gpu, SIZE);
+        let view = target.create_view(&Default::default());
+        let mut queue = Vec::new();
+        for _ in 0..80 {
+            pump(renderer, &loaded, &mut queue, 8);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        read_pixels(&gpu, &target, SIZE)
+    };
+
+    let mut whole = Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, generous_budget());
+    let expected = draw(&mut whole);
+
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut split = split_renderer(&gpu, &loaded, settings, generous_budget());
+    let actual = draw(&mut split);
+    assert!(
+        errors.lock().unwrap().is_empty(),
+        "{:?}",
+        errors.lock().unwrap()
+    );
+    assert_eq!(actual, expected);
+}
+
+/// With prefetch on, pages load for what is near the camera but behind it, down to a coarser
+/// level than for what it sees.
+#[test]
+fn prefetch_loads_what_is_near_but_out_of_view() {
+    let Some(gpu) = request_gpu() else { return };
+    // Two meshes, so that each has pages of its own: one in view, one behind the camera.
+    let scene = SceneAsset {
+        meshes: vec![
+            build_virtual_mesh(&sphere(7), &BuildOptions::default()),
+            build_virtual_mesh(&sphere(7), &BuildOptions::default()),
+        ],
+        materials: vec![Material::default()],
+        instances: vec![
+            instance(0, Mat4::IDENTITY),
+            instance(1, Mat4::from_translation(Vec3::new(0.0, 0.0, 3.2))),
+        ],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    const SIZE: u32 = 256;
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 1.6),
+        fov_y: 50.0_f32.to_radians(),
+        near: 0.05,
+        ..Default::default()
+    };
+    let installed = |prefetch_radius: f32| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Albedo,
+            temporal_accumulation: false,
+            prefetch_radius,
+            ..Default::default()
+        };
+        let mut renderer =
+            Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, generous_budget());
+        let target = test_target(&gpu, SIZE);
+        let view = target.create_view(&Default::default());
+        let mut queue = Vec::new();
+        for _ in 0..160 {
+            pump(&mut renderer, &loaded, &mut queue, 8);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+        }
+        renderer.stats().streaming.installed
+    };
+    let pinned = loaded.scene.pinned_pages;
+    let (facing, around, far) = (installed(0.0), installed(10.0), installed(0.05));
+    let seen = facing - pinned;
+    assert!(seen > 2, "the sphere in view streams in: {seen} pages");
+    let behind = around - facing;
+    assert!(behind > 0, "what is behind the camera loads too");
+    assert!(behind < seen, "but coarser: {behind} pages against {seen}");
+    assert_eq!(far, facing, "and not from beyond the radius");
 }
 
 /// The scene starts with only its coarsest pages and fills in slowly. Every frame along the way
@@ -462,6 +629,75 @@ fn a_small_pool_evicts_what_is_out_of_view_and_shows_no_holes() {
         ..generous_budget()
     };
     let mut renderer = Renderer::streaming(&gpu, &loaded.scene, FORMAT, settings, budget);
+    let target = test_target(&gpu, SIZE);
+    let view = target.create_view(&Default::default());
+
+    let mut queue = Vec::new();
+    for (visit, x) in [0.0, APART, 0.0, APART].into_iter().enumerate() {
+        let camera = Camera {
+            position: Vec3::new(x, 0.0, DISTANCE),
+            fov_y: 50.0_f32.to_radians(),
+            near: 0.05,
+            ..Default::default()
+        };
+        for frame in 0..90 {
+            pump(&mut renderer, &loaded, &mut queue, 4);
+            renderer.render(&gpu, &camera, &darkness(), &view, (SIZE, SIZE), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            let streaming = renderer.stats().streaming;
+            assert!(streaming.installed <= slots, "the pool overflowed");
+            if frame % 8 == 0 {
+                let pixels = read_pixels(&gpu, &target, SIZE);
+                let holes = holes_in_sphere(&pixels, SIZE, DISTANCE, camera.fov_y);
+                assert_eq!(holes, 0, "visit {visit}, frame {frame}");
+            }
+        }
+    }
+    // Forced regions divide this small pool between three bands, none of which then overflows.
+    // How bands evict is covered by the residency tests.
+    if std::env::var_os("SOLSTICE_FORCE_REGIONS").is_none() {
+        assert!(
+            renderer.stats().streaming.evictions > 0,
+            "the second sphere should have pushed out the first"
+        );
+    }
+}
+
+/// The same, for a scene whose cluster records come and go with its pages.
+#[test]
+fn a_small_pool_of_a_split_scene_evicts_and_shows_no_holes() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(7), &BuildOptions::default());
+    const APART: f32 = 100.0;
+    let scene = SceneAsset {
+        meshes: vec![mesh.clone(), mesh],
+        materials: vec![white_material()],
+        instances: vec![
+            instance(0, Mat4::IDENTITY),
+            instance(1, Mat4::from_translation(Vec3::X * APART)),
+        ],
+        ..Default::default()
+    };
+    let loaded = paginate(&scene);
+    const SIZE: u32 = 256;
+    const DISTANCE: f32 = 1.6;
+    let settings = RendererSettings {
+        debug_view: DebugView::Albedo,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+
+    // Room for the coarsest pages and a part of what one close view needs.
+    let pinned = loaded.scene.pinned_pages;
+    let slots = pinned + 10;
+    assert!(slots < loaded.scene.pages.len() as u32);
+    let budget = StreamingBudget {
+        geometry_bytes: u64::from(slots) * solstice_asset::paged::PAGE_BYTES as u64,
+        ..generous_budget()
+    };
+    let mut renderer = split_renderer(&gpu, &loaded, settings, budget);
     let target = test_target(&gpu, SIZE);
     let view = target.create_view(&Default::default());
 
@@ -1123,6 +1359,153 @@ fn small_casters_shadow_through_the_software_rasterizer() {
     );
 }
 
+/// The floor of [`ball_on_floor`] with, in place of the ball, a square sheet of `side` by `side`
+/// balls of `radius`, touching, level at `height` over the origin. Each ball is one cluster.
+fn sheet_of_balls(side: u32, radius: f32, height: f32) -> SceneAsset {
+    let mut scene = ball_on_floor();
+    scene.meshes[0] = build_virtual_mesh(&sphere(0), &BuildOptions::default());
+    let floor = scene.instances.pop().expect("the floor");
+    scene.instances.clear();
+    let half = side as f32 * radius;
+    for z in 0..side {
+        for x in 0..side {
+            let at = Vec3::new(
+                (2 * x + 1) as f32 * radius - half,
+                height,
+                (2 * z + 1) as f32 * radius - half,
+            );
+            scene.instances.push(instance(
+                0,
+                Mat4::from_scale_rotation_translation(Vec3::splat(radius), Quat::IDENTITY, at),
+            ));
+        }
+    }
+    scene.instances.push(floor);
+    scene
+}
+
+/// Clusters under a texel of a shadow map across are drawn into it as specks: a point each, in
+/// place of their triangles. A sheet of touching balls four millimetres across, half a texel of
+/// even the nearest cascade, must cast a shadow, and the cascade must report that the balls
+/// went as specks, so that the shadow cannot be the rasterizers'. A speck marks every texel its
+/// bounds touch, where a rasterizer marks only the texels whose centres a triangle covers, and
+/// misses most of them at this size: so specks never let through more light than triangles do.
+#[test]
+fn clusters_under_a_texel_shadow_as_specks() {
+    let Some(gpu) = request_gpu() else {
+        return;
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 2.0, 2.5),
+        yaw: 0.0,
+        pitch: -0.7,
+        ..Default::default()
+    };
+    let sun_direction = Vec3::new(1.0, 1.0, 0.0).normalize();
+    let sun = Environment {
+        sun_direction,
+        sky_intensity: 0.0,
+        gi_intensity: 0.0,
+        ..Default::default()
+    };
+    let size = 256;
+    let settings = |speck_texels: f32| RendererSettings {
+        temporal_accumulation: false,
+        speck_texels,
+        ..Default::default()
+    };
+    let (side, height) = (150, 0.5);
+    let scene = sheet_of_balls(side, 0.002, height);
+    // On the floor in the sheet's shadow, clear of the sheet as the camera sees it.
+    let in_shadow = Vec3::new(-0.5, 0.0, 0.1);
+    let (px, py) = pixel_of(&camera, size, in_shadow);
+
+    let specks = render_in(&gpu, &scene, &camera, settings(1.0), size, &sun);
+    assert!(
+        specks.shadow_specks >= side * side / 2,
+        "{} of the sheet's {} balls were drawn as specks",
+        specks.shadow_specks,
+        side * side
+    );
+    let triangles = render_in(&gpu, &scene, &camera, settings(0.0), size, &sun);
+    assert_eq!(triangles.shadow_specks, 0, "specks are off");
+
+    let mut bare = scene.clone();
+    bare.instances.drain(..(side * side) as usize);
+    let lit = brightness(patch(
+        &render_in(&gpu, &bare, &camera, settings(1.0), size, &sun).pixels,
+        size,
+        px,
+        py,
+        2,
+    ));
+    let as_specks = brightness(patch(&specks.pixels, size, px, py, 2));
+    let as_triangles = brightness(patch(&triangles.pixels, size, px, py, 2));
+    assert!(
+        as_specks + 30.0 < lit,
+        "the floor at ({px}, {py}) is {as_specks} under the sheet and {lit} without it: no shadow"
+    );
+    assert!(
+        as_specks < as_triangles + 12.0,
+        "the shadow is {as_specks} drawn as specks, lighter than the {as_triangles} of triangles"
+    );
+}
+
+/// The GI's voxels take clusters under a voxel across as specks too: a clump of small red balls
+/// shows red in the voxels, where only the specks' own pass can have put it.
+#[test]
+fn clusters_under_a_voxel_are_voxelized_as_specks() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 96;
+    let camera = over_the_floor();
+    let mut scene = red_ball_on_floor();
+    scene.meshes[0] = build_virtual_mesh(&sphere(0), &BuildOptions::default());
+    let floor = scene.instances.pop().expect("the floor");
+    scene.instances.clear();
+    // A block of balls a twentieth of a metre across, in voxels a fifth of a metre across.
+    let centre = Vec3::new(0.0, 1.0, 0.0);
+    for index in 0..1000 {
+        let cell = Vec3::new(
+            (index % 10) as f32,
+            (index / 10 % 10) as f32,
+            (index / 100) as f32,
+        );
+        let mut ball = instance(
+            0,
+            Mat4::from_scale_rotation_translation(
+                Vec3::splat(0.025),
+                Quat::IDENTITY,
+                centre + (cell - 4.5) * 0.1,
+            ),
+        );
+        ball.material = 1;
+        scene.instances.push(ball);
+    }
+    scene.instances.push(floor);
+    let (bx, by) = pixel_of(&camera, size, centre);
+    let redness = |speck_texels: f32| {
+        let settings = RendererSettings {
+            debug_view: DebugView::Voxels,
+            speck_texels,
+            ..Default::default()
+        };
+        let mut stage = Stage::new(&gpu, &scene, settings, size);
+        stage.frames(&gpu, &camera, &low_sun(), 12);
+        let [r, g, _] = patch(&stage.pixels(&gpu), size, bx, by, 1);
+        r / g.max(1.0)
+    };
+    let as_specks = redness(1.0);
+    assert!(
+        as_specks > 2.0,
+        "the balls drawn as specks aren't in the voxels: {as_specks}"
+    );
+    let as_triangles = redness(0.0);
+    assert!(
+        as_triangles > 2.0,
+        "the balls drawn as triangles aren't in the voxels: {as_triangles}"
+    );
+}
+
 /// A white ball on a wide floor, lit by the sun from +X, for judging how clouds light a scene.
 fn ball_on_floor() -> SceneAsset {
     let mut floor = Mesh::default();
@@ -1367,6 +1750,41 @@ fn twilight_fades_steadily_into_night() {
     }
 }
 
+/// Something dim fills the view: a room lit through its windows, as far as exposure knows. By day
+/// the eye adapts to it and sees it plainly. By night the same dimness is the night, and stays
+/// dark: exposure reaching as far by night would turn every night grey.
+#[test]
+fn a_dim_room_is_seen_plainly_by_day_and_night_stays_dark() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 64;
+    // A black wall glowing faintly, ten stops and more below sunlit ground and three below where
+    // exposure stops by night, with the sun behind it and no sky to light or mirror in it.
+    let mut scene = wall(0.0);
+    scene.materials[0].emissive = [0.0006; 3];
+    let day = Environment {
+        sun_direction: Vec3::new(0.0, 0.7, -0.7).normalize(),
+        sky_intensity: 0.0,
+        ..Default::default()
+    };
+    // The moon stands where the sun did, at a 2500th of its light.
+    let night = Environment {
+        sun_illuminance: day.sun_illuminance / 2500.0,
+        daylight_illuminance: day.sun_illuminance,
+        ..day
+    };
+    let seen = |environment: &Environment| {
+        let mut stage = Stage::new(&gpu, &scene, RendererSettings::default(), size);
+        stage.frames(&gpu, &Camera::default(), environment, 30);
+        mean_brightness(&stage.pixels(&gpu))
+    };
+    let (by_day, by_night) = (seen(&day), seen(&night));
+    assert!(by_day > 90.0, "the room by day is {by_day}");
+    assert!(
+        by_night < by_day * 0.6,
+        "the night is brightened to {by_night}, against {by_day} by day"
+    );
+}
+
 #[test]
 fn the_moon_is_drawn_without_a_dark_halo() {
     let Some(gpu) = request_gpu() else { return };
@@ -1461,6 +1879,31 @@ fn render_sea(
     quality: Quality,
     size: u32,
 ) -> Vec<u8> {
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        ..Default::default()
+    };
+    render_sea_under(
+        gpu,
+        camera,
+        (ocean, sea_level),
+        debug,
+        quality,
+        size,
+        &environment,
+    )
+}
+
+/// `render_sea` for a `sea`, its ocean's name and its level, under `environment`.
+fn render_sea_under(
+    gpu: &Gpu,
+    camera: &Camera,
+    (ocean, sea_level): (&str, f32),
+    debug: DebugView,
+    quality: Quality,
+    size: u32,
+    environment: &Environment,
+) -> Vec<u8> {
     let errors: Arc<Mutex<Vec<String>>> = Default::default();
     let sink = errors.clone();
     gpu.device
@@ -1475,14 +1918,10 @@ fn render_sea(
     let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
     renderer.set_ocean(Some(Ocean::by_name(ocean).unwrap()), 0.0);
     renderer.set_sea_level(sea_level);
-    let environment = Environment {
-        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
-        ..Default::default()
-    };
     let target = test_target(gpu, size);
     let view = target.create_view(&Default::default());
     for _ in 0..30 {
-        renderer.render(gpu, camera, &environment, &view, (size, size), 1.0 / 60.0);
+        renderer.render(gpu, camera, environment, &view, (size, size), 1.0 / 60.0);
         gpu.device
             .poll(wgpu::PollType::wait_indefinitely())
             .unwrap();
@@ -1603,6 +2042,105 @@ fn what_stands_out_of_the_sea_is_not_covered_by_it() {
     );
 }
 
+/// The ball on its floor with these ponds, and a calm sea at `sea` if any, as finally drawn.
+fn render_ponds(gpu: &Gpu, camera: &Camera, ponds: &[Pond], sea: Option<f32>) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut settings = RendererSettings::default();
+    settings.apply_quality(Quality::High);
+    // Each pixel is then this frame's alone, so one outside a pond can be held to what it was.
+    settings.temporal_accumulation = false;
+    let mut renderer = Renderer::new(gpu, &paginate(&ball_on_floor()), FORMAT, settings);
+    if let Some(level) = sea {
+        renderer.set_ocean(Some(Ocean::by_name("murky").unwrap()), 0.0);
+        renderer.set_sea_level(level);
+    }
+    renderer.set_ponds(ponds);
+    // Daylight well above what the views measure keeps exposure at its limit, the same for all.
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        daylight_illuminance: 4000.0,
+        ..Default::default()
+    };
+    let target = test_target(gpu, POND_SIZE);
+    let view = target.create_view(&Default::default());
+    for _ in 0..30 {
+        renderer.render(
+            gpu,
+            camera,
+            &environment,
+            &view,
+            (POND_SIZE, POND_SIZE),
+            1.0 / 60.0,
+        );
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, POND_SIZE);
+    let errors = errors.lock().unwrap();
+    assert!(
+        errors.is_empty(),
+        "GPU errors: {}",
+        errors.join(
+            "
+"
+        )
+    );
+    pixels
+}
+
+const POND_SIZE: u32 = 128;
+
+/// How far apart two colours are: the most any channel differs.
+fn apart(a: [f32; 3], b: [f32; 3]) -> f32 {
+    (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f32::max)
+}
+
+#[test]
+fn a_pond_is_water_within_its_rectangle_and_nothing_outside_it() {
+    let Some(gpu) = request_gpu() else { return };
+    // Looking down at the floor with the ball in the middle. A pond 2.5 m deep covers the floor
+    // to the ball's left, and stops short of the ball.
+    let camera = Camera {
+        position: Vec3::new(0.0, 8.0, 10.0),
+        pitch: -0.7,
+        ..Default::default()
+    };
+    let pond = Pond::parse("-60,-60,-1.5,60,2.5").unwrap();
+    let dry = render_ponds(&gpu, &camera, &[], None);
+    let wet = render_ponds(&gpu, &camera, &[pond], None);
+    let (left, right, row) = (POND_SIZE / 4, POND_SIZE * 3 / 4, POND_SIZE / 2);
+    let changed = apart(
+        patch(&dry, POND_SIZE, left, row, 6),
+        patch(&wet, POND_SIZE, left, row, 6),
+    );
+    let kept = apart(
+        patch(&dry, POND_SIZE, right, row, 6),
+        patch(&wet, POND_SIZE, right, row, 6),
+    );
+    assert!(kept < 3.0, "the floor outside the pond changed by {kept}");
+    assert!(
+        changed > 20.0,
+        "the floor under the pond changed by only {changed}"
+    );
+
+    // A scene with a sea draws the sea, and its ponds not at all.
+    let sea = render_ponds(&gpu, &camera, &[], Some(1.0));
+    let both = render_ponds(&gpu, &camera, &[pond], Some(1.0));
+    for x in [left, right] {
+        let differs = apart(
+            patch(&sea, POND_SIZE, x, row, 6),
+            patch(&both, POND_SIZE, x, row, 6),
+        );
+        assert!(differs < 3.0, "a pond changed the sea by {differs} at {x}");
+    }
+}
+
 #[test]
 fn the_bed_shows_through_shallow_water_and_not_through_deep() {
     let Some(gpu) = request_gpu() else { return };
@@ -1610,6 +2148,14 @@ fn the_bed_shows_through_shallow_water_and_not_through_deep() {
     // water the floor shows bright; under 30 m the water absorbs what it reflects, and the
     // sea is dark. Water that hid its bed at any depth, or showed it at every depth, fails.
     let size = 64;
+    // Daylight is set well above what either view measures, so exposure stays at its darkest
+    // limit for both. Left to follow each picture it brings the deep sea up to middle grey, and
+    // the two then differ by where exposure stops, not by what the water hides.
+    let environment = Environment {
+        sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
+        daylight_illuminance: 4000.0,
+        ..Default::default()
+    };
     let brightness = |depth: f32| {
         let camera = Camera {
             position: Vec3::new(40.0, depth + 4.0, 0.0),
@@ -1617,14 +2163,14 @@ fn the_bed_shows_through_shallow_water_and_not_through_deep() {
             pitch: -1.3,
             ..Default::default()
         };
-        let pixels = render_sea(
+        let pixels = render_sea_under(
             &gpu,
             &camera,
-            "ocean",
-            depth,
+            ("ocean", depth),
             DebugView::Lit,
             Quality::High,
             size,
+            &environment,
         );
         // The middle of the view, clear of the sun's highlight at the edges.
         let mut sum = 0.0;

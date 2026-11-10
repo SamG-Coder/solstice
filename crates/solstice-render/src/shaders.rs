@@ -50,6 +50,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "vg/cover_none.wgsl",
     "vg/depth_write.wgsl",
     "vg/shadow_merge.wgsl",
+    "vg/speck_depth.wgsl",
     "vg/hzb_seed.wgsl",
     "vg/hzb_down.wgsl",
     "vg/resolve.wgsl",
@@ -81,11 +82,14 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "ocean/waterline_params.wgsl",
     "ocean/waterline.wgsl",
     "ocean/surface.wgsl",
+    "ocean/optics.wgsl",
     "ocean/shade.wgsl",
+    "ocean/pond.wgsl",
     "sky/milky_way.wgsl",
     "sky/milky_way_bake.wgsl",
     "sky/bodies.wgsl",
     "lighting/sun_shadow.wgsl",
+    "lighting/specular_aa.wgsl",
     "lighting/light_tiles_common.wgsl",
     "lighting/light_shadows_common.wgsl",
     "lighting/deferred.wgsl",
@@ -117,6 +121,7 @@ pub const ENTRY_POINTS: &[&str] = &[
     "vg/raster_sw.wgsl",
     "vg/raster_sw_depth.wgsl",
     "vg/shadow_merge.wgsl",
+    "vg/speck_depth.wgsl",
     "vg/hzb_seed.wgsl",
     "vg/hzb_down.wgsl",
     "vg/resolve.wgsl",
@@ -128,6 +133,7 @@ pub const ENTRY_POINTS: &[&str] = &[
     "ocean/mips.wgsl",
     "ocean/surface.wgsl",
     "ocean/shade.wgsl",
+    "ocean/pond.wgsl",
     "ocean/waterline.wgsl",
     "sky/milky_way_bake.wgsl",
     "clouds/noise.wgsl",
@@ -224,7 +230,7 @@ pub fn expand_for(path: &str, skinned: bool, regions: Option<RegionPlan>) -> Str
         source.replace(SKINNING_ON, "const SKINNING: bool = false;")
     };
     match regions {
-        Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
+        Some(plan) => rewrite_shader(&source, plan.cluster_chunk, plan.pools()),
         None => source,
     }
 }
@@ -266,7 +272,7 @@ pub fn module_regions(
 ) -> wgpu::ShaderModule {
     let source = expand(path);
     let source = match regions {
-        Some(plan) => rewrite_shader(&source, plan.cluster_chunk),
+        Some(plan) => rewrite_shader(&source, plan.cluster_chunk, plan.pools()),
         None => source,
     };
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -401,7 +407,7 @@ mod tests {
     fn shaders_rewritten_for_regions_are_valid() {
         let plan = RegionPlan {
             cluster_chunk: 1000,
-            band_slots: [1, 1, 1],
+            band_slots: [1, 1, 1, 1, 0, 0, 0, 0],
         };
         let check = |path: &str, source: String| {
             let module = naga::front::wgsl::parse_str(&source)
@@ -430,7 +436,11 @@ mod tests {
         }
         check(
             "gi/voxelize.wgsl",
-            rewrite_shader(&expand("gi/voxelize.wgsl"), plan.cluster_chunk),
+            rewrite_shader(
+                &expand("gi/voxelize.wgsl"),
+                plan.cluster_chunk,
+                plan.pools(),
+            ),
         );
     }
 

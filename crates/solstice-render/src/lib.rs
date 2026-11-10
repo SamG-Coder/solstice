@@ -44,7 +44,7 @@ pub mod vg;
 pub use clouds::{Observation, Weather, WeatherCycle};
 pub use frame::{Camera, DebugView, Environment};
 pub use gpu::{Gpu, GpuError};
-pub use ocean::{Ocean, Swell};
+pub use ocean::{Ocean, Pond, Swell};
 pub use particles::{Effect, EffectId, ParticleStats};
 pub use renderer::{FrameStats, Quality, Renderer, RendererSettings, SceneMemory, StreamingBudget};
 pub use streaming::{StreamRequest, StreamingStats};

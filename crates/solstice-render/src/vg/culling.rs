@@ -53,6 +53,20 @@ pub struct PassView {
     /// 1 if this view sends cut-out clusters through their own lists and rasterizers; 0 if it
     /// draws them with everything else, solid or testing the mask itself.
     pub masked_lists: u32,
+    /// For the camera's own view of a streamed scene: how far around the camera pages are asked
+    /// for that it isn't facing, at a coarser level of detail. 0 for none.
+    pub prefetch_radius: f32,
+    /// For a view kept from frame to frame, in a streamed scene: where in the page requests the
+    /// bits begin that it sets, one for each page it asks for, or 0 for none. Such a view asks
+    /// only on the frames it is redrawn, so what it asks for is told apart from what the camera
+    /// asks for every frame: held longer, and the view redrawn when it comes. [`ViewSlots`]
+    /// fills this in.
+    pub hold_requests: u32,
+    /// For a depth map or a voxelization: clusters under this many texels or voxels across are
+    /// drawn as specks, a point each, by one thread, where a rasterizer gives each a workgroup.
+    /// 0 for none.
+    pub speck_texels: f32,
+    pub _pad_prefetch: u32,
 }
 
 /// Which instances a view draws. Twin of the `INSTANCES_` constants in `vg/pass_view.wgsl`.
@@ -124,7 +138,17 @@ impl PassView {
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             masked_lists: 0,
+            prefetch_radius: 0.0,
+            hold_requests: 0,
+            speck_texels: 0.0,
+            _pad_prefetch: 0,
         }
+    }
+
+    /// The same view, drawing clusters under this many texels across as specks.
+    pub fn with_specks(mut self, texels: f32) -> Self {
+        self.speck_texels = texels;
+        self
     }
 
     /// The same view, cutting out masked clusters through their own lists.
@@ -177,20 +201,31 @@ const _: () = assert!(std::mem::size_of::<PassView>() <= SLOT_STRIDE as usize);
 /// A uniform buffer holding several [`PassView`]s, selected by dynamic offset.
 pub struct ViewSlots {
     pub buffer: wgpu::Buffer,
+    /// See [`PassView::hold_requests`]: what views kept from frame to frame are given, those
+    /// of static instances and then those of the GI's.
+    pub hold_requests: [u32; 2],
 }
 
 impl ViewSlots {
     pub fn new(gpu: &Gpu, count: u32) -> Self {
         Self {
             buffer: gpu.uniform_buffer("view slots", u64::from(count * SLOT_STRIDE)),
+            hold_requests: [0; 2],
         }
     }
 
     pub fn write(&self, gpu: &Gpu, slot: u32, view: &PassView) {
+        let mut view = *view;
+        // The views kept from frame to frame are those that leave out what may move.
+        if view.instance_filter == InstanceFilter::Static as u32 {
+            view.hold_requests = self.hold_requests[0];
+        } else if view.instance_filter == InstanceFilter::Gi as u32 {
+            view.hold_requests = self.hold_requests[1];
+        }
         gpu.queue.write_buffer(
             &self.buffer,
             u64::from(Self::offset(slot)),
-            bytemuck::bytes_of(view),
+            bytemuck::bytes_of(&view),
         );
     }
 
@@ -214,7 +249,9 @@ const ARGS_DRAW_OFFSET: u64 = 24;
 const ARGS_MERGE_OFFSET: u64 = 40;
 const ARGS_MASKED_SOFTWARE_OFFSET: u64 = 56;
 const ARGS_MASKED_DRAW_OFFSET: u64 = 68;
-const ARGS_SIZE: u64 = 84;
+const ARGS_SPECK_OFFSET: u64 = 84;
+const ARGS_VOXEL_SPECK_OFFSET: u64 = 96;
+const ARGS_SIZE: u64 = 108;
 /// Size of `CullState` in bytes.
 const STATE_SIZE: u64 = 72;
 /// Where in `CullState` the opaque lists' end is. A frame's clear stops short of it.
@@ -234,6 +271,9 @@ pub enum CullPhase {
 pub struct CullWork {
     state: wgpu::Buffer,
     pub visible: wgpu::Buffer,
+    /// A depth map's specks: the first phase's retry list, which a view without occlusion has
+    /// no other use for.
+    pub specks: wgpu::Buffer,
     args: wgpu::Buffer,
     first_phase: wgpu::BindGroup,
     second_phase: wgpu::BindGroup,
@@ -295,6 +335,7 @@ impl CullWork {
         Self {
             state,
             visible,
+            specks: queue_b,
             args,
             first_phase,
             second_phase,
@@ -325,6 +366,16 @@ impl CullWork {
 
     pub const fn masked_draw_args_offset() -> u64 {
         ARGS_MASKED_DRAW_OFFSET
+    }
+
+    /// Offset of the dispatch that draws a depth map's specks.
+    pub const fn speck_args_offset() -> u64 {
+        ARGS_SPECK_OFFSET
+    }
+
+    /// Offset of the dispatch that voxelizes a voxelization's specks.
+    pub const fn voxel_speck_args_offset() -> u64 {
+        ARGS_VOXEL_SPECK_OFFSET
     }
 
     /// Offset of the draw arguments for merging software-rasterized depth into a depth map:
@@ -366,6 +417,7 @@ struct StatsShared {
     software_clusters: AtomicU32,
     triangles: AtomicU32,
     dropped: AtomicU32,
+    specks: AtomicU32,
     /// Set when a copy was recorded and still needs its map request.
     copied: AtomicBool,
     /// Set from the map request until the data has been consumed.
@@ -427,6 +479,7 @@ impl CullStats {
                 .store(software, Ordering::Release);
             self.shared.triangles.store(triangles, Ordering::Release);
             self.shared.dropped.store(dropped, Ordering::Release);
+            self.shared.specks.store(words[11], Ordering::Release);
         }
         self.staging.unmap();
     }
@@ -458,6 +511,12 @@ impl CullStats {
     /// Clusters sent to the software rasterizer in the most recently read-back frame.
     pub fn software_clusters(&self) -> u32 {
         self.shared.software_clusters.load(Ordering::Acquire)
+    }
+
+    /// Clusters drawn into a depth map as specks in the most recently read-back frame. They are
+    /// not among [`Self::clusters`].
+    pub fn specks(&self) -> u32 {
+        self.shared.specks.load(Ordering::Acquire)
     }
 
     /// Queue entries and clusters lost for want of room in the most recently read-back frame.
@@ -640,6 +699,9 @@ mod tests {
                 receiver_planes,
                 eye_light,
                 masked_lists,
+                prefetch_radius,
+                hold_requests,
+                speck_texels,
             ]
         );
     }

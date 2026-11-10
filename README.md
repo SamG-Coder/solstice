@@ -255,12 +255,18 @@ buffer, which a final pass resolves to a G-buffer with analytic derivatives.
   screen tile, as Lumen's screen traces do, skipping whole tiles a ray passes in front of. Hits
   take their colour from last frame's image, found through motion vectors.
 - **Reflections:** one glossy ray per half-resolution pixel: screen space, then the volume, then sky.
+  A ray that runs out of steps among surfaces brings the light of the nearest, not the sky, and
+  one sample may add no more than about the light around it, so a room lit by what bounces in
+  has no sparks of daylight on its polished stone. Roughness is raised where the normals under
+  a pixel disagree, so fine relief doesn't glitter.
 - **Clouds:** volumetric, ray marched through noise in a layer over a curved planet. They cast
   shadows on the ground, and a small panorama of them feeds the skylight, GI and reflections, so
   an overcast sky dims and greys the whole scene. See below.
 - **Post:** temporal anti-aliasing and upscaling, histogram exposure, bloom, ACES tone mapping, and
   contrast-adaptive sharpening on the displayed values, held within each pixel's neighbours so that
-  no edge gets a dark halo.
+  no edge gets a dark halo. Exposure follows what is on screen down to seven stops below sunlit
+  ground, which keeps night dark, and under a sun that is well up five stops further, so a hall
+  lit only by what bounces in through its doors is seen as the eye would see it.
 
 ### Clouds and weather
 

@@ -18,13 +18,17 @@ struct Exposure {
     _pad1: f32,
 }
 
-const BINS: u32 = 128u;
-const MIN_LOG_LUMINANCE: f32 = -8.0;
-const LOG_LUMINANCE_RANGE: f32 = 18.0;
+// Matches EXPOSURE_BINS in post.rs.
+const BINS: u32 = 192u;
+// The dimmest luminance told apart, as its logarithm, and how many stops the bins span. It
+// reaches well under the darkest average exposure adapts to, a room by day, twelve stops below
+// sunlit ground: a bin's worth of pixels piled up at the bottom would hold the average above it.
+const MIN_LOG_LUMINANCE: f32 = -17.0;
+const LOG_LUMINANCE_RANGE: f32 = 27.0;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var scene: texture_2d<f32>;
-@group(0) @binding(2) var<storage, read_write> histogram: array<atomic<u32>, 128>;
+@group(0) @binding(2) var<storage, read_write> histogram: array<atomic<u32>, BINS>;
 @group(0) @binding(3) var<storage, read_write> exposure: Exposure;
 
 // Samples a sparse grid of pixels. The average does not need every one.

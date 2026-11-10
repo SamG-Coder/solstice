@@ -17,7 +17,8 @@
 use crate::collision::{encode_shape, Collision, CollisionIndex, HeightfieldEntry, ShapeEntry};
 use crate::gpu::{ClusterBones, PackedCluster, PackedNode};
 use crate::paged::{
-    upper_mip_count, ClusterSet, LoadedScene, MeshInfo, PageInfo, PagedScene, PAGE_BYTES,
+    upper_mip_count, ClusterSet, ExternalTables, LoadedScene, MeshInfo, PageInfo, PagedScene,
+    PAGE_BYTES,
 };
 use crate::scene::{
     Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, Sea,
@@ -47,6 +48,8 @@ const CLIP_TAG: [u8; 4] = *b"CLIP";
 const GLOW_TAG: [u8; 4] = *b"GLOW";
 /// The optional section holding the transparent glowing cards, written only if there are any.
 const CARD_TAG: [u8; 4] = *b"CARD";
+/// The optional section that says a manifest leaves out its clusters and pinned pages.
+const EXTERNAL_TAG: [u8; 4] = *b"EXTP";
 /// In a skin section's mesh list: a mesh that isn't skinned.
 const NO_BONE_LISTS: i32 = i32::MIN;
 
@@ -65,6 +68,8 @@ pub enum DecodeError {
     BadSkin,
     BadGlow,
     BadCards,
+    /// The file made for browsers, read where the whole scene's file is wanted.
+    SplitForBrowsers,
 }
 
 impl fmt::Display for DecodeError {
@@ -89,6 +94,12 @@ impl fmt::Display for DecodeError {
             Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
             Self::BadGlow => write!(f, "the scene's emissive maps are malformed"),
             Self::BadCards => write!(f, "the scene's cards are malformed"),
+            Self::SplitForBrowsers => {
+                write!(
+                    f,
+                    "this is the file made for browsers: open the .solstice file"
+                )
+            }
         }
     }
 }
@@ -185,6 +196,11 @@ pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
     out.extend_from_slice(&manifest);
     out.extend_from_slice(&data);
     out
+}
+
+/// Cluster records as they are stored and as the GPU reads them.
+pub fn cluster_bytes(clusters: &[PackedCluster]) -> &[u8] {
+    bytemuck::cast_slice(clusters)
 }
 
 /// Deflates a page as [`encode`] does, for writers that lay out the data area themselves.
@@ -291,6 +307,11 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     }
     if !scene.cards.cards.is_empty() {
         w.section(CARD_TAG, &encode_cards(&scene.cards));
+    }
+    if let Some(tables) = scene.external {
+        let mut contents = tables.clusters.to_le_bytes().to_vec();
+        contents.extend_from_slice(&tables.pinned_bytes.to_le_bytes());
+        w.section(EXTERNAL_TAG, &contents);
     }
     w.finish()
 }
@@ -793,6 +814,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let mut clips = Vec::new();
     let mut glow = GlowMaps::default();
     let mut cards = Cards::default();
+    let mut external = None;
     while !r.bytes.is_empty() {
         let tag: [u8; 4] = r.pod()?;
         let contents: Vec<u8> = r.slice()?;
@@ -816,6 +838,19 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             glow = decode_glow(&contents)?;
         } else if tag == CARD_TAG {
             cards = decode_cards(&contents)?;
+        } else if tag == EXTERNAL_TAG {
+            let (clusters, pinned_bytes) = <[u8; 16]>::try_from(contents.as_slice())
+                .map(|b| {
+                    let word = |at: usize| {
+                        u64::from_le_bytes(b[at..at + 8].try_into().expect("eight bytes"))
+                    };
+                    (word(0), word(8))
+                })
+                .map_err(|_| DecodeError::BadPages)?;
+            external = Some(ExternalTables {
+                clusters,
+                pinned_bytes,
+            });
         }
     }
     let glow_ok = materials.iter().all(|material| {
@@ -880,6 +915,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         clips,
         glow,
         cards,
+        external,
     };
     if !tables_are_consistent(&scene) {
         return Err(DecodeError::BadPages);
@@ -905,6 +941,10 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedScene, DecodeError> {
     let manifest = inflate(packed)?;
     let scene = decode_manifest(&manifest, end)?;
     drop(manifest);
+    // Its cluster records and pinned pages are not where a whole file's are.
+    if scene.external.is_some() {
+        return Err(DecodeError::SplitForBrowsers);
+    }
 
     let mut pages = Vec::new();
     for page in 0..scene.pages.len() as u32 {
@@ -1005,7 +1045,7 @@ pub fn unpack_page(scene: &PagedScene, page: u32, packed: &[u8]) -> Result<Vec<u
 /// Checks everything the renderer would otherwise index blindly while installing pages. A bad
 /// file should fail here rather than panic later.
 fn tables_are_consistent(scene: &PagedScene) -> bool {
-    let clusters = scene.clusters.len() as u64;
+    let clusters = scene.cluster_count() as u64;
     let generated = scene.generated.len() as u64;
     let sets = scene.sets.len() as u64;
     let pages = scene.pages.len() as u64;
@@ -1024,9 +1064,15 @@ fn tables_are_consistent(scene: &PagedScene) -> bool {
         && scene.pages[..pinned]
             .iter()
             .map(PageInfo::raw_bytes)
-            .sum::<usize>()
-            == scene.pinned_data.len();
-    sets_ok
+            .sum::<usize>() as u64
+            == scene
+                .external
+                .map_or(scene.pinned_data.len() as u64, |tables| tables.pinned_bytes);
+    // Left out means left out: a file that says so and has them anyway is not one this wrote.
+    let external_ok =
+        scene.external.is_none() || (scene.clusters.is_empty() && scene.pinned_data.is_empty());
+    external_ok
+        && sets_ok
         && pages_ok
         && pinned_ok
         && scene.generated.iter().all(|&c| u64::from(c) < clusters)
@@ -1399,6 +1445,55 @@ mod tests {
         bad(|c| c.cards[0].vertex_count = 2);
         bad(|c| c.images[0].width = 6);
         bad(|c| c.images[0].glow_mips[0].pop().map(|_| ()).unwrap());
+    }
+
+    /// What a browser reads: the small manifest, with the big tables told apart from it.
+    fn without_tables(mut scene: PagedScene) -> PagedScene {
+        let external = ExternalTables {
+            clusters: scene.clusters.len() as u64,
+            pinned_bytes: scene.pinned_data.len() as u64,
+        };
+        scene.clusters.clear();
+        scene.pinned_data.clear();
+        scene.external = Some(external);
+        scene
+    }
+
+    #[test]
+    fn a_manifest_can_leave_out_its_big_tables() {
+        let scene = sample_scene().scene;
+        let (clusters, pinned) = (scene.clusters.len(), scene.pinned_data.len());
+        let small = without_tables(scene.clone());
+        let decoded = decode_manifest(&encode_manifest(&small), 0).unwrap();
+        assert!(decoded.clusters.is_empty() && decoded.pinned_data.is_empty());
+        assert_eq!(decoded.cluster_count(), clusters);
+        assert_eq!(
+            decoded.external.unwrap().pinned_bytes,
+            pinned as u64,
+            "and says how much there is"
+        );
+        assert_eq!(decoded.page_dependencies(), scene.page_dependencies());
+        // Read as a whole scene's file, it is refused and not taken for a damaged one.
+        assert_eq!(
+            decode(&encode_header_and_manifest(&small)).err(),
+            Some(DecodeError::SplitForBrowsers)
+        );
+    }
+
+    #[test]
+    fn a_manifest_that_leaves_out_too_little_or_too_much_is_refused() {
+        let small = without_tables(sample_scene().scene);
+        let bad = |change: fn(&mut PagedScene)| {
+            let mut scene = small.clone();
+            change(&mut scene);
+            assert_eq!(
+                decode_manifest(&encode_manifest(&scene), 0).err(),
+                Some(DecodeError::BadPages)
+            );
+        };
+        bad(|s| s.external.as_mut().unwrap().clusters = 0);
+        bad(|s| s.external.as_mut().unwrap().pinned_bytes += 1);
+        bad(|s| s.pinned_data.push(0));
     }
 
     #[test]

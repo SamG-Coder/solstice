@@ -10,7 +10,7 @@
 
 use crate::host::{ScriptEvent, RESERVED_EVENTS};
 use crate::value::{number, EntityValue, ScriptValue, Vec3Value};
-use solstice_world::{Entity, Name, TimerId, World};
+use solstice_world::{Entity, Input, Name, Played, TimerId, World};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
@@ -87,6 +87,14 @@ fn context<'a, 'e>(eval: &Evaluator<'_, 'a, 'e>) -> anyhow::Result<&'a Context<'
     eval.extra
         .and_then(|extra| extra.downcast_ref::<Context>())
         .ok_or_else(|| anyhow::anyhow!("engine functions can only be called from a handler"))
+}
+
+/// The step's input, as the handler's actor hears it: none of it for the one the player plays,
+/// while they are away flying the camera, so the keys that fly it don't walk who was left.
+fn heard<'a>(context: &'a Context) -> Option<&'a Input> {
+    let input = context.world.input();
+    let left = input.away() && context.world.entities.get::<&Played>(context.actor).is_ok();
+    (!left).then_some(input)
 }
 
 /// Builds a script event from a name and Starlark arguments.
@@ -298,19 +306,26 @@ pub(crate) fn engine(builder: &mut GlobalsBuilder) {
         Ok(heap.alloc(AllocList(found.into_iter().map(EntityValue))))
     }
 
-    /// An input action's value this step: 1 held, 0 released, between for a stick.
+    /// An input action's value this step: 1 held, 0 released, between for a stick. The actor
+    /// the player plays hears no input while the player is away from it, flying the camera.
     fn input(action: &str, eval: &mut Evaluator) -> anyhow::Result<f64> {
-        Ok(f64::from(context(eval)?.world.input().value(action)))
+        Ok(heard(context(eval)?).map_or(0.0, |input| f64::from(input.value(action))))
     }
 
     /// Whether an input action is held this step.
     fn held(action: &str, eval: &mut Evaluator) -> anyhow::Result<bool> {
-        Ok(context(eval)?.world.input().held(action))
+        Ok(heard(context(eval)?).is_some_and(|input| input.held(action)))
     }
 
     /// Whether an input action was pressed since the step before.
     fn pressed(action: &str, eval: &mut Evaluator) -> anyhow::Result<bool> {
-        Ok(context(eval)?.world.input().pressed(action))
+        Ok(heard(context(eval)?).is_some_and(|input| input.pressed(action)))
+    }
+
+    /// Where the game is watched from this step: the camera, whether the player's or one flown
+    /// freely. `viewer() - self.position` is how far off it is, and which way.
+    fn viewer(eval: &mut Evaluator) -> anyhow::Result<Vec3Value> {
+        Ok(Vec3Value(context(eval)?.world.input().viewer()))
     }
 
     /// Simulated seconds since the game started.

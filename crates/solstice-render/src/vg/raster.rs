@@ -83,6 +83,8 @@ impl VisibilityBuffer {
 /// Bindings for rasterizing the output of one [`CullWork`].
 pub struct RasterBindings {
     pub group: wgpu::BindGroup,
+    /// What the pass that draws a depth map's specks reads.
+    specks: wgpu::BindGroup,
     /// What the masked rasterizers read, in a scene that has any.
     pub mask: Option<wgpu::BindGroup>,
 }
@@ -110,6 +112,9 @@ pub struct Rasterizer {
     depth_read_layout: wgpu::BindGroupLayout,
     software_depth: wgpu::ComputePipeline,
     merge_depth: wgpu::RenderPipeline,
+    /// Draws a depth map's specks into a [`DepthBuffer`]: see `vg/speck_depth.wgsl`.
+    speck_layout: wgpu::BindGroupLayout,
+    speck_depth: wgpu::ComputePipeline,
     masked: Option<Masked>,
 }
 
@@ -175,7 +180,9 @@ impl Rasterizer {
             .texture_unfilterable();
         if regions.is_some() {
             // The second cluster binding, and the pool's middle and far bands.
-            raster_layout = raster_layout.storage_read().storage_read().storage_read();
+            for _ in 0..regions.map_or(0, |plan| plan.pools()) {
+                raster_layout = raster_layout.storage_read();
+            }
         }
         let raster_layout = raster_layout.build(gpu, "raster");
         let vis_layout = LayoutBuilder::new()
@@ -217,6 +224,18 @@ impl Rasterizer {
             &depth_module,
             "main",
             &[&raster_layout, &depth_write_layout],
+        );
+        let speck_layout = LayoutBuilder::new()
+            .uniform_dynamic()
+            .storage_read()
+            .storage_read()
+            .build(gpu, "depth specks");
+        let speck_module = shaders::module(&gpu.device, "vg/speck_depth.wgsl");
+        let speck_depth = gpu.compute_pipeline(
+            "depth specks",
+            &speck_module,
+            "main",
+            &[&speck_layout, &depth_write_layout],
         );
         let merge_module = shaders::module(&gpu.device, "vg/shadow_merge.wgsl");
         let merge_layout = gpu
@@ -314,6 +333,8 @@ impl Rasterizer {
             depth_read_layout,
             software_depth,
             merge_depth,
+            speck_layout,
+            speck_depth,
             masked,
         }
     }
@@ -385,6 +406,16 @@ impl Rasterizer {
             pass.set_bind_group(2, mask, &[]);
             pass.dispatch_workgroups_indirect(work.args(), CullWork::masked_software_args_offset());
         }
+        // The clusters under a texel across, which culling listed apart: nothing, for a view
+        // that draws none as specks.
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("depth specks"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.speck_depth);
+        pass.set_bind_group(0, &bindings.specks, &[ViewSlots::offset(slot)]);
+        pass.set_bind_group(1, &depth.write, &[]);
+        pass.dispatch_workgroups_indirect(work.args(), CullWork::speck_args_offset());
     }
 
     /// Draws the depth in `depth` into the depth attachment of `pass`, under its depth test:
@@ -429,9 +460,24 @@ impl Rasterizer {
                         scene.triangles.as_entire_binding(),
                         far.as_entire_binding(),
                     ]);
+                    resources.extend(
+                        scene
+                            .pool_spares
+                            .iter()
+                            .map(|pool| pool.as_entire_binding()),
+                    );
                 }
                 gpu.bind_group("raster", &self.raster_layout, &resources)
             },
+            specks: gpu.bind_group(
+                "depth specks",
+                &self.speck_layout,
+                &[
+                    slots.binding(),
+                    work.specks.as_entire_binding(),
+                    work.state().as_entire_binding(),
+                ],
+            ),
             mask: self.masked.as_ref().map(|masked| {
                 gpu.bind_group(
                     "masked raster",

@@ -159,6 +159,8 @@ pub struct GpuScene {
     pub clusters_more: Option<wgpu::Buffer>,
     /// The far band's page pool, if the scene has regions.
     pub pool_far: Option<wgpu::Buffer>,
+    /// The bands for what the other three can't hold, if the scene has regions and uses any.
+    pub pool_spares: Vec<wgpu::Buffer>,
     pub materials: wgpu::Buffer,
     pub lights: wgpu::Buffer,
     pub textures: TextureArrays,
@@ -222,26 +224,52 @@ impl GpuScene {
                 wgpu::BufferUsages::COPY_DST,
             )
         };
-        let (pool, middle, far) = match regions {
+        let (pool, middle, far, spares) = match regions {
             Some(plan) => (
                 pool_of("page pool, near", plan.band_slots[0]),
                 pool_of("page pool, middle", plan.band_slots[1]),
                 Some(pool_of("page pool, far", plan.band_slots[2])),
+                (3..plan.pools())
+                    .map(|band| pool_of("page pool, spare", plan.band_slots[band]))
+                    .collect(),
             ),
             None => {
                 let pool = pool_of("page pool", slots);
-                (pool.clone(), pool, None)
+                (pool.clone(), pool, None, Vec::new())
             }
         };
-        let (clusters, clusters_more) = match regions {
-            Some(plan) => {
+        assert!(
+            scene.external.is_none() || scene.skeletons.is_empty(),
+            "a scene that keeps its cluster records outside its manifest can't be skinned"
+        );
+        let empty = |label: &str, records: u64| {
+            // Never empty: a binding must hold at least one record.
+            let bytes =
+                records.max(1) * std::mem::size_of::<solstice_asset::PackedCluster>() as u64;
+            gpu.storage_buffer(label, bytes, wgpu::BufferUsages::COPY_DST)
+        };
+        // Such a scene has records only for the pages in its pool, a block for each slot.
+        let resident = scene.external.map(|_| {
+            let total = regions.map_or(slots, |plan| plan.band_slots.iter().sum());
+            u64::from(total) * u64::from(scene.max_page_clusters().max(1))
+        });
+        let (clusters, clusters_more) = match (regions, resident) {
+            (Some(plan), Some(total)) => {
+                let first = total.min(u64::from(plan.cluster_chunk));
+                (
+                    empty("clusters", first),
+                    Some(empty("clusters, more", total - first)),
+                )
+            }
+            (None, Some(total)) => (empty("clusters", total), None),
+            (Some(plan), None) => {
                 let (first, rest) = scene.clusters.split_at(plan.cluster_chunk as usize);
                 (
                     gpu.storage_buffer_init("clusters", first),
                     Some(gpu.storage_buffer_init("clusters, more", rest)),
                 )
             }
-            None => (gpu.storage_buffer_init("clusters", &scene.clusters), None),
+            (None, None) => (gpu.storage_buffer_init("clusters", &scene.clusters), None),
         };
         Self {
             instances: gpu.storage_buffer_init("instances", &instances),
@@ -252,6 +280,7 @@ impl GpuScene {
             regions,
             clusters_more,
             pool_far: far,
+            pool_spares: spares,
             materials: gpu.storage_buffer_init("materials", &materials),
             lights: gpu.storage_buffer_init("lights", &scene.lights),
             textures,
@@ -276,10 +305,11 @@ impl GpuScene {
         match band {
             0 => &self.vertices,
             1 => &self.triangles,
-            _ => self
+            2 => self
                 .pool_far
                 .as_ref()
                 .expect("only scenes with regions have a far band"),
+            spare => &self.pool_spares[spare - 3],
         }
     }
 
@@ -287,7 +317,10 @@ impl GpuScene {
     pub fn geometry_bytes(&self) -> (u64, u64) {
         let more = self.clusters_more.as_ref().map_or(0, wgpu::Buffer::size);
         let pools = match &self.pool_far {
-            Some(far) => self.vertices.size() + self.triangles.size() + far.size(),
+            Some(far) => {
+                let spare: u64 = self.pool_spares.iter().map(wgpu::Buffer::size).sum();
+                self.vertices.size() + self.triangles.size() + far.size() + spare
+            }
             None => self.vertices.size(),
         };
         (self.clusters.size() + more, pools)

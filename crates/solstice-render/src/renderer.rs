@@ -10,6 +10,7 @@ use crate::lighting::{
     environment_group, environment_layout, DeferredLighting, LightShadows, LightTiles,
 };
 use crate::ocean::grid::PATCH_CELLS;
+use crate::ocean::pond::{Pond, PondWater};
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
 use crate::ocean::waterline::{SeaViews, Waterline};
 use crate::ocean::{Ocean, Sea, SeaState};
@@ -21,7 +22,9 @@ use crate::profiler::{section, Profiler, SECTIONS};
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT, MOVING_SLOTS};
 use crate::sky::Sky;
-use crate::streaming::{choose_tiers, StreamRequest, Streamer, StreamingStats};
+use crate::streaming::{
+    choose_tiers, StreamRequest, Streamer, StreamingStats, HOLD_SHADOWS, HOLD_VOXELS,
+};
 use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, InstanceFilter, PassView, RasterBindings,
     Rasterizer, Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
@@ -85,6 +88,15 @@ pub struct RendererSettings {
     /// The same, in shadow map texels. Shadow maps are the costliest pass on small GPUs, and
     /// a shadow's outline hides far more error than a directly visible surface does.
     pub shadow_lod_threshold: f32,
+    /// For a streamed scene: how far around the camera, in metres, pages are loaded for what it
+    /// isn't facing, at a coarser level of detail, so that turning or moving fast starts from
+    /// more than the coarsest geometry. 0 loads only what is seen.
+    pub prefetch_radius: f32,
+    /// Clusters under this many texels of a shadow cascade, or voxels of the GI, across are
+    /// drawn into it as specks: a point each, by one thread, where a rasterizer gives each a
+    /// workgroup. For a scene whose coarsest clusters are small, of which a far cascade is
+    /// nearly all specks. 0 draws every cluster's triangles.
+    pub speck_texels: f32,
     /// Internal resolution relative to the output. Temporal upscaling fills in the rest.
     pub render_scale: f32,
     pub debug_view: DebugView,
@@ -115,6 +127,8 @@ impl Default for RendererSettings {
         Self {
             lod_threshold: 1.0,
             shadow_lod_threshold: 1.0,
+            prefetch_radius: 0.0,
+            speck_texels: 0.0,
             render_scale: 1.0,
             debug_view: DebugView::Lit,
             temporal_accumulation: true,
@@ -212,6 +226,8 @@ pub struct FrameStats {
     pub shadow_triangles: u32,
     /// How many of those clusters went to the software rasterizer.
     pub shadow_software_clusters: u32,
+    /// Clusters it drew as specks, besides those.
+    pub shadow_specks: u32,
     /// Queue entries and clusters the main view, and that cascade, lost for want of room in
     /// their lists. Zero unless the scene has outgrown them, in which case the image, or the
     /// shadow, has holes.
@@ -237,7 +253,7 @@ struct SizedResources {
     light_tiles_group: wgpu::BindGroup,
     post: PostBindings,
     hdr: Target,
-    /// Where the water pass draws, when there is a sea.
+    /// Where the water pass draws, when there is a sea, or ponds.
     water: Option<WaterTargets>,
     /// The depth particles test against.
     particles: ParticleTargets,
@@ -290,6 +306,9 @@ pub struct Renderer {
     sea_level: f32,
     /// Draws and shades the sea's surface, when there is a sea.
     water: Option<WaterSurface>,
+    /// The scene's still water, and what shades it: made when there are ponds and no sea.
+    ponds: Vec<Pond>,
+    pond_water: Option<PondWater>,
     /// Effects, and the pool their particles live in.
     particles: Particles,
     /// The layout of the lighting bind group, for passes made after the renderer.
@@ -327,7 +346,7 @@ impl Renderer {
             scene.regions,
         );
         for page in 0..loaded.scene.pages.len() as u32 {
-            streamer.install_now(gpu, &scene, page, loaded.page(page));
+            streamer.install_now(gpu, &scene, page, loaded.page(page), &[]);
         }
         streamer.flush(gpu, &scene);
         Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&loaded.scene.sea)
@@ -351,11 +370,31 @@ impl Renderer {
         let plan = choose_tiers(gpu, paged, budget.texture_bytes);
         let scene = GpuScene::new(gpu, paged, slots, None, Some(plan));
         let mut streamer = Streamer::new(gpu, paged, slots, Some(plan), scene.regions);
-        for page in 0..paged.pinned_pages {
-            streamer.install_now(gpu, &scene, page, paged.pinned_page(page));
+        if paged.external.is_none() {
+            for page in 0..paged.pinned_pages {
+                streamer.install_now(gpu, &scene, page, paged.pinned_page(page), &[]);
+            }
+            streamer.flush(gpu, &scene);
         }
-        streamer.flush(gpu, &scene);
         Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&paged.sea)
+    }
+
+    /// For a scene that keeps its tables outside its manifest: takes a pinned page and its
+    /// cluster records, in order. All must arrive before the first frame.
+    pub fn install_pinned(&mut self, gpu: &Gpu, page: u32, data: &[u8], clusters: &[u8]) {
+        self.streamer
+            .install_now(gpu, &self.scene, page, data, clusters);
+    }
+
+    /// As [`Self::deliver`], for a page of such a scene: with its cluster records, which
+    /// [`StreamRequest::clusters`] says where to find.
+    pub fn deliver_page(&mut self, id: u32, data: Vec<u8>, clusters: Vec<u8>) -> bool {
+        self.streamer.deliver_page(id, data, clusters)
+    }
+
+    /// Writes what the pinned pages changed. Call after the last of them.
+    pub fn finish_external_tables(&mut self, gpu: &Gpu) {
+        self.streamer.flush(gpu, &self.scene);
     }
 
     /// Gives the renderer the scene's sea, if it has one.
@@ -376,6 +415,24 @@ impl Renderer {
     /// Sets the calm sea's level, in metres.
     pub fn set_sea_level(&mut self, level: f32) {
         self.sea_level = level;
+    }
+
+    /// Sets the scene's ponds: level sheets of still, clear water. A scene with an open sea
+    /// draws the sea and not its ponds.
+    pub fn set_ponds(&mut self, ponds: &[Pond]) {
+        self.ponds = ponds.to_vec();
+        // Made again with the new ponds on the next frame, which has the GPU to hand.
+        self.pond_water = None;
+    }
+
+    /// Whether the frame has water over the lit scene, and whether that water is a sea.
+    fn water_kind(&self) -> Option<bool> {
+        (self.sea.is_some() || self.has_ponds()).then_some(self.sea.is_some())
+    }
+
+    /// Whether the scene's ponds are drawn: it has some, and no sea.
+    fn has_ponds(&self) -> bool {
+        self.sea.is_none() && !self.ponds.is_empty()
     }
 
     /// How many instances the scene has. Instances are named by their index in the scene file,
@@ -476,7 +533,9 @@ impl Renderer {
         settings: RendererSettings,
     ) -> Self {
         let frame_uniform = gpu.uniform_buffer("frame", std::mem::size_of::<FrameUniform>() as u64);
-        let view_slots = ViewSlots::new(gpu, SLOT_COUNT);
+        let mut view_slots = ViewSlots::new(gpu, SLOT_COUNT);
+        let hold = streamer.hold_bases();
+        view_slots.hold_requests = [hold[HOLD_SHADOWS], hold[HOLD_VOXELS]];
 
         let cull = CullPipelines::new(gpu, scene.has_skins, scene.regions);
         let masked_capacity = if scene.has_masked {
@@ -493,12 +552,15 @@ impl Renderer {
             masked_capacity,
             streamer.requests_buffer(),
         );
+        // A scene too large for one binding has more in its farthest shadow cascade, at its
+        // coarsest, than the usual lists hold, and what they drop leaves holes in the shadows.
+        let aux_scale = if scene.regions.is_some() { 2 } else { 1 };
         let aux_work = CullWork::new(
             gpu,
             &cull,
             "aux cull",
-            AUX_QUEUE_CAPACITY,
-            AUX_VISIBLE_CAPACITY,
+            AUX_QUEUE_CAPACITY * aux_scale,
+            AUX_VISIBLE_CAPACITY * aux_scale,
             masked_capacity,
             streamer.requests_buffer(),
         );
@@ -596,6 +658,8 @@ impl Renderer {
             ocean_request: None,
             sea_level: 0.0,
             water: None,
+            ponds: Vec::new(),
+            pond_water: None,
             environment_layout,
             sized: None,
             history: None,
@@ -733,6 +797,7 @@ impl Renderer {
             particles: self.particles.stats(),
             shadow_clusters: self.aux_work.stats().clusters(),
             shadow_software_clusters: self.aux_work.stats().software_clusters(),
+            shadow_specks: self.aux_work.stats().specks(),
             shadow_triangles: self.aux_work.stats().triangles(),
             dropped: self.main_work.stats().dropped(),
             shadow_dropped: self.aux_work.stats().dropped(),
@@ -780,6 +845,14 @@ impl Renderer {
                 cells,
             ));
         }
+        if !self.has_ponds() {
+            self.pond_water = None;
+        } else if self.pond_water.is_none() {
+            let water = PondWater::new(gpu, &self.environment_layout);
+            let clear = Ocean::by_name("clear").unwrap_or_default();
+            water.set(gpu, &self.ponds, &clear);
+            self.pond_water = Some(water);
+        }
         self.ensure_sized(gpu, render_size, output_size);
         self.time += delta_seconds;
         self.frame_seconds = delta_seconds.clamp(1.0 / 1000.0, 0.25);
@@ -808,21 +881,22 @@ impl Renderer {
 
         // Everything below draws what's installed from here on, with instances where they are
         // this frame.
-        self.streamer.update(gpu, &self.scene);
+        self.streamer.update(gpu, &self.scene, delta_seconds);
         let changes = self.scene.update_instances(gpu);
         let streamed = self.streamer.should_refresh_cached_views();
-        if streamed {
+        let shadows_streamed = streamed & (1 << HOLD_SHADOWS) != 0;
+        if shadows_streamed {
             self.shadows.mark_stale();
         }
         if changes.shadows_changed {
             self.shadows.mark_stale_now();
         }
-        if streamed || changes.shadows_changed {
+        if shadows_streamed || changes.shadows_changed {
             if let Some(water) = &mut self.water {
                 water.seabed.mark_stale();
             }
         }
-        if streamed || changes.gi_changed {
+        if streamed & (1 << HOLD_VOXELS) != 0 || changes.gi_changed {
             self.volume.mark_stale();
         }
 
@@ -830,6 +904,8 @@ impl Renderer {
         let parity = (self.frame_index & 1) as usize;
 
         self.write_frame_data(gpu, camera, environment, render_size);
+        self.shadows.speck_texels = self.settings.speck_texels;
+        self.volume.speck_voxels = self.settings.speck_texels;
         let shadow_work = self.shadows.prepare(
             gpu,
             &self.view_slots,
@@ -842,6 +918,9 @@ impl Renderer {
             0.5 * render_size.1 as f32 * camera.projection(aspect).y_axis.y,
             &self.scene.instance_table.moving_spheres(),
         );
+        // A cascade and a level of voxels each cost several times a frame to redraw: not both
+        // on one frame.
+        self.volume.hold_off = shadow_work.due.contains(&true);
         let volume_work = self
             .volume
             .prepare(gpu, &self.view_slots, SLOT_VOXEL, camera.position);
@@ -1050,6 +1129,21 @@ impl Renderer {
                 },
                 &self.shadows,
             );
+        } else if let (Some(ponds), Some(targets)) = (&mut self.pond_water, &sized.water) {
+            ponds.record(
+                gpu,
+                &mut encoder,
+                &self.environment,
+                targets,
+                SceneViews {
+                    lit: &sized.hdr.view,
+                    depth: &sized.gbuffer.depth.view,
+                    motion: &sized.gbuffer.motion.view,
+                    depth_pyramid: sized.screen_gi.depth_pyramid_view(),
+                    normals: &sized.gbuffer.normal.view,
+                },
+                &self.shadows,
+            );
         }
 
         // Particles, over the lit scene and the water.
@@ -1106,6 +1200,7 @@ impl Renderer {
             self.frame_index,
             delta_seconds,
             environment.daylight(),
+            environment.day(),
             passthrough,
         );
 
@@ -1133,7 +1228,7 @@ impl Renderer {
             s.render_size == render_size
                 && s.output_size == output_size
                 && s.screen_gi.probe_rays() == self.settings.probe_rays
-                && s.water.is_some() == self.sea.is_some()
+                && s.water.as_ref().map(WaterTargets::for_sea) == self.water_kind()
         });
         if unchanged {
             return;
@@ -1191,9 +1286,8 @@ impl Renderer {
             &self.light_shadows.view,
         );
         let water = self
-            .sea
-            .is_some()
-            .then(|| WaterTargets::new(gpu, render_size));
+            .water_kind()
+            .map(|sea| WaterTargets::new(gpu, render_size, sea));
         let (scene_color, scene_depth, scene_motion) = match &water {
             Some(water) => (
                 &water.color.view,
@@ -1342,6 +1436,10 @@ impl Renderer {
             receiver_planes: [Vec4::ZERO; 6],
             eye_light: Vec3::Y,
             masked_lists: 1,
+            prefetch_radius: self.settings.prefetch_radius,
+            hold_requests: 0,
+            speck_texels: 0.0,
+            _pad_prefetch: 0,
         };
         self.view_slots.write(
             gpu,

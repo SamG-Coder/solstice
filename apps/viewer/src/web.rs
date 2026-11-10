@@ -60,10 +60,21 @@ pub struct WebViewer {
     instance_poses: Vec<u32>,
     #[cfg(feature = "gameplay")]
     play: Option<crate::play::PlayMode>,
+    /// See [`WebViewer::external_tables`].
+    external_tables: Option<Vec<f64>>,
+    pinned_sizes: Vec<u32>,
+    pinned_clusters: Vec<u32>,
     /// What scripts logged, and errors, for the page to take.
     #[cfg(feature = "gameplay")]
     messages: Vec<crate::play::Message>,
 }
+
+/// How far around the camera a scene read in parts loads what isn't in view, in metres.
+const LARGE_SCENE_PREFETCH: f32 = 24.0;
+/// Such a scene's clusters under this many texels of a shadow cascade, or voxels of the GI,
+/// across are drawn into it as specks: its coarsest clusters are small, and far cascades and
+/// coarse voxels are nearly all specks.
+const LARGE_SCENE_SPECKS: f32 = 1.0;
 
 #[wasm_bindgen]
 impl WebViewer {
@@ -82,6 +93,26 @@ impl WebViewer {
     ) -> Result<WebViewer, JsValue> {
         let scene = file::decode_manifest(&manifest, data_offset as u64).map_err(error_string)?;
         drop(manifest);
+        let external_tables = scene
+            .external
+            .map(|tables| vec![tables.clusters as f64, tables.pinned_bytes as f64]);
+        let pinned_clusters: Vec<u32> = scene
+            .external
+            .map(|_| {
+                (0..scene.pinned_pages)
+                    .map(|page| scene.page_cluster_count(page))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pinned_sizes: Vec<u32> = scene
+            .external
+            .map(|_| {
+                scene.pages[..scene.pinned_pages as usize]
+                    .iter()
+                    .map(|page| page.raw_bytes() as u32)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let (width, height) = (canvas.width().max(1), canvas.height().max(1));
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -122,7 +153,20 @@ impl WebViewer {
             &gpu,
             &scene,
             config.format,
-            RendererSettings::default(),
+            RendererSettings {
+                // A scene this large takes a moment to bring in what a turn reveals.
+                prefetch_radius: if scene.external.is_some() {
+                    LARGE_SCENE_PREFETCH
+                } else {
+                    0.0
+                },
+                speck_texels: if scene.external.is_some() {
+                    LARGE_SCENE_SPECKS
+                } else {
+                    0.0
+                },
+                ..Default::default()
+            },
             budget,
         );
         Ok(WebViewer {
@@ -133,6 +177,9 @@ impl WebViewer {
             camera: FlyCamera::new(initial_camera(scene.viewpoint)),
             clock: DayClock::new(TimeOfDay::default(), DEFAULT_DAY_SECONDS),
             gpu_errors,
+            external_tables,
+            pinned_sizes,
+            pinned_clusters,
             gameplay: scene.gameplay,
             #[cfg(feature = "gameplay")]
             collision: scene.collision,
@@ -155,9 +202,43 @@ impl WebViewer {
         })
     }
 
-    /// What to fetch next, as a flat array with four numbers per request: its id, the first
-    /// byte in the file, one past the last byte, and 1 if it must be inflated. Each request
-    /// must later go to `deliver` or `request_failed`.
+    /// For a scene whose tables come separately: how many cluster records and how many bytes
+    /// of pinned pages. Empty for any other scene.
+    pub fn external_tables(&self) -> Vec<f64> {
+        self.external_tables.clone().unwrap_or_default()
+    }
+
+    /// The size in bytes of each pinned page of such a scene, in order.
+    pub fn pinned_sizes(&self) -> Vec<u32> {
+        self.pinned_sizes.clone()
+    }
+
+    /// How many cluster records each pinned page of such a scene has, in order. Their records
+    /// are the first of the table, in this order.
+    pub fn pinned_cluster_counts(&self) -> Vec<u32> {
+        self.pinned_clusters.clone()
+    }
+
+    /// Takes one of such a scene's pinned pages and its cluster records, in order.
+    pub fn install_pinned(&mut self, page: u32, bytes: &[u8], clusters: &[u8]) {
+        self.renderer
+            .install_pinned(&self.gpu, page, bytes, clusters);
+    }
+
+    /// Takes a page of such a scene, inflated, with its cluster records.
+    pub fn deliver_page(&mut self, id: u32, bytes: Vec<u8>, clusters: Vec<u8>) -> bool {
+        self.renderer.deliver_page(id, bytes, clusters)
+    }
+
+    /// Call when all of such a scene's tables have been handed over.
+    pub fn finish_external_tables(&mut self) {
+        self.renderer.finish_external_tables(&self.gpu);
+    }
+
+    /// What to fetch next, as a flat array with six numbers per request: its id, the first
+    /// byte in the file, one past the last byte, 1 if it must be inflated, and the range of its
+    /// cluster records in their table, which is empty unless they must come too. Each request
+    /// must later go to `deliver`, `deliver_page` or `request_failed`.
     pub fn stream_requests(&mut self, max_fetching: u32) -> Vec<f64> {
         self.renderer
             .stream_requests(max_fetching)
@@ -168,6 +249,8 @@ impl WebViewer {
                     request.start as f64,
                     request.end as f64,
                     f64::from(u8::from(request.deflated)),
+                    request.clusters.map_or(0.0, |range| range.0 as f64),
+                    request.clusters.map_or(0.0, |range| range.1 as f64),
                 ]
             })
             .collect()
@@ -204,6 +287,27 @@ impl WebViewer {
     /// Wanted pages with no room in the pool.
     pub fn pages_starved(&self) -> u32 {
         self.renderer.stats().streaming.starved
+    }
+
+    /// What the shadow cascade last redrawn drew: clusters, triangles, and clusters that found
+    /// no room in its lists, which leave holes in the shadows.
+    pub fn shadow_load(&self) -> Vec<u32> {
+        let stats = self.renderer.stats();
+        vec![
+            stats.shadow_clusters,
+            stats.shadow_triangles,
+            stats.shadow_dropped,
+        ]
+    }
+
+    /// For a scene with several pools: the pages in each and its size, a pair per pool.
+    pub fn page_pools(&self) -> Vec<u32> {
+        let bands = self.renderer.stats().streaming.bands;
+        bands
+            .iter()
+            .flatten()
+            .flat_map(|&(installed, slots)| [installed, slots])
+            .collect()
     }
 
     /// Layers sharpened beyond the base tier, as middle and top counts.
@@ -394,10 +498,32 @@ impl WebViewer {
         )
     }
 
+    /// Lays still water over the scene: ponds written `x0,z0,x1,z1,level`, with `;` between
+    /// them. Returns false, changing nothing, if they can't be read.
+    pub fn set_ponds(&mut self, ponds: &str) -> bool {
+        match solstice_render::Pond::parse_list(ponds) {
+            Ok(ponds) => {
+                self.renderer.set_ponds(&ponds);
+                true
+            }
+            Err(error) => {
+                log::warn!("ponds: {error}");
+                false
+            }
+        }
+    }
+
     pub fn set_camera(&mut self, x: f32, y: f32, z: f32, yaw: f32, pitch: f32) {
         self.camera.camera.position = Vec3::new(x, y, z);
         self.camera.camera.yaw = yaw;
         self.camera.camera.pitch = pitch;
+    }
+
+    /// Where the camera is: x, y, z, yaw and pitch, as `set_camera` takes them.
+    pub fn camera(&self) -> Vec<f32> {
+        let camera = &self.camera.camera;
+        let at = camera.position;
+        vec![at.x, at.y, at.z, camera.yaw, camera.pitch]
     }
 
     pub fn triangles(&self) -> u32 {
@@ -450,6 +576,21 @@ impl WebViewer {
         !self.gameplay.is_empty()
     }
 
+    /// Forgets the scene's game, so that another can be given in its place.
+    pub fn clear_game(&mut self) {
+        self.gameplay.clear();
+    }
+
+    /// Gives the scene a gameplay file, in place of any of that name. So a game kept in a
+    /// folder beside the page is played on a scene baked without it. Before `play`.
+    pub fn add_game_file(&mut self, name: &str, text: &str) {
+        self.gameplay.retain(|file| file.name != name);
+        self.gameplay.push(GameFile {
+            name: name.to_owned(),
+            text: text.to_owned(),
+        });
+    }
+
     /// Whether this build can play one: the gameplay build can, the plain one can't.
     pub fn can_play() -> bool {
         cfg!(feature = "gameplay")
@@ -458,7 +599,7 @@ impl WebViewer {
     fn playing_as_someone(&self) -> bool {
         #[cfg(feature = "gameplay")]
         if let Some(play) = &self.play {
-            return play.play.has_player();
+            return play.play.has_camera();
         }
         false
     }
@@ -502,6 +643,12 @@ impl WebViewer {
         self.collision_pieces.push(bytes);
     }
 
+    /// The files the scene's game names and lacks: for a game given file by file, what to give
+    /// next. Empty once it has them all.
+    pub fn game_files_missing(&self) -> Vec<String> {
+        solstice_game::missing_files(&self.gameplay)
+    }
+
     /// Starts the scene's game, with its collision delivered. Rejects with every mistake in its
     /// files, one to a line.
     pub fn play(&mut self) -> Result<(), JsValue> {
@@ -530,9 +677,26 @@ impl WebViewer {
         Ok(())
     }
 
-    /// Whether a game is running, and someone in it has the camera.
+    /// Whether a game is running with someone in it to play, who has the camera unless the
+    /// player is flying.
     pub fn has_player(&self) -> bool {
-        self.playing_as_someone()
+        self.play
+            .as_ref()
+            .is_some_and(|play| play.play.has_player())
+    }
+
+    /// Whether the player has left whoever they play, to fly the camera.
+    pub fn flying(&self) -> bool {
+        self.play.as_ref().is_some_and(|play| play.play.flying())
+    }
+
+    /// Lets the player leave whoever they play and fly the camera, from where it is, or puts
+    /// them back. Flying, the one left stands where they were; the rest of the game still
+    /// hears the keys, so a door opens to the camera. Nothing changes in a game with no player.
+    pub fn set_flying(&mut self, flying: bool) {
+        if let Some(play) = &mut self.play {
+            play.play.set_flying(flying);
+        }
     }
 
     fn devices(&mut self) -> Option<&mut solstice_game::Devices> {

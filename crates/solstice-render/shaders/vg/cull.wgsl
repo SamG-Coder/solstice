@@ -36,6 +36,8 @@ const REQUEST_LOWEST_LOAD: u32 = 2u;
 const REQUEST_PER_PIXEL: f32 = 16.0;
 const REQUEST_MAX_PIXELS: f32 = 100000.0;
 // Shadow and voxel views only affect the image indirectly, so they yield to the main camera.
+// How many times coarser what is near but out of view may be than if it were seen.
+const PREFETCH_RELAX: f32 = 4.0;
 const REQUEST_ORTHO_WEIGHT: f32 = 0.125;
 // `Instance.texture_info` of a material with no texture.
 const NO_TEXTURE: u32 = 0xffffffffu;
@@ -59,8 +61,9 @@ const SOFTWARE_MAX_DIAMETER_TEXELS: f32 = 16.0;
 @group(1) @binding(1) var<storage, read_write> queue: array<QueueEntry>;
 @group(1) @binding(2) var<storage, read_write> retry: array<QueueEntry>;
 @group(1) @binding(3) var<storage, read_write> visible: array<VisibleCluster>;
-// Per page: 0 if not reached this frame, else how much it is wanted. See `residency.rs`.
-// From the end, per texture layer: the edge a texture must have to look sharp in this frame.
+// Per page: 0 if not reached since the array was last read, else how much it is wanted. See
+// `residency.rs`. Then a bit per page, set by the views kept from frame to frame that asked.
+// From the end, per texture layer: the edge a texture must have to look sharp.
 @group(1) @binding(4) var<storage, read_write> page_requests: array<atomic<u32>>;
 
 fn push_queue(entry: QueueEntry) {
@@ -98,6 +101,41 @@ fn emit_cluster(instance: u32, cluster: u32, software: bool) -> bool {
         visible[capacity - 1u - atomicAdd(&state.hw_count, 1u)] = VisibleCluster(instance, cluster);
     }
     return true;
+}
+
+// Sends a cluster to be drawn as a speck. For a voxelization it goes to the hardware end of the
+// list, which nothing else there uses, and gi/voxelize.wgsl marks the voxels its bounds touch.
+// For a depth map, the texels its bounds touch and its depth are worked out here, where its
+// bounds are to hand, and vg/speck_depth.wgsl only writes them.
+fn emit_speck(instance: u32, cluster: u32, center: vec3f, radius: f32) {
+    if view.allow_software == 2u {
+        _ = emit_cluster(instance, cluster, false);
+        return;
+    }
+    let clip = view.raster_view_proj * vec4f(center, 1.0);
+    let at = vec2f((clip.x * 0.5 + 0.5) * view.viewport.x, (0.5 - clip.y * 0.5) * view.viewport.y);
+    let reach = radius * view.lod_scale;
+    let last = vec2i(view.viewport) - 1;
+    let low = vec2i(floor(at - reach));
+    let high = vec2i(floor(at + reach));
+    // Nothing of it lands in the map. Depth runs 0 at the light's side to 1 at the far side.
+    if any(high < vec2i(0)) || any(low > last) || clip.z <= 0.0 || clip.z >= 1.0 {
+        return;
+    }
+    let slot = atomicAdd(&state.speck_count, 1u);
+    if slot >= arrayLength(&retry) {
+        atomicAdd(&state.dropped, 1u);
+        return;
+    }
+    // The far side of its bounds, so that it does not shadow itself.
+    let m = view.raster_view_proj;
+    let depth = min(clip.z + radius * length(vec3f(m[0][2], m[1][2], m[2][2])), 1.0);
+    let first = vec2u(max(low, vec2i(0)));
+    let more = min(vec2u(min(high, last)) - first, vec2u(3u));
+    retry[slot] = QueueEntry(
+        first.x | (first.y << 13u) | (more.x << 26u) | (more.y << 28u),
+        max(u32((1.0 - depth) * 16777215.0), 1u),
+    );
 }
 
 // The same for cut-out clusters, in the part of the list after the opaque clusters' part.
@@ -227,6 +265,16 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
         if view.phase == 0u {
             push_retry(QueueEntry(entry.instance, cluster_index | CLUSTER_BIT));
         }
+        return;
+    }
+
+    // A cluster under a texel of a depth map, or a voxel, across marks the same texel or two
+    // whichever of its triangles is drawn, and a rasterizer gives it a hundred threads and more
+    // to do so. In a scene whose coarsest clusters are small, a far cascade is nearly all such
+    // clusters: they are drawn as points, by a thread each.
+    if view.speck_texels > 0.0 && view.is_ortho != 0u && !instance_masked(instance)
+        && 2.0 * radius * view.lod_scale < view.speck_texels {
+        emit_speck(entry.instance, cluster_index, center, radius);
         return;
     }
 
@@ -362,6 +410,20 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     let center = transform_point(instance, node.center);
     let radius = (node.radius + instance.lod_margin) * instance.max_scale;
     if !in_frustum(center, radius) {
+        // Near the camera but out of its view: nothing is drawn, but pages are asked for down
+        // to a coarser level, so that a turn or a fast move finds more than the coarsest
+        // geometry already there. What is in view is always wanted more.
+        if view.prefetch_radius > 0.0 && view.phase == 0u
+            && parent_pixels > view.lod_threshold * PREFETCH_RELAX
+            && distance(center, view.camera_position) - radius < view.prefetch_radius {
+            if node.is_leaf == 0u {
+                for (var i = 0u; i < node.count; i++) {
+                    push_queue(QueueEntry(entry.instance, node.first + i));
+                }
+            } else {
+                atomicMax(&page_requests[page], REQUEST_LOWEST_LOAD);
+            }
+        }
         return;
     }
     if !passes_occlusion(center, radius) {
@@ -385,6 +447,10 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     let weight = select(1.0, REQUEST_ORTHO_WEIGHT, view.is_ortho != 0u);
     let wanted = min(parent_pixels, REQUEST_MAX_PIXELS) * weight * REQUEST_PER_PIXEL;
     atomicMax(&page_requests[page], REQUEST_LOWEST_LOAD + u32(wanted));
+    if view.hold_requests != 0u {
+        // A view kept from frame to frame asks only now, as it is drawn.
+        atomicOr(&page_requests[view.hold_requests + (page >> 5u)], 1u << (page & 31u));
+    }
     if (node.is_leaf & NODE_INSTALLED) == 0u {
         return;
     }

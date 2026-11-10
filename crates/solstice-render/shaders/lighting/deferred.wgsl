@@ -6,6 +6,7 @@
 #include "common/scene.wgsl"
 #include "sky/bodies.wgsl"
 #include "lighting/sun_shadow.wgsl"
+#include "lighting/specular_aa.wgsl"
 
 @group(0) @binding(0) var albedo_tex: texture_2d<f32>;
 @group(0) @binding(1) var normal_tex: texture_2d<f32>;
@@ -94,6 +95,47 @@ fn local_light(index: u32, s: Surface, view: vec3f, world: vec3f) -> vec3f {
     return shade_light(s, view, direction) * light.intensity * falloff * open;
 }
 
+// How fast a reflection texel stops counting as it leaves the pixel's surface, by its distance
+// off that surface over the distance from the eye, squared. As gi/probe_integrate.wgsl has it.
+const REFLECTION_PLANE_SHARPNESS: f32 = 7000.0;
+
+// The reflection at a pixel, from the half-resolution texels around it. Each texel stands for
+// the two by two pixels under it, and filtering between them as they lie would carry what a
+// column reflects two pixels out onto the wall behind it. So each counts by how near the pixel's
+// surface its nearest pixel lies. The texel over this pixel always counts in full.
+fn reflection_on_surface(pixel: vec2i, world: vec3f, normal: vec3f, distance: f32) -> vec4f {
+    let last = vec2i(textureDimensions(reflection_tex)) - vec2i(1);
+    let last_pixel = vec2i(frame.viewport) - vec2i(1);
+    let at = (vec2f(pixel) + vec2f(0.5)) * 0.5 - vec2f(0.5);
+    let first = vec2i(floor(at));
+    let part = at - floor(at);
+    let sharpness = REFLECTION_PLANE_SHARPNESS / (distance * distance);
+    var sum = vec4f(0.0);
+    var total = 0.0;
+    for (var i = 0; i < 4; i++) {
+        let corner = vec2i((i & 1), (i >> 1));
+        let texel = clamp(first + corner, vec2i(0), last);
+        let side = mix(vec2f(1.0) - part, part, vec2f(corner));
+        var weight = side.x * side.y;
+        let nearest = clamp(clamp(pixel, texel * 2, texel * 2 + vec2i(1)), vec2i(0), last_pixel);
+        if any(nearest != pixel) {
+            let other_depth = textureLoad(depth_tex, nearest, 0).r;
+            if other_depth <= 0.0 {
+                continue;
+            }
+            let other = reconstruct_world(frame, vec2f(nearest) + vec2f(0.5), other_depth);
+            let off = dot(other - world, normal);
+            weight *= exp(-off * off * sharpness);
+        }
+        sum += textureLoad(reflection_tex, texel, 0) * weight;
+        total += weight;
+    }
+    return sum / max(total, 1.0e-6);
+}
+
+// The most of the haze's glow that skylight alone gives the air, where no sun reaches it.
+const AIR_SKY_SHARE: f32 = 0.25;
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     let size = vec2u(frame.viewport);
@@ -137,7 +179,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let albedo_cavity = textureLoad(albedo_tex, pixel, 0);
     let packed = textureLoad(normal_tex, pixel, 0);
     let normal = oct_decode(packed.xy);
-    let roughness = packed.z;
+    let roughness = antialiased_roughness(normal_tex, depth_tex, pixel, normal, depth, packed.z);
     let metallic = packed.w;
     let world = reconstruct_world(frame, center, depth);
     let to_camera = frame.camera_position - world;
@@ -183,8 +225,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     // Indirect specular. Rough surfaces did not trace, and their blurry reflection is
     // reasonably well estimated from the same irradiance.
-    let reflection_uv = center * frame.inv_viewport;
-    let reflection = textureSampleLevel(reflection_tex, clamp_sampler, reflection_uv, 0.0);
+    let reflection = reflection_on_surface(pixel, world, normal, distance);
     let n_dot_v = max(dot(normal, view), 0.0);
     let specular_scale = environment_brdf(surface.f0, roughness, n_dot_v);
     let rough_estimate = irradiance / PI;
@@ -197,7 +238,12 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     color += emissive;
 
-    color = aerial_perspective(color, world, view, distance);
+    // The air between glows only as far as light reaches it: sunlight by the shadow maps, and
+    // skylight by how much of the open sky's light arrives here.
+    let air_sun = air_lit(view, distance, noise);
+    let open_sky = PI * luminance(clear_sky_radiance(vec3f(0.0, 1.0, 0.0)));
+    let air_sky = clamp(luminance(irradiance) / max(open_sky, 1.0e-4), 0.0, 1.0) * AIR_SKY_SHARE;
+    color = aerial_perspective_lit(color, world, view, distance, mix(air_sky, 1.0, air_sun));
 
     switch frame.debug_mode {
         case DEBUG_DIFFUSE_GI: {

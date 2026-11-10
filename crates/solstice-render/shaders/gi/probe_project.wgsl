@@ -78,11 +78,10 @@ fn project(@builtin(global_invocation_id) id: vec3u) {
     probes_out[slot] = probe;
 }
 
-// Blends with neighbours lying on the same surface.
-@compute @workgroup_size(8, 8)
-fn filter_spatial(@builtin(global_invocation_id) id: vec3u) {
+// Blends a probe with the eight around it, `step` tiles away, that lie on the same surface.
+fn blend_with_neighbours(id: vec2u, step: i32) {
     let grid = probe_grid_size(frame.viewport);
-    if any(id.xy >= grid) {
+    if any(id >= grid) {
         return;
     }
     let slot = id.y * grid.x + id.x;
@@ -99,7 +98,7 @@ fn filter_spatial(@builtin(global_invocation_id) id: vec3u) {
             if dx == 0 && dy == 0 {
                 continue;
             }
-            let c = vec2i(id.xy) + vec2i(dx, dy);
+            let c = vec2i(id) + vec2i(dx, dy) * step;
             if any(c < vec2i(0)) || any(c >= vec2i(grid)) {
                 continue;
             }
@@ -108,7 +107,9 @@ fn filter_spatial(@builtin(global_invocation_id) id: vec3u) {
                 continue;
             }
             let normal_weight = pow(max(dot(other.normal.xyz, probe.normal.xyz), 0.0), 8.0);
-            let plane = abs(dot(other.position.xyz - probe.position.xyz, probe.normal.xyz));
+            let offset = other.position.xyz - probe.position.xyz;
+            // Off either one's plane: two walls that meet share neither.
+            let plane = max(abs(dot(offset, probe.normal.xyz)), abs(dot(offset, other.normal.xyz)));
             let weight = normal_weight * exp(-plane * plane_scale * 8.0);
             if weight > 1.0e-3 {
                 for (var i = 0; i < 9; i++) {
@@ -122,4 +123,17 @@ fn filter_spatial(@builtin(global_invocation_id) id: vec3u) {
         probe.sh[i] /= total;
     }
     probes_out[slot] = probe;
+}
+
+// Two passes, the second reaching twice as far, come to a blend over seven probes a side for
+// the cost of two over three. A room lit by a patch of sun that few rays find needs that many
+// to be even.
+@compute @workgroup_size(8, 8)
+fn filter_spatial(@builtin(global_invocation_id) id: vec3u) {
+    blend_with_neighbours(id.xy, 1);
+}
+
+@compute @workgroup_size(8, 8)
+fn filter_wide(@builtin(global_invocation_id) id: vec3u) {
+    blend_with_neighbours(id.xy, 2);
 }
