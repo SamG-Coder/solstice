@@ -11,6 +11,7 @@ solstice-anim.workspace = true
 solstice-asset.workspace = true
 solstice-physics.workspace = true
 solstice-script.workspace = true
+solstice-vehicle.workspace = true
 solstice-world.workspace = true
 
 [dev-dependencies]

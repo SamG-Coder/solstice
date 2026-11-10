@@ -16,6 +16,8 @@
 //! blocker 40 2 0 1 4 90 0              # an invisible wall: x y z, full size, yaw_degrees
 //! actor cove/gate.actor 20.7 0 0 90 locked=true  # an actor, with its properties' values
 //! input cove/play.input                # the input actions, if not the built-in ones
+//! track circuit/circuit.track          # a circuit: its centre line, and what lies beside it
+//! circuit 1900                         # the land, road and planting round that track, this wide
 //! ```
 //!
 //! Actors, their scripts and the input actions travel inside the scene file, as its gameplay
@@ -80,6 +82,9 @@ enum Command {
     Actor(ActorLine),
     Blocker(Blocker),
     Input(String),
+    Track(String),
+    /// The land round the scene's track, this many metres across.
+    Circuit(f32),
 }
 
 fn parse_line(line: &str) -> Result<Option<Command>, String> {
@@ -208,6 +213,20 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
         "input" => {
             expect(1)?;
             Command::Input(values[0].to_string())
+        }
+        "track" => {
+            expect(1)?;
+            Command::Track(values[0].to_string())
+        }
+        "circuit" => {
+            expect(1)?;
+            let size = number(0)?;
+            if !(200.0..=8000.0).contains(&size) {
+                return Err(format!(
+                    "a circuit's land is 200 to 8000 metres across, not {size}"
+                ));
+            }
+            Command::Circuit(size)
         }
         other => return Err(format!("unknown command '{other}'")),
     }))
@@ -527,6 +546,11 @@ impl Gameplay {
         if animation.is_some() && actor.mesh.is_none() {
             return Err(format!("{} is animated but has no mesh", line.file));
         }
+        if let Some(vehicle) = &actor.vehicle {
+            let name = resolve(&line.file, &vehicle.path);
+            solstice_game::VehicleSpec::parse(self.read(base, &name)?)
+                .map_err(|e| format!("{name}: {e}"))?;
+        }
         let mesh = actor.mesh.as_ref().map(|mesh| {
             (
                 resolve(&line.file, &mesh.path),
@@ -550,9 +574,22 @@ impl Gameplay {
         Ok(())
     }
 
+    fn set_track(&mut self, base: &Path, name: &str) -> Result<(), String> {
+        if self.game.track.is_some() {
+            return Err("`track` is given twice".to_owned());
+        }
+        let name = resolve(GAME_FILE, name);
+        solstice_game::Track::parse(self.read(base, &name)?).map_err(|e| format!("{name}: {e}"))?;
+        self.game.track = Some(name);
+        Ok(())
+    }
+
     /// The scene's gameplay files, with the list of its actors first, or none if it has none.
     fn finish(mut self) -> Vec<GameFile> {
-        if self.game.actors.is_empty() && self.game.blockers.is_empty() && self.game.input.is_none()
+        if self.game.actors.is_empty()
+            && self.game.blockers.is_empty()
+            && self.game.input.is_none()
+            && self.game.track.is_none()
         {
             return Vec::new();
         }
@@ -664,6 +701,7 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     };
     let mut terrain = None;
     let mut water = None;
+    let mut circuit = None;
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
     let mut order: Vec<PathBuf> = Vec::new();
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
@@ -782,6 +820,8 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             }
             Some(Command::Blocker(blocker)) => gameplay.game.blockers.push(blocker),
             Some(Command::Input(input)) => gameplay.set_input(base, &input).map_err(at)?,
+            Some(Command::Track(track)) => gameplay.set_track(base, &track).map_err(at)?,
+            Some(Command::Circuit(size)) => circuit = Some(size),
         }
     }
 
@@ -869,6 +909,27 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 scene.collide[instance as usize] = *how;
             }
         }
+    }
+    // A circuit's land, road and planting are built from its track, which also gives the
+    // ground to drive on and the barriers to stop at.
+    if let Some(size) = circuit {
+        let name = gameplay
+            .game
+            .track
+            .clone()
+            .ok_or("`circuit` needs a `track` line: the land is shaped to the track")?;
+        let text = gameplay
+            .files
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.text.clone())
+            .ok_or_else(|| format!("{name}: not read"))?;
+        let track = solstice_game::Track::parse(&text).map_err(|e| format!("{name}: {e}"))?;
+        scene.collide.resize(scene.instances.len(), Collide::Auto);
+        let built = crate::circuit::build(&mut scene, &track, size);
+        scene.collide.resize(scene.instances.len(), Collide::None);
+        scene.ground = Some(built.ground);
+        gameplay.game.blockers.extend(built.blockers);
     }
     scene.gameplay = gameplay.finish();
 

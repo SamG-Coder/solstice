@@ -132,6 +132,8 @@ pub struct SceneGame {
     pub blockers: Vec<Blocker>,
     /// The `.input` file, relative to the scene's text file, or the built-in actions if none.
     pub input: Option<String>,
+    /// The `.track` file, relative to the scene's text file, if the scene is a circuit.
+    pub track: Option<String>,
 }
 
 impl SceneGame {
@@ -153,6 +155,13 @@ impl SceneGame {
                     game.input = Some(words[1].to_owned());
                 }
                 "input" => return Err(error("expected `input FILE`".to_owned())),
+                "track" if words.len() == 2 => {
+                    if game.track.is_some() {
+                        return Err(error("`track` is given twice".to_owned()));
+                    }
+                    game.track = Some(words[1].to_owned());
+                }
+                "track" => return Err(error("expected `track FILE`".to_owned())),
                 other => return Err(error(format!("unknown line `{other}`"))),
             }
         }
@@ -163,6 +172,9 @@ impl SceneGame {
         let mut text = String::new();
         if let Some(input) = &self.input {
             let _ = writeln!(text, "input {input}");
+        }
+        if let Some(track) = &self.track {
+            let _ = writeln!(text, "track {track}");
         }
         for actor in &self.actors {
             text.push_str(&actor.to_text());
@@ -178,9 +190,9 @@ impl SceneGame {
 
 /// The files a scene's gameplay names that `files` lacks, each once, in the order named: for
 /// a viewer that is handed a game a file at a time, to ask for the rest. [`GAME_FILE`] is the
-/// first, then the input actions and actor files it names, then each actor's script and
-/// animation. A file that can't be read names nothing: loading the game says what is wrong
-/// with it.
+/// first, then the input actions, track and actor files it names, then each actor's script,
+/// animation and vehicle. A file that can't be read names nothing: loading the game says what
+/// is wrong with it.
 pub fn missing_files(files: &[GameFile]) -> Vec<String> {
     let file = |name: &str| files.iter().find(|f| f.name == name).map(|f| &*f.text);
     let mut named = Vec::new();
@@ -189,11 +201,13 @@ pub fn missing_files(files: &[GameFile]) -> Vec<String> {
         Some(Err(_)) => {}
         Some(Ok(scene)) => {
             named.extend(scene.input);
+            named.extend(scene.track);
             for line in scene.actors {
                 let actor = file(&line.file).map(ActorFile::parse);
                 named.push(line.file.clone());
                 if let Some(Ok(actor)) = actor {
-                    let relative = actor.script.iter().chain(&actor.animation);
+                    let vehicle = actor.vehicle.as_ref().map(|vehicle| &vehicle.path);
+                    let relative = actor.script.iter().chain(&actor.animation).chain(vehicle);
                     named.extend(relative.map(|name| resolve(&line.file, name)));
                 }
             }
@@ -343,13 +357,34 @@ animation ../door.anim
 ",
         ));
         files.push(file(
+            "cars/car.actor",
+            "name car
+vehicle car.vehicle
+",
+        ));
+        files[0].text.push_str(
+            "track ring.track
+actor cars/car.actor 0 0 0 0
+",
+        );
+        files.push(file(
             "keys.input",
             "interact key KeyF
 ",
         ));
-        assert_eq!(missing_files(&files), ["doors/door.star", "door.anim"]);
+        assert_eq!(
+            missing_files(&files),
+            [
+                "ring.track",
+                "doors/door.star",
+                "door.anim",
+                "cars/car.vehicle"
+            ]
+        );
         files.push(file("doors/door.star", ""));
         files.push(file("door.anim", ""));
+        files.push(file("ring.track", ""));
+        files.push(file("cars/car.vehicle", ""));
         assert!(missing_files(&files).is_empty());
         // A file with a mistake names nothing: loading the game reports it.
         files[0].text = "actor".to_owned();

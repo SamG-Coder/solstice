@@ -271,6 +271,7 @@ dependencies = [
  "solstice-builder",
  "solstice-game",
  "solstice-import",
+ "solstice-physics",
  "solstice-procgen",
  "solstice-script",
 ]
@@ -3210,6 +3211,7 @@ dependencies = [
  "solstice-asset",
  "solstice-physics",
  "solstice-script",
+ "solstice-vehicle",
  "solstice-world",
 ]
 
@@ -3235,6 +3237,7 @@ dependencies = [
  "glam 0.33.12",
  "rapier3d",
  "solstice-asset",
+ "solstice-vehicle",
  "solstice-world",
 ]
 
@@ -3274,6 +3277,13 @@ dependencies = [
  "solstice-world",
  "starlark",
  "starlark_derive",
+]
+
+[[package]]
+name = "solstice-vehicle"
+version = "0.2.0"
+dependencies = [
+ "glam 0.33.12",
 ]
 
 [[package]]

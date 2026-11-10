@@ -99,6 +99,11 @@ struct WeldedMesh {
 }
 
 /// Converts a triangle mesh to a cluster LOD DAG.
+///
+/// The mesh's points are snapped to one 16-bit grid across the whole of it, the same step
+/// along all three axes: [`Mesh::grid_step`] says how fine that is. Points nearer each other
+/// than a step become one, and what stood less than a step proud of something in another mesh
+/// may end up behind it.
 pub fn build_virtual_mesh(mesh: &Mesh, options: &BuildOptions) -> VirtualMesh {
     build(mesh, None, options)
 }
@@ -784,6 +789,44 @@ pub(crate) mod tests {
     use super::*;
     use crate::mesh::Vertex;
     use solstice_asset::gpu::unpack_triangle;
+
+    #[test]
+    fn a_long_mesh_keeps_its_points_coarsely_however_thin_it_is() {
+        // A strip a kilometre long, a metre wide, and 6 mm higher along one side than the
+        // other: a line painted on a road, say, with the road's camber.
+        let strip = |length: f32| {
+            let corner = |x: f32, z: f32, y: f32| Vertex {
+                position: Vec3::new(x, y, z),
+                normal: Vec3::Y,
+                uv: Vec2::new(x, z),
+            };
+            Mesh {
+                vertices: vec![
+                    corner(0.0, 0.0, 0.0),
+                    corner(1.0, 0.0, 0.006),
+                    corner(1.0, length, 0.006),
+                    corner(0.0, length, 0.0),
+                ],
+                indices: vec![0, 2, 1, 0, 3, 2],
+            }
+        };
+        let long = strip(1000.0);
+        assert!((long.grid_step() - 1000.0 / 65535.0).abs() < 1.0e-6);
+        let built = build_virtual_mesh(&long, &BuildOptions::default());
+        assert_eq!(built.quant_step, long.grid_step());
+        // Its 6 mm of height is less than half a step: built, it is flat.
+        let heights: Vec<u16> = built.vertices.iter().map(|v| v.data[1]).collect();
+        assert!(heights.iter().all(|&h| h == heights[0]), "{heights:?}");
+        // A hundred metres of it keeps that height, to within a millimetre.
+        let short = strip(100.0);
+        assert!(short.grid_step() < 0.0016);
+        let built = build_virtual_mesh(&short, &BuildOptions::default());
+        let heights: Vec<u16> = built.vertices.iter().map(|v| v.data[1]).collect();
+        let (low, high) = (heights.iter().min().unwrap(), heights.iter().max().unwrap());
+        let risen = f32::from(high - low) * built.quant_step;
+        assert!((risen - 0.006).abs() < 0.001, "it rises {risen} m");
+        assert_eq!(Mesh::default().grid_step(), 0.0);
+    }
 
     /// A closed subdivided icosphere with bumps, so simplification has real
     /// geometric error to measure.
