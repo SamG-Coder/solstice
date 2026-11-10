@@ -202,6 +202,25 @@ pub fn rock(subdivisions: u32, seed: u32) -> Mesh {
     surface.into_mesh()
 }
 
+/// A mesh of four-cornered pieces, each given as its corners in order round it. Each faces the
+/// way `facing` says for a point in it: a road's pieces face up.
+pub fn quads(pieces: &[[Vec3; 4]], facing: impl Fn(Vec3) -> Vec3) -> Mesh {
+    let mut surface = Surface::default();
+    for piece in pieces {
+        let base = surface.positions.len() as u32;
+        surface.positions.extend_from_slice(piece);
+        let normal = (piece[1] - piece[0]).cross(piece[2] - piece[0]);
+        let (b, d) = if normal.dot(facing(piece[0])) >= 0.0 {
+            (1, 3)
+        } else {
+            (3, 1)
+        };
+        surface.faces.push([base, base + b, base + 2]);
+        surface.faces.push([base, base + 2, base + d]);
+    }
+    surface.into_mesh()
+}
+
 /// A square patch of terrain, `size` wide with `cells` quads per side, sampling `height`.
 pub fn terrain(size: f32, cells: u32, height: impl Fn(f32, f32) -> f32) -> Mesh {
     let mut surface = Surface::default();

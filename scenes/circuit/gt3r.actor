@@ -1,0 +1,6 @@
+# The Porsche 911 GT3 R (992): the car the player drives.
+# Its model is built by tools/blender/gt3r/make.py into target/circuit/gt3r.glb.
+name car
+mesh ../../target/circuit/gt3r.glb 1
+vehicle gt3r.vehicle
+camera 0 1.1 0

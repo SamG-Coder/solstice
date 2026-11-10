@@ -1,0 +1,9 @@
+# Kestrel Head: a circuit round an island, along its cliffs and through its woods.
+# Make the car first (tools/blender/gt3r/make.py) and the track file
+# (python tools/track/make_coast.py). The land, road and planting are built from the track.
+texture_size 1024
+ocean 0 coastal
+camera -290 33 110 0.2 -0.1
+track circuit/coast.track
+circuit 1900
+actor circuit/gt3r.actor -300.29 30.01 89.99 -0.9
