@@ -6,6 +6,8 @@
 //!   scene carries.
 //! * [`input`]: `.input` files, which map keys, the mouse, gamepads and touch to actions.
 //! * [`play`]: a running game, built from a baked scene's gameplay files.
+//! * [`track`]: `.track` files, a circuit's centre line and what lies beside it; [`race`], which
+//!   times laps round it; and [`drive`], the player's car, its camera and its instruments.
 //!
 //! None of it touches the GPU. The viewers move the renderer's instances, and its camera, as
 //! [`play::Play::frame`] tells them.
@@ -14,14 +16,20 @@ use solstice_asset::MAX_COORDINATE;
 
 pub mod actor;
 pub mod animation;
+pub mod drive;
 pub mod input;
 pub mod play;
+pub mod race;
 pub mod scene;
+pub mod track;
 
 pub use actor::{ActorFile, Mesh, Property, PropertyKind};
+pub use drive::Hud;
 pub use input::{Binding, Device, Devices, InputMap};
 pub use play::{Message, Play, View};
 pub use scene::{missing_files, ActorLine, Blocker, SceneGame, GAME_FILE};
+pub use solstice_vehicle::VehicleSpec;
+pub use track::Track;
 
 use std::fmt;
 

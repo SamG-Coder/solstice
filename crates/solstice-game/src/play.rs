@@ -7,18 +7,23 @@
 
 use crate::actor::ActorFile;
 use crate::animation::{AnimatedActors, AnimationAssets};
+use crate::drive::{self, Chase, DrawnWheel, Hud, Wheels, HUB_REACH, SPIN_REACH};
 use crate::input::{Devices, InputMap};
+use crate::race::{format_time, Lap, LapEvent};
 use crate::resolve;
 use crate::scene::{SceneGame, GAME_FILE};
+use crate::track::Track;
 use glam::{EulerRot, Mat4, Quat, Vec3};
 use solstice_asset::NO_POSE;
 use solstice_asset::{Collision, GameFile};
-use solstice_physics::{Overlap, Physics};
+use solstice_physics::vehicle::{Surface, Vehicle, VehicleSpec};
+use solstice_physics::{Car, Overlap, Physics, GRAVITY};
 use solstice_script::{Script, ScriptEvent, ScriptHost};
 use solstice_world::{
     Entity, Game, GlobalTransform, Name, Played, Schedule, TickGroup, Transform, World,
+    STEP_SECONDS,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -48,17 +53,27 @@ struct Drawn {
     entity: Entity,
     /// Its `.anim` file, if it is animated, by its path in the scene's gameplay.
     animation: Option<String>,
-    /// Each instance, and where it is relative to the actor.
+    /// Each instance, and where it is relative to the actor: or, for a car's wheel, relative
+    /// to the wheel's own middle.
     instances: Vec<(u32, Mat4)>,
+    /// For a car, which wheel each instance is carried by, if any, and whether it turns with
+    /// it: a brake caliper is carried, and doesn't.
+    wheels: Vec<Option<(usize, bool)>>,
     /// Where the actor was last drawn, to move its instances only when it moves.
     drawn: Option<Mat4>,
+    /// Where a car's wheels were last drawn, relative to it: rolled, and as their uprights.
+    rolled: Option<[(Mat4, Mat4); 4]>,
 }
 
 /// The actor the player plays, and where its eye is.
 struct Player {
     entity: Entity,
     eye: Vec3,
+    /// Whether it is a car, followed by the chase camera.
+    car: bool,
 }
+
+const WHEEL_NAMES: [&str; 4] = ["front left", "front right", "rear left", "rear right"];
 
 /// A scene's game, running.
 pub struct Play {
@@ -83,6 +98,14 @@ pub struct Play {
     viewer: Vec3,
     /// Whether the player has left whoever they play, to fly the camera.
     flying: bool,
+    /// The circuit, if the scene is one.
+    track: Option<Rc<Track>>,
+    /// The camera that follows the player's car.
+    chase: Chase,
+    /// The player's car's instruments, as of the latest frame.
+    hud: Option<Hud>,
+    /// What the timing of laps has to say, for the viewer to show.
+    race_log: Rc<RefCell<Vec<String>>>,
 }
 
 impl Play {
@@ -116,8 +139,33 @@ impl Play {
             },
         };
 
+        let track = match &scene.track {
+            None => None,
+            Some(name) => match file(name).map(|text| Track::parse(text)) {
+                Some(Ok(track)) => Some(Rc::new(track)),
+                Some(Err(e)) => {
+                    errors.push(format!("{name}: {e}"));
+                    None
+                }
+                None => {
+                    errors.push(format!("{name}: missing from the scene's gameplay"));
+                    None
+                }
+            },
+        };
+
         let host = Rc::new(RefCell::new(ScriptHost::new()));
         let physics = Rc::new(RefCell::new(Physics::new()));
+        if let Some(track) = &track {
+            // What each tyre is on. A car's wheels are near each other, and near where they
+            // were, so the search starts from the last place found.
+            let (track, near) = (track.clone(), Cell::new(None));
+            physics.borrow_mut().set_surfaces(move |point| {
+                let place = track.locate(point, near.get());
+                near.set(Some(place.sample));
+                place.surface
+            });
+        }
         if let Some(collision) = collision {
             physics.borrow_mut().add_scene(collision, &instance);
         }
@@ -201,6 +249,26 @@ impl Play {
             if actor.camera.is_some() && player.is_none() {
                 components.add(Played);
             }
+            // A car: its numbers, its wheels as they are drawn, and its laps.
+            let mut hubs = None;
+            if let Some(vehicle) = &actor.vehicle {
+                let name = resolve(&line.file, &vehicle.path);
+                match file(&name).map(|text| VehicleSpec::parse(text)) {
+                    Some(Ok(spec)) => {
+                        let car = Car::new(Vehicle::new(spec, GRAVITY), vehicle.automatic);
+                        hubs = Some(car.vehicle.spec().hubs());
+                        components.add(Wheels::at_rest(&car.vehicle)).add(car);
+                        if let Some(track) = &track {
+                            components.add(Lap::new(track));
+                        }
+                    }
+                    Some(Err(e)) => errors.push(format!("{name}: {e}")),
+                    None => errors.push(format!(
+                        "{}: its vehicle {name} is missing from the scene's gameplay",
+                        line.file
+                    )),
+                }
+            }
             let entity = world.spawn(components.build());
             if let Some(eye) = actor.camera {
                 if player.is_some() {
@@ -208,17 +276,50 @@ impl Play {
                         "{at}: only one actor can have a camera, and one already does"
                     ));
                 }
-                player = Some(Player { entity, eye });
+                player = Some(Player {
+                    entity,
+                    eye,
+                    car: hubs.is_some(),
+                });
             }
             if let Some(range) = &line.instances {
                 let placed = Mat4::from_rotation_translation(rotation, line.position);
                 let mut instances = Vec::new();
+                let mut wheels = Vec::new();
                 for id in range.clone() {
-                    match instance(id) {
-                        Some(world) => instances.push((id, placed.inverse() * world)),
+                    let Some(world) = instance(id) else {
+                        errors.push(format!("{at}: the scene has no instance {id}"));
+                        break;
+                    };
+                    let local = placed.inverse() * world;
+                    // A piece of a car's mesh with its own origin at a hub is that wheel.
+                    let origin = local.w_axis.truncate();
+                    let wheel = hubs.and_then(|hubs: [Vec3; 4]| {
+                        hubs.iter()
+                            .position(|hub| hub.distance(origin) < HUB_REACH)
+                            .map(|index| (index, hubs[index]))
+                    });
+                    match wheel {
+                        Some((index, hub)) => {
+                            let turns = hub.distance(origin) < SPIN_REACH;
+                            instances.push((id, Mat4::from_translation(-hub) * local));
+                            wheels.push(Some((index, turns)));
+                        }
                         None => {
-                            errors.push(format!("{at}: the scene has no instance {id}"));
-                            break;
+                            instances.push((id, local));
+                            wheels.push(None);
+                        }
+                    }
+                }
+                if let Some(hubs) = hubs {
+                    for (index, hub) in hubs.iter().enumerate() {
+                        if !wheels.contains(&Some((index, true))) {
+                            errors.push(format!(
+                                "{at}: its mesh has no piece with its origin at the {} hub, \
+                                 {} {} {}: a car's wheels are pieces of its mesh, each with its \
+                                 own origin at its middle",
+                                WHEEL_NAMES[index], hub.x, hub.y, hub.z
+                            ));
                         }
                     }
                 }
@@ -226,7 +327,9 @@ impl Play {
                     entity,
                     animation: actor.animation.as_ref().map(|a| resolve(&line.file, a)),
                     instances,
+                    wheels,
                     drawn: None,
+                    rolled: None,
                 });
             }
         }
@@ -236,7 +339,108 @@ impl Play {
 
         let mut schedule = Schedule::new();
         ScriptHost::install(&host, &mut schedule);
+        // The player's car takes what the player asks of it, after scripts have had their say.
+        let driven = player.as_ref().filter(|p| p.car).map(|p| p.entity);
+        let circuit = track.clone();
+        // Whether the car is driving itself round the circuit, and where on it it last was.
+        let (mut itself, mut last_at) = (false, None);
+        schedule.add(TickGroup::PrePhysics, "driving", move |world| {
+            let Some(entity) = driven else {
+                return;
+            };
+            // While the player is away flying the camera, the keys that fly it are not the
+            // car's: it is asked for nothing, as a walker left standing hears nothing.
+            let away = world.input().away();
+            let mut asked = if away {
+                Default::default()
+            } else {
+                drive::asked(world.input())
+            };
+            let reset = !away && world.input().pressed("reset");
+            if !away && world.input().pressed("autopilot") {
+                itself = !itself;
+                last_at = None;
+            }
+            if let (true, Some(track)) = (itself, &circuit) {
+                let car = world
+                    .entities
+                    .query_one_mut::<(&Transform, &Car)>(entity)
+                    .ok();
+                if let Some((transform, car)) = car {
+                    let (driven, at) = drive::autopilot(
+                        track,
+                        transform.translation,
+                        transform.rotation * Vec3::NEG_Z,
+                        car.vehicle.telemetry().speed,
+                        last_at,
+                    );
+                    (asked, last_at) = (driven, Some(at));
+                }
+            }
+            if let Ok(mut car) = world.entities.get::<&mut Car>(entity) {
+                car.asked = asked;
+            }
+            // Put back on the track when the player asks, and when the car has fallen far
+            // below it: off a cliff, or into the sea.
+            let fallen = circuit.as_ref().is_some_and(|track| {
+                world.entities.get::<&Transform>(entity).is_ok_and(|at| {
+                    let place = track.locate(at.translation, last_at);
+                    at.translation.y < track.samples[place.sample].position.y - drive::FALLEN
+                })
+            });
+            if let (true, Some(track)) = (reset || fallen, &circuit) {
+                drive::put_back(world, entity, track);
+                last_at = None;
+            }
+        });
         Physics::install(&physics, &mut schedule);
+        // Each car's wheels as they are after the step, and its laps.
+        let race_log: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (circuit, log) = (track.clone(), race_log.clone());
+        schedule.add(TickGroup::PostPhysics, "racing", move |world| {
+            let mut log = log.borrow_mut();
+            for (car, wheels, transform, lap) in world
+                .entities
+                .query::<(&Car, &mut Wheels, &Transform, Option<&mut Lap>)>()
+                .iter()
+            {
+                wheels.follow(&car.vehicle);
+                let (Some(lap), Some(track)) = (lap, &circuit) else {
+                    continue;
+                };
+                // Off the track: every wheel that is on the ground is on neither asphalt nor
+                // kerb.
+                let mut grounded = car.vehicle.wheels.iter().filter(|wheel| wheel.on_ground);
+                let off_track = grounded.clone().next().is_some()
+                    && grounded
+                        .all(|wheel| !matches!(wheel.surface, Surface::Asphalt | Surface::Kerb));
+                for event in lap.step(track, transform.translation, off_track, STEP_SECONDS) {
+                    match event {
+                        LapEvent::Started => log.push("lap 1 started".to_owned()),
+                        LapEvent::Sector { .. } => {}
+                        LapEvent::Finished {
+                            lap,
+                            seconds,
+                            valid,
+                            best,
+                        } => {
+                            let note = if !valid {
+                                "  (off track: doesn't count)".to_owned()
+                            } else {
+                                match best {
+                                    Some(best) if seconds < best => {
+                                        format!("  best, by {:.3}", best - seconds)
+                                    }
+                                    Some(best) => format!("  +{:.3}", seconds - best),
+                                    None => String::new(),
+                                }
+                            };
+                            log.push(format!("lap {lap}: {}{note}", format_time(seconds)));
+                        }
+                    }
+                }
+            }
+        });
         let animated: Rc<RefCell<AnimatedActors>> = Default::default();
         let running = animated.clone();
         schedule.add(TickGroup::PostPhysics, "animation", move |world| {
@@ -279,7 +483,21 @@ impl Play {
             poses: Vec::new(),
             viewer: Vec3::ZERO,
             flying: false,
+            track,
+            chase: Chase::default(),
+            hud: None,
+            race_log,
         })
+    }
+
+    /// The circuit, if the scene is one.
+    pub fn track(&self) -> Option<&Track> {
+        self.track.as_deref()
+    }
+
+    /// The player's car's instruments as of the latest frame, if the player drives a car.
+    pub fn hud(&self) -> Option<&Hud> {
+        self.hud.as_ref()
     }
 
     /// Gives every animated actor its skeleton and clips, from what the scene holds. Returns every
@@ -403,6 +621,9 @@ impl Play {
             self.unstepped = 0.0;
             self.pitch = pitch;
         }
+        if input.pressed("camera") {
+            self.chase.view = self.chase.view.next();
+        }
         self.gather_messages();
         let entities = &self.game.world.entities;
         for drawn in &mut self.drawn {
@@ -410,13 +631,34 @@ impl Play {
                 continue;
             };
             let world = global.interpolated(steps.alpha);
-            if drawn.drawn == Some(world) {
+            // A car's wheels, between the last two steps as the car is.
+            let rolled = entities.get::<&Wheels>(drawn.entity).ok().map(|wheels| {
+                std::array::from_fn(|index| {
+                    let (before, now) = (&wheels.before[index], &wheels.now[index]);
+                    (
+                        DrawnWheel::between(before, now, steps.alpha),
+                        DrawnWheel::upright(before, now, steps.alpha),
+                    )
+                })
+            });
+            if drawn.drawn == Some(world) && drawn.rolled == rolled {
                 continue;
             }
-            for (id, local) in &drawn.instances {
-                place(*id, world * *local);
+            let moved = drawn.drawn != Some(world);
+            for ((id, local), wheel) in drawn.instances.iter().zip(&drawn.wheels) {
+                match (wheel, &rolled) {
+                    (Some((wheel, true)), Some(rolled)) => {
+                        place(*id, world * rolled[*wheel].0 * *local)
+                    }
+                    (Some((wheel, false)), Some(rolled)) => {
+                        place(*id, world * rolled[*wheel].1 * *local)
+                    }
+                    _ if moved => place(*id, world * *local),
+                    _ => {}
+                }
             }
             drawn.drawn = Some(world);
+            drawn.rolled = rolled;
         }
 
         let player = self.player.as_ref().filter(|_| !flying)?;
@@ -424,6 +666,40 @@ impl Play {
             .get::<&GlobalTransform>(player.entity)
             .ok()?
             .interpolated(steps.alpha);
+        if player.car {
+            let car = entities.get::<&Car>(player.entity).ok()?;
+            let telemetry = *car.vehicle.telemetry();
+            let look = drive::Look {
+                back: input.held("look_back"),
+                around: input.value("look_round"),
+                over: input.value("look_over"),
+            };
+            let shot = self
+                .chase
+                .frame(world, telemetry.speed, look, seconds as f32);
+            self.hud = Some(Hud {
+                telemetry,
+                limit: car.vehicle.spec().engine.limit,
+                throttle: car.controls.throttle,
+                brake: car.controls.brake,
+                steer: car.controls.steer,
+                lap: entities
+                    .get::<&Lap>(player.entity)
+                    .ok()
+                    .map(|lap| (*lap).clone()),
+                track: self
+                    .track
+                    .as_ref()
+                    .map(|track| track.name.clone())
+                    .unwrap_or_default(),
+                view: self.chase.view,
+            });
+            return Some(View {
+                position: shot.position,
+                yaw: shot.yaw,
+                pitch: shot.pitch,
+            });
+        }
         let (_, rotation, translation) = world.to_scale_rotation_translation();
         Some(View {
             position: translation + rotation * player.eye,
@@ -480,6 +756,9 @@ impl Play {
         }
         for line in host.take_log() {
             let text = format!("{}: {}", who(Some(line.entity)), line.text);
+            self.messages.push_back(Message { error: false, text });
+        }
+        for text in self.race_log.borrow_mut().drain(..) {
             self.messages.push_back(Message { error: false, text });
         }
         let dropped = host.take_dropped();

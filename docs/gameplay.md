@@ -59,7 +59,10 @@ Not in the first version, with room left for each:
 - **Two-phase occlusion culling** (`vg/culling.rs`) already copes with motion: anything the old
   depth hid wrongly is retried against the new depth in the same frame.
 - **Vertices** are 16 bytes on one 16-bit grid per mesh: position, a packed normal, UV, and one
-  spare 16-bit value (`x y z nx ny u v _`, `solstice-asset/src/gpu.rs`). There are no bone
+  spare 16-bit value (`x y z nx ny u v _`, `solstice-asset/src/gpu.rs`). The grid has one step
+  for all three axes, a 65,535th of the mesh's longest side (`Mesh::grid_step`), so a mesh
+  that is very long keeps its points coarsely however thin it is: a kilometre of road as one
+  mesh, to 15 mm. There are no bone
   weights. The importer warns that it ignores skins and animations
   (`solstice-import/src/lib.rs`), and imports models in their rest pose.
 - **Dynamic attributes:**
@@ -562,6 +565,10 @@ rest. At 60 fps a frame runs one fixed step:
   - Terrain becomes a heightfield, sampled about every metre. Water doesn't collide.
   - An actor's mesh doesn't collide: its `collider` line does.
   - `blocker X Y Z SX SY SZ YAW` adds an invisible wall, or an invisible step.
+    - A wall that something fast may hit wants depth behind its face. A car at 50 m/s goes
+      0.8 m in a step: a wall 0.3 m thick stops it, but with its nose more than half-way
+      through, and what is more than half-way through a box is pushed out of its far side.
+      The circuit's barriers are 5 m deep for that (`apps/bake/src/circuit/paving.rs`).
 - **Actors.** An `.actor` file's `collider box SX SY SZ` or `collider capsule RADIUS HEIGHT`
   gives it a shape, kinematic by default, so it goes where its script puts it and pushes what
   is in the way.
@@ -1042,6 +1049,64 @@ def on_hour(self, hour):
 - **Who is in charge.** While a game runs, it owns the environment. The web page's time and
   weather controls become debug overrides, marked as such, and hand control back when released.
   A scene file can still set the starting values.
+
+## Cars and circuits
+
+Built for a racing game on the engine,
+[solstice-racing](https://github.com/SamG-Coder/solstice-racing), and all of it as built.
+
+- **A car is an actor.** `vehicle FILE [manual]` in an `.actor` file gives the actor a car's
+  dynamics in place of a collider's. The pieces of its mesh whose origins are at its hubs are
+  its wheels: they roll, steer and ride the suspension. A piece within 60 mm of a hub but not
+  at it, such as a brake caliper, goes with the wheel without turning.
+- **The vehicle model** (`crates/solstice-vehicle`) knows nothing of the engine: a body, four
+  wheels, and a `Ground` to cast rays at.
+  - Tyres: Pacejka's formula along and across, combined by similarity, with load sensitivity
+    and a relaxation length.
+  - Suspension: a spring, a damper, an anti-roll bar and bump stops at each wheel.
+  - The engine, clutch, gearbox, differential and brakes are solved together, implicitly, ten
+    times a step, so a locked wheel or a slipping clutch is stable.
+  - Drag and downforce.
+  - Anti-lock brakes, traction control and stability control, each a line in the car's file.
+    Stability control watches the rear tyres' slip angle: past the angle they grip best at,
+    it eases the engine, lets go of the rear brakes and brakes the outside front wheel.
+  - A `.vehicle` file holds a car's numbers. `tests/gt.vehicle` is a rear-engined GT racing
+    car, and its tests hold it to what its class does (`tests/rear_engined.rs`).
+- **The driver** (`driver.rs`) is between the player and the car, as in every driving game.
+  A key is a wheel hard over; a wheel hard over at speed is a spin. So steering eases, a full
+  push gives less lock the faster the car goes, and past a few degrees of slide the wheel
+  turns towards the way the car is going, as a real wheel pulls a driver's hands round.
+  Pedals ease too, and the gearbox changes gear by itself unless the actor says `manual`.
+  - `tests/keys.rs` drives the car as keys do: hard over and flat out, flicked one way and
+    the other, on the brakes, with two wheels on the grass. Nothing there slides past 12
+    degrees. Before stability control and the wheel that follows a slide, a flick left and
+    right spun it at every speed.
+- **A circuit** is a `.track` file, named by a scene's `track FILE`: its centre line as points,
+  each with the way across the road, the road's width, and what lies either side of it
+  (`kerb`, `grass`, `gravel`, `concrete`). From it each tyre knows what it is on, laps are
+  timed with sectors, a lap that leaves the road does not count, and `reset` puts a car back.
+  A car that falls far below its track is put back without asking.
+- **The camera** follows the player's car. `camera` steps through four views behind it, each
+  further out, and two on it. `look_round` and `look_over`, the right stick, swing it round
+  the car and tip it over; `look_back` is the mirror.
+- **Input actions** for all this are among the built-in ones: `throttle`, `brake`, `steer`,
+  `handbrake`, `shift_up`, `shift_down`, `reset`, `camera`, `look_back`, `look_round`,
+  `look_over`, and `autopilot`, which hands the car to a driver of its own that follows the
+  track's centre line at a speed the bends ahead allow. That is for showing a circuit off,
+  and for trying one headless: `viewer SCENE --play --press autopilot@40 --frames 5000`.
+- **Building one.** `circuit SIZE` in a scene file builds a whole circuit from the scene's
+  track (`apps/bake/src/circuit`): an island whose height follows the road, with cliffs, the
+  road with its racing line of rubber, lines, kerbs, gravel and barriers, grass and woods.
+  The ground a car drives on is the same land.
+  - What is laid along the road is cut into meshes 96 m square. As one mesh the size of the
+    circuit its points would be kept to 13 mm, more than paint stands above a road
+    (`Mesh::grid_step`).
+  - Beyond its edge the ground is level with the road's edge, even where the road is
+    banked. Carried on outwards, a banked corner's tilt made a ramp of its gravel trap.
+- **Viewers.** Natively the window's title is the dashboard. The browser build gives the
+  page the same figures (`hud`), and the page draws them.
+- **Left for later.** Sound; other cars; a dashboard drawn in the native window; glass that
+  is seen through, which wants blended materials.
 
 ## Viewers
 

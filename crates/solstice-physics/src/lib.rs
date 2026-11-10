@@ -7,7 +7,15 @@
 //! * A [`Character`] is walked by a kinematic character controller: it follows the ground, climbs
 //!   steps and gentle slopes, and is stopped by walls. It goes where [`Walk`] says.
 //!
+//! * A [`Car`] is driven by `solstice-vehicle`'s dynamics on the scene's collision, with a body
+//!   here that hits things: see [`car`].
+//!
 //! Each runs in the fixed steps, so a recorded run replays the same.
+
+pub mod car;
+
+pub use car::Car;
+pub use solstice_vehicle as vehicle;
 
 use glam::{Mat4, Quat, Vec3};
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
@@ -120,6 +128,10 @@ pub struct Physics {
     collisions: Receiver<CollisionEvent>,
     _forces: Receiver<ContactForceEvent>,
     _tears: Receiver<SoftBodyTearEvent>,
+    /// Each car's step, in a fixed order.
+    cars: BTreeMap<Entity, car::CarStep>,
+    /// What the ground is made of at a place, for tyres.
+    surfaces: Option<Box<dyn Fn(Vec3) -> solstice_vehicle::Surface>>,
     /// Problems with the scene's shapes, for the viewer to show.
     pub warnings: Vec<String>,
 }
@@ -191,6 +203,8 @@ impl Physics {
             collisions,
             _forces: forces,
             _tears: tears,
+            cars: BTreeMap::new(),
+            surfaces: None,
             warnings: Vec::new(),
         }
     }
@@ -324,7 +338,9 @@ impl Physics {
     /// steps the simulation, walks the characters, and writes back what physics moved.
     pub fn step(&mut self, world: &mut World) {
         self.take_in_actors(world);
+        self.take_in_cars(world);
         self.follow_transforms(world);
+        self.drive_cars(world);
         self.pipeline.step(
             to_vector(Vec3::new(0.0, -GRAVITY, 0.0)),
             &self.params,
@@ -340,6 +356,7 @@ impl Physics {
             &(),
             &self.events,
         );
+        self.settle_cars();
         self.walk_characters(world);
         self.write_back(world);
         self.report_overlaps(world);

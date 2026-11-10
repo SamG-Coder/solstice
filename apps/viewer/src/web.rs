@@ -784,6 +784,51 @@ impl WebViewer {
             .map_err(|e| JsValue::from_str(&e))
     }
 
+    /// The player's car's instruments, for the page to draw, or nothing if the player drives no
+    /// car: speed in km/h, gear (-1 reverse, 0 neutral), revs a minute and where the limiter
+    /// is, throttle and brake from 0 to 1, whether the anti-lock brakes, traction control and rev limiter are at work, laps
+    /// finished, this lap's seconds, the last lap's and the best (each -1 if there is none),
+    /// whether this lap still counts, and whether stability control is at work.
+    pub fn hud(&self) -> Vec<f64> {
+        let Some(hud) = self.play.as_ref().and_then(|play| play.play.hud()) else {
+            return Vec::new();
+        };
+        let t = &hud.telemetry;
+        let flag = |on: bool| f64::from(u8::from(on));
+        let mut values = vec![
+            f64::from(t.speed.abs() * 3.6),
+            f64::from(t.gear),
+            f64::from(t.rpm),
+            f64::from(hud.limit),
+            f64::from(hud.throttle),
+            f64::from(hud.brake),
+            flag(t.abs_active),
+            flag(t.traction_active),
+            flag(t.limiter),
+        ];
+        match &hud.lap {
+            Some(lap) => values.extend([
+                f64::from(lap.count),
+                lap.current.unwrap_or(-1.0),
+                lap.last.unwrap_or(-1.0),
+                lap.best.unwrap_or(-1.0),
+                flag(lap.valid),
+            ]),
+            None => values.extend([0.0, -1.0, -1.0, -1.0, 1.0]),
+        }
+        values.push(flag(t.stability_active));
+        values
+    }
+
+    /// The name of the circuit the player's car is on, or nothing.
+    pub fn hud_track(&self) -> String {
+        self.play
+            .as_ref()
+            .and_then(|play| play.play.hud())
+            .map(|hud| hud.track.clone())
+            .unwrap_or_default()
+    }
+
     /// What scripts have logged, and every error, since this was last asked, oldest first.
     /// Errors start with `error: `.
     pub fn take_messages(&mut self) -> Vec<String> {

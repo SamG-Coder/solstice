@@ -16,3 +16,6 @@ solstice-procgen.workspace = true
 glam.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+
+[dev-dependencies]
+solstice-physics.workspace = true

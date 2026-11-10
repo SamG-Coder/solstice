@@ -132,6 +132,8 @@ pub struct SceneGame {
     pub blockers: Vec<Blocker>,
     /// The `.input` file, relative to the scene's text file, or the built-in actions if none.
     pub input: Option<String>,
+    /// The `.track` file, relative to the scene's text file, if the scene is a circuit.
+    pub track: Option<String>,
 }
 
 impl SceneGame {
@@ -153,6 +155,13 @@ impl SceneGame {
                     game.input = Some(words[1].to_owned());
                 }
                 "input" => return Err(error("expected `input FILE`".to_owned())),
+                "track" if words.len() == 2 => {
+                    if game.track.is_some() {
+                        return Err(error("`track` is given twice".to_owned()));
+                    }
+                    game.track = Some(words[1].to_owned());
+                }
+                "track" => return Err(error("expected `track FILE`".to_owned())),
                 other => return Err(error(format!("unknown line `{other}`"))),
             }
         }
@@ -163,6 +172,9 @@ impl SceneGame {
         let mut text = String::new();
         if let Some(input) = &self.input {
             let _ = writeln!(text, "input {input}");
+        }
+        if let Some(track) = &self.track {
+            let _ = writeln!(text, "track {track}");
         }
         for actor in &self.actors {
             text.push_str(&actor.to_text());

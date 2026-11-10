@@ -9,4 +9,5 @@ license.workspace = true
 glam.workspace = true
 rapier3d.workspace = true
 solstice-asset.workspace = true
+solstice-vehicle.workspace = true
 solstice-world.workspace = true
