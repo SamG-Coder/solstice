@@ -59,7 +59,10 @@ Not in the first version, with room left for each:
 - **Two-phase occlusion culling** (`vg/culling.rs`) already copes with motion: anything the old
   depth hid wrongly is retried against the new depth in the same frame.
 - **Vertices** are 16 bytes on one 16-bit grid per mesh: position, a packed normal, UV, and one
-  spare 16-bit value (`x y z nx ny u v _`, `solstice-asset/src/gpu.rs`). There are no bone
+  spare 16-bit value (`x y z nx ny u v _`, `solstice-asset/src/gpu.rs`). The grid has one step
+  for all three axes, a 65,535th of the mesh's longest side (`Mesh::grid_step`), so a mesh
+  that is very long keeps its points coarsely however thin it is: a kilometre of road as one
+  mesh, to 15 mm. There are no bone
   weights. The importer warns that it ignores skins and animations
   (`solstice-import/src/lib.rs`), and imports models in their rest pose.
 - **Dynamic attributes:**
