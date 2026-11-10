@@ -15,7 +15,9 @@ use solstice_asset::NO_POSE;
 use solstice_asset::{Collision, GameFile};
 use solstice_physics::{Overlap, Physics};
 use solstice_script::{Script, ScriptEvent, ScriptHost};
-use solstice_world::{Entity, Game, GlobalTransform, Name, Schedule, TickGroup, Transform, World};
+use solstice_world::{
+    Entity, Game, GlobalTransform, Name, Played, Schedule, TickGroup, Transform, World,
+};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -79,6 +81,8 @@ pub struct Play {
     /// Bones to pose, for the viewer to hand to the renderer.
     poses: Vec<(u32, Vec<Mat4>)>,
     viewer: Vec3,
+    /// Whether the player has left whoever they play, to fly the camera.
+    flying: bool,
 }
 
 impl Play {
@@ -194,6 +198,9 @@ impl Play {
             if let Some(character) = actor.character {
                 components.add(character);
             }
+            if actor.camera.is_some() && player.is_none() {
+                components.add(Played);
+            }
             let entity = world.spawn(components.build());
             if let Some(eye) = actor.camera {
                 if player.is_some() {
@@ -271,6 +278,7 @@ impl Play {
             animated,
             poses: Vec::new(),
             viewer: Vec3::ZERO,
+            flying: false,
         })
     }
 
@@ -334,13 +342,32 @@ impl Play {
         self.player.is_some()
     }
 
+    /// Whether the camera is the player's now: there is a player, and they are not flying.
+    pub fn has_camera(&self) -> bool {
+        self.player.is_some() && !self.flying
+    }
+
+    /// Lets the player leave whoever they play and fly the camera, or brings them back. Flying,
+    /// [`Play::frame`] gives no view, and the script of the one they left hears no input, so
+    /// the keys that fly the camera don't walk them too. Everything else hears it all: a door
+    /// opens to a camera flown up to it.
+    pub fn set_flying(&mut self, flying: bool) {
+        self.flying = flying;
+    }
+
+    /// Whether the player is flying the camera, away from whoever they play.
+    pub fn flying(&self) -> bool {
+        self.flying && self.player.is_some()
+    }
+
     /// Presses an action in the next frame, whatever the devices do: for scripted runs.
     pub fn press(&mut self, action: &str) {
         self.presses.push(action.to_owned());
     }
 
     /// Runs a frame `seconds` long, with the devices as they are. `place` is told where to draw
-    /// each instance that moved. Returns where the player's camera is, if there is a player.
+    /// each instance that moved. Returns where the player's camera is, if there is a player
+    /// and they are not [flying](Play::set_flying).
     ///
     /// Movement (the mouse, dragging) builds up in `devices` until a step uses it, and is
     /// given to that step as a rate over the time since the step before. So none is lost in
@@ -355,6 +382,8 @@ impl Play {
         self.unstepped += seconds;
         let mut input = self.map.actions(devices, self.unstepped as f32);
         input.set_viewer(self.viewer);
+        let flying = self.flying();
+        input.set_away(flying);
         for action in self.presses.drain(..) {
             input.press(&action);
         }
@@ -366,8 +395,9 @@ impl Play {
             self.viewer,
             &mut self.poses,
         );
-        let pitch = (self.pitch + input.value("look_up") * self.unstepped as f32)
-            .clamp(-MAX_PITCH, MAX_PITCH);
+        // Flying, the mouse turns the flown camera: the player's own looks where it did.
+        let looked = if flying { 0.0 } else { input.value("look_up") };
+        let pitch = (self.pitch + looked * self.unstepped as f32).clamp(-MAX_PITCH, MAX_PITCH);
         if steps.steps > 0 {
             devices.clear_movement();
             self.unstepped = 0.0;
@@ -389,7 +419,7 @@ impl Play {
             drawn.drawn = Some(world);
         }
 
-        let player = self.player.as_ref()?;
+        let player = self.player.as_ref().filter(|_| !flying)?;
         let world = entities
             .get::<&GlobalTransform>(player.entity)
             .ok()?

@@ -1104,6 +1104,14 @@ def on_hour(self, hour):
     - Instance numbers belong to one bake. Baked again from other sources, a scene may number
       them otherwise, and nothing checks that a game's numbers still mean what they did.
   - With actors but no player, the keys both fly the camera and reach the game.
+  - **Flying from the player.** With a player, **V** leaves them standing and flies the
+    camera from where it is, and V again puts it back at their eye. The page has a button
+    for it too, `?fly` starts that way, and so does `--fly` natively.
+    - The game goes on, and hears every key as before, except the script of the one who was
+      left: to it nothing is held or pressed, so the keys that fly the camera don't walk
+      them off. A door that opens to `viewer()` opens to the flown camera.
+    - Being away is part of each step's input, as the viewer's place is, so a replay of a
+      run with flying in it is still the same run.
   - Keys typed into the page's own controls don't reach the game.
 - **Left for later.** An actor's instances are movable from the start, so a gate that seldom
   moves still has its own shadow pass and leaves the GI voxels. Making them movable only once

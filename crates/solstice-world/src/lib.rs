@@ -20,7 +20,7 @@ pub use clock::{FixedClock, FrameSteps, MAX_STEPS_PER_FRAME, STEPS_PER_SECOND, S
 pub use events::{steps_for, TimerId};
 pub use game::{Game, Schedule, TickGroup};
 pub use hecs::{self, Entity};
-pub use input::{Input, Recording};
+pub use input::{Input, Played, Recording};
 pub use name::Name;
 pub use transform::{GlobalTransform, Parent, Snap, Transform, Walk};
 pub use world::World;

@@ -7,19 +7,26 @@
 //!
 //! Gameplay reads the input of the step it is in, never of the frame, so a recording of each
 //! step's input replays a run exactly. Where the game is watched from is part of it for the same
-//! reason: a door that opens to whoever stands by it must open in the replay too.
+//! reason: a door that opens to whoever stands by it must open in the replay too. So is whether
+//! the player has left whoever they play, to fly the camera.
 
 use glam::Vec3;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-/// Each action's value, which were pressed since the step before, and where the game is watched
-/// from. Actions not mentioned are 0.
+/// Marks the entity the player plays: the one whose script hears nothing while the player is
+/// [away](Input::away) from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Played;
+
+/// Each action's value, which were pressed since the step before, where the game is watched
+/// from, and whether the player is away. Actions not mentioned are 0.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Input {
     values: BTreeMap<Arc<str>, f32>,
     pressed: BTreeSet<Arc<str>>,
     viewer: Vec3,
+    away: bool,
 }
 
 impl Input {
@@ -70,6 +77,18 @@ impl Input {
         self.viewer
     }
 
+    /// Says whether the player has left whoever they play, to fly the camera: the keys then
+    /// move the camera, and must not walk the one left standing.
+    pub fn set_away(&mut self, away: bool) {
+        self.away = away;
+    }
+
+    /// Whether the player is away from whoever they play. The input is all still here, for
+    /// everything else that listens: a door opens to a camera flown up to it.
+    pub fn away(&self) -> bool {
+        self.away
+    }
+
     /// Every action that isn't 0, in name order.
     pub fn values(&self) -> impl Iterator<Item = (&str, f32)> {
         self.values.iter().map(|(name, &value)| (&**name, value))
@@ -86,12 +105,13 @@ impl Input {
         into.extend(self.pressed.iter().cloned());
     }
 
-    /// This input's values and viewer, with `pressed` as what was pressed.
+    /// This input, with `pressed` as what was pressed.
     pub(crate) fn with_pressed(&self, pressed: &BTreeSet<Arc<str>>) -> Input {
         Input {
             values: self.values.clone(),
             pressed: pressed.clone(),
             viewer: self.viewer,
+            away: self.away,
         }
     }
 }
@@ -181,6 +201,12 @@ mod tests {
             input.with_pressed(&BTreeSet::new()).viewer(),
             input.viewer()
         );
+        // So is whether the player is away, flying the camera.
+        assert!(!input.away());
+        input.set_away(true);
+        assert!(input.with_pressed(&BTreeSet::new()).away());
+        assert_ne!(input, Input::new());
+        input.set_away(false);
         // A step watched from elsewhere is another input, so a recording keeps both.
         let mut recording = Recording::new(0);
         recording.push(&Input::new());

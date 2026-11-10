@@ -46,6 +46,8 @@
   #play { left: 50%; bottom: 16px; transform: translateX(-50%); padding: 0; z-index: 1; }
   #play button { background: var(--accent); color: #1c1712; border: 0; border-radius: 7px;
     padding: 9px 22px; font: inherit; font-weight: 700; cursor: pointer; }
+  /* While playing it is the button to fly, out of the way of the help and the scripts' log. */
+  @media (min-width: 621px) { #play.fly { left: auto; right: 12px; bottom: 12px; transform: none; } }
   #script-log { left: 12px; right: 12px; bottom: 64px; max-width: 72ch; max-height: 30vh;
     overflow-y: auto; padding: 8px 12px; font: 12px/1.45 ui-monospace, Consolas, monospace;
     white-space: pre-wrap; }
@@ -159,7 +161,8 @@
   <b>Click</b> to look around, <b>WASD</b> to move, <b>Q E</b> down and up, <b>Shift</b> faster, <b>Esc</b> to release
 </aside>
 
-<!-- Offered on scenes with a game; playing loads the gameplay build of the viewer. -->
+<!-- Offered on scenes with a game; playing loads the gameplay build of the viewer. Playing
+     as someone, it is the button that leaves them to fly the camera, and comes back. -->
 <aside class="panel" id="play" hidden><button type="button">Play</button></aside>
 <!-- What the game's scripts log, and their errors. -->
 <aside class="panel" id="script-log" hidden aria-live="polite"></aside>
@@ -1039,9 +1042,30 @@ async function startGame(viewer, file) {
     pad.axes.forEach((v, i) => PAD_AXES[i] && viewer.gamepad_axis(PAD_AXES[i], v));
   };
 
-  el("help").innerHTML = viewer.has_player()
-    ? "<b>Click</b> to play, <b>WASD</b> to move, the <b>mouse</b> to look, <b>E</b> to use, <b>Esc</b> to release"
-    : "Playing. <b>Click</b> to look around, <b>WASD</b> to move, <b>Esc</b> to release";
+  const WALK_HELP = "<b>Click</b> to play, <b>WASD</b> to move, the <b>mouse</b> to look, <b>E</b> to use, <b>V</b> to fly, <b>Esc</b> to release";
+  const FLY_HELP = "Flying. <b>Click</b> to look around, <b>WASD</b> to move, <b>E</b> and <b>Q</b> for up and down, <b>V</b> to play again";
+  if (viewer.has_player()) {
+    // Someone to play: V, or the button, leaves them standing to fly the camera, and comes back.
+    const button = el("play").querySelector("button");
+    const setFlying = (flying) => {
+      viewer.set_flying(flying);
+      button.textContent = flying ? "Stop flying" : "Fly";
+      el("help").innerHTML = flying ? FLY_HELP : WALK_HELP;
+    };
+    setFlying(params.has("fly"));
+    el("play").classList.add("fly");
+    el("play").hidden = false;
+    button.addEventListener("click", () => {
+      setFlying(!viewer.flying());
+      // Left with the keyboard, the button would take the keys meant for the game.
+      button.blur();
+    });
+    addEventListener("keydown", (e) => {
+      if (e.code === "KeyV" && !e.repeat && !typing(e)) setFlying(!viewer.flying());
+    });
+  } else {
+    el("help").innerHTML = "Playing. <b>Click</b> to look around, <b>WASD</b> to move, <b>Esc</b> to release";
+  }
   return { tick() { readGamepads(); show(viewer.take_messages()); } };
 }
 

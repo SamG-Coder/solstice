@@ -556,6 +556,71 @@ fn a_blocker_in_the_scene_stops_the_player() {
     assert!(view.position.z > -3.0, "{view:?}");
 }
 
+const LATCH: &str = r#"
+def on_begin(self):
+    self.vars.used = 0
+    self.vars.ahead = 0.0
+
+def on_tick(self, dt):
+    if pressed("interact"):
+        self.vars.used += 1
+    self.vars.ahead = max(self.vars.ahead, input("forward"))
+"#;
+
+#[test]
+fn flying_leaves_the_player_standing_while_the_rest_of_the_game_hears_the_keys() {
+    let latch = ("latch.actor", "name latch\nscript latch.star\n");
+    let mut play = walking_game(
+        &[latch, ("latch.star", LATCH)],
+        "actor hero.actor 0 0.5 0 0\nactor latch.actor 0 0 -8 0\n",
+    );
+    let walked = walk_forward(&mut play, 60);
+    assert!(play.has_camera() && !play.flying());
+    let hero_z = |play: &Play| match var(play, "hero", "z") {
+        Some(ScriptValue::Float(z)) => z as f32,
+        other => panic!("{other:?}"),
+    };
+
+    // Flown from, he stands where he was left, though the keys that fly the camera are his
+    // to walk with, and the camera is nobody's.
+    play.set_flying(true);
+    assert!(play.has_player() && play.flying() && !play.has_camera());
+    let mut devices = Devices::new();
+    devices.key("KeyW", true);
+    devices.mouse_motion(0.0, -100.0);
+    for frame in 0..60 {
+        if frame == 30 {
+            devices.key("KeyE", true);
+        }
+        assert_eq!(play.frame(STEP_SECONDS, &mut devices, |_, _| {}), None);
+    }
+    assert!(
+        (hero_z(&play) - walked.position.z).abs() < 0.1,
+        "stood at {}, left at {walked:?}",
+        hero_z(&play)
+    );
+    // Everything else heard them: the key used, and the one held.
+    assert_eq!(var(&play, "latch", "used"), Some(ScriptValue::Int(1)));
+    assert_eq!(var(&play, "latch", "ahead"), Some(ScriptValue::Float(1.0)));
+
+    // Back, the camera is his again, looking where it did, and he walks on.
+    play.set_flying(false);
+    let view = walk_forward(&mut play, 60);
+    assert!(view.position.z < walked.position.z - 2.0, "{view:?}");
+    assert_eq!(view.pitch, walked.pitch);
+    assert!(play.take_messages().is_empty());
+
+    // With nobody to play, there is nobody to leave: the camera was never theirs.
+    let scene = files(&[
+        (GAME_FILE, "actor latch.actor 0 0 0 0\n"),
+        ("latch.actor", "name latch\nscript latch.star\n"),
+        ("latch.star", LATCH),
+    ]);
+    let mut play = Play::load(&scene, baked, None).unwrap();
+    play.set_flying(true);
+    assert!(!play.flying() && !play.has_camera());
+}
+
 const GATEKEEPER: &str = r#"
 def on_enter(self, who):
     self.vars.came = who

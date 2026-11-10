@@ -519,6 +519,13 @@ impl WebViewer {
         self.camera.camera.pitch = pitch;
     }
 
+    /// Where the camera is: x, y, z, yaw and pitch, as `set_camera` takes them.
+    pub fn camera(&self) -> Vec<f32> {
+        let camera = &self.camera.camera;
+        let at = camera.position;
+        vec![at.x, at.y, at.z, camera.yaw, camera.pitch]
+    }
+
     pub fn triangles(&self) -> u32 {
         self.renderer.stats().triangles
     }
@@ -592,7 +599,7 @@ impl WebViewer {
     fn playing_as_someone(&self) -> bool {
         #[cfg(feature = "gameplay")]
         if let Some(play) = &self.play {
-            return play.play.has_player();
+            return play.play.has_camera();
         }
         false
     }
@@ -670,9 +677,26 @@ impl WebViewer {
         Ok(())
     }
 
-    /// Whether a game is running, and someone in it has the camera.
+    /// Whether a game is running with someone in it to play, who has the camera unless the
+    /// player is flying.
     pub fn has_player(&self) -> bool {
-        self.playing_as_someone()
+        self.play
+            .as_ref()
+            .is_some_and(|play| play.play.has_player())
+    }
+
+    /// Whether the player has left whoever they play, to fly the camera.
+    pub fn flying(&self) -> bool {
+        self.play.as_ref().is_some_and(|play| play.play.flying())
+    }
+
+    /// Lets the player leave whoever they play and fly the camera, from where it is, or puts
+    /// them back. Flying, the one left stands where they were; the rest of the game still
+    /// hears the keys, so a door opens to the camera. Nothing changes in a game with no player.
+    pub fn set_flying(&mut self, flying: bool) {
+        if let Some(play) = &mut self.play {
+            play.play.set_flying(flying);
+        }
     }
 
     fn devices(&mut self) -> Option<&mut solstice_game::Devices> {

@@ -4,15 +4,17 @@
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
-//! viewer [SCENE] --play [--scripts DIR] [--capture out.png --frames N [--press ACTION@FRAME]...
-//!        [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
+//! viewer [SCENE] --play [--fly] [--scripts DIR] [--capture out.png --frames N
+//!        [--press ACTION@FRAME]... [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
 //! viewer [SCENE] --game DIR [the same as with --play]
 //! viewer [SCENE] --instances-near x,y,z,radius
 //! ```
 //!
 //! `--play` runs the scene's game, if it has one: its actors move, the camera is the player's,
 //! and keys and the mouse are its input. Its scripts are reloaded from `--scripts` (by default
-//! `scenes`, where scene text files live) when they change on disk.
+//! `scenes`, where scene text files live) when they change on disk. **V** leaves the player
+//! standing and flies the camera from where it is, and comes back; `--fly` starts that way. The
+//! game goes on meanwhile, and still hears the keys: a door opens to the camera flown up to it.
 //!
 //! `--game DIR` plays the game in a folder in place of the one baked into the scene, if any:
 //! its `scene.game`, and the actor files, scripts and input actions that names. So a scene
@@ -290,6 +292,8 @@ mod native {
         bob: Option<[f32; 5]>,
         /// Run the scene's game.
         play: bool,
+        /// Start the game flying the camera, with whoever is played left standing.
+        fly: bool,
         /// A folder holding the game to run, in place of the scene's own.
         game: Option<PathBuf>,
         /// List the instances placed within a radius of a point, as x, y, z, radius, and stop.
@@ -357,12 +361,13 @@ mod native {
             log::warn!("this scene has no collision: rebake it to walk on it");
         }
         match PlayMode::start(renderer, files, collision.as_ref(), &scene.animation()) {
-            Ok(play) => {
+            Ok(mut play) => {
                 log::info!(
                     "playing: {} instances move, scripts {}",
                     play.play.instances().count(),
                     play.play.scripts().join(", ")
                 );
+                play.play.set_flying(options.fly);
                 Some(play)
             }
             Err(errors) => {
@@ -497,6 +502,7 @@ mod native {
             bob: None,
             play: false,
             game: None,
+            fly: false,
             instances_near: None,
             scripts: PathBuf::from("scenes"),
             presses: Vec::new(),
@@ -645,6 +651,7 @@ mod native {
                 }
                 "--stream" => options.stream = true,
                 "--play" => options.play = true,
+                "--fly" => options.fly = true,
                 "--game" => {
                     // Its scripts are watched where they were read from.
                     let folder = PathBuf::from(value()?);
@@ -1475,11 +1482,12 @@ mod native {
             if let Some(bob) = &mut state.bob {
                 bob.advance(&mut state.renderer, delta);
             }
-            // Playing as someone, the keys and the mouse are theirs; otherwise they fly the camera.
+            // Playing as someone, the keys and the mouse are theirs; otherwise, or having left
+            // them with V, they fly the camera.
             let playing_as_someone = state
                 .play
                 .as_ref()
-                .is_some_and(|(p, _)| p.play.has_player());
+                .is_some_and(|(p, _)| p.play.has_camera());
             if !playing_as_someone {
                 state.camera.update(
                     &CameraInput {
@@ -1568,6 +1576,12 @@ mod native {
                             if !event.repeat {
                                 let down = event.state == ElementState::Pressed;
                                 play.devices.key(&format!("{code:?}"), down);
+                                // Leaves whoever is played to fly the camera, and comes back.
+                                if down && code == KeyCode::KeyV && play.play.has_player() {
+                                    let flying = !play.play.flying();
+                                    play.play.set_flying(flying);
+                                    log::info!("{}", if flying { "flying" } else { "playing" });
+                                }
                             }
                         }
                         match event.state {
