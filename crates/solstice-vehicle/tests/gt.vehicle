@@ -28,7 +28,7 @@ torque 7500 472
 torque 8000 463
 torque 8400 454                    # 400 kW here
 torque 8800 430
-torque 9250 398
+torque 9200 398
 torque 9600 346
 
 gears 3.34 2.5 1.95 1.58 1.31 1.113

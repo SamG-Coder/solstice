@@ -70,6 +70,9 @@ pub struct Track {
 /// How many samples either side of a hint are searched for the nearest: enough for a car at any
 /// speed between two steps, and for the wheels of one car.
 const NEARBY: usize = 16;
+/// Every how many samples a search of the whole lap looks first, before searching near the
+/// nearest of those: at most `NEARBY`, so the search near it reaches every sample between.
+const COARSE: usize = 8;
 
 impl Track {
     /// A track through these samples, closing back to the first.
@@ -113,7 +116,6 @@ impl Track {
         self.length
     }
 
-    /// How far round the lap each sector starts, the first at 0.
     /// Where line `line` is, in metres round the lap: 0 is the start line, then each sector's.
     pub fn sector_start(&self, line: usize) -> f32 {
         match line {
@@ -122,6 +124,7 @@ impl Track {
         }
     }
 
+    /// How far round the lap each sector starts, the first at 0.
     pub fn sector_starts(&self) -> Vec<f32> {
         std::iter::once(0.0)
             .chain(self.sectors.iter().map(|&sample| self.distances[sample]))
@@ -243,21 +246,31 @@ impl Track {
             }
             best
         };
+        let around = |hint: usize| {
+            let hint = hint % count;
+            nearest(&mut (0..=2 * NEARBY).map(|k| (hint + count + k - NEARBY % count) % count))
+        };
         let mut best = match hint {
-            Some(hint) => {
-                let hint = hint % count;
-                nearest(&mut (0..=2 * NEARBY).map(|k| (hint + count + k - NEARBY % count) % count))
-            }
+            Some(hint) => around(hint),
             None => nearest(&mut (0..count)),
         };
         // Where two stretches run side by side, as at a hairpin, a hint can hold on to the wrong
-        // one: a point off the road the hint found may be on another, so it is searched for
-        // afresh. Off the road is rare enough, and a lap's samples few enough, for that.
+        // one: a point off the road the hint found may be on another, so the lap is searched
+        // again. A wheel on a kerb is off the road, at most corners, so that search looks at
+        // every eighth sample first and then near the nearest of them.
         if hint.is_some() {
             let found = &self.samples[best.1];
             let road = found.half_left.max(found.half_right);
             if best.0 > road * road {
-                best = nearest(&mut (0..count));
+                let from = |index: usize| point.distance_squared(self.samples[index].position);
+                let coarse = (0..count)
+                    .step_by(COARSE)
+                    .min_by(|&a, &b| from(a).total_cmp(&from(b)))
+                    .unwrap_or(0);
+                let searched = around(coarse);
+                if searched.0 < best.0 {
+                    best = searched;
+                }
             }
         }
         let (_, index, share) = best;

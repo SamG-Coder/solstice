@@ -621,6 +621,10 @@ impl VehicleSpec {
         if engine.torque.len() < 2 {
             return Err("the engine needs at least two `torque` points".into());
         }
+        let (first, last) = (engine.torque[0].0, engine.torque[engine.torque.len() - 1].0);
+        if first < 0.0 || last > 30_000.0 {
+            return Err("the `torque` points are from 0 to 30,000 rpm".into());
+        }
         if engine.torque.windows(2).any(|pair| pair[1].0 <= pair[0].0) {
             return Err("the `torque` points must rise in rpm".into());
         }
@@ -638,8 +642,9 @@ impl VehicleSpec {
                 "the engine's limit must be well above its idle, and at most 30,000".into(),
             );
         }
-        if engine.friction.0 < 0.0 || engine.friction.1 < 0.0 {
-            return Err("engine friction can't be below 0".into());
+        if !(0.0..=1000.0).contains(&engine.friction.0) || !(0.0..=1.0).contains(&engine.friction.1)
+        {
+            return Err("engine friction is from 0 to 1000 N m, and 0 to 1 more a rpm".into());
         }
         let gearbox = &self.gearbox;
         if gearbox.gears.is_empty() || gearbox.gears.len() > 10 {
@@ -661,8 +666,10 @@ impl VehicleSpec {
             return Err("the gearbox's efficiency is between 0.5 and 1".into());
         }
         let diff = &self.differential;
-        if diff.preload < 0.0 || !(0.0..=1.0).contains(&diff.power) {
-            return Err("the diff's preload can't be below 0, nor its power lock above 1".into());
+        if !(0.0..=10_000.0).contains(&diff.preload) || !(0.0..=1.0).contains(&diff.power) {
+            return Err(
+                "the diff's preload is from 0 to 10,000 N m, and its power lock from 0 to 1".into(),
+            );
         }
         share("the diff's coast lock", diff.coast)?;
         let aero = 0.0..=50.0;
@@ -897,7 +904,7 @@ mod tests {
     /// engine, froze the car, or slid it off sideways.
     #[test]
     fn numbers_no_car_has_are_mistakes() {
-        let refused: [fn(&mut VehicleSpec); 9] = [
+        let refused: [fn(&mut VehicleSpec); 12] = [
             |s| s.body_size = Vec3::splat(1.0e30),
             |s| s.mass = 1.0e-30,
             |s| s.inertia.y = 1.0e-6,
@@ -907,6 +914,9 @@ mod tests {
             |s| (s.front.brake, s.rear.brake) = (0.0, 0.0),
             |s| s.engine.limit = 1.0e9,
             |s| s.aero.downforce = 1.0e9,
+            |s| s.engine.friction = (1.0e30, 1.0e30),
+            |s| s.differential.preload = 1.0e30,
+            |s| s.engine.torque.last_mut().unwrap().0 = 1.0e9,
         ];
         for (index, change) in refused.iter().enumerate() {
             let mut spec = VehicleSpec::gt();
