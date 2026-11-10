@@ -22,6 +22,28 @@ impl Mesh {
         self.indices.len() / 3
     }
 
+    /// How finely this mesh's points will be kept once it is built, in the mesh's own units: a
+    /// 65,535th of its longest side, the same along all three.
+    ///
+    /// Every point of a built mesh lies on that grid (see `build_virtual_mesh`). For most
+    /// things it is far finer than matters: a ten metre statue keeps its points to 0.15 mm.
+    /// But it is one grid for the whole mesh, so a mesh that is very long keeps its points
+    /// coarsely however thin it is. A road a kilometre long, built as one mesh, keeps them to
+    /// 15 mm, up and down as well as along; paint laid 12 mm above it as another such mesh
+    /// then comes and goes under it. Something long with fine detail is better built as
+    /// several meshes, each of a part of it.
+    pub fn grid_step(&self) -> f32 {
+        let (mut min, mut max) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for vertex in &self.vertices {
+            min = min.min(vertex.position);
+            max = max.max(vertex.position);
+        }
+        if self.vertices.is_empty() {
+            return 0.0;
+        }
+        (max - min).max_element() / 65535.0
+    }
+
     /// Replaces every normal with the area-weighted average of its adjacent faces.
     pub fn compute_smooth_normals(&mut self) {
         for vertex in &mut self.vertices {
