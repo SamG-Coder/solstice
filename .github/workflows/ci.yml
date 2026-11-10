@@ -27,6 +27,9 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # The native viewer reads gamepads with gilrs, which on Linux finds them through udev.
+      - name: Install udev's headers
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev
       # Which crates a pull request affects (scripts/affected.py): those whose files changed
       # and everything depending on them. A change outside the crates (Cargo.lock, CI, build
       # scripts, scenes) affects everything. A pull request is checked out as its merge into the

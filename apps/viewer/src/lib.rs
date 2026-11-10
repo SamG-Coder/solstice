@@ -3,6 +3,8 @@
 
 pub mod bob;
 pub mod camera_path;
+#[cfg(all(feature = "gameplay", not(target_arch = "wasm32")))]
+pub mod pad;
 #[cfg(feature = "gameplay")]
 pub mod play;
 #[cfg(target_arch = "wasm32")]

@@ -1092,7 +1092,10 @@ def on_hour(self, hour):
     with the gameplay build. That build reads keys, the mouse, standard-layout gamepads and
     touch: a stick under the left thumb, looking under the right, and taps. It shows what
     scripts log, and their errors, in a panel.
-  - Gamepads natively are left for later: they need a crate of their own (`gilrs`).
+  - Natively, gamepads are read with `gilrs` (`apps/viewer/src/pad.rs`) and passed on under
+    the names the browser's standard layout uses, so one `.input` file serves both. The pad
+    used most recently is the one read, as in the browser. On Linux, building needs udev's
+    headers (`libudev-dev`).
   - **A game from a folder.** `viewer SCENE --game DIR` plays the game in a folder in place of
     the scene's own: its `scene.game`, and the actor files, scripts and input actions that
     names, all named from the folder. On the web, `?game=NAME` does the same with

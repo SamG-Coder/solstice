@@ -19,7 +19,7 @@ required-features = ["gameplay"]
 # it, so a page that only looks at scenes downloads none of it (docs/gameplay.md, Viewers).
 [features]
 default = ["gameplay"]
-gameplay = ["dep:solstice-game"]
+gameplay = ["dep:solstice-game", "dep:gilrs"]
 
 [dependencies]
 solstice-asset.workspace = true
@@ -31,6 +31,8 @@ wgpu.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 env_logger = "0.11"
+# Gamepads, natively. In the browser the page reads them (apps/viewer/web/index.html).
+gilrs = { version = "0.11", optional = true }
 png = "0.17"
 pollster.workspace = true
 winit = "0.30"

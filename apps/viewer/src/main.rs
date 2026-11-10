@@ -42,6 +42,7 @@ mod native {
         RendererSettings, StreamRequest, StreamingBudget, TimeOfDay, Weather,
     };
     use solstice_viewer::bob::Bobbing;
+    use solstice_viewer::pad::Pads;
     use solstice_viewer::play::PlayMode;
     use solstice_viewer::{
         default_environment, initial_camera, parse_time, CameraInput, DayClock, FlyCamera,
@@ -1385,6 +1386,8 @@ mod native {
         camera: FlyCamera,
         bob: Option<Bobbing>,
         play: Option<(PlayMode, ScriptWatch)>,
+        /// The gamepads plugged in, for a game to be played with.
+        pads: Option<Pads>,
         last_frame: Instant,
         title_timer: f32,
         frames_since_title: u32,
@@ -1437,6 +1440,7 @@ mod native {
             });
             Ok(WindowState {
                 bob,
+                pads: play.as_ref().and_then(|_| Pads::new()),
                 play,
                 reader,
                 window,
@@ -1502,6 +1506,9 @@ mod native {
             }
             if let Some((play, watch)) = &mut state.play {
                 watch.check(play, delta);
+                if let Some(pads) = &mut state.pads {
+                    pads.poll(&mut play.devices);
+                }
                 log_messages(play.frame(&mut state.renderer, &mut state.camera.camera, delta));
             }
 
