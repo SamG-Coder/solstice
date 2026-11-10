@@ -235,6 +235,39 @@ mod tests {
     }
 
     #[test]
+    fn the_triggers_are_the_pedals_and_the_left_stick_steers() {
+        let throttle = Did::Button(Button::RightTrigger2, 0.6);
+        assert!((after(&[throttle], "throttle") - 0.6).abs() < 1.0e-6);
+        assert_eq!(
+            after(&[Did::Button(Button::LeftTrigger2, 1.0)], "brake"),
+            1.0
+        );
+        assert_eq!(after(&[Did::Axis(Axis::LeftStickX, 1.0)], "steer"), 1.0);
+        assert!(after(&[Did::Axis(Axis::LeftStickX, -0.5)], "steer") < -0.3);
+        // A trigger that comes as an axis is the same pedal.
+        assert!((after(&[Did::Axis(Axis::RightZ, 0.8)], "throttle") - 0.8).abs() < 1.0e-6);
+        // The bumpers change gear, and the right stick looks round the car.
+        assert_eq!(
+            after(&[Did::Button(Button::RightTrigger, 1.0)], "shift_up"),
+            1.0
+        );
+        assert_eq!(
+            after(&[Did::Button(Button::LeftTrigger, 1.0)], "shift_down"),
+            1.0
+        );
+        assert_eq!(after(&[Did::Button(Button::North, 1.0)], "reset"), 1.0);
+        assert_eq!(
+            after(&[Did::Axis(Axis::RightStickX, 1.0)], "look_round"),
+            1.0
+        );
+        // Pulled back, which is below zero to gilrs, tips the camera up over the car.
+        assert_eq!(
+            after(&[Did::Axis(Axis::RightStickY, -1.0)], "look_over"),
+            1.0
+        );
+    }
+
+    #[test]
     fn a_trigger_is_a_button_however_the_pad_gives_it() {
         let map = InputMap::parse("fire gamepad r2\naim gamepad l2\nback gamepad down\n").unwrap();
         let read = |did: Did, action: &str| {
