@@ -68,6 +68,8 @@ pub enum DecodeError {
     BadSkin,
     BadGlow,
     BadCards,
+    /// The file made for browsers, read where the whole scene's file is wanted.
+    SplitForBrowsers,
 }
 
 impl fmt::Display for DecodeError {
@@ -92,6 +94,12 @@ impl fmt::Display for DecodeError {
             Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
             Self::BadGlow => write!(f, "the scene's emissive maps are malformed"),
             Self::BadCards => write!(f, "the scene's cards are malformed"),
+            Self::SplitForBrowsers => {
+                write!(
+                    f,
+                    "this is the file made for browsers: open the .solstice file"
+                )
+            }
         }
     }
 }
@@ -933,6 +941,10 @@ pub fn decode(bytes: &[u8]) -> Result<LoadedScene, DecodeError> {
     let manifest = inflate(packed)?;
     let scene = decode_manifest(&manifest, end)?;
     drop(manifest);
+    // Its cluster records and pinned pages are not where a whole file's are.
+    if scene.external.is_some() {
+        return Err(DecodeError::SplitForBrowsers);
+    }
 
     let mut pages = Vec::new();
     for page in 0..scene.pages.len() as u32 {
@@ -1461,6 +1473,11 @@ mod tests {
             "and says how much there is"
         );
         assert_eq!(decoded.page_dependencies(), scene.page_dependencies());
+        // Read as a whole scene's file, it is refused and not taken for a damaged one.
+        assert_eq!(
+            decode(&encode_header_and_manifest(&small)).err(),
+            Some(DecodeError::SplitForBrowsers)
+        );
     }
 
     #[test]

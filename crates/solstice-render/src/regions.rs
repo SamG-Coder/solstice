@@ -12,7 +12,7 @@
 //! For an RTX 5080 on x64, natively or in Chrome: the one setup these scenes are for. Other devices
 //! may work, and fail with a clear message if they offer too few storage buffers.
 //!
-//! A pool address holds its band in the top two bits, above the place within that band's buffer.
+//! A pool address holds its band in the top three bits, above the place within that band's buffer.
 //! Adding a cluster's local offset to it needs no special care, and `counts` is left alone.
 
 use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
@@ -58,10 +58,14 @@ pub fn binding_slots(limits: &wgpu::Limits) -> u32 {
     (binding_bytes(limits) / PAGE_BYTES as u64) as u32
 }
 
+/// The most one binding may hold: what the device allows, and no more than an address has bits
+/// for below its band. A browser passes on whatever limit it is given, and a pool larger than
+/// that would have its addresses run into the next band's.
 fn binding_bytes(limits: &wgpu::Limits) -> u64 {
     limits
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size)
+        .min(4 << BAND_SHIFT)
 }
 
 /// Each page's band, with `cap` the most pages one binding can hold.

@@ -86,6 +86,9 @@ fn web_split(path: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error
     let mut scene =
         file::decode_manifest(&manifest, header.manifest_offset + header.manifest_bytes)?;
     drop(manifest);
+    if scene.external.is_some() {
+        return Err("this file is split already: split the .solstice file it was made from".into());
+    }
     if !scene.skeletons.is_empty() {
         return Err("a scene with skinned meshes can't be split".into());
     }

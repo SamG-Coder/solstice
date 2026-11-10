@@ -428,9 +428,9 @@ impl Residency {
     pub fn refill(&mut self, max_fetching: u32) -> Vec<u32> {
         let (mut free, mut room) = self.room();
         // The host holds the data of every page that has come and waits to go in, and a pool
-        // slow to make room would let them pile up without end: once as many wait as may be
-        // fetched at once, no more are fetched until some have gone in.
-        let can_fetch = if self.arrived.len() as u32 >= max_fetching {
+        // slow to make room would let them pile up without end: once as many wait on the pool
+        // as may be fetched at once, no more are fetched until some have gone in.
+        let can_fetch = if self.waiting_on_pool() >= max_fetching {
             0
         } else {
             room.iter()
@@ -471,6 +471,28 @@ impl Residency {
         }
         self.fetching += started.len() as u32;
         started
+    }
+
+    /// How many pages have come and wait only for the pool to take them: everything each
+    /// depends on is in, or has come or is coming in its turn. One waiting for a page that is
+    /// absent, because its fetch failed or it has left since, waits for a fetch, not for the
+    /// pool: were it counted, enough of them would stop the very fetch they wait for.
+    fn waiting_on_pool(&self) -> u32 {
+        // What a page depends on has a lower id, so is decided before it, and these stay in
+        // order.
+        let mut orphaned: Vec<u32> = Vec::new();
+        let mut waiting = 0;
+        for &page in &self.arrived {
+            let orphan = self.dependencies[page as usize].iter().any(|&d| {
+                self.states[d as usize] == State::Absent || orphaned.binary_search(&d).is_ok()
+            });
+            if orphan {
+                orphaned.push(page);
+            } else {
+                waiting += 1;
+            }
+        }
+        waiting
     }
 
     /// When more pages need slots than the pool can give, finds the installed pages that are
@@ -950,6 +972,34 @@ mod tests {
         );
         assert!(residency.next_install(1).is_some());
         assert_eq!(residency.refill(2), [2, 3], "one went in: fetching goes on");
+    }
+
+    /// Pages that wait for one whose fetch failed don't stop it being fetched again, however
+    /// many they are, nor do those that wait for them.
+    #[test]
+    fn pages_waiting_for_a_failed_fetch_do_not_hold_back_fetching_it_again() {
+        // Page 0, its two children, and a child of the first of those.
+        let mut residency = Residency::new(vec![vec![], vec![0], vec![0], vec![1]], 0, 4);
+        assert_eq!(residency.plan(1, &[10; 4], 2), [0, 1]);
+        residency.arrived(1);
+        assert_eq!(residency.refill(2), [2]);
+        residency.arrived(2);
+        residency.failed(0);
+        assert_eq!(residency.next_install(1), None, "their parent isn't in");
+
+        assert_eq!(
+            residency.plan(2, &[10; 4], 2),
+            [0, 3],
+            "two wait, as many as may be fetched at once, but for a fetch and not the pool"
+        );
+        residency.arrived(3);
+        residency.arrived(0);
+        assert_eq!(residency.refill(2), [], "now they wait on the pool");
+        let mut order = Vec::new();
+        while let Some(install) = residency.next_install(2) {
+            order.push(install.page);
+        }
+        assert_eq!(order, [0, 1, 2, 3]);
     }
 
     /// A page takes an empty slot of another band before it makes a page of its own leave.

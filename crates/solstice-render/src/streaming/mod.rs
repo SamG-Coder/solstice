@@ -943,7 +943,7 @@ fn locate_slot(regions: Option<&RegionPlan>, slot: u32) -> (usize, u32) {
 }
 
 /// Where a slot's vertices and triangles begin, in units of vertices and of triangle words.
-/// Triangles start right after the page's own vertices. The band goes in the top two bits, which
+/// Triangles start right after the page's own vertices. The band goes in the top three bits, which
 /// is zero in a scene with one pool.
 fn slot_bases(band: usize, local: u32, vertex_count: u32) -> (u32, u32) {
     let band = (band as u32) << crate::regions::BAND_SHIFT;
@@ -1008,6 +1008,14 @@ mod tests {
         assert_eq!(vertices >> BAND_SHIFT, BANDS as u32 - 1);
         assert!(u64::from(vertices & low) * 4 + u64::from(PAGE_WORDS) <= 1 << BAND_SHIFT);
         assert_eq!(triangles >> BAND_SHIFT, BANDS as u32 - 1);
+
+        // A device that allows a larger binding still gets pools an address can reach into.
+        let roomy = crate::regions::binding_slots(&wgpu::Limits {
+            max_storage_buffer_binding_size: 1 << 32,
+            max_buffer_size: 1 << 33,
+            ..Default::default()
+        });
+        assert_eq!(u64::from(roomy) * u64::from(PAGE_WORDS), 1 << BAND_SHIFT);
     }
 
     #[test]

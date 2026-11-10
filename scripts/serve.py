@@ -47,7 +47,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def resolve(self):
         path = self.path.split("?", 1)[0].split("#", 1)[0]
         parts = [p for p in path.split("/") if p and p != "."]
-        if ".." in parts:
+        # Nothing above the directory: on Windows a backslash or a drive would climb out too.
+        if any(p == ".." or "\\" in p or ":" in p for p in parts):
             return None
         full = os.path.join(self.directory, *parts)
         if os.path.isdir(full):
@@ -82,12 +83,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(full, "rb") as file:
             for first, last in spans:
                 file.seek(first)
-                part = file.read(last - first + 1)
-                self.throttle.wait(len(part))
-                try:
-                    self.wfile.write(part)
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    return
+                # A part may be most of the file: never more than a chunk of it in memory.
+                remaining = last - first + 1
+                while remaining > 0:
+                    chunk = file.read(min(CHUNK_BYTES, remaining))
+                    if not chunk:
+                        return
+                    self.throttle.wait(len(chunk))
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        return
+                    remaining -= len(chunk)
 
     def respond(self, send_body):
         time.sleep(self.latency)
