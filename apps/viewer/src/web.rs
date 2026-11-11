@@ -155,6 +155,10 @@ impl WebViewer {
             geometry_bytes: geometry_budget as u64,
             texture_bytes: texture_budget as u64,
         };
+        // A scene too large for one binding needs more storage buffers than some GPUs have.
+        if let Some(reason) = Renderer::streaming_unsupported(&gpu, &scene, budget) {
+            return Err(JsValue::from_str(&reason));
+        }
         let renderer = Renderer::streaming(
             &gpu,
             &scene,

@@ -872,7 +872,7 @@ async function main() {
   addEventListener("blur", () => keys.clear());
   // A mouse's click captures the pointer; a touch has nothing to capture.
   canvas.addEventListener("click", (e) => {
-    if (e.pointerType !== "touch") canvas.requestPointerLock();
+    if (e.pointerType !== "touch") canvas.requestPointerLock?.();
   });
   addEventListener("mousemove", (e) => {
     if (document.pointerLockElement === canvas) {
@@ -972,8 +972,8 @@ async function main() {
     game?.tick();
     viewer.frame(
       delta,
-      axis("KeyW", "KeyS") + flying.forward,
-      axis("KeyD", "KeyA") + flying.right,
+      Math.max(-1, Math.min(1, axis("KeyW", "KeyS") + flying.forward)),
+      Math.max(-1, Math.min(1, axis("KeyD", "KeyA") + flying.right)),
       axis("KeyE", "KeyQ"),
       lookYaw,
       lookPitch,
