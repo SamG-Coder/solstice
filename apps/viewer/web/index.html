@@ -89,6 +89,14 @@
   #overlay[hidden] { display: none; }
   #message { max-width: 44ch; font-size: 15px; }
   #message.error { color: #ffb4a2; }
+  /* What the browser offered, under a failure to start: on a phone the console is out of reach. */
+  #report { margin-top: 14px; text-align: left; max-width: min(92vw, 80ch); }
+  #report[hidden] { display: none; }
+  #report pre { max-height: 45vh; overflow: auto; margin: 8px 0; padding: 8px 10px; white-space: pre-wrap;
+    word-break: break-word; font: 11px/1.4 ui-monospace, Consolas, monospace; color: var(--muted);
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px; user-select: text; }
+  #report button { background: #1c1712; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 5px; padding: 5px 12px; font: inherit; cursor: pointer; }
   progress { width: 280px; height: 6px; margin-top: 14px; accent-color: var(--accent); }
 
   @media (max-width: 620px) {
@@ -228,6 +236,10 @@
   <div>
     <div id="message">Starting…</div>
     <progress id="progress" max="1" value="0" hidden></progress>
+    <div id="report" hidden>
+      <pre id="report-text"></pre>
+      <button type="button" id="report-copy">Copy</button>
+    </div>
   </div>
 </div>
 
@@ -274,6 +286,65 @@ function fail(text) {
   el("progress").hidden = true;
   el("message").textContent = text;
   el("message").className = "error";
+}
+
+/// The limits the renderer and its fallbacks turn on, as an adapter reports them.
+const REPORTED_LIMITS = [
+  "maxStorageBuffersPerShaderStage", "maxStorageBuffersInVertexStage",
+  "maxStorageBuffersInFragmentStage", "maxStorageTexturesPerShaderStage",
+  "maxStorageTexturesInFragmentStage", "maxSampledTexturesPerShaderStage",
+  "maxStorageBufferBindingSize", "maxBufferSize", "maxColorAttachments",
+  "maxComputeInvocationsPerWorkgroup", "maxComputeWorkgroupSizeX",
+  "maxComputeWorkgroupStorageSize", "maxInterStageShaderVariables",
+  "maxUniformBufferBindingSize", "maxTextureDimension2D", "maxTextureArrayLayers",
+];
+
+/// What the browser offers, adapter by adapter: for the page to show when the viewer can't
+/// start, as a phone's console is out of reach. Each adapter is asked for afresh.
+async function adapterReport() {
+  const lines = [
+    `Page: ${location.href}`,
+    `Browser: ${navigator.userAgent}`,
+    `Secure context: ${isSecureContext}, WebGPU: ${Boolean(navigator.gpu)}`,
+  ];
+  const describe = async (label, options) => {
+    let adapter;
+    try {
+      adapter = await navigator.gpu.requestAdapter(options);
+    } catch (error) {
+      lines.push(`${label}: request failed (${error.message ?? error})`);
+      return;
+    }
+    if (!adapter) {
+      lines.push(`${label}: none`);
+      return;
+    }
+    const info = adapter.info ?? {};
+    const name = [info.vendor, info.architecture, info.device, info.description]
+      .filter(Boolean).join(" / ");
+    lines.push(`${label}: ${name || "unnamed"}${info.isFallbackAdapter ? " (software)" : ""}`);
+    lines.push(`  features: ${[...adapter.features].sort().join(", ") || "none"}`);
+    lines.push(`  limits: ${REPORTED_LIMITS.filter((key) => key in adapter.limits)
+      .map((key) => `${key} ${adapter.limits[key]}`).join(", ")}`);
+  };
+  if (navigator.gpu) {
+    await describe("Core adapter", undefined);
+    await describe("Compatibility adapter", { featureLevel: "compatibility" });
+    await describe("Software adapter", { forceFallbackAdapter: true });
+  }
+  return lines.join("\n");
+}
+
+/// Fails with `text`, and under it what the browser offered, to read or copy.
+async function failWithReport(text) {
+  fail(text);
+  const report = await adapterReport().catch((error) => `No report: ${error.message ?? error}`);
+  console.info(report);
+  el("report-text").textContent = report;
+  el("report").hidden = false;
+  el("report-copy").onclick = () => navigator.clipboard?.writeText(report)
+    .then(() => { el("report-copy").textContent = "Copied"; })
+    .catch(() => { el("report-copy").textContent = "Copy failed: select the text"; });
 }
 
 /// Reads parts of a scene file by HTTP Range. If the server doesn't do ranges, the whole file
@@ -653,13 +724,19 @@ async function requestAdapter() {
 
 async function main() {
   if (!navigator.gpu) {
-    fail("This browser does not support WebGPU. Try a recent version of Chrome or Edge.");
+    failWithReport("This browser does not support WebGPU. Try a recent version of Chrome or Edge.");
     return;
   }
   // Checked up front, so nobody downloads a whole scene to learn their GPU can't show it.
   const adapter = await requestAdapter();
   if (!adapter) {
-    fail("WebGPU is available in this browser, but not for this GPU or driver. Try updating your graphics driver, or a different browser.");
+    // Some phones' browsers offer a GPU only at WebGPU's "compatibility" level, as on OpenGL ES,
+    // which lacks what the renderer is built on.
+    const compatible = await navigator.gpu.requestAdapter({ featureLevel: "compatibility" })
+      .catch(() => null);
+    failWithReport(compatible
+      ? "This browser offers WebGPU on this GPU only in its compatibility mode, which this viewer can't run on yet."
+      : "WebGPU is available in this browser, but not for this GPU or driver. Try updating your graphics driver, or a different browser.");
     return;
   }
   await init();
@@ -1257,7 +1334,10 @@ async function startGame(viewer, file) {
 
 main().catch((error) => {
   console.error(error);
-  fail(error.message ?? String(error));
+  // A GPU the viewer can't use says what it offered; any other failure says only what failed.
+  const message = error.message ?? String(error);
+  if (/GPU|adapter|device/i.test(message)) failWithReport(message);
+  else fail(message);
 });
 </script>
 </body>
