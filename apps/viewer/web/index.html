@@ -85,7 +85,8 @@
   body.driving #help { max-width: min(46ch, 30vw); }
   #help b { color: var(--ink); font-weight: 600; }
 
-  #overlay { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; }
+  #overlay { position: fixed; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px;
+    overflow: auto; }
   #overlay[hidden] { display: none; }
   #message { max-width: 44ch; font-size: 15px; }
   #message.error { color: #ffb4a2; }
@@ -299,18 +300,24 @@ const REPORTED_LIMITS = [
   "maxUniformBufferBindingSize", "maxTextureDimension2D", "maxTextureArrayLayers",
 ];
 
+/// The browser's own adapter request, kept before `requestAdapter` may replace it, so that the
+/// report says what the browser itself offers.
+const browserRequestAdapter = globalThis.GPU?.prototype.requestAdapter;
+let compatibilityShim = false;
+
 /// What the browser offers, adapter by adapter: for the page to show when the viewer can't
 /// start, as a phone's console is out of reach. Each adapter is asked for afresh.
 async function adapterReport() {
   const lines = [
     `Page: ${location.href}`,
     `Browser: ${navigator.userAgent}`,
-    `Secure context: ${isSecureContext}, WebGPU: ${Boolean(navigator.gpu)}`,
+    `Secure context: ${isSecureContext}, WebGPU: ${Boolean(navigator.gpu)}`
+      + (compatibilityShim ? ", using a compatibility adapter as core" : ""),
   ];
   const describe = async (label, options) => {
     let adapter;
     try {
-      adapter = await navigator.gpu.requestAdapter(options);
+      adapter = await browserRequestAdapter.call(navigator.gpu, options);
     } catch (error) {
       lines.push(`${label}: request failed (${error.message ?? error})`);
       return;
@@ -342,7 +349,7 @@ async function failWithReport(text) {
   console.info(report);
   el("report-text").textContent = report;
   el("report").hidden = false;
-  el("report-copy").onclick = () => navigator.clipboard?.writeText(report)
+  el("report-copy").onclick = () => (navigator.clipboard?.writeText(report) ?? Promise.reject())
     .then(() => { el("report-copy").textContent = "Copied"; })
     .catch(() => { el("report-copy").textContent = "Copy failed: select the text"; });
 }
@@ -719,6 +726,7 @@ async function requestAdapter() {
     return requestDevice.call(this, { ...descriptor, requiredFeatures });
   };
   console.info("using a GPU offered for WebGPU compatibility, which can do core WebGPU");
+  compatibilityShim = true;
   return compatible;
 }
 
@@ -1334,10 +1342,9 @@ async function startGame(viewer, file) {
 
 main().catch((error) => {
   console.error(error);
-  // A GPU the viewer can't use says what it offered; any other failure says only what failed.
-  const message = error.message ?? String(error);
-  if (/GPU|adapter|device/i.test(message)) failWithReport(message);
-  else fail(message);
+  // Under any failure to start, what the browser offered: it is often why, and costs nothing
+  // on a page that has already failed.
+  failWithReport(error?.message ?? String(error));
 });
 </script>
 </body>
