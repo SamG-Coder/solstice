@@ -744,7 +744,10 @@ async function main() {
       .catch(() => null);
     failWithReport(compatible
       ? "This browser offers WebGPU on this GPU only in its compatibility mode, which this viewer can't run on yet."
-      : "WebGPU is available in this browser, but not for this GPU or driver. Try updating your graphics driver, or a different browser.");
+      // The browser has WebGPU and offers no adapter at all: on Android, Chrome turns WebGPU
+      // on only for the GPUs it has tested, and leaves others, such as some Samsung phones', out.
+      : "This browser has WebGPU, but offers no adapter for this GPU: it doesn't turn WebGPU on for it yet. "
+        + "In Chrome, chrome://flags/#enable-unsafe-webgpu turns it on anyway, at your own risk.");
     return;
   }
   await init();
