@@ -21,6 +21,9 @@ use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
 pub const BANDS: usize = 8;
 /// A pool address holds its band above this bit: a pool of 2 GiB is 2^29 words.
 pub const BAND_SHIFT: u32 = 29;
+/// The fewest pools a scene split into regions binds: the near, middle and far bands.
+pub const FEWEST_POOLS: usize = 3;
+
 /// Storage buffers per stage the heaviest pass binds with this many pools: the masked rasterizers.
 pub fn required_storage_buffers(pools: usize) -> u32 {
     8 + pools as u32
@@ -104,6 +107,31 @@ impl RegionPlan {
     /// How many pools the scene binds.
     pub fn pools(&self) -> usize {
         pools_of(&self.band_slots)
+    }
+
+    /// Why a scene with a pool of `slots` can't be drawn under these limits: it needs regions,
+    /// and they take more storage buffers per stage than the device offers. [`Self::decide`]
+    /// panics there; this says so first, for a message the host can show.
+    pub fn unsupported(limits: &wgpu::Limits, scene: &PagedScene, slots: u32) -> Option<String> {
+        let limit = binding_bytes(limits);
+        let clusters = match scene.external {
+            Some(_) => {
+                u64::from(slots.min(scene.pages.len() as u32))
+                    * u64::from(scene.max_page_clusters().max(1))
+            }
+            None => scene.clusters.len() as u64,
+        };
+        let pool_bytes = u64::from(slots) * PAGE_BYTES as u64;
+        if clusters * CLUSTER_BYTES <= limit && pool_bytes <= limit {
+            return None;
+        }
+        let needed = required_storage_buffers(pools_of(&band_slots(scene, slots, limit)));
+        let offered = limits.max_storage_buffers_per_shader_stage;
+        (offered < needed).then(|| {
+            format!(
+                "this scene is too large for this GPU: it needs {needed} storage buffers per                  stage, and this GPU offers {offered}"
+            )
+        })
     }
 
     /// The plan for a scene with a pool of `slots`, or `None` if it fits in single bindings.
@@ -424,6 +452,28 @@ mod tests {
             pinned_pages: pinned,
             ..Default::default()
         }
+    }
+
+    /// A scene that fits one binding is fine anywhere; one that needs regions is refused, with
+    /// a reason, by a device with too few storage buffers, and accepted by one with enough.
+    #[test]
+    fn a_scene_needing_regions_is_refused_where_they_cannot_be_bound() {
+        let few = wgpu::Limits {
+            max_storage_buffer_binding_size: 4 * PAGE_BYTES as u64,
+            max_buffer_size: 1 << 31,
+            max_storage_buffers_per_shader_stage: 8,
+            ..wgpu::Limits::defaults()
+        };
+        let many = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: required_storage_buffers(BANDS),
+            ..few.clone()
+        };
+        let rounds = [1, 1, 5, 5, 9, 9];
+        let scene = scene(&rounds, 2);
+        assert_eq!(RegionPlan::unsupported(&few, &scene, 4), None);
+        let reason = RegionPlan::unsupported(&few, &scene, 6).expect("refused");
+        assert!(reason.contains("offers 8"), "{reason}");
+        assert_eq!(RegionPlan::unsupported(&many, &scene, 6), None);
     }
 
     /// A pool over the limit doesn't mean a cluster table over it.

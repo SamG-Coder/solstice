@@ -352,6 +352,20 @@ impl Renderer {
         Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&loaded.scene.sea)
     }
 
+    /// Why [`Self::streaming`] can't draw this scene on this GPU within `budget`, if it can't:
+    /// a message for the host to show, where `streaming` would panic.
+    pub fn streaming_unsupported(
+        gpu: &Gpu,
+        paged: &PagedScene,
+        budget: StreamingBudget,
+    ) -> Option<String> {
+        crate::regions::RegionPlan::unsupported(
+            &gpu.limits,
+            paged,
+            streaming_slots(gpu, paged, budget),
+        )
+    }
+
     /// Creates a renderer that starts with only a scene's pinned pages and smallest textures,
     /// and draws with what it has while the host supplies the rest: see
     /// [`Self::stream_requests`]. GPU memory for the scene stays within `budget`, apart from
@@ -363,10 +377,7 @@ impl Renderer {
         settings: RendererSettings,
         budget: StreamingBudget,
     ) -> Self {
-        let slots = u32::try_from(budget.geometry_bytes / PAGE_BYTES as u64)
-            .unwrap_or(u32::MAX)
-            .max(paged.pinned_pages)
-            .min(paged.pages.len() as u32);
+        let slots = streaming_slots(gpu, paged, budget);
         let plan = choose_tiers(gpu, paged, budget.texture_bytes);
         let scene = GpuScene::new(gpu, paged, slots, None, Some(plan));
         let mut streamer = Streamer::new(gpu, paged, slots, Some(plan), scene.regions);
@@ -1457,4 +1468,15 @@ fn mark(profiler: &Option<Profiler>, encoder: &mut wgpu::CommandEncoder, section
     if let Some(profiler) = profiler {
         profiler.mark(encoder, section);
     }
+}
+
+/// The page pool a streaming renderer gives a scene within `budget`: no less than its pinned
+/// pages, no more than all of them, and on a GPU with too few storage buffers for regions,
+/// what one binding holds (`Fallbacks::pool_in_one_binding`) unless its pinned pages need more.
+fn streaming_slots(gpu: &Gpu, paged: &PagedScene, budget: StreamingBudget) -> u32 {
+    let mut slots = u32::try_from(budget.geometry_bytes / PAGE_BYTES as u64).unwrap_or(u32::MAX);
+    if gpu.fallbacks.pool_in_one_binding {
+        slots = slots.min(crate::regions::binding_slots(&gpu.limits));
+    }
+    slots.max(paged.pinned_pages).min(paged.pages.len() as u32)
 }

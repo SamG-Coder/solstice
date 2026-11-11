@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Solstice</title>
+<!-- No icon, said here so that browsers don't ask for /favicon.ico and log its absence. -->
+<link rel="icon" href="data:,">
 <style>
   :root {
     --ink: #f4efe6;
@@ -42,6 +44,9 @@
   #scenes a[aria-current] { background: var(--accent); color: #1c1712; }
 
   #help { left: 12px; bottom: 12px; color: var(--muted); padding: 8px 12px; }
+
+  /* On a narrow screen, the button that shows the settings and the rest of the readouts. */
+  #more { display: none; color: var(--ink); font: inherit; font-weight: 600; cursor: pointer; }
 
   #play { left: 50%; bottom: 16px; transform: translateX(-50%); padding: 0; z-index: 1; }
   #play button { background: var(--accent); color: #1c1712; border: 0; border-radius: 7px;
@@ -87,7 +92,13 @@
   progress { width: 280px; height: 6px; margin-top: 14px; accent-color: var(--accent); }
 
   @media (max-width: 620px) {
-    #controls { top: auto; bottom: 12px; right: 12px; left: 12px; width: auto; }
+    #controls { top: auto; bottom: 64px; right: 12px; left: 12px; width: auto;
+      max-height: calc(100% - 140px); overflow-y: auto; }
+    /* The view comes first: the frame rate alone, and the rest behind the button. */
+    body:not(.more) #controls { display: none; }
+    body:not(.more) #hud dl > :nth-child(n+3), body:not(.more) #hud h1 { display: none; }
+    #hud { min-width: 0; padding: 6px 10px; }
+    #more:not([hidden]) { display: block; right: 12px; bottom: 12px; padding: 8px 14px; }
         #help { display: none; }
     #scenes { top: 8px; }
     #hud { top: 56px; }
@@ -124,6 +135,8 @@
     <dt>Time</dt><dd id="time-now">-</dd>
   </dl>
 </aside>
+
+<button type="button" class="panel" id="more" aria-controls="controls" aria-expanded="false" hidden>Settings</button>
 
 <aside class="panel" id="controls" hidden>
   <label>View
@@ -614,13 +627,37 @@ async function loadExternalTables(viewer, tables, start) {
   el("progress").hidden = true;
 }
 
+/// The adapter the viewer will be given. Chrome offers some GPUs only to pages asking for
+/// WebGPU's "compatibility" feature level, though they can do all of core WebGPU, as its own
+/// software adapter on an Android emulator does; the viewer asks for core. If no core adapter
+/// is offered, such an adapter is taken, and its devices asked for core. Anywhere a core
+/// adapter is offered, nothing changes.
+async function requestAdapter() {
+  const adapter = await navigator.gpu.requestAdapter();
+  if (adapter) return adapter;
+  const CORE = "core-features-and-limits";
+  const compatible = await navigator.gpu.requestAdapter({ featureLevel: "compatibility" });
+  if (!compatible?.features.has(CORE)) return null;
+  const requestAdapter = GPU.prototype.requestAdapter;
+  GPU.prototype.requestAdapter = function (options = {}) {
+    return requestAdapter.call(this, { ...options, featureLevel: "compatibility" });
+  };
+  const requestDevice = GPUAdapter.prototype.requestDevice;
+  GPUAdapter.prototype.requestDevice = function (descriptor = {}) {
+    const requiredFeatures = [...(descriptor.requiredFeatures ?? []), CORE];
+    return requestDevice.call(this, { ...descriptor, requiredFeatures });
+  };
+  console.info("using a GPU offered for WebGPU compatibility, which can do core WebGPU");
+  return compatible;
+}
+
 async function main() {
   if (!navigator.gpu) {
     fail("This browser does not support WebGPU. Try a recent version of Chrome or Edge.");
     return;
   }
   // Checked up front, so nobody downloads a whole scene to learn their GPU can't show it.
-  const adapter = await navigator.gpu.requestAdapter();
+  const adapter = await requestAdapter();
   if (!adapter) {
     fail("WebGPU is available in this browser, but not for this GPU or driver. Try updating your graphics driver, or a different browser.");
     return;
@@ -647,7 +684,12 @@ async function main() {
     geometryBudget,
     textureBudget,
     params.has("unpack-textures"),
+    // ?limits=webgpu asks for no more than the WebGPU defaults, as many phones are given.
+    params.get("limits") === "webgpu",
   );
+  // A GPU given less than the renderer asks for has passes that do without.
+  const fallbacks = viewer.fallbacks();
+  if (fallbacks) console.info(`fallbacks for this GPU's limits: ${fallbacks}`);
   await loadExternalTables(viewer, tables, manifestEnd);
   const streamer = new Streamer(viewer, file, manifestEnd);
 
@@ -828,7 +870,10 @@ async function main() {
   addEventListener("keydown", (e) => keys.add(e.code));
   addEventListener("keyup", (e) => keys.delete(e.code));
   addEventListener("blur", () => keys.clear());
-  canvas.addEventListener("click", () => canvas.requestPointerLock());
+  // A mouse's click captures the pointer; a touch has nothing to capture.
+  canvas.addEventListener("click", (e) => {
+    if (e.pointerType !== "touch") canvas.requestPointerLock?.();
+  });
   addEventListener("mousemove", (e) => {
     if (document.pointerLockElement === canvas) {
       lookYaw -= e.movementX * 0.002;
@@ -838,6 +883,50 @@ async function main() {
 
   const game = await startGame(viewer, file);
   const axis = (positive, negative) => (keys.has(positive) ? 1 : 0) - (keys.has(negative) ? 1 : 0);
+
+  // Touch, where no game takes it: a stick under the left thumb flies, as a game's does, and
+  // dragging anywhere else looks around.
+  const flying = { forward: 0, right: 0 };
+  if (!game) {
+    const STICK_PIXELS = 60;
+    const LOOK_PER_PIXEL = 0.004;
+    const touches = new Map();
+    const stickTaken = () => [...touches.values()].some((touch) => touch.stick);
+    canvas.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      for (const t of e.changedTouches) {
+        touches.set(t.identifier, {
+          stick: t.clientX < innerWidth / 2 && !stickTaken(),
+          x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY,
+        });
+      }
+    }, { passive: false });
+    canvas.addEventListener("touchmove", (e) => {
+      e.preventDefault();
+      for (const t of e.changedTouches) {
+        const touch = touches.get(t.identifier);
+        if (!touch) continue;
+        if (touch.stick) {
+          const clamp = (v) => Math.max(-1, Math.min(1, v));
+          flying.right = clamp((t.clientX - touch.x0) / STICK_PIXELS);
+          flying.forward = clamp(-(t.clientY - touch.y0) / STICK_PIXELS);
+        } else {
+          lookYaw -= (t.clientX - touch.x) * LOOK_PER_PIXEL;
+          lookPitch -= (t.clientY - touch.y) * LOOK_PER_PIXEL;
+        }
+        touch.x = t.clientX;
+        touch.y = t.clientY;
+      }
+    }, { passive: false });
+    const endTouch = (e) => {
+      for (const t of e.changedTouches) {
+        if (touches.get(t.identifier)?.stick) Object.assign(flying, { forward: 0, right: 0 });
+        touches.delete(t.identifier);
+      }
+    };
+    canvas.addEventListener("touchend", endTouch);
+    canvas.addEventListener("touchcancel", endTouch);
+  }
 
   new ResizeObserver(() => {
     const [width, height] = canvasSize();
@@ -849,7 +938,12 @@ async function main() {
   }).observe(canvas);
 
   el("overlay").hidden = true;
-  for (const id of ["hud", "controls", "help"]) el(id).hidden = false;
+  for (const id of ["hud", "controls", "help", "more"]) el(id).hidden = false;
+  el("more").addEventListener("click", () => {
+    const open = document.body.classList.toggle("more");
+    el("more").setAttribute("aria-expanded", String(open));
+    el("more").textContent = open ? "Close" : "Settings";
+  });
 
   el("source").textContent = compact(viewer.source_triangles());
   el("instances").textContent = viewer.instances().toLocaleString();
@@ -878,8 +972,8 @@ async function main() {
     game?.tick();
     viewer.frame(
       delta,
-      axis("KeyW", "KeyS"),
-      axis("KeyD", "KeyA"),
+      Math.max(-1, Math.min(1, axis("KeyW", "KeyS") + flying.forward)),
+      Math.max(-1, Math.min(1, axis("KeyD", "KeyA") + flying.right)),
       axis("KeyE", "KeyQ"),
       lookYaw,
       lookPitch,

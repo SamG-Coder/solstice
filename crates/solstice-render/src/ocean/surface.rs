@@ -205,6 +205,8 @@ pub struct WaterSurface {
     raster_layout: wgpu::BindGroupLayout,
     raster: wgpu::RenderPipeline,
     shade_layout: wgpu::BindGroupLayout,
+    /// See [`crate::Fallbacks::ocean_depth_from_pyramid`].
+    depth_from_pyramid: bool,
     shade: wgpu::ComputePipeline,
     cells: u32,
     /// This frame's patches: the whole ones, then the quarters.
@@ -295,10 +297,16 @@ impl WaterSurface {
                 cache: None,
             });
 
+        // See `Fallbacks::ocean_depth_from_pyramid`.
+        let from_pyramid = gpu.fallbacks.ocean_depth_from_pyramid;
+        let opaque_depth = LayoutBuilder::new().texture();
+        let opaque_depth = if from_pyramid {
+            opaque_depth.skip()
+        } else {
+            opaque_depth.texture_unfilterable()
+        };
         let shade_layout = ShadowMaps::add_to_layout(
-            LayoutBuilder::new()
-                .texture()
-                .texture_unfilterable()
+            opaque_depth
                 .texture_unfilterable()
                 .depth_texture()
                 .texture_unfilterable()
@@ -314,9 +322,17 @@ impl WaterSurface {
         .texture()
         .depth_texture()
         .build(gpu, "ocean shade");
+        let mut source = shaders::expand("ocean/shade.wgsl");
+        if from_pyramid {
+            source = shaders::depth_from_pyramid(&source);
+        }
         let shade = gpu.compute_pipeline(
             "ocean shade",
-            &shaders::module(&gpu.device, "ocean/shade.wgsl"),
+            &gpu.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("ocean/shade.wgsl"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                }),
             "main",
             &[&shade_layout, environment],
         );
@@ -346,6 +362,7 @@ impl WaterSurface {
             raster_layout,
             raster,
             shade_layout,
+            depth_from_pyramid: from_pyramid,
             shade,
             cells,
             whole_count: 0,
@@ -479,30 +496,33 @@ impl WaterSurface {
                     tex(&self.seabed.view),
                 ],
             );
-            let shade = gpu.bind_group(
-                "ocean shade",
-                &self.shade_layout,
-                &[
-                    tex(scene.lit),
-                    tex(scene.depth),
-                    tex(scene.motion),
-                    tex(layer_depth),
-                    tex(&calm.view),
-                    tex(&waves.derivatives.view),
-                    tex(&waves.displacement.view),
-                    wgpu::BindingResource::Sampler(&self.sampler),
-                    self.uniform.as_entire_binding(),
-                    tex(&targets.color.view),
-                    tex(&targets.scene_depth.view),
-                    tex(&targets.motion.view),
-                    shadows.uniform.as_entire_binding(),
-                    tex(&shadows.array_view),
-                    wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
-                    tex(scene.depth_pyramid),
-                    tex(scene.normals),
-                    tex(&self.seabed.view),
-                ],
-            );
+            let mut resources = vec![tex(scene.lit)];
+            if !self.depth_from_pyramid {
+                resources.push(tex(scene.depth));
+            }
+            resources.extend([
+                tex(scene.motion),
+                tex(layer_depth),
+                tex(&calm.view),
+                tex(&waves.derivatives.view),
+                tex(&waves.displacement.view),
+                wgpu::BindingResource::Sampler(&self.sampler),
+                self.uniform.as_entire_binding(),
+                tex(&targets.color.view),
+                tex(&targets.scene_depth.view),
+                tex(&targets.motion.view),
+                shadows.uniform.as_entire_binding(),
+                tex(&shadows.array_view),
+                wgpu::BindingResource::Sampler(&shadows.comparison_sampler),
+                tex(scene.depth_pyramid),
+                tex(scene.normals),
+                tex(&self.seabed.view),
+            ]);
+            let shade = if self.depth_from_pyramid {
+                gpu.bind_group_skipping("ocean shade", &self.shade_layout, &resources, 1)
+            } else {
+                gpu.bind_group("ocean shade", &self.shade_layout, &resources)
+            };
             self.groups = Some((waves.generation(), targets.generation, raster, shade));
         }
         let (_, _, raster, shade) = self.groups.as_ref().expect("made above");

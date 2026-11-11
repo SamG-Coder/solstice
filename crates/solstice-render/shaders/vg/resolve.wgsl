@@ -31,7 +31,11 @@ fn load_vertex(index: u32) -> PackedVertex {
 @group(1) @binding(1) var out_normal: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var out_emissive: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(3) var out_motion: texture_storage_2d<rg32float, write>;
+// Left out on a GPU allowing four storage textures per stage, where vg/resolve_depth.wgsl
+// writes depth instead.
+// depth:begin
 @group(1) @binding(4) var out_depth: texture_storage_2d<r32float, write>;
+// depth:end
 // Each texture lives in one of three arrays, per `Material.texture_tier`.
 @group(1) @binding(5) var material_sampler: sampler;
 @group(1) @binding(6) var base_color: texture_2d_array<f32>;
@@ -158,7 +162,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let pixel = id.xy;
     let index = pixel.y * size.x + pixel.x;
     let depth = bitcast<f32>(vis_depth[index]);
+    // depth:begin
     textureStore(out_depth, pixel, vec4f(depth, 0.0, 0.0, 0.0));
+    // depth:end
     if depth <= 0.0 {
         textureStore(out_albedo, pixel, vec4f(0.0));
         textureStore(out_normal, pixel, vec4f(0.0));
