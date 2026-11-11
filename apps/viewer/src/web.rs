@@ -82,7 +82,10 @@ impl WebViewer {
     /// `requests` asks for more. `data_offset` is where the file's data area begins. Budgets
     /// are in bytes of GPU memory. Rejects if WebGPU is unavailable or the GPU lacks required
     /// capabilities, with a message suitable for showing to the user. `unpack_textures` acts as
-    /// if the GPU had no block compression, to test that path.
+    /// if the GPU had no block compression, to test that path. `default_limits` asks for no more
+    /// than the WebGPU default limits, as many phones are given, to see their fallbacks on any
+    /// GPU.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create(
         canvas: HtmlCanvasElement,
         manifest: Vec<u8>,
@@ -90,6 +93,7 @@ impl WebViewer {
         geometry_budget: f64,
         texture_budget: f64,
         unpack_textures: bool,
+        default_limits: bool,
     ) -> Result<WebViewer, JsValue> {
         let scene = file::decode_manifest(&manifest, data_offset as u64).map_err(error_string)?;
         drop(manifest);
@@ -122,10 +126,12 @@ impl WebViewer {
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(error_string)?;
-        let mut gpu = Gpu::request(
+        let defaults = wgpu::Limits::defaults();
+        let mut gpu = Gpu::request_within(
             &instance,
             Some(&surface),
             wgpu::PowerPreference::HighPerformance,
+            default_limits.then_some(&defaults),
         )
         .await
         .map_err(error_string)?;
@@ -565,6 +571,22 @@ impl WebViewer {
     /// Particles alive, from a recent frame.
     pub fn particles_alive(&self) -> u32 {
         self.renderer.stats().particles.alive
+    }
+
+    /// What the renderer does differently for this GPU's limits, for the page to show: empty
+    /// on a GPU with all it asks for.
+    pub fn fallbacks(&self) -> String {
+        let fallbacks = self.gpu.fallbacks;
+        [
+            (fallbacks.separate_depth, "depth apart"),
+            (fallbacks.ocean_depth_from_pyramid, "sea depth from pyramid"),
+            (fallbacks.pool_in_one_binding, "one-binding pool"),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
     }
 
     pub fn gpu_error_count(&self) -> u32 {

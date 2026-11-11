@@ -54,6 +54,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "vg/hzb_seed.wgsl",
     "vg/hzb_down.wgsl",
     "vg/resolve.wgsl",
+    "vg/resolve_depth.wgsl",
     "sky/luts.wgsl",
     "clouds/noise.wgsl",
     "clouds/coverage.wgsl",
@@ -125,6 +126,7 @@ pub const ENTRY_POINTS: &[&str] = &[
     "vg/hzb_seed.wgsl",
     "vg/hzb_down.wgsl",
     "vg/resolve.wgsl",
+    "vg/resolve_depth.wgsl",
     "sky/luts.wgsl",
     "ocean/spectrum.wgsl",
     "ocean/evolve.wgsl",
@@ -238,17 +240,38 @@ pub fn expand_for(path: &str, skinned: bool, regions: Option<RegionPlan>) -> Str
 /// A shader with the lines between `// glow:begin` and `// glow:end` taken out, as they were
 /// never written, for a scene with no emissive maps.
 pub fn without_glow(source: &str) -> String {
+    without_section(source, "glow")
+}
+
+/// A shader with the lines between `// NAME:begin` and `// NAME:end` taken out, as they were
+/// never written.
+pub fn without_section(source: &str, name: &str) -> String {
+    let (begin, end) = (format!("// {name}:begin"), format!("// {name}:end"));
     let mut out = String::with_capacity(source.len());
     let mut inside = false;
     for line in source.split_inclusive('\n') {
-        match line.trim() {
-            "// glow:begin" => inside = true,
-            "// glow:end" => inside = false,
-            _ if !inside => out.push_str(line),
-            _ => {}
+        let trimmed = line.trim();
+        if trimmed == begin {
+            inside = true;
+        } else if trimmed == end {
+            inside = false;
+        } else if !inside {
+            out.push_str(line);
         }
     }
     out
+}
+
+/// A water shader that reads the opaque scene's depth from mip 0 of its depth pyramid, which
+/// holds the same depth, in place of a binding of its own: see
+/// [`crate::Fallbacks::ocean_depth_from_pyramid`].
+pub fn depth_from_pyramid(source: &str) -> String {
+    const LOAD: &str = "textureLoad(opaque_depth,";
+    assert!(
+        source.contains(LOAD),
+        "the shader doesn't read opaque_depth"
+    );
+    without_section(source, "opaque-depth").replace(LOAD, "textureLoad(depth_pyramid,")
 }
 
 /// Compiles an entry-point file that places vertices: see [`expand_for`].
@@ -367,6 +390,80 @@ mod tests {
         )
         .validate(&module)
         .expect("the shader is valid");
+    }
+
+    fn assert_valid(source: &str) {
+        let module = naga::front::wgsl::parse_str(source).expect("the shader parses");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        .expect("the shader is valid");
+    }
+
+    /// For a GPU allowing four storage textures per stage, the resolve leaves depth to
+    /// vg/resolve_depth.wgsl, and binds what it keeps at the numbers it always had.
+    #[test]
+    fn resolve_without_depth_binds_four_storage_textures() {
+        for glow in [false, true] {
+            let mut source = without_section(&expand("vg/resolve.wgsl"), "depth");
+            if !glow {
+                source = without_glow(&source);
+            }
+            for gone in ["out_depth", "depth:begin", "@group(1) @binding(4)"] {
+                assert!(!source.contains(gone), "{gone} is still there");
+            }
+            assert_eq!(source.matches("texture_storage_2d").count(), 4);
+            assert!(source.contains("@group(1) @binding(5) var material_sampler"));
+            assert_valid(&source);
+        }
+        let full = expand("vg/resolve.wgsl");
+        assert_eq!(full.matches("texture_storage_2d").count(), 5);
+    }
+
+    /// The ocean read through its depth pyramid binds one sampled texture fewer, and reads
+    /// mip 0 wherever it read the scene's depth.
+    #[test]
+    fn ocean_shade_reads_depth_from_the_pyramid() {
+        let full = expand("ocean/shade.wgsl");
+        let source = depth_from_pyramid(&full);
+        for gone in [
+            "var opaque_depth",
+            "textureLoad(opaque_depth",
+            "opaque-depth:begin",
+        ] {
+            assert!(!source.contains(gone), "{gone} is still there");
+        }
+        assert!(!source.contains("@group(0) @binding(1)"));
+        assert_eq!(
+            source.matches("textureLoad(depth_pyramid,").count(),
+            full.matches("textureLoad(opaque_depth,").count()
+                + full.matches("textureLoad(depth_pyramid,").count()
+        );
+        assert_valid(&source);
+    }
+
+    #[test]
+    fn a_section_and_its_markers_go_and_nothing_else() {
+        let source = "a
+// x:begin
+b
+  // x:end
+c
+// y:begin
+d
+// y:end
+";
+        assert_eq!(
+            without_section(source, "x"),
+            "a
+c
+// y:begin
+d
+// y:end
+"
+        );
     }
 
     #[test]

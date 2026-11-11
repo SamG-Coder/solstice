@@ -21,6 +21,9 @@ use solstice_asset::paged::{PagedScene, PAGE_BYTES, ROOT_ROUND};
 pub const BANDS: usize = 8;
 /// A pool address holds its band above this bit: a pool of 2 GiB is 2^29 words.
 pub const BAND_SHIFT: u32 = 29;
+/// The fewest pools a scene split into regions binds: the near, middle and far bands.
+pub const FEWEST_POOLS: usize = 3;
+
 /// Storage buffers per stage the heaviest pass binds with this many pools: the masked rasterizers.
 pub fn required_storage_buffers(pools: usize) -> u32 {
     8 + pools as u32

@@ -363,10 +363,12 @@ impl Renderer {
         settings: RendererSettings,
         budget: StreamingBudget,
     ) -> Self {
-        let slots = u32::try_from(budget.geometry_bytes / PAGE_BYTES as u64)
-            .unwrap_or(u32::MAX)
-            .max(paged.pinned_pages)
-            .min(paged.pages.len() as u32);
+        let mut slots =
+            u32::try_from(budget.geometry_bytes / PAGE_BYTES as u64).unwrap_or(u32::MAX);
+        if gpu.fallbacks.pool_in_one_binding {
+            slots = slots.min(crate::regions::binding_slots(&gpu.limits));
+        }
+        let slots = slots.max(paged.pinned_pages).min(paged.pages.len() as u32);
         let plan = choose_tiers(gpu, paged, budget.texture_bytes);
         let scene = GpuScene::new(gpu, paged, slots, None, Some(plan));
         let mut streamer = Streamer::new(gpu, paged, slots, Some(plan), scene.regions);

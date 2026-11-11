@@ -42,17 +42,24 @@ impl GBuffer {
     }
 }
 
+/// Where the resolve's output group binds depth.
+const DEPTH_BINDING: u32 = 4;
+
 /// The resolve compute pass.
 pub struct Resolve {
     pipeline: wgpu::ComputePipeline,
     data_layout: wgpu::BindGroupLayout,
     output_layout: wgpu::BindGroupLayout,
+    /// On a GPU allowing too few storage textures per stage for the resolve to write depth
+    /// too ([`crate::Fallbacks::separate_depth`]), the pass that writes it, and its layout.
+    depth: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
 }
 
 /// The bind groups of one resolve configuration, rebuilt on resize.
 pub struct ResolveBindings {
     data: wgpu::BindGroup,
     output: wgpu::BindGroup,
+    depth: Option<wgpu::BindGroup>,
 }
 
 impl Resolve {
@@ -82,22 +89,27 @@ impl Resolve {
             }
         }
         let data_layout = data_layout.build(gpu, "resolve data");
-        let mut output_layout = LayoutBuilder::new()
+        let separate_depth = gpu.fallbacks.separate_depth;
+        let output_layout = LayoutBuilder::new()
             .storage_texture(ALBEDO_FORMAT)
             .storage_texture(NORMAL_FORMAT)
             .storage_texture(EMISSIVE_FORMAT)
-            .storage_texture(MOTION_FORMAT)
-            .storage_texture(DEPTH_FORMAT)
-            .sampler()
-            .texture_array()
-            .texture_array()
-            .texture_array()
-            .texture_array()
-            .texture_array()
-            .texture_array()
-            .texture_array()
-            .texture_array()
-            .texture_array();
+            .storage_texture(MOTION_FORMAT);
+        let mut output_layout = if separate_depth {
+            output_layout.skip()
+        } else {
+            output_layout.storage_texture(DEPTH_FORMAT)
+        }
+        .sampler()
+        .texture_array()
+        .texture_array()
+        .texture_array()
+        .texture_array()
+        .texture_array()
+        .texture_array()
+        .texture_array()
+        .texture_array()
+        .texture_array();
         if glow {
             output_layout = output_layout.texture_array();
         }
@@ -105,6 +117,9 @@ impl Resolve {
         let mut source = shaders::expand_for("vg/resolve.wgsl", skinned, regions);
         if !glow {
             source = shaders::without_glow(&source);
+        }
+        if separate_depth {
+            source = shaders::without_section(&source, "depth");
         }
         let module = gpu
             .device
@@ -121,6 +136,23 @@ impl Resolve {
             ),
             data_layout,
             output_layout,
+            depth: separate_depth.then(|| {
+                let layout = LayoutBuilder::new()
+                    .uniform()
+                    .storage_read()
+                    .storage_texture(DEPTH_FORMAT)
+                    .build(gpu, "resolve depth");
+                let module = gpu
+                    .device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("vg/resolve_depth.wgsl"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            shaders::expand("vg/resolve_depth.wgsl").into(),
+                        ),
+                    });
+                let pipeline = gpu.compute_pipeline("resolve depth", &module, "main", &[&layout]);
+                (pipeline, layout)
+            }),
         }
     }
 
@@ -164,7 +196,11 @@ impl Resolve {
                     wgpu::BindingResource::TextureView(&gbuffer.normal.view),
                     wgpu::BindingResource::TextureView(&gbuffer.emissive.view),
                     wgpu::BindingResource::TextureView(&gbuffer.motion.view),
-                    wgpu::BindingResource::TextureView(&gbuffer.depth.view),
+                ];
+                if self.depth.is_none() {
+                    resources.push(wgpu::BindingResource::TextureView(&gbuffer.depth.view));
+                }
+                resources.extend([
                     wgpu::BindingResource::Sampler(&scene.material_sampler),
                     wgpu::BindingResource::TextureView(&scene.textures.base.color_view),
                     wgpu::BindingResource::TextureView(&scene.textures.base.normal_view),
@@ -175,12 +211,32 @@ impl Resolve {
                     wgpu::BindingResource::TextureView(&scene.textures.top.color_view),
                     wgpu::BindingResource::TextureView(&scene.textures.top.normal_view),
                     wgpu::BindingResource::TextureView(&scene.textures.top.material_view),
-                ];
+                ]);
                 if let Some(glow) = &scene.glow_maps {
                     resources.push(wgpu::BindingResource::TextureView(glow));
                 }
-                gpu.bind_group("resolve output", &self.output_layout, &resources)
+                if self.depth.is_some() {
+                    gpu.bind_group_skipping(
+                        "resolve output",
+                        &self.output_layout,
+                        &resources,
+                        DEPTH_BINDING,
+                    )
+                } else {
+                    gpu.bind_group("resolve output", &self.output_layout, &resources)
+                }
             },
+            depth: self.depth.as_ref().map(|(_, layout)| {
+                gpu.bind_group(
+                    "resolve depth",
+                    layout,
+                    &[
+                        frame.as_entire_binding(),
+                        visibility.depth.as_entire_binding(),
+                        wgpu::BindingResource::TextureView(&gbuffer.depth.view),
+                    ],
+                )
+            }),
         }
     }
 
@@ -200,5 +256,10 @@ impl Resolve {
         pass.set_bind_group(1, &bindings.output, &[]);
         pass.set_bind_group(2, wetness, &[]);
         pass.dispatch_workgroups(groups_for(size.0, 8), groups_for(size.1, 8), 1);
+        if let (Some((pipeline, _)), Some(group)) = (&self.depth, &bindings.depth) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(groups_for(size.0, 8), groups_for(size.1, 8), 1);
+        }
     }
 }

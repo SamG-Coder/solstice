@@ -3,6 +3,7 @@
 //! ```text
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
+//!        [--limits webgpu]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
 //! viewer [SCENE] --play [--fly] [--scripts DIR] [--capture out.png --frames N
 //!        [--press ACTION@FRAME]... [--hold KEY@FROM-TO]... [--mouse PIXELS@FRAME]...]
@@ -268,6 +269,9 @@ mod native {
         power: wgpu::PowerPreference,
         /// Acts as if the GPU had no block compression, to test that path.
         unpack_textures: bool,
+        /// Asks for no more than these limits of the GPU, to see what a small one is given:
+        /// `--limits webgpu`, the WebGPU defaults, which many phones are given.
+        limits: Option<wgpu::Limits>,
         /// Metres per frame the capture camera slides sideways, for moving-view benchmarks.
         capture_motion: f32,
         /// A camera path to fly, with results written to `flyover_out`.
@@ -489,6 +493,7 @@ mod native {
             settings: RendererSettings::default(),
             power: wgpu::PowerPreference::HighPerformance,
             unpack_textures: false,
+            limits: None,
             capture_motion: 0.0,
             flyover: None,
             flyover_out: PathBuf::from("screenshots/flyover"),
@@ -727,6 +732,10 @@ mod native {
                 }
                 "--low-power" => options.power = wgpu::PowerPreference::LowPower,
                 "--unpack-textures" => options.unpack_textures = true,
+                "--limits" => match value()?.as_str() {
+                    "webgpu" => options.limits = Some(wgpu::Limits::defaults()),
+                    other => return Err(format!("unknown limits: {other}")),
+                },
                 "--scale" => {
                     options.settings.render_scale =
                         value()?.parse().map_err(|e| format!("--scale: {e}"))?;
@@ -815,7 +824,12 @@ mod native {
             .capture
             .as_ref()
             .expect("capture mode requires a path");
-        let mut gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        let mut gpu = pollster::block_on(Gpu::request_within(
+            &create_instance(),
+            None,
+            options.power,
+            options.limits.as_ref(),
+        ))?;
         gpu.block_compressed_textures &= !options.unpack_textures;
 
         let errors: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
@@ -1086,7 +1100,12 @@ mod native {
         let path = solstice_viewer::camera_path::CameraPath::parse(&text)?;
         std::fs::create_dir_all(&options.flyover_out)?;
 
-        let mut gpu = pollster::block_on(Gpu::request(&create_instance(), None, options.power))?;
+        let mut gpu = pollster::block_on(Gpu::request_within(
+            &create_instance(),
+            None,
+            options.power,
+            options.limits.as_ref(),
+        ))?;
         gpu.block_compressed_textures &= !options.unpack_textures;
         let errors: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
         let sink = errors.clone();
@@ -1421,8 +1440,12 @@ mod native {
             );
             let instance = create_instance();
             let surface = instance.create_surface(window.clone())?;
-            let gpu =
-                pollster::block_on(Gpu::request(&instance, Some(&surface), self.options.power))?;
+            let gpu = pollster::block_on(Gpu::request_within(
+                &instance,
+                Some(&surface),
+                self.options.power,
+                self.options.limits.as_ref(),
+            ))?;
 
             let size = window.inner_size();
             let mut config = surface

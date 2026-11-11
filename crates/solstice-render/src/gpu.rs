@@ -25,8 +25,48 @@ impl std::error::Error for GpuError {}
 
 /// Storage buffers the heaviest pass binds in a single shader stage.
 const REQUIRED_STORAGE_BUFFERS: u32 = 8;
-/// Storage textures the G-buffer resolve binds in a single shader stage.
-const REQUIRED_STORAGE_TEXTURES: u32 = 5;
+/// Storage textures the busiest pass binds in a single shader stage, with every fallback.
+const REQUIRED_STORAGE_TEXTURES: u32 = 4;
+/// Storage textures the G-buffer resolve binds when it writes depth too.
+const RESOLVE_STORAGE_TEXTURES: u32 = 5;
+/// Sampled textures the ocean's shading binds in one stage, with the scene's depth apart from
+/// its depth pyramid.
+const OCEAN_SAMPLED_TEXTURES: u32 = 17;
+
+/// What the renderer does differently on a device that offers less, chosen once from the
+/// device's limits. A device with all it asks for has none, and pays nothing for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fallbacks {
+    /// The G-buffer's depth is written by a pass of its own, so that the resolve binds four
+    /// storage textures, as the WebGPU defaults and many phones allow, rather than five.
+    pub separate_depth: bool,
+    /// The ocean's shading reads the opaque scene's depth from mip 0 of its depth pyramid,
+    /// which is the same depth, binding 16 sampled textures per stage, as the WebGPU defaults
+    /// allow, rather than 17.
+    pub ocean_depth_from_pyramid: bool,
+    /// A streamed scene's page pool is kept to what one storage binding holds: a larger pool
+    /// is split into regions, whose bindings take more storage buffers per stage than this
+    /// device offers.
+    pub pool_in_one_binding: bool,
+}
+
+impl Fallbacks {
+    /// The fallbacks a device with these limits needs.
+    pub fn for_limits(limits: &wgpu::Limits) -> Self {
+        Self {
+            separate_depth: limits.max_storage_textures_per_shader_stage < RESOLVE_STORAGE_TEXTURES,
+            ocean_depth_from_pyramid: limits.max_sampled_textures_per_shader_stage
+                < OCEAN_SAMPLED_TEXTURES,
+            pool_in_one_binding: limits.max_storage_buffers_per_shader_stage
+                < crate::regions::required_storage_buffers(crate::regions::FEWEST_POOLS),
+        }
+    }
+
+    /// Whether any fallback is in use.
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
 
 /// The device and queue, plus what was learned about them.
 pub struct Gpu {
@@ -37,6 +77,8 @@ pub struct Gpu {
     pub limits: wgpu::Limits,
     /// Whether scene textures may stay in BC formats. Without this they are unpacked on load.
     pub block_compressed_textures: bool,
+    /// What the renderer does differently for these limits.
+    pub fallbacks: Fallbacks,
 }
 
 impl Gpu {
@@ -49,6 +91,17 @@ impl Gpu {
         surface: Option<&wgpu::Surface<'_>>,
         power_preference: wgpu::PowerPreference,
     ) -> Result<Self, GpuError> {
+        Self::request_within(instance, surface, power_preference, None).await
+    }
+
+    /// Like [`Gpu::request`], but asks for no more than `cap` of any limit: to see on a large
+    /// GPU what a small one is given.
+    pub async fn request_within(
+        instance: &wgpu::Instance,
+        surface: Option<&wgpu::Surface<'_>>,
+        power_preference: wgpu::PowerPreference,
+        cap: Option<&wgpu::Limits>,
+    ) -> Result<Self, GpuError> {
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference,
@@ -59,7 +112,10 @@ impl Gpu {
             .await
             .map_err(|error| GpuError::NoAdapter(error.to_string()))?;
 
-        let limits = adapter.limits();
+        let limits = match cap {
+            Some(cap) => adapter.limits().or_worse_values_from(cap),
+            None => adapter.limits(),
+        };
         if limits.max_storage_buffers_per_shader_stage < REQUIRED_STORAGE_BUFFERS {
             return Err(GpuError::Unsupported(format!(
                 "needs {REQUIRED_STORAGE_BUFFERS} storage buffers per stage, has {}",
@@ -93,6 +149,10 @@ impl Gpu {
             .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let adapter_info = adapter.get_info();
         log::info!("using {} ({:?})", adapter_info.name, adapter_info.backend);
+        let fallbacks = Fallbacks::for_limits(&limits);
+        if fallbacks.any() {
+            log::info!("with fallbacks for its limits: {fallbacks:?}");
+        }
         Ok(Self {
             adapter,
             device,
@@ -100,6 +160,7 @@ impl Gpu {
             adapter_info,
             limits,
             block_compressed_textures,
+            fallbacks,
         })
     }
 
@@ -216,6 +277,34 @@ impl Gpu {
             entries: &entries,
         })
     }
+
+    /// Creates a bind group like [`Gpu::bind_group`] for a layout made with
+    /// [`LayoutBuilder::skip`] at binding `skipped`: resources from there on take the binding
+    /// after their place in the list.
+    pub fn bind_group_skipping(
+        &self,
+        label: &str,
+        layout: &wgpu::BindGroupLayout,
+        resources: &[wgpu::BindingResource<'_>],
+        skipped: u32,
+    ) -> wgpu::BindGroup {
+        let entries: Vec<wgpu::BindGroupEntry<'_>> = resources
+            .iter()
+            .enumerate()
+            .map(|(place, resource)| {
+                let place = place as u32;
+                wgpu::BindGroupEntry {
+                    binding: if place < skipped { place } else { place + 1 },
+                    resource: resource.clone(),
+                }
+            })
+            .collect();
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &entries,
+        })
+    }
 }
 
 /// Builds a bind group layout, numbering entries from binding 0 in call order.
@@ -224,6 +313,8 @@ impl Gpu {
 pub struct LayoutBuilder {
     entries: Vec<wgpu::BindGroupLayoutEntry>,
     visibility: wgpu::ShaderStages,
+    /// The binding the next entry takes.
+    next: u32,
 }
 
 impl LayoutBuilder {
@@ -232,6 +323,7 @@ impl LayoutBuilder {
         Self {
             entries: Vec::new(),
             visibility: wgpu::ShaderStages::COMPUTE,
+            next: 0,
         }
     }
 
@@ -243,11 +335,19 @@ impl LayoutBuilder {
 
     fn push(mut self, ty: wgpu::BindingType) -> Self {
         self.entries.push(wgpu::BindGroupLayoutEntry {
-            binding: self.entries.len() as u32,
+            binding: self.next,
             visibility: self.visibility,
             ty,
             count: None,
         });
+        self.next += 1;
+        self
+    }
+
+    /// Leaves a binding out, for a variant of a shader that does without it: later entries
+    /// keep their numbers. Its bind groups are made with [`Gpu::bind_group_skipping`].
+    pub fn skip(mut self) -> Self {
+        self.next += 1;
         self
     }
 
@@ -437,4 +537,64 @@ impl Target {
 /// Number of workgroups needed to cover `count` items.
 pub fn groups_for(count: u32, group_size: u32) -> u32 {
     count.div_ceil(group_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What Chrome gives a desktop GPU, such as the RTX 5080 and the Radeon 780M.
+    fn desktop() -> wgpu::Limits {
+        wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 16,
+            max_storage_textures_per_shader_stage: 8,
+            max_sampled_textures_per_shader_stage: 48,
+            ..wgpu::Limits::defaults()
+        }
+    }
+
+    #[test]
+    fn a_desktop_gpu_needs_no_fallbacks() {
+        assert_eq!(Fallbacks::for_limits(&desktop()), Fallbacks::default());
+        assert!(!Fallbacks::for_limits(&desktop()).any());
+    }
+
+    /// What many phones, and Chrome's own software adapter, are given.
+    #[test]
+    fn the_webgpu_defaults_need_every_fallback() {
+        let fallbacks = Fallbacks::for_limits(&wgpu::Limits::defaults());
+        assert_eq!(
+            fallbacks,
+            Fallbacks {
+                separate_depth: true,
+                ocean_depth_from_pyramid: true,
+                pool_in_one_binding: true,
+            }
+        );
+        assert!(fallbacks.any());
+    }
+
+    /// Each fallback turns on exactly where its pass would ask for more than the device has.
+    #[test]
+    fn each_fallback_starts_one_below_what_its_pass_binds() {
+        let with = |change: fn(&mut wgpu::Limits)| {
+            let mut limits = desktop();
+            change(&mut limits);
+            Fallbacks::for_limits(&limits)
+        };
+        assert!(!with(|l| l.max_storage_textures_per_shader_stage = 5).separate_depth);
+        assert!(with(|l| l.max_storage_textures_per_shader_stage = 4).separate_depth);
+        assert!(!with(|l| l.max_sampled_textures_per_shader_stage = 17).ocean_depth_from_pyramid);
+        assert!(with(|l| l.max_sampled_textures_per_shader_stage = 16).ocean_depth_from_pyramid);
+        assert!(!with(|l| l.max_storage_buffers_per_shader_stage = 11).pool_in_one_binding);
+        assert!(with(|l| l.max_storage_buffers_per_shader_stage = 10).pool_in_one_binding);
+        // Each alone: the others stay off.
+        assert_eq!(
+            with(|l| l.max_storage_textures_per_shader_stage = 4),
+            Fallbacks {
+                separate_depth: true,
+                ..Default::default()
+            }
+        );
+    }
 }

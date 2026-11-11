@@ -18,7 +18,11 @@
 
 // The opaque scene, lit, with its depth and motion.
 @group(0) @binding(0) var lit: texture_2d<f32>;
+// On a GPU allowing 16 sampled textures per stage, the depth pyramid's mip 0, the same depth,
+// is read in its place.
+// opaque-depth:begin
 @group(0) @binding(1) var opaque_depth: texture_2d<f32>;
+// opaque-depth:end
 @group(0) @binding(2) var opaque_motion: texture_2d<f32>;
 // The water layer: its depth, and where its water lay on the calm sea.
 @group(0) @binding(3) var water_depth: texture_depth_2d;

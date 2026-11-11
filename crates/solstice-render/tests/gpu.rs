@@ -36,6 +36,22 @@ fn request_gpu() -> Option<Gpu> {
     }
 }
 
+/// A GPU asking for no more than `limits`, as a small one is given, or `None` if there is none.
+fn request_gpu_within(limits: &wgpu::Limits) -> Option<Gpu> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    pollster::block_on(Gpu::request_within(
+        &instance,
+        None,
+        wgpu::PowerPreference::HighPerformance,
+        Some(limits),
+    ))
+    .map_err(|error| eprintln!("skipping GPU test: {error}"))
+    .ok()
+}
+
 /// A unit icosphere: closed, so every pixel inside its silhouette must be covered.
 fn sphere(subdivisions: u32) -> Mesh {
     let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
@@ -5411,5 +5427,57 @@ fn a_mesh_carried_far_from_its_bind_pose_is_still_drawn() {
         let pixels = stage.pixels(&gpu);
         let holes = holes_within(&pixels, SIZE, distance, fov_y, 0.9);
         assert_eq!(holes, 0, "{holes} holes at distance {distance}");
+    }
+}
+
+/// Many phones, and Chrome's own software adapter, are given only the WebGPU defaults: four
+/// storage textures and 16 sampled textures per stage, where the resolve and the ocean bind
+/// more. With every fallback those limits choose, the sea, the ball and its floor draw without
+/// an error, and as they draw on the same GPU with all it offers.
+#[test]
+fn the_webgpu_default_limits_draw_what_a_desktop_gpu_does() {
+    let Some(full) = request_gpu() else { return };
+    let Some(small) = request_gpu_within(&wgpu::Limits::defaults()) else {
+        return;
+    };
+    assert!(
+        small.fallbacks.separate_depth
+            && small.fallbacks.ocean_depth_from_pyramid
+            && small.fallbacks.pool_in_one_binding,
+        "{:?}",
+        small.fallbacks
+    );
+    // Over the water and the ball's shore at once.
+    let camera = Camera {
+        position: Vec3::new(8.0, 7.0, 8.0),
+        yaw: 0.8,
+        pitch: -0.4,
+        ..Default::default()
+    };
+    for (debug, quality) in [
+        (DebugView::Lit, Quality::High),
+        (DebugView::Lit, Quality::Low),
+        (DebugView::Ocean, Quality::High),
+        (DebugView::Motion, Quality::High),
+    ] {
+        let size = 96;
+        let expected = render_sea(&full, &camera, "ocean", 5.0, debug, quality, size);
+        let got = render_sea(&small, &camera, "ocean", 5.0, debug, quality, size);
+        let differing = expected
+            .chunks_exact(4)
+            .zip(got.chunks_exact(4))
+            .filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| x.abs_diff(*y) > 1))
+            .count();
+        assert_eq!(
+            differing, 0,
+            "{debug:?} at {quality:?}: {differing} pixels differ"
+        );
+        // Not a blank image either way.
+        let distinct: std::collections::HashSet<&[u8]> = got.chunks_exact(4).collect();
+        assert!(
+            distinct.len() > 10,
+            "{debug:?}: only {} colours",
+            distinct.len()
+        );
     }
 }
