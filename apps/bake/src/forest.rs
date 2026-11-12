@@ -169,6 +169,7 @@ pub fn build(texture_size: u32) -> SceneAsset {
             uv_scale: 1.0 / BARK_TILE_METRES,
             normal_strength: 1.0,
             texture_layer: bark_layer,
+            flags: Material::SWAYS | Material::TREE,
             ..Default::default()
         });
         materials.push(Material {
@@ -176,7 +177,7 @@ pub fn build(texture_size: u32) -> SceneAsset {
             roughness: 1.0,
             normal_strength: 1.0,
             texture_layer: leaf_layer,
-            flags: Material::TWO_SIDED | Material::FOLIAGE,
+            flags: Material::TWO_SIDED | Material::FOLIAGE | Material::SWAYS | Material::TREE,
             ..Default::default()
         });
         grown.push(Grown {

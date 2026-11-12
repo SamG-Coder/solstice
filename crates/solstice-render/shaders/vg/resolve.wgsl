@@ -237,18 +237,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let s0 = vertex_sway(w, instance, local0, world0, eye);
             let s1 = vertex_sway(w, instance, local1, world1, eye);
             let s2 = vertex_sway(w, instance, local2, world2, eye);
-            let now0 = bend_offset(s0.now, s0.height);
-            let now1 = bend_offset(s1.now, s1.height);
-            let now2 = bend_offset(s2.now, s2.height);
-            sway_before0 = bend_offset(s0.before, s0.height);
-            sway_before1 = bend_offset(s1.before, s1.height);
-            sway_before2 = bend_offset(s2.before, s2.height);
-            world0 += now0;
-            world1 += now1;
-            world2 += now2;
-            world_normal0 = bend_direction(s0.now, world_normal0);
-            world_normal1 = bend_direction(s1.now, world_normal1);
-            world_normal2 = bend_direction(s2.now, world_normal2);
+            sway_before0 = s0.before;
+            sway_before1 = s1.before;
+            sway_before2 = s2.before;
+            world0 += s0.now;
+            world1 += s1.now;
+            world2 += s2.now;
+            world_normal0 = bend_direction(s0.bend, world_normal0);
+            world_normal1 = bend_direction(s1.bend, world_normal1);
+            world_normal2 = bend_direction(s2.bend, world_normal2);
         }
     }
     let clip = array<vec4f, 3>(

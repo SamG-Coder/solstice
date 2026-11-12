@@ -357,11 +357,31 @@ ready. Tests are mutation-checked as the particle steps were.
      - Rendered, a flagged post leans downwind with its foot in place, writes motion where the
        floor writes none, and the same post unflagged stands still even in a gale.
    - Seen in: the Forest (re-baked with the flag).
-2. **Trees.** Skeletons from the grower, the GPU spring simulation and its CPU reference, leaf
-   flutter, distance LOD, the near-cascade shadow policy.
-   - Tests: a gust bends a tree downwind and it rings down at its natural frequency; branches
-     move relative to the trunk; trees beyond range return to the static cache; skinned bounds
-     still hold every vertex.
+2. **Trees.** *Built; in review.* **A change from the plan: no skeletons.** Measured against
+   what the Forest needs, skeletons would have meant uploading every tree's bones each frame,
+   skinning each leaf vertex through up to four bones, and treating all its trees as moving,
+   so every shadow cascade redrew them each frame. Instead trees sway as grass does, where
+   their vertices are placed, from the same wind, read at the trunk so a whole tree moves
+   together (`common/sway_vertex.wgsl`, `tree_offset`):
+   - the trunk leans with the wind's drag, saturating in a gale, and sways at its own slow
+     rate, 0.3–0.55 Hz, with and across the wind; its offset grows with the square of the
+     height, and the top comes down as it leans, so it bends rather than shears;
+   - branches bob and swing by their reach from the trunk, faster, each around the crown in its
+     own phase, so a crown never moves as one block;
+   - leaves flutter, fastest, each its own way;
+   - a tree's sway fades out at 60–90 m on High; its branches' bob and its leaves' flutter,
+     being small, are worked out only nearer.
+   - `Material::TREE` (16) with `SWAYS`, and `INSTANCE_TREE` and `INSTANCE_FLUTTERS` for
+     leaves; the material mask is now 24 bits. The Forest's trees and bushes carry it.
+   - Culling grows a tree's spheres by 0.1 of their top's height plus 0.6 m, but sizes a
+     swaying cluster by its own sphere when choosing a rasterizer. Sized by the grown sphere,
+     the wood's tiny leaf clusters left the software rasterizer for the hardware one, which
+     cost 0.7 ms on the RTX 5080.
+   - Trees cast their shadows at rest, as grass does; dappled light under them stays still.
+   - Tests, through the bending shader: a tree's foot stays put and its top leans downwind,
+     further than halfway up; leaves stay on the wood they grow on; a branch's tip moves more
+     than its base; nothing goes beyond what culling allows; a far tree and a calm one stand
+     still.
 3. **Water.** Cat's paws and whitecaps on the sea, wind-driven pond ripples with fetch.
    - Seen in: the Cove; ponds in the Zorah and harbour scenes.
 4. **Rain**, in the air and on surfaces, built together as one step. *Built; in review.* You

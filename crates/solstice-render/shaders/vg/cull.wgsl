@@ -282,13 +282,18 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
     // 2 means the list is consumed by a compute pass, not a rasterizer: voxelization.
     var software = view.allow_software == 2u;
     if view.allow_software == 1u {
+        // How big it is on screen: swaying moves a cluster about, but hardly changes its size,
+        // so a swaying one is sized by its own sphere, at the nearest the wind can bring it.
+        // Sized by the sphere grown for the wind, a wood's tiny leaf clusters would leave the
+        // software rasterizer, where they are cheap, for the hardware one.
+        let size = select(radius, cluster.radius * instance.max_scale, instance_sways(instance) && !instance_skinned(instance));
         if view.is_ortho != 0u {
             // Orthographic: the same size everywhere.
-            software = 2.0 * radius * view.lod_scale < SOFTWARE_MAX_DIAMETER_TEXELS;
+            software = 2.0 * size * view.lod_scale < SOFTWARE_MAX_DIAMETER_TEXELS;
         } else {
             let distance = length(center - view.camera_position) - radius;
             if distance > view.near {
-                software = 2.0 * radius * view.lod_scale / distance < SOFTWARE_MAX_DIAMETER_PX;
+                software = 2.0 * size * view.lod_scale / distance < SOFTWARE_MAX_DIAMETER_PX;
             }
         }
     }

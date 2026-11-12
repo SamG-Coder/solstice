@@ -9,8 +9,21 @@ const SWAYING: bool = true;
 // rounded up.
 const GRASS_REACH: f32 = 0.65;
 
+// Trees sway by their height and reach from the trunk, never further than this share of the
+// height plus this much, in metres: what culling allows them.
+const TREE_REACH: f32 = 0.1;
+const TREE_REACH_BASE: f32 = 0.6;
+
 fn instance_sways(i: Instance) -> bool {
     return SWAYING && (i.material & INSTANCE_SWAYS) != 0u;
+}
+
+fn instance_tree(i: Instance) -> bool {
+    return (i.material & INSTANCE_TREE) != 0u;
+}
+
+fn instance_flutters(i: Instance) -> bool {
+    return (i.material & INSTANCE_FLUTTERS) != 0u;
 }
 
 // How much a bounding sphere of a swaying instance must grow, in the mesh's units, to hold
@@ -20,5 +33,9 @@ fn sway_reach(i: Instance, center_y: f32, radius: f32, view_sways: bool) -> f32 
     if !view_sways || !instance_sways(i) {
         return 0.0;
     }
-    return GRASS_REACH * max(center_y + radius, 0.0);
+    let top = max(center_y + radius, 0.0);
+    if instance_tree(i) {
+        return TREE_REACH * top + TREE_REACH_BASE;
+    }
+    return GRASS_REACH * top;
 }

@@ -605,3 +605,90 @@ fn last_frames_bend_comes_from_last_frames_wind() {
     let paused = tip(&gpu, &wind, instance_words(1.0, true), at, eye, true);
     assert_eq!(paused.now[..3], paused.before[..3]);
 }
+
+/// A tree standing at the origin, as the GPU holds it, its leaves if `leaves`.
+fn tree_words(leaves: bool) -> [u32; 52] {
+    let mut words = instance_words(1.0, true);
+    words[45] |= crate::scene::INSTANCE_TREE
+        | if leaves {
+            crate::scene::INSTANCE_FLUTTERS
+        } else {
+            0
+        };
+    words
+}
+
+#[test]
+fn a_tree_leans_from_its_foot_and_its_leaves_stay_on_it() {
+    let Some(gpu) = request_gpu() else { return };
+    let wind = blown(&weather(30.0, 270.0, 0.0, 0.0), 60, 1.0 / 60.0);
+    let (field, _) = fill(&gpu, &wind, Vec2::ZERO, true, [40.0, 60.0]);
+    let eye = Vec3::new(0.0, 2.0, -20.0);
+    // Up the trunk, and out along a branch.
+    let points: Vec<Vec3> = (0..=16)
+        .map(|i| Vec3::new(0.0, i as f32, 0.0))
+        .chain((1..=6).map(|i| Vec3::new(i as f32 * 0.7, 9.0, 0.3)))
+        .collect();
+    let wood = probe(&gpu, &field, tree_words(false), &points, eye);
+    let leaves = probe(&gpu, &field, tree_words(true), &points, eye);
+    // The foot stays where it stands; the top leans downwind, +X, further than halfway up.
+    assert!(offset(&wood[0]).length() < 1.0e-4);
+    let (half, top) = (offset(&wood[8]), offset(&wood[16]));
+    assert!(
+        top.x > 0.1 && top.x > half.x * 2.0,
+        "half {half}, top {top}"
+    );
+    for (p, (w, l)) in points.iter().zip(wood.iter().zip(&leaves)) {
+        // Never beyond what culling allows.
+        let most = TREE_REACH * p.y + TREE_REACH_BASE + 1.0e-4;
+        assert!(offset(w).length() <= most && offset(l).length() <= most);
+        // Leaves move with the wood they grow on, and flutter only a little about it.
+        assert!(
+            (offset(l) - offset(w)).length() < 0.06,
+            "{}",
+            (offset(l) - offset(w)).length()
+        );
+        // The rasterizers place them where resolve does.
+        for i in 0..3 {
+            assert!((w.now[i] - w.placed[i]).abs() < 1.0e-5);
+        }
+    }
+    // The branch's tip moves more than its base, as it bobs on its own.
+    let base = offset(&wood[17]) - offset(&wood[9]);
+    let tip = offset(&wood[22]) - offset(&wood[9]);
+    assert!(tip.length() > base.length(), "base {base}, tip {tip}");
+}
+
+#[test]
+fn a_far_tree_stands_still_and_a_calm_one_too() {
+    let Some(gpu) = request_gpu() else { return };
+    let gale = blown(&weather(30.0, 270.0, 0.5, 0.5), 10, 0.1);
+    let still = blown(&weather(0.0, 270.0, 0.5, 0.5), 10, 0.1);
+    let at = [Vec3::new(1.0, 12.0, 0.5)];
+    let (field, _) = fill(&gpu, &gale, Vec2::ZERO, true, [40.0, 60.0]);
+    let far = probe(
+        &gpu,
+        &field,
+        tree_words(true),
+        &at,
+        Vec3::new(0.0, 2.0, -200.0),
+    );
+    assert_eq!(offset(&far[0]), Vec3::ZERO);
+    let near = probe(
+        &gpu,
+        &field,
+        tree_words(true),
+        &at,
+        Vec3::new(0.0, 2.0, -20.0),
+    );
+    assert!(offset(&near[0]).length() > 0.05);
+    let (calm, _) = fill(&gpu, &still, Vec2::ZERO, true, [40.0, 60.0]);
+    let none = probe(
+        &gpu,
+        &calm,
+        tree_words(true),
+        &at,
+        Vec3::new(0.0, 2.0, -20.0),
+    );
+    assert_eq!(offset(&none[0]), Vec3::ZERO);
+}

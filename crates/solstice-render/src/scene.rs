@@ -58,6 +58,10 @@ pub(crate) const INSTANCE_STAYS_IN_GI: u32 = 1 << 28;
 pub(crate) const INSTANCE_MASKED: u32 = 1 << 27;
 /// Sways in the wind (`common/sway.wgsl`), from its material's [`Material::SWAYS`].
 pub(crate) const INSTANCE_SWAYS: u32 = 1 << 26;
+/// Sways as a tree, from its material's [`Material::TREE`].
+pub(crate) const INSTANCE_TREE: u32 = 1 << 25;
+/// A tree's leaves, which flutter: [`Material::TREE`] and [`Material::FOLIAGE`].
+pub(crate) const INSTANCE_FLUTTERS: u32 = 1 << 24;
 
 impl GpuInstance {
     /// Places the instance at `world`. Where it was drawn last stays as `prev_world`.
@@ -466,7 +470,7 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
         index.push(Some(out.len() as u32));
         // The bits above hold the INSTANCE_ flags.
         let source = scene.materials.get(instance.material as usize);
-        debug_assert!(instance.material < INSTANCE_SWAYS, "too many materials");
+        debug_assert!(instance.material < INSTANCE_FLUTTERS, "too many materials");
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());
@@ -494,6 +498,20 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
                     INSTANCE_SWAYS
                 } else {
                     0
+                }
+                | match source {
+                    Some(m)
+                        if m.flags & (Material::SWAYS | Material::TREE)
+                            == Material::SWAYS | Material::TREE =>
+                    {
+                        INSTANCE_TREE
+                            | if m.flags & Material::FOLIAGE != 0 {
+                                INSTANCE_FLUTTERS
+                            } else {
+                                0
+                            }
+                    }
+                    _ => 0,
                 },
             max_scale: max_scale(linear),
             texture_info: texture_info(scene.materials.get(instance.material as usize)),
