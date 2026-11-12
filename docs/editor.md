@@ -339,7 +339,9 @@ The scene's settings are `texture_size`, `camera`, `terrain`, `land`, `meadow`, 
 and `game` (`input`, `track`, `circuit`). The components that say what an entity is, at most
 one each, are `mesh` (a whole model or one `part`, with `collide` and `skinned`), `actor`,
 `light`, `blocker`, `wood`, `clear`, `path`, `yard` and `pond`; an entity with none is a folder.
-`transform` holds `position`, `rotation` (degrees about X, Y and Z, applied yaw, pitch, roll),
+A child's transform is in the world, not relative to its parent: folders only group, as
+Unreal's do. `transform` holds `position`, `rotation` (degrees about X, Y and Z, as yaw about Y,
+then pitch about the turned X, then roll about the turned Z),
 a uniform `scale`, and `ground`: the share of its height sunk into the terrain, for a model
 that stands on it. Anything left at its default is left out of the file. Unknown fields, a
 later format, a repeated id, or an entity that is two kinds of thing are refused with a reason.
@@ -359,7 +361,10 @@ it places; the comments above it become its note; a run of banner comments
 from where each line was, so converting twice gives the same ids. Two tests hold the converter
 to the text: every scene in `scenes/` converts, is written and read back, and lowers to exactly
 the commands its text has; and, given the scans, baking the converted project gives a
-byte-identical scene file to baking the text, apart from the new map of entities. The scenes
+byte-identical scene file to baking the text, apart from the new map of entities (shown for
+Cove; Harbour's and the walker's files weren't on the PC it was run on). A project lowers its
+settings before its entities, so a text that names its `input` or `track` after an actor would
+list its gameplay files in another order; none of the site's scenes does. The scenes
 move over one at a time, each with your go-ahead, and `publish-scenes.py` then publishes from
 the project.
 
@@ -408,7 +413,8 @@ and its baked file; the baked file's pieces fill the cache, so nothing is baked 
 **The baked scene records which entity made which instances.** A new optional section in the
 scene file, `SRCE`, lists each entity's id and the range of instances it became; all that the
 terrain grows (the ground, its meadow and woods, the water) is listed as `terrain`, and a
-circuit's land as `circuit`. It is a few bytes an entity, written by every project bake, and
+circuit's land as `circuit` (so no entity may have either id). It is a few bytes an entity,
+written by every project bake that places anything, and
 skipped by every reader that doesn't know it. The editor needs it to turn a click on an
 instance into an entity.
 

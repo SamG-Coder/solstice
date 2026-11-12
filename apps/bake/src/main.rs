@@ -331,6 +331,9 @@ fn check_character(path: &std::path::Path, roles: Option<&PathBuf>) -> Result<()
 
 fn main() -> Result<(), String> {
     let mut options = parse_args()?;
+    if options.scene_file.is_some() && options.project_scene.is_some() {
+        return Err("give --scene or --project, not both".into());
+    }
     if let Some(path) = &options.convert {
         let written = project::convert_file(path)?;
         println!("wrote {}", written.display());

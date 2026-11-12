@@ -43,7 +43,8 @@ rayon = "1"
 rustc-hash = "2"
 # The editor's project files (docs/editor.md). Both were already built, through Starlark.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` reads every number back exactly as it was written.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 wgpu = "30"
 
 # Geometry processing is unusably slow unoptimised, even while debugging the renderer.

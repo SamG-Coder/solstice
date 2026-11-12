@@ -270,12 +270,16 @@ pub fn convert(text: &str, name: &str) -> Result<Scene, String> {
         if let Some(comment) = trimmed.strip_prefix('#') {
             let comment = comment.trim();
             if let Some(rest) = comment.strip_prefix("----") {
-                banner.push(rest.trim().to_owned());
+                let rest = rest.trim();
+                // A rule, `# ---------`, divides but names nothing.
+                if !rest.trim_start_matches('-').is_empty() {
+                    banner.push(rest.to_owned());
+                }
             } else if !banner.is_empty() || !comment.is_empty() {
                 // A plain comment after a banner ends it.
                 if !banner.is_empty() {
                     close(&mut folder, &mut entities);
-                    folder = Some(start_folder(&mut banner, folder_id(number)));
+                    folder = Some(open_folder(&mut banner, &mut note, folder_id(number)));
                 }
                 note.push(comment.to_owned());
             }
@@ -283,7 +287,7 @@ pub fn convert(text: &str, name: &str) -> Result<Scene, String> {
         }
         if !banner.is_empty() {
             close(&mut folder, &mut entities);
-            folder = Some(start_folder(&mut banner, folder_id(number)));
+            folder = Some(open_folder(&mut banner, &mut note, folder_id(number)));
         }
         let trailing = line
             .split_once('#')
@@ -318,10 +322,31 @@ pub fn convert(text: &str, name: &str) -> Result<Scene, String> {
             None => {}
         }
     }
+    // Comments after the last command, or a banner with nothing under it, describe the scene.
+    let rest: Vec<String> = note.into_iter().chain(banner).collect();
+    if !rest.is_empty() {
+        if !scene.note.is_empty() {
+            scene.note.push('\n');
+        }
+        scene.note.push_str(&rest.join("\n"));
+    }
     close(&mut folder, &mut entities);
     scene.entities = entities;
     scene.check().map_err(|e| format!("{name}: {e}"))?;
     Ok(scene)
+}
+
+/// A folder for a banner, with the comments just above the banner kept in its note.
+fn open_folder(banner: &mut Vec<String>, note: &mut Vec<String>, id: String) -> Entity {
+    let mut folder = start_folder(banner, id);
+    if !note.is_empty() {
+        let mut lines = std::mem::take(note);
+        if !folder.note.is_empty() {
+            lines.push(std::mem::take(&mut folder.note));
+        }
+        folder.note = lines.join("\n");
+    }
+    folder
 }
 
 /// A folder for a banner, named by its first sentence, with the whole banner as its note.
@@ -703,6 +728,28 @@ pond -10 -10 -4 -2 0.5 coastal
     }
 
     #[test]
+    fn no_comment_is_lost_or_misplaced() {
+        let text = "# about the tower
+model a.gltf 0 0 0 0 1
+# -------------------
+
+# above the walls
+# ---- Walls
+model b.gltf 1 0 0 0 1
+# still to do: the keep
+";
+        let scene = convert(text, "t.txt").unwrap();
+        assert_eq!(scene.entities[0].note, "about the tower");
+        let walls = &scene.entities[1];
+        assert_eq!(walls.name, "Walls");
+        assert_eq!(walls.note, "above the walls");
+        assert_eq!(walls.children[0].note, "");
+        assert_eq!(scene.note, "still to do: the keep");
+        // The rule made no folder.
+        assert_eq!(scene.entities.len(), 2);
+    }
+
+    #[test]
     fn converting_twice_gives_the_same_ids() {
         assert_eq!(
             convert(TEXT, "t.txt").unwrap(),
@@ -755,10 +802,10 @@ pond -10 -10 -4 -2 0.5 coastal
             let path = folder.join(name);
             {
                 let text = std::fs::read_to_string(&path).unwrap();
-                let scene = convert(&text, &name).unwrap();
+                let scene = convert(&text, name).unwrap();
                 let read = Scene::parse(&scene.to_json()).unwrap();
                 assert_eq!(
-                    commands(lower(&read, &name).unwrap()),
+                    commands(lower(&read, name).unwrap()),
                     text_commands(&text),
                     "{name}"
                 );

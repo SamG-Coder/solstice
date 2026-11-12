@@ -1632,6 +1632,38 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_map_of_entities_is_refused() {
+        let good = encode_sources(&[Source {
+            id: "a91fXq2b".into(),
+            instances: 0..2,
+        }]);
+        assert!(decode_sources(&good, 2).is_ok());
+        // Cut short anywhere.
+        for len in 0..good.len() {
+            assert_eq!(
+                decode_sources(&good[..len], 2),
+                Err(DecodeError::BadSources),
+                "{len}"
+            );
+        }
+        // A count, or an id's length, far beyond what is there.
+        let mut huge = good.clone();
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_sources(&huge, 2), Err(DecodeError::BadSources));
+        let mut long = good.clone();
+        long[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_sources(&long, 2), Err(DecodeError::BadSources));
+        // An id that isn't text, and a range that runs backwards.
+        let mut bad_text = good.clone();
+        bad_text[16] = 0xff;
+        assert_eq!(decode_sources(&bad_text, 2), Err(DecodeError::BadSources));
+        let mut backwards = good;
+        backwards[4..8].copy_from_slice(&2u32.to_le_bytes());
+        backwards[8..12].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(decode_sources(&backwards, 2), Err(DecodeError::BadSources));
+    }
+
+    #[test]
     fn a_sea_travels_with_its_scene() {
         let mut loaded = sample_scene();
         let sea = Sea {

@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 
 /// The format version written. A file with a later one is refused rather than half read.
 pub const FORMAT: u32 = 1;
+/// Ids an entity can't have: a baked scene's map of which entity made which instances lists
+/// what the terrain and a circuit make under these.
+pub const RESERVED_IDS: [&str; 2] = ["terrain", "circuit"];
 /// The name of a project's own file, at the top of its folder.
 pub const PROJECT_FILE: &str = "solstice.project";
 
@@ -479,6 +482,12 @@ impl Scene {
         for entity in self.walk() {
             if entity.id.is_empty() {
                 return Err(Error(format!("`{}` has no id", entity.name)));
+            }
+            if RESERVED_IDS.contains(&entity.id.as_str()) {
+                return Err(Error(format!(
+                    "id `{}` is kept for what the scene's land makes",
+                    entity.id
+                )));
             }
             if !seen.insert(entity.id.as_str()) {
                 return Err(Error(format!("id `{}` is used twice", entity.id)));
