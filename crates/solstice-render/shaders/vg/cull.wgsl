@@ -344,7 +344,8 @@ fn posed_sphere(instance: Instance, cluster_index: u32, c: Cluster) -> vec4f {
         count += 1u;
     }
     let center = sum / f32(count);
-    var reach = 0.0;
+    // Bent as it is posed, if it sways too.
+    var reach = sway_reach(instance, c.center.y, c.radius, view.is_ortho == 0u);
     for (var i = 0u; i < count; i++) {
         reach = max(reach, distance(moved[i], center));
     }

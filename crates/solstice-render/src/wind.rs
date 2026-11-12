@@ -30,9 +30,9 @@ pub const FIELD_TEXEL_METRES: f32 = 2.0;
 /// without a sampler.
 pub const FIELD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
-/// The farthest the wind leans a point of grass sideways, as a share of its height. Twin of
+/// The farthest the wind carries a point of grass, as a share of its height. Twin of
 /// `GRASS_REACH` in `common/sway.wgsl`, which culling grows bounds by.
-pub const GRASS_REACH: f32 = 0.6;
+pub const GRASS_REACH: f32 = 0.65;
 
 /// The wind 10 m up as a share of the weather's wind at cloud height.
 pub const GROUND_SHARE: f32 = 0.5;
@@ -196,12 +196,18 @@ impl FieldParams {
     }
 }
 
-/// The texture the field pass fills: the field, then a row of what readers need besides.
-pub fn field_texture(gpu: &Gpu) -> Target {
+/// The texture the field pass fills: the field, then a row of what readers need besides. A scene
+/// with nothing that sways gets a texel, never written, only to bind.
+pub fn field_texture(gpu: &Gpu, sways: bool) -> Target {
+    let size = if sways {
+        (FIELD_TEXELS, FIELD_TEXELS + 1)
+    } else {
+        (1, 1)
+    };
     Target::new(
         gpu,
         "wind field",
-        (FIELD_TEXELS, FIELD_TEXELS + 1),
+        size,
         FIELD_FORMAT,
         wgpu::TextureUsages::COPY_SRC,
     )

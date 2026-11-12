@@ -5753,3 +5753,44 @@ fn swaying_grass_says_how_it_moved_and_the_ground_does_not() {
     }
     assert!(most <= 2, "motion {most} with nothing moving");
 }
+
+#[test]
+fn grass_leaning_in_a_steady_wind_reads_only_how_it_moves_now() {
+    let Some(gpu) = request_gpu() else { return };
+    // A steady wind leans the post well over, but from one frame to the next only its shimmer
+    // moves it. Motion that took the lean itself for movement would read many times more.
+    let wind = westerly(14.0, 0.0);
+    let motion = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Motion,
+        12,
+        1.0 / 60.0,
+    );
+    let albedo = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Albedo,
+        12,
+        1.0 / 60.0,
+    );
+    let still = ((127 * 128 + 64) * 4) as usize;
+    let mut most = 0;
+    let mut posts = 0;
+    for y in 44..64u32 {
+        for x in 0..128u32 {
+            let i = ((y * 128 + x) * 4) as usize;
+            if albedo[i] > 240 {
+                posts += 1;
+                most = most.max(
+                    u32::from(motion[i].abs_diff(motion[still]))
+                        + u32::from(motion[i + 1].abs_diff(motion[still + 1])),
+                );
+            }
+        }
+    }
+    assert!(posts > 10, "only {posts} post pixels");
+    assert!(most < 40, "the leaning post's motion reads {most}");
+}

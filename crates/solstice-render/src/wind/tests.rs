@@ -176,6 +176,32 @@ fn the_field_is_centred_on_the_camera_in_whole_texels() {
 }
 
 #[test]
+fn weather_written_before_gusts_reads_as_it_did() {
+    let old = Weather::parse(
+        "coverage 0.5
+wind speed=9 from=200
+rain 0.2
+",
+    )
+    .unwrap();
+    assert_eq!((old.wind_speed, old.wind_from, old.rain), (9.0, 200.0, 0.2));
+    // The defaults: some gusts, as most days have.
+    assert_eq!((old.gusts, old.turbulence), (0.4, 0.4));
+    let new = Weather::parse(
+        "wind speed=9 gusts=0.9 turbulence=2
+",
+    )
+    .unwrap();
+    assert_eq!((new.gusts, new.turbulence), (0.9, 1.0));
+    assert_eq!(Weather::parse(&new.to_text()).unwrap(), new);
+    assert!(Weather::parse(
+        "wind gust=1
+"
+    )
+    .is_err());
+}
+
+#[test]
 fn records_lay_out_as_their_shader_twins() {
     crate::shaders::assert_twin!(
         "wind/field.wgsl",
@@ -267,7 +293,7 @@ fn read_field(gpu: &Gpu, field: &Target) -> Vec<[f32; 4]> {
 
 /// Fills a field for `wind` around `camera`.
 fn fill(gpu: &Gpu, wind: &Wind, camera: Vec2, sway: bool, fade: [f32; 2]) -> (Target, FieldParams) {
-    let field = field_texture(gpu);
+    let field = field_texture(gpu, true);
     let pass = WindField::new(gpu, &field);
     let params = FieldParams::around(camera, wind, sway, fade);
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
@@ -443,8 +469,8 @@ fn a_blade_bends_downwind_and_keeps_its_length() {
         assert!(lean.normalize().dot(wind_here.normalize()) > 0.9);
         // Never past the reach culling allows for.
         for (p, r) in points.iter().zip(&results) {
-            let sideways = Vec2::new(r.now[0], r.now[2]).length();
-            assert!(sideways <= GRASS_REACH * p.y + 1.0e-5);
+            let carried = Vec3::new(r.now[0], r.now[1], r.now[2]).length();
+            assert!(carried <= GRASS_REACH * p.y + 1.0e-5);
             // The rasterizers place it where resolve does.
             for i in 0..3 {
                 assert!((r.now[i] - r.placed[i]).abs() < 1.0e-6);

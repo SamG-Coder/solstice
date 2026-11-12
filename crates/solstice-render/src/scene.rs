@@ -307,7 +307,10 @@ impl GpuScene {
             has_masked: instances.iter().any(|i| i.has_flag(INSTANCE_MASKED)),
             has_skins: instances.iter().any(GpuInstance::is_skinned),
             has_sways: instances.iter().any(|i| i.has_flag(INSTANCE_SWAYS)),
-            wind_field: crate::wind::field_texture(gpu),
+            wind_field: crate::wind::field_texture(
+                gpu,
+                instances.iter().any(|i| i.has_flag(INSTANCE_SWAYS)),
+            ),
             instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
             skins,
             light_count: scene.lights.len() as u32,
