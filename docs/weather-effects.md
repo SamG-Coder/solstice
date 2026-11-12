@@ -3,8 +3,9 @@
 Grass that waves as a gust rolls across the meadow, trees whose trunks lean while their branches
 bob and their leaves flutter, a sea and ponds roughened by the same gust as it passes, rain that
 leans with that wind, darkens the stone and fills the hollows, and lightning that throws the
-scene's shadows for a moment before the thunder arrives. This is the plan, written before any of
-it is built, for you to change before it is.
+scene's shadows for a moment before the thunder arrives. This is the plan as it was written before
+any of it was built. It has been built since (#67 to #71); where the code went another way, the
+code and its module comments are the reference, and the notes below say so.
 
 ## Goals
 
@@ -34,7 +35,7 @@ it is built, for you to change before it is.
   sea's spectrum follows the weather's wind slowly (`ocean/sea.rs`). Ponds ripple in five fixed
   directions regardless of the wind (`ocean/pond.wgsl`). Nothing else moves.
 - **Foliage is real geometry in the virtual-geometry pipeline**: grass patches of folded blades
-  (`procgen/foliage/grass.rs`, 2 m patches in the Forest) and trees grown as tubes of stems with
+  (`solstice-procgen/src/foliage/grass.rs`, 2 m patches in the Forest) and trees grown as tubes of stems with
   leaf cards (`foliage/tree.rs`), with the `FOLIAGE` material flag (two-sided, transmission).
   Vertices are 16 bytes: position, normal, UV. There is no per-vertex room for wind data.
 - **Skinning** (PR #50/#54) already deforms virtual geometry "where it is used": cull bounds
@@ -80,7 +81,7 @@ it is built, for you to change before it is.
 
 ### 1. The wind field
 
-One small module, `weather/wind.rs`, with its WGSL twin `common/wind.wgsl`. Everything that
+One small module, `wind.rs` in the renderer, with its WGSL twin `common/wind.wgsl`. Everything that
 moves with the wind includes the WGSL and reads the same few values.
 
 - **Mean wind.** From the weather: the cloud-height wind brought to 10 m (as now, about half),
@@ -206,7 +207,8 @@ This is `docs/particles.md` steps 4b and 5, built on the particle system that ex
   camera, drawn through the shared culling and rasterizing, at rest, cached and redrawn only
   when the camera moves far or the scene changes (like a shadow cascade). Rain stops at the
   first surface above it; the same map shelters surfaces from wetting and finds eaves for drips.
-- **Drops**: the renderer's own `rain.particles` effect, camera-following, its rate and drop
+- **Drops** (built as a pass of its own, `rain/draw.wgsl`, rather than as a particle effect):
+  camera-following, its rate and drop
   sizes from the rain rate by Marshall and Palmer, falling at Gunn and Kinzer's speeds, carried
   sideways by the wind field: rain leans with the gusts, and slants harder as one passes.
 - **Streaks**: each drop drawn as its path over one exposure, thin, lit by the sun's shadow and

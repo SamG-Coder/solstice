@@ -470,23 +470,7 @@ mod tests {
     use std::f32::consts::TAU;
     use std::sync::{Arc, Mutex};
 
-    fn request_gpu() -> Option<Gpu> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        match pollster::block_on(Gpu::request(
-            &instance,
-            None,
-            wgpu::PowerPreference::HighPerformance,
-        )) {
-            Ok(gpu) => Some(gpu),
-            Err(error) => {
-                eprintln!("skipping GPU test: {error}");
-                None
-            }
-        }
-    }
+    use crate::gpu::test_gpu as request_gpu;
 
     fn sea() -> SeaState {
         SeaState {

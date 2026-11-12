@@ -23,15 +23,6 @@ const RING_HEIGHT: f32 = 0.0012;
 // Rings a cell starts a second, at most.
 const RINGS_PER_SECOND: f32 = 1.6;
 
-fn hash4(a: u32, b: u32, c: u32) -> vec4f {
-    let h = pcg(a + pcg(b + pcg(c)));
-    return vec4f(
-        hash_to_unit(h),
-        hash_to_unit(h ^ 0x9e3779b9u),
-        hash_to_unit(h ^ 0x85ebca6bu),
-        hash_to_unit(h ^ 0xc2b2ae35u),
-    );
-}
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
