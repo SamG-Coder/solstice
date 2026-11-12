@@ -206,6 +206,12 @@ fn falling(corner: u32, ring: u32, index: u32) -> Varyings {
     }
     let distance = length(head - camera);
     fade *= smoothstep(NEAREST, NEAREST * 2.5, distance) * through_air(distance);
+    // A far drop seen against the sky shows about the sky's own light, and vanishes into it:
+    // drawn there, the outer rings would speckle the clouds like snow.
+    if ring > 0u {
+        let elevation = (head.y - camera.y) / distance;
+        fade *= 1.0 - smoothstep(0.05, 0.3, elevation);
+    }
     let velocity = vec3f(wind.x, -speed, wind.y);
     let tail = head - velocity * rain.drops.z * RING_STRETCH[ring];
     let diameter = rain.drops.x * (0.7 + 0.6 * seed.x);
