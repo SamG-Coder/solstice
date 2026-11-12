@@ -289,6 +289,39 @@ frame's, reprojected; texels behind geometry are skipped. At 1080p in the forest
 
 ![The six built-in kinds of weather over the temple: clear, fair, broken, overcast, storm and cirrus](docs/weather.jpg)
 
+### Wind, rain and thunder
+
+One wind blows through everything: the weather's mean wind near the ground, turning and
+swelling slowly, with gusts and lulls tens of metres across carried downwind at its speed, and
+its direction wandering from place to place. A gust is seen crossing the meadow, then the pond,
+then bending the rain.
+
+- **Grass** bends along an arc as a blade does, by the drag of the wind, and shimmers; gusts roll
+  over a meadow as waves. **Trees** lean and sway from their trunks, their branches bob in their
+  own time around the crown, and their leaves flutter. Both are bent where their vertices are
+  placed, in culling, both rasterizers and resolve, with true motion vectors.
+- **Water**: gusts roughen the sea's short waves as they cross it, as cat's paws; ponds ripple
+  with the wind over them.
+- **Rain** falls at its measured speeds, as many drops and as big as the rain rate says, leaning
+  with the wind, lit by the sky, the shadowed sun and lamps. It costs only its drawing: no drop
+  is simulated. It splashes, rings the water, drips from eaves, and thickens the haze. A map of
+  the scene from above keeps it from under roofs.
+- **Wet surfaces**: what the sky reaches soaks and later dries; sand darkens with a sheen,
+  stone takes a film, puddles fill the hollows and ring with drops.
+- **Lightning**: flashes in the cloud and bolts to the ground, a few strokes each, light the
+  clouds, the sky and the scene with sharp shadows, while exposure holds as an eye does.
+  **Thunder** follows at the speed of sound, made in the browser from noise: tick *Sound* under
+  Extras. **L** calls lightning down ahead.
+
+Nothing of it runs in a scene or a sky without it. A storm in the forest costs about 0.5 ms on an
+RTX 5080 at 1280×720. See [`docs/weather-effects.md`](docs/weather-effects.md).
+
+| Rain on the temple | Lightning over the cove at night |
+|---|---|
+| ![The temple soaked in a downpour, its sand dark and puddled](docs/rain-temple.jpg) | ![A bolt behind the fort, its flash on the wet sand](docs/lightning-cove.jpg) |
+| **A gale in the forest** | **A storm over the cove** |
+| ![Rain slanting through the wood in a gale, the grass laid over](docs/storm-forest.jpg) | ![Rain over the cove's sea and wet beach](docs/storm-cove.jpg) |
+
 ### Time of day, the moon and the stars
 
 The sun follows the standard formulas for its declination through the year and its hour angle
