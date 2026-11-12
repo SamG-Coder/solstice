@@ -6,6 +6,10 @@ use crate::shaders;
 use crate::vg::GBuffer;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Each pixel's distance from the eye, kept beside the diffuse history to tell whether last
+/// frame's pixel showed the same surface. Thirty-two bits: no smaller one-channel float format
+/// can be written as storage.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 /// Must match the constant of the same name in `gi/probe_common.wgsl`.
 const PROBE_SPACING: u32 = 16;
 /// The rays a probe may trace on a side, `RendererSettings::probe_rays`. Each has its own
@@ -85,6 +89,8 @@ impl ScreenGi {
             .texture()
             .storage_read()
             .storage_texture(FORMAT)
+            .texture_unfilterable()
+            .storage_texture(DEPTH_FORMAT)
             .build(gpu, "probe integrate");
         let reflect_layout = LayoutBuilder::new()
             .texture()
@@ -182,6 +188,10 @@ impl ScreenGi {
             Target::new(gpu, "gi diffuse 0", size, FORMAT, none),
             Target::new(gpu, "gi diffuse 1", size, FORMAT, none),
         ];
+        let diffuse_depth = [
+            Target::new(gpu, "gi diffuse depth 0", size, DEPTH_FORMAT, none),
+            Target::new(gpu, "gi diffuse depth 1", size, DEPTH_FORMAT, none),
+        ];
         let reflections = [
             Target::new(gpu, "gi reflections 0", half_size, FORMAT, none),
             Target::new(gpu, "gi reflections 1", half_size, FORMAT, none),
@@ -228,6 +238,8 @@ impl ScreenGi {
                     tex(&diffuse[1 - parity].view),
                     probes.as_entire_binding(),
                     tex(&diffuse[parity].view),
+                    tex(&diffuse_depth[1 - parity].view),
+                    tex(&diffuse_depth[parity].view),
                 ],
             )
         };

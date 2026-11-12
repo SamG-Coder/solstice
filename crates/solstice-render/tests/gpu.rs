@@ -6092,3 +6092,66 @@ fn a_flash_of_lightning_lights_the_night() {
         "the sky goes from {sky_dark} to {sky_lit}"
     );
 }
+
+/// Where a ball has just rolled past, the floor it uncovers takes the light the floor has, not
+/// the light the ball had there. The diffuse GI is remembered from frame to frame, and once kept
+/// the ball's light behind it for many frames: by day the sun outshines it, but at dusk and by
+/// night that light is most of what is seen, and everything that moved left a trail.
+#[test]
+fn indirect_light_leaves_no_trail_behind_what_moves() {
+    let Some(gpu) = request_gpu() else { return };
+    let size = 128;
+    let camera = over_the_floor();
+    // Dusk: the sun low and a fiftieth as bright, the sky lighting most of the floor.
+    let dusk = Environment {
+        sun_illuminance: low_sun().sun_illuminance / 50.0,
+        daylight_illuminance: low_sun().sun_illuminance,
+        ..low_sun()
+    };
+    // The diffuse GI alone, without the temporal filter that would smooth it.
+    let settings = RendererSettings {
+        debug_view: DebugView::DiffuseGi,
+        ..untemporal()
+    };
+    let (start, end) = (2.0, -2.0);
+    let mut moving = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    moving.renderer.move_instance(0, place(start));
+    moving.frames(&gpu, &camera, &dusk, 30);
+    let steps = 20;
+    for step in 1..=steps {
+        let x = start + (end - start) * step as f32 / steps as f32;
+        moving.renderer.move_instance(0, place(x));
+        moving.frames(&gpu, &camera, &dusk, 1);
+    }
+    let moved = moving.pixels(&gpu);
+    let mut still = Stage::new(&gpu, &red_ball_on_floor(), settings, size);
+    still.renderer.move_instance(0, place(end));
+    still.frames(&gpu, &camera, &dusk, 60);
+    let settled = still.pixels(&gpu);
+
+    // The floor the ball crossed and hid from view, from just behind where it stands to where it
+    // set off. It kept a trail of 4.8 on a floor of 110 here, against 1.4 since.
+    let mut trail = 0.0;
+    let mut floor = 0.0;
+    let mut count = 0.0;
+    for step in 0..=8 {
+        let x = end + 1.6 + (start - end - 1.6) * step as f32 / 8.0;
+        for z in [-2.5, -2.0, -1.5, -1.0, -0.5, 0.0] {
+            let (px, py) = pixel_of(&camera, size, Vec3::new(x, 0.0, z));
+            let a = brightness(patch(&moved, size, px, py, 0));
+            let b = brightness(patch(&settled, size, px, py, 0));
+            trail += (a - b).abs();
+            floor += b;
+            count += 1.0;
+        }
+    }
+    let (trail, floor) = (trail / count, floor / count);
+    assert!(
+        floor > 20.0,
+        "the floor's indirect light is too dim to tell: {floor}"
+    );
+    assert!(
+        trail < floor * 0.025,
+        "the ball left a trail in the indirect light: {trail:.1} on a floor of {floor:.1}"
+    );
+}
