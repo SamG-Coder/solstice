@@ -2060,6 +2060,17 @@ fn what_stands_out_of_the_sea_is_not_covered_by_it() {
 
 /// The ball on its floor with these ponds, and a calm sea at `sea` if any, as finally drawn.
 fn render_ponds(gpu: &Gpu, camera: &Camera, ponds: &[Pond], sea: Option<f32>) -> Vec<u8> {
+    render_ponds_in(gpu, camera, ponds, sea, Weather::default())
+}
+
+/// The same, in `weather`.
+fn render_ponds_in(
+    gpu: &Gpu,
+    camera: &Camera,
+    ponds: &[Pond],
+    sea: Option<f32>,
+    weather: Weather,
+) -> Vec<u8> {
     let errors: Arc<Mutex<Vec<String>>> = Default::default();
     let sink = errors.clone();
     gpu.device
@@ -2076,6 +2087,7 @@ fn render_ponds(gpu: &Gpu, camera: &Camera, ponds: &[Pond], sea: Option<f32>) ->
         renderer.set_sea_level(level);
     }
     renderer.set_ponds(ponds);
+    renderer.set_weather(weather, 0.0);
     // Daylight well above what the views measure keeps exposure at its limit, the same for all.
     let environment = Environment {
         sun_direction: Vec3::new(1.0, 0.7, 0.2).normalize(),
@@ -5967,5 +5979,64 @@ fn rain_falls_in_the_open_and_not_under_a_roof() {
     assert!(
         roof < open * 0.2,
         "under the roof {roof}, in the open {open}"
+    );
+}
+
+#[test]
+fn the_wind_ruffles_a_pond() {
+    let Some(gpu) = request_gpu() else { return };
+    // Looking along a pond towards the sun, low, where ripples break up its glitter.
+    let camera = Camera {
+        position: Vec3::new(-55.0, 1.5, 0.0),
+        yaw: (-1.0_f32).atan2(-0.2),
+        pitch: -0.2,
+        ..Default::default()
+    };
+    let pond = Pond::parse("-60,-60,-1.5,60,0.3").unwrap();
+    let wind = |speed: f32| Weather {
+        wind_speed: speed,
+        wind_from: 200.0,
+        gusts: 0.0,
+        turbulence: 0.0,
+        rain: 0.0,
+        ..Weather::by_name("clear").unwrap()
+    };
+    let still = render_ponds_in(&gpu, &camera, &[pond], None, wind(0.5));
+    let breezy = render_ponds_in(&gpu, &camera, &[pond], None, wind(10.0));
+    let gale = render_ponds_in(&gpu, &camera, &[pond], None, wind(40.0));
+    if let Ok(dir) = std::env::var("SOLSTICE_TEST_IMAGES") {
+        for (name, p) in [("still", &still), ("gale", &gale)] {
+            let mut ppm = format!(
+                "P6
+{POND_SIZE} {POND_SIZE}
+255
+"
+            )
+            .into_bytes();
+            ppm.extend(p.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+            std::fs::write(format!("{dir}/pond_{name}.ppm"), ppm).unwrap();
+        }
+    }
+    // How far, on average over the water, an image is from still water's.
+    let from_still = |image: &[u8]| {
+        let mut sum = 0.0;
+        let mut count = 0.0;
+        for y in POND_SIZE / 2 + 8..POND_SIZE {
+            for x in 0..POND_SIZE {
+                let i = ((y * POND_SIZE + x) * 4) as usize;
+                for c in 0..3 {
+                    sum += f32::from(image[i + c].abs_diff(still[i + c]));
+                }
+                count += 3.0;
+            }
+        }
+        sum / count
+    };
+    let (breeze, blow) = (from_still(&breezy), from_still(&gale));
+    // The wind breaks the sun's glitter up, more the harder it blows.
+    assert!(blow > 1.0, "a gale changed the water by only {blow}");
+    assert!(
+        breeze < blow,
+        "a breeze changed it by {breeze}, a gale by {blow}"
     );
 }

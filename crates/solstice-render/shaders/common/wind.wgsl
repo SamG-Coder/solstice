@@ -18,6 +18,12 @@ struct WindSnapshot {
     _pad: f32,
 }
 
+// A snapshot packed into two vectors, as the water's uniforms carry it: the mean wind, gusts and
+// turbulence; then the air's offset and the time.
+fn unpack_wind(a: vec4f, b: vec4f) -> WindSnapshot {
+    return WindSnapshot(a.xy, b.xy, b.z, a.z, a.w, 0.0);
+}
+
 // Sizes of the gusts, in metres: broad gusts and lulls, and the rolls within them that run
 // over a field of grass as waves.
 const WIND_GUST_SIZE: f32 = 42.0;

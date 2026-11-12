@@ -16,6 +16,7 @@
 #include "ocean/seabed.wgsl"
 #include "ocean/optics.wgsl"
 #include "rain/rings.wgsl"
+#include "common/wind.wgsl"
 
 // The opaque scene, lit, with its depth and motion.
 @group(0) @binding(0) var lit: texture_2d<f32>;
@@ -142,7 +143,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     } else {
         let n_dot_v = max(dot(normal, view), 1.0e-3);
         let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
-        let roughness = sqrt(sq(surface_roughness(footprint)) + rained.z);
+        // Gusts roughen the short waves as they cross, more than the long ones can follow:
+        // cat's paws, dark patches running downwind. Cox and Munk found the waves' mean square
+        // slope grows with the wind's speed as 0.003 + 0.00512 U.
+        let air = unpack_wind(surface.wind[0], surface.wind[1]);
+        let here = length(wind_velocity(air, world.xz));
+        let paws = (0.003 + 0.00512 * here) / (0.003 + 0.00512 * length(air.mean));
+        let roughness = sqrt(sq(surface_roughness(footprint)) * paws + rained.z);
         // One reflected ray per pixel, off a facet the ripples tilt at random by the surface's
         // roughness; temporal accumulation gathers them into the blurred reflection.
         let jitter = vec2f(
