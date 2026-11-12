@@ -176,10 +176,11 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
         }
         "land" => {
             expect(2)?;
-            Command::Land {
-                sand: number(0)?,
-                dirt: number(1)?,
+            let (sand, dirt) = (number(0)?, number(1)?);
+            if sand < 0.0 || dirt < 0.0 {
+                return Err("'land' takes widths of sand and dirt of 0 or more".to_string());
             }
+            Command::Land { sand, dirt }
         }
         "path" => {
             expect(5)?;
@@ -205,14 +206,25 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
         }
         "meadow" => {
             expect(1)?;
-            Command::Meadow(number(0)?)
+            let radius = number(0)?;
+            if radius <= 0.0 {
+                return Err("'meadow' takes a radius above 0".to_string());
+            }
+            Command::Meadow(radius)
         }
         "wood" => {
             expect(4)?;
+            let (radius, spacing) = (number(2)?, number(3)?);
+            if radius <= 0.0 || spacing <= 0.5 {
+                return Err(
+                    "'wood' takes a radius above 0 and trees more than half a metre apart"
+                        .to_string(),
+                );
+            }
             Command::Wood {
                 at: glam::Vec2::new(number(0)?, number(1)?),
-                radius: number(2)?,
-                spacing: number(3)?,
+                radius,
+                spacing,
             }
         }
         "ocean" => {
@@ -1070,6 +1082,48 @@ mod tests {
         assert!(has_clips_for(&clips, "a.anim", 0));
         assert!(!has_clips_for(&clips, "a.anim", 1));
         assert!(!has_clips_for(&clips, "b.anim", 0));
+    }
+
+    #[test]
+    fn the_land_commands_parse_and_refuse_nonsense() {
+        assert_eq!(
+            parse_line("land 10 5"),
+            Ok(Some(Command::Land {
+                sand: 10.0,
+                dirt: 5.0
+            }))
+        );
+        assert_eq!(
+            parse_line("path 1 2 3 4 2.5"),
+            Ok(Some(Command::Path {
+                from: glam::Vec2::new(1.0, 2.0),
+                to: glam::Vec2::new(3.0, 4.0),
+                width: 2.5
+            }))
+        );
+        assert!(matches!(
+            parse_line("yard -1 -1 1 1"),
+            Ok(Some(Command::Yard { .. }))
+        ));
+        assert!(matches!(
+            parse_line("clear 0 0 30"),
+            Ok(Some(Command::Clear { .. }))
+        ));
+        assert_eq!(parse_line("meadow 75"), Ok(Some(Command::Meadow(75.0))));
+        assert!(matches!(
+            parse_line("wood 1 2 20 7"),
+            Ok(Some(Command::Wood { .. }))
+        ));
+        for bad in [
+            "land -1 5",
+            "meadow 0",
+            "wood 1 2 20 0",
+            "wood 1 2 0 7",
+            "path 1 2 3 4",
+            "land 1",
+        ] {
+            assert!(parse_line(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

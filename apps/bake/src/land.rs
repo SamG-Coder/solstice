@@ -153,7 +153,24 @@ fn split(polygon: &[Point], field: impl Fn(&Point) -> f32) -> (Vec<Point>, Vec<P
             above.push(a);
         }
         if (fa < 0.0) != (fb < 0.0) {
-            let crossing = a.lerp(b, fa / (fa - fb));
+            // Worked out from the same end whichever way round the edge is walked, so the
+            // triangles either side of it share the point exactly.
+            // A crossing within a hair of either end is that end, so no sliver of a triangle is
+            // left that would collapse on one side of the edge and not the other.
+            let snap = |t: f32| {
+                if t < 0.02 {
+                    0.0
+                } else if t > 0.98 {
+                    1.0
+                } else {
+                    t
+                }
+            };
+            let crossing = if (a.p.x, a.p.z) < (b.p.x, b.p.z) {
+                a.lerp(b, snap(fa / (fa - fb)))
+            } else {
+                b.lerp(a, snap(fb / (fb - fa)))
+            };
             below.push(crossing);
             above.push(crossing);
         }
@@ -202,11 +219,26 @@ impl KindMesh {
 
 /// Lays one small triangle down on the meshes of the kinds it covers, cut along its borders.
 fn lay(meshes: &mut [KindMesh; 3], triangle: [Point; 3]) {
-    let (sand, rest) = split(&triangle, |p| p.fields.0);
-    let (dirt, grass) = split(&rest, |p| p.fields.1);
-    meshes[SAND].polygon(&sand);
-    meshes[DIRT].polygon(&dirt);
-    meshes[GRASS].polygon(&grass);
+    // Cut every piece along both borders in turn, so that where one border's cut lands on the
+    // other's, both pieces either side have the point: then each piece is one kind.
+    let mut pieces = vec![triangle.to_vec()];
+    for field in [|p: &Point| p.fields.0, |p: &Point| p.fields.1] {
+        pieces = pieces
+            .into_iter()
+            .flat_map(|piece| {
+                let (below, above) = split(&piece, field);
+                [below, above]
+            })
+            .filter(|piece| piece.len() >= 3)
+            .collect();
+    }
+    for piece in pieces {
+        let n = piece.len() as f32;
+        let mean = piece.iter().fold((0.0, 0.0), |m, p| {
+            (m.0 + p.fields.0 / n, m.1 + p.fields.1 / n)
+        });
+        meshes[kind_of(mean)].polygon(&piece);
+    }
 }
 
 /// The terrain `size` metres across in `cells` a side, a mesh for each kind of ground, from the
@@ -227,6 +259,30 @@ pub fn zoned_terrain(
             height(x, z - e) - height(x, z + e),
         )
         .normalize()
+    };
+    // Which cells are cut finely: those a border comes near.
+    let far = |f: (f32, f32)| f.0.abs() > step * 1.5 && f.1.abs() > step * 1.5;
+    let at = |column: u32, row: u32, dx: f32, dz: f32| {
+        Vec2::new(
+            (column as f32 + dx) * step - half,
+            (row as f32 + dz) * step - half,
+        )
+    };
+    let fine: Vec<bool> = (0..cells * cells)
+        .map(|index| {
+            let (column, row) = (index % cells, index / cells);
+            let samples = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
+                .map(|(dx, dz)| fields(at(column, row, dx, dz)));
+            let kinds = samples.map(kind_of);
+            !(kinds.iter().all(|&k| k == kinds[0]) && samples.into_iter().all(far))
+        })
+        .collect();
+    let is_fine = |column: i64, row: i64| {
+        column >= 0
+            && row >= 0
+            && (column as u32) < cells
+            && (row as u32) < cells
+            && fine[(row as u32 * cells + column as u32) as usize]
     };
     let mut meshes: [KindMesh; 3] = Default::default();
     for row in 0..cells {
@@ -249,22 +305,8 @@ pub fn zoned_terrain(
                 corner(0.0, 1.0),
                 corner(1.0, 1.0),
             );
-            let middle = fields(Vec2::new(x0 + step * 0.5, z0 + step * 0.5));
-            // Whole, where no border comes within a cell's width.
-            let far = |f: (f32, f32)| f.0.abs() > step * 1.5 && f.1.abs() > step * 1.5;
-            let kinds = [a.fields, b.fields, c.fields, d.fields, middle].map(kind_of);
-            if kinds.iter().all(|&k| k == kinds[0])
-                && [a.fields, b.fields, c.fields, d.fields, middle]
-                    .into_iter()
-                    .all(far)
-            {
-                let k = kinds[0];
-                meshes[k].triangle([(a.p, a.n), (c.p, c.n), (b.p, b.n)]);
-                meshes[k].triangle([(b.p, b.n), (c.p, c.n), (d.p, d.n)]);
-                continue;
-            }
-            // Where a border is near: smaller cells on the big cell's own two triangles, so that
-            // the big cells around meet them without a crack, each cut along the border.
+            // A point of the cell on its own two triangles, so that whatever is laid on it
+            // meets its neighbours along their shared edges exactly.
             let on_cell = |u: f32, v: f32| {
                 let y = if u + v <= 1.0 {
                     a.p.y + (b.p.y - a.p.y) * u + (c.p.y - a.p.y) * v
@@ -279,6 +321,43 @@ pub fn zoned_terrain(
                 }
             };
             let small = 1.0 / FINE as f32;
+            let (col, rw) = (column as i64, row as i64);
+            if !fine[(row * cells + column) as usize] {
+                let k = kind_of(fields(Vec2::new(x0 + step * 0.5, z0 + step * 0.5)));
+                // Beside a finely cut cell, the shared edge carries its points too, or a
+                // T-junction would open along it: the cell is laid as a fan from its middle
+                // round its edge, a to c to d to b, with every point the neighbours have.
+                let sides = [
+                    (is_fine(col - 1, rw), (0.0, 0.0), (0.0, 1.0)),
+                    (is_fine(col, rw + 1), (0.0, 1.0), (1.0, 1.0)),
+                    (is_fine(col + 1, rw), (1.0, 1.0), (1.0, 0.0)),
+                    (is_fine(col, rw - 1), (1.0, 0.0), (0.0, 0.0)),
+                ];
+                if !sides.iter().any(|s| s.0) {
+                    meshes[k].triangle([(a.p, a.n), (c.p, c.n), (b.p, b.n)]);
+                    meshes[k].triangle([(b.p, b.n), (c.p, c.n), (d.p, d.n)]);
+                    continue;
+                }
+                let mut rim = Vec::new();
+                for (cut, from, to) in sides {
+                    let steps = if cut { FINE } else { 1 };
+                    for n in 0..steps {
+                        let t = n as f32 / steps as f32;
+                        rim.push(on_cell(
+                            from.0 + (to.0 - from.0) * t,
+                            from.1 + (to.1 - from.1) * t,
+                        ));
+                    }
+                }
+                let middle = on_cell(0.5, 0.5);
+                for n in 0..rim.len() {
+                    let (p, q) = (rim[n], rim[(n + 1) % rim.len()]);
+                    meshes[k].triangle([(middle.p, middle.n), (p.p, p.n), (q.p, q.n)]);
+                }
+                continue;
+            }
+            // Where a border is near: smaller cells on the big cell's own two triangles, each
+            // cut along the border.
             for j in 0..FINE {
                 for i in 0..FINE {
                     let (u0, v0) = (i as f32 * small, j as f32 * small);
@@ -601,6 +680,52 @@ mod tests {
         assert!(plan.may_plant(Vec2::new(15.0, 8.0), 1.0, &kind_at));
         assert!(!plan.may_plant(Vec2::new(15.0, 2.0), 1.0, &kind_at));
         assert!(!plan.may_plant(Vec2::new(52.0, 52.0), 1.0, &kind_at));
+    }
+
+    #[test]
+    fn the_zoned_terrain_is_watertight() {
+        let height = |x: f32, z: f32| (x * 0.3).sin() + (z * 0.2).cos();
+        let fields = |p: Vec2| (p.x + 0.5 * p.y - 0.3, p.length() - 6.0);
+        let meshes = zoned_terrain(20.0, 20, &height, &fields);
+        // Every edge between two triangles, across all three kinds' meshes, is used by exactly
+        // two of them, and every edge on the square's rim by one: no crack, no T-junction.
+        let key = |v: &Vertex| {
+            (
+                (v.position.x * 1024.0).round() as i64,
+                (v.position.z * 1024.0).round() as i64,
+            )
+        };
+        type Edge = ((i64, i64), (i64, i64));
+        let mut uses: HashMap<Edge, u32> = HashMap::new();
+        for m in &meshes {
+            for t in m.indices.chunks_exact(3) {
+                for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+                    let (a, b) = (
+                        key(&m.vertices[t[i] as usize]),
+                        key(&m.vertices[t[j] as usize]),
+                    );
+                    if a != b {
+                        *uses.entry((a.min(b), a.max(b))).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let rim = |k: (i64, i64)| k.0.abs() == 10 * 1024 || k.1.abs() == 10 * 1024;
+        for ((a, b), count) in &uses {
+            let on_rim = rim(*a) && rim(*b) && (a.0 == b.0 || a.1 == b.1);
+            let expected = if on_rim { 1 } else { 2 };
+            assert_eq!(*count, expected, "edge {a:?} to {b:?}");
+        }
+        // And each kind's heights lie on the plain terrain's surface: its vertices at the cells'
+        // corners are the plain terrain's own.
+        for m in &meshes {
+            for v in &m.vertices {
+                let (x, z) = (v.position.x, v.position.z);
+                if (x - x.round()).abs() < 1.0e-4 && (z - z.round()).abs() < 1.0e-4 {
+                    assert!((v.position.y - height(x.round(), z.round())).abs() < 1.0e-4);
+                }
+            }
+        }
     }
 
     #[test]
