@@ -53,8 +53,8 @@ pub struct Material {
     pub base_color: [f32; 4],
     /// RGB radiance.
     pub emissive: [f32; 3],
-    /// [`Material::TWO_SIDED`], [`Material::FOLIAGE`] and [`Material::MASKED`]. Older files hold
-    /// zero here.
+    /// [`Material::TWO_SIDED`], [`Material::FOLIAGE`], [`Material::MASKED`] and
+    /// [`Material::SWAYS`]. Older files hold zero here.
     pub flags: u32,
     pub roughness: f32,
     pub metallic: f32,
@@ -82,6 +82,10 @@ impl Material {
     /// Cut out: alpha in its colour map is coverage instead of cavity, and a texel is solid when
     /// that is at least 0.5. The cut-off is built into the map (`docs/cutouts.md`).
     pub const MASKED: u32 = 4;
+    /// Sways in the wind as grass does: each point bends by its height above the mesh's own
+    /// ground, `y = 0`, so the mesh is made standing on it (`docs/weather-effects.md`). Older
+    /// files never sway.
+    pub const SWAYS: u32 = 8;
     /// `flags` above this bit hold one more than the material's layer in [`GlowMaps`], or zero
     /// for a material whose emissive colour is even all over.
     pub const GLOW_SHIFT: u32 = 16;

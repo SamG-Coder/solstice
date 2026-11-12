@@ -40,6 +40,7 @@ pub mod sky;
 pub mod streaming;
 pub mod time_of_day;
 pub mod vg;
+pub mod wind;
 
 pub use clouds::{Observation, Weather, WeatherCycle};
 pub use frame::{Camera, DebugView, Environment};

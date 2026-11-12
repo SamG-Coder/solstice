@@ -56,6 +56,8 @@ pub(crate) const INSTANCE_HIDDEN: u32 = 1 << 29;
 pub(crate) const INSTANCE_STAYS_IN_GI: u32 = 1 << 28;
 /// Cut out: goes through the masked lists and rasterizers (`docs/cutouts.md`).
 pub(crate) const INSTANCE_MASKED: u32 = 1 << 27;
+/// Sways in the wind (`common/sway.wgsl`), from its material's [`Material::SWAYS`].
+pub(crate) const INSTANCE_SWAYS: u32 = 1 << 26;
 
 impl GpuInstance {
     /// Places the instance at `world`. Where it was drawn last stays as `prev_world`.
@@ -177,6 +179,11 @@ pub struct GpuScene {
     /// Whether anything bends to a pose. A scene with nothing that does has skinning compiled out
     /// of its shaders.
     pub has_skins: bool,
+    /// Whether anything sways in the wind. A scene with nothing that does has swaying compiled
+    /// out of its shaders, and never fills the wind field for it.
+    pub has_sways: bool,
+    /// The wind near the ground, around the camera, for what sways (`wind.rs`).
+    pub wind_field: crate::gpu::Target,
     /// The CPU's copy of `instances`, and what has changed in it.
     pub instance_table: InstanceTable,
     /// Bones for the scene's poses, and each skinned cluster's bone list.
@@ -190,6 +197,14 @@ pub struct GpuScene {
 }
 
 impl GpuScene {
+    /// What moves this scene's vertices, which the shaders that place them are compiled for.
+    pub fn deform(&self) -> crate::shaders::Deform {
+        crate::shaders::Deform {
+            skinned: self.has_skins,
+            sways: self.has_sways,
+        }
+    }
+
     /// Creates everything but the contents of the page pool, which holds `slots` pages.
     /// Texture levels are written straight away if `upper_textures` holds them all. Otherwise
     /// tiers follow `plan`, with only the base tier filled, and streaming does the rest.
@@ -291,6 +306,8 @@ impl GpuScene {
             gpu_instance_count: instances.len() as u32,
             has_masked: instances.iter().any(|i| i.has_flag(INSTANCE_MASKED)),
             has_skins: instances.iter().any(GpuInstance::is_skinned),
+            has_sways: instances.iter().any(|i| i.has_flag(INSTANCE_SWAYS)),
+            wind_field: crate::wind::field_texture(gpu),
             instance_table: InstanceTable::new(instances, gpu_index, instance_spheres(scene)),
             skins,
             light_count: scene.lights.len() as u32,
@@ -446,7 +463,7 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
         index.push(Some(out.len() as u32));
         // The bits above hold the INSTANCE_ flags.
         let source = scene.materials.get(instance.material as usize);
-        debug_assert!(instance.material < INSTANCE_MASKED, "too many materials");
+        debug_assert!(instance.material < INSTANCE_SWAYS, "too many materials");
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());
@@ -467,6 +484,11 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
                 }
                 | if source.is_some_and(|m| m.flags & Material::MASKED != 0) {
                     INSTANCE_MASKED
+                } else {
+                    0
+                }
+                | if source.is_some_and(|m| m.flags & Material::SWAYS != 0) {
+                    INSTANCE_SWAYS
                 } else {
                     0
                 },

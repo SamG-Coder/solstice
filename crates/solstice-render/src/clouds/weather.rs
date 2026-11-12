@@ -10,7 +10,7 @@
 //! thickness 1600
 //! density 1
 //! cirrus 0.15
-//! wind speed=7 from=250
+//! wind speed=7 from=250 gusts=0.45 turbulence=0.45
 //! evolution 1
 //! rain 0
 //! ```
@@ -39,6 +39,11 @@ pub struct Weather {
     pub wind_speed: f32,
     /// Compass direction the wind blows from, in degrees: 270 is a westerly.
     pub wind_from: f32,
+    /// How gusty the wind is near the ground, `0..1`: 0 blows steadily, 1 in strong gusts and
+    /// lulls (docs/weather-effects.md).
+    pub gusts: f32,
+    /// How much the wind's direction wanders from place to place, `0..1`.
+    pub turbulence: f32,
     /// How fast clouds grow and fade as they drift, relative to ordinary weather.
     pub evolution: f32,
     /// How heavily it rains, `0..1`: darkens cloud bases and greys the air.
@@ -101,6 +106,8 @@ impl Weather {
             cirrus: 0.15,
             wind_speed: 7.0,
             wind_from: 250.0,
+            gusts: 0.4,
+            turbulence: 0.4,
             evolution: 1.0,
             rain: 0.0,
         }
@@ -141,6 +148,10 @@ impl Weather {
                         match key {
                             "speed" => weather.wind_speed = number(value).map_err(at)?.max(0.0),
                             "from" => weather.wind_from = number(value).map_err(at)?,
+                            "gusts" => weather.gusts = number(value).map_err(at)?.clamp(0.0, 1.0),
+                            "turbulence" => {
+                                weather.turbulence = number(value).map_err(at)?.clamp(0.0, 1.0)
+                            }
                             _ => return Err(at(format!("unknown wind setting {key}"))),
                         }
                     }
@@ -154,7 +165,7 @@ impl Weather {
     /// Writes this state in the form [`Weather::parse`] reads.
     pub fn to_text(&self) -> String {
         format!(
-            "coverage {}\ntype {}\nbase {}\nthickness {}\ndensity {}\ncirrus {}\nwind speed={} from={}\nevolution {}\nrain {}\n",
+            "coverage {}\ntype {}\nbase {}\nthickness {}\ndensity {}\ncirrus {}\nwind speed={} from={} gusts={} turbulence={}\nevolution {}\nrain {}\n",
             self.coverage,
             self.cloud_type,
             self.base,
@@ -163,6 +174,8 @@ impl Weather {
             self.cirrus,
             self.wind_speed,
             self.wind_from,
+            self.gusts,
+            self.turbulence,
             self.evolution,
             self.rain
         )
@@ -180,6 +193,8 @@ impl Weather {
             density: mix(self.density, to.density),
             cirrus: mix(self.cirrus, to.cirrus),
             wind_speed: mix(self.wind_speed, to.wind_speed),
+            gusts: mix(self.gusts, to.gusts),
+            turbulence: mix(self.turbulence, to.turbulence),
             wind_from: (self.wind_from + turn * t).rem_euclid(360.0),
             evolution: mix(self.evolution, to.evolution),
             rain: mix(self.rain, to.rain),
@@ -256,6 +271,13 @@ impl Weather {
             // Wind at cloud height is about twice that near the ground.
             wind_speed: report.wind_kmh / 3.6 * 2.0,
             wind_from: report.wind_from,
+            // Stronger winds and showers are gustier; storms most of all.
+            gusts: if storm {
+                0.85
+            } else {
+                (0.3 + report.wind_kmh / 80.0 + if showers { 0.2 } else { 0.0 }).min(1.0)
+            },
+            turbulence: if storm { 0.7 } else { 0.4 },
             evolution: 1.0 + rain,
             rain,
         }

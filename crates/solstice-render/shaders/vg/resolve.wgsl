@@ -9,6 +9,7 @@
 #include "common/scene.wgsl"
 #include "common/skin.wgsl"
 #include "common/skin_vertex.wgsl"
+#include "common/sway_vertex.wgsl"
 #include "common/frame.wgsl"
 #include "common/wetness.wgsl"
 
@@ -22,6 +23,8 @@
 @group(0) @binding(7) var<storage, read> triangles: array<u32>;
 @group(0) @binding(8) var<storage, read> materials: array<Material>;
 @group(0) @binding(9) var bone_texture: texture_2d<f32>;
+// The wind, for what sways in it: see common/sway_vertex.wgsl.
+@group(0) @binding(10) var wind_field: texture_2d<f32>;
 
 fn load_vertex(index: u32) -> PackedVertex {
     return vertices[index];
@@ -215,9 +218,38 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         normal1 = normalize(skin_direction(now1, normal1));
         normal2 = normalize(skin_direction(now2, normal2));
     }
-    let world0 = transform_point(instance, local0);
-    let world1 = transform_point(instance, local1);
-    let world2 = transform_point(instance, local2);
+    var world0 = transform_point(instance, local0);
+    var world1 = transform_point(instance, local1);
+    var world2 = transform_point(instance, local2);
+    var world_normal0 = transform_normal(instance, normal0);
+    var world_normal1 = transform_normal(instance, normal1);
+    var world_normal2 = transform_normal(instance, normal2);
+    // Where the wind had each corner last frame, from where it stands at rest, in the world.
+    var sway_before0 = vec3f(0.0);
+    var sway_before1 = vec3f(0.0);
+    var sway_before2 = vec3f(0.0);
+    if instance_sways(instance) {
+        let w = wind_params();
+        if w.sway != 0.0 {
+            // As the rasterizers placed them (vg/raster_common.wgsl), and turned with them.
+            let eye = frame.camera_position;
+            let s0 = vertex_sway(w, instance, local0, world0, eye);
+            let s1 = vertex_sway(w, instance, local1, world1, eye);
+            let s2 = vertex_sway(w, instance, local2, world2, eye);
+            let now0 = bend_offset(s0.now, s0.height);
+            let now1 = bend_offset(s1.now, s1.height);
+            let now2 = bend_offset(s2.now, s2.height);
+            sway_before0 = bend_offset(s0.before, s0.height);
+            sway_before1 = bend_offset(s1.before, s1.height);
+            sway_before2 = bend_offset(s2.before, s2.height);
+            world0 += now0;
+            world1 += now1;
+            world2 += now2;
+            world_normal0 = bend_direction(s0.now, world_normal0);
+            world_normal1 = bend_direction(s1.now, world_normal1);
+            world_normal2 = bend_direction(s2.now, world_normal2);
+        }
+    }
     let clip = array<vec4f, 3>(
         frame.view_proj * vec4f(world0, 1.0),
         frame.view_proj * vec4f(world1, 1.0),
@@ -243,12 +275,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let duv_dx = interp2(b_x, uv0, uv1, uv2) - uv;
     let duv_dy = interp2(b_y, uv0, uv1, uv2) - uv;
 
-    var normal = normalize(interp3(
-        b,
-        transform_normal(instance, normal0),
-        transform_normal(instance, normal1),
-        transform_normal(instance, normal2),
-    ));
+    var normal = normalize(interp3(b, world_normal0, world_normal1, world_normal2));
     // Seen from behind, a two-sided surface is lit as its other side.
     let face = cross(world1 - world0, world2 - world0);
     if (material.flags & MATERIAL_TWO_SIDED) != 0u && dot(face, frame.camera_position - world0) < 0.0 {
@@ -306,7 +333,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     // Motion, in UV units from this pixel to where it was last frame.
     let local = interp3(b, before0, before1, before2);
-    let prev_world = transform_point_prev(instance, local);
+    // Where the instance had it last frame, and the wind carried it then.
+    let prev_world = transform_point_prev(instance, local) + interp3(b, sway_before0, sway_before1, sway_before2);
     let prev_clip = frame.prev_view_proj * vec4f(prev_world, 1.0);
     let current_clip = frame.unjittered_view_proj * vec4f(world, 1.0);
     let prev_ndc = prev_clip.xy / prev_clip.w;
@@ -349,6 +377,19 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             // `motion` points from here to last frame's place, so this shows the way it went:
             // a hundredth of the screen per frame is full colour.
             emissive = vec3f(clamp(vec2f(0.5) - vec2f(motion.x, -motion.y) * 50.0, vec2f(0.0), vec2f(1.0)), 0.5);
+        }
+        case DEBUG_WIND: {
+            let w = wind_params();
+            var shown = vec3f(0.02);
+            if SWAYING && w.texel > 0.0 {
+                // Hue the way it blows, brightness how hard: 12 m/s 10 m up is full.
+                let v = wind_sample(w, world.xz).xy;
+                let hue = atan2(v.y, v.x) / TAU + 0.5;
+                let k = fract(vec3f(hue) + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - vec3f(3.0);
+                let tint = mix(vec3f(1.0), clamp(abs(k) - vec3f(1.0), vec3f(0.0), vec3f(1.0)), 0.6);
+                shown = tint * clamp(length(v) / 12.0, 0.0, 1.0);
+            }
+            emissive = shown * max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);
         }
         case DEBUG_WETNESS: {
             let shade = max(dot(normal, frame.sun_direction) * 0.5 + 0.5, 0.1);

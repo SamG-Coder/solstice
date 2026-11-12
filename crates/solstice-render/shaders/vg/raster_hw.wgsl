@@ -30,7 +30,7 @@ fn cluster_vertex(vertex_index: u32, visible_index: u32) -> VertexOutput {
         let local = local_vertex(packed_triangle, corner);
         let vertex = load_vertex(cluster.vertex_offset + local);
         let posed = posed_position(instance, cluster, local, decode_position(instance, vertex));
-        let world = transform_point(instance, posed);
+        let world = place_vertex(instance, posed);
         clip[corner] = view.raster_view_proj * vec4f(world, 1.0);
     }
 

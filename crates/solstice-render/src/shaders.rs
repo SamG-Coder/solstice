@@ -17,6 +17,12 @@ macro_rules! shader_table {
 /// Every shader file, by its path relative to the `shaders` directory.
 pub const SOURCES: &[(&str, &str)] = shader_table![
     "common/math.wgsl",
+    "common/noise.wgsl",
+    "common/wind.wgsl",
+    "common/sway.wgsl",
+    "common/sway_vertex.wgsl",
+    "wind/field.wgsl",
+    "wind/sway_probe.wgsl",
     "common/scene.wgsl",
     "common/skin.wgsl",
     "common/skin_vertex.wgsl",
@@ -117,6 +123,8 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
 #[cfg(test)]
 pub const ENTRY_POINTS: &[&str] = &[
     "vg/cull.wgsl",
+    "wind/field.wgsl",
+    "wind/sway_probe.wgsl",
     "vg/cull_control.wgsl",
     "vg/raster_hw_fragment.wgsl",
     "vg/raster_sw.wgsl",
@@ -220,17 +228,31 @@ pub fn module(device: &wgpu::Device, path: &str) -> wgpu::ShaderModule {
 
 /// The line in `common/skin.wgsl` that turns skinning on.
 const SKINNING_ON: &str = "const SKINNING: bool = true;";
+/// The line in `common/sway.wgsl` that turns swaying in the wind on.
+const SWAYING_ON: &str = "const SWAYING: bool = true;";
+
+/// What can move the vertices of a scene's instances, which the shaders that place them are
+/// compiled for. What a scene doesn't have is compiled out, so it costs what it did before.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Deform {
+    /// Anything bends to a pose (`skin.rs`).
+    pub skinned: bool,
+    /// Anything sways in the wind (`wind.rs`).
+    pub sways: bool,
+}
 
 /// The source of an entry point that places vertices, for a scene with or without anything
-/// skinned. Without, skinning is compiled out, so that scene costs what it did before skinning.
-pub fn expand_for(path: &str, skinned: bool, regions: Option<RegionPlan>) -> String {
-    let source = expand(path);
-    let source = if skinned {
-        source
-    } else {
+/// skinned or swaying.
+pub fn expand_for(path: &str, deform: Deform, regions: Option<RegionPlan>) -> String {
+    let mut source = expand(path);
+    if !deform.skinned {
         assert!(source.contains(SKINNING_ON), "{path} doesn't skin");
-        source.replace(SKINNING_ON, "const SKINNING: bool = false;")
-    };
+        source = source.replace(SKINNING_ON, "const SKINNING: bool = false;");
+    }
+    if !deform.sways {
+        assert!(source.contains(SWAYING_ON), "{path} doesn't sway");
+        source = source.replace(SWAYING_ON, "const SWAYING: bool = false;");
+    }
     match regions {
         Some(plan) => rewrite_shader(&source, plan.cluster_chunk, plan.pools()),
         None => source,
@@ -278,12 +300,12 @@ pub fn depth_from_pyramid(source: &str) -> String {
 pub fn module_for(
     device: &wgpu::Device,
     path: &str,
-    skinned: bool,
+    deform: Deform,
     regions: Option<RegionPlan>,
 ) -> wgpu::ShaderModule {
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(path),
-        source: wgpu::ShaderSource::Wgsl(expand_for(path, skinned, regions).into()),
+        source: wgpu::ShaderSource::Wgsl(expand_for(path, deform, regions).into()),
     })
 }
 
@@ -487,7 +509,7 @@ d
             "vg/raster_hw_masked.wgsl",
             "vg/resolve.wgsl",
         ] {
-            let source = expand_for(path, false, None);
+            let source = expand_for(path, Deform::default(), None);
             let module = naga::front::wgsl::parse_str(&source).expect("the shader parses");
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
@@ -496,6 +518,7 @@ d
             .validate(&module)
             .unwrap_or_else(|error| panic!("{path}: {error}"));
             assert!(source.contains("const SKINNING: bool = false;"), "{path}");
+            assert!(source.contains("const SWAYING: bool = false;"), "{path}");
         }
     }
 
@@ -528,7 +551,12 @@ d
             "vg/resolve.wgsl",
         ] {
             for skinned in [false, true] {
-                check(path, expand_for(path, skinned, Some(plan)));
+                for sways in [false, true] {
+                    check(
+                        path,
+                        expand_for(path, Deform { skinned, sways }, Some(plan)),
+                    );
+                }
             }
         }
         check(

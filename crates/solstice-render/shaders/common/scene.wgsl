@@ -101,7 +101,8 @@ const INSTANCE_MOVABLE: u32 = 0x40000000u;
 const INSTANCE_HIDDEN: u32 = 0x20000000u;
 const INSTANCE_STAYS_IN_GI: u32 = 0x10000000u;
 const INSTANCE_MASKED: u32 = 0x08000000u;
-const INSTANCE_MATERIAL_MASK: u32 = 0x07ffffffu;
+const INSTANCE_SWAYS: u32 = 0x04000000u;
+const INSTANCE_MATERIAL_MASK: u32 = 0x03ffffffu;
 
 fn instance_material(i: Instance) -> u32 {
     return i.material & INSTANCE_MATERIAL_MASK;

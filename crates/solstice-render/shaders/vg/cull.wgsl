@@ -17,6 +17,7 @@
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
 #include "common/skin.wgsl"
+#include "common/sway.wgsl"
 #include "vg/pass_view.wgsl"
 
 struct QueueEntry {
@@ -309,7 +310,9 @@ fn try_emit(entry: QueueEntry, cluster_index: u32, instance: Instance) {
 // sphere moved by each bone of the cluster, which is what this bounds.
 fn posed_sphere(instance: Instance, cluster_index: u32, c: Cluster) -> vec4f {
     if !instance_skinned(instance) {
-        return vec4f(transform_point(instance, c.center), c.radius * instance.max_scale);
+        // What sways can lean out of its sphere, in a view that sees it sway.
+        let reach = sway_reach(instance, c.center.y, c.radius, view.is_ortho == 0u);
+        return vec4f(transform_point(instance, c.center), (c.radius + reach) * instance.max_scale);
     }
     let at = u32(i32(cluster_index) + instance.bone_lists);
     let list = textureLoad(
@@ -408,7 +411,8 @@ fn process(@builtin(global_invocation_id) id: vec3u) {
     }
 
     let center = transform_point(instance, node.center);
-    let radius = (node.radius + instance.lod_margin) * instance.max_scale;
+    let reach = sway_reach(instance, node.center.y, node.radius, view.is_ortho == 0u);
+    let radius = (node.radius + instance.lod_margin + reach) * instance.max_scale;
     if !in_frustum(center, radius) {
         // Near the camera but out of its view: nothing is drawn, but pages are asked for down
         // to a coarser level, so that a turn or a fast move finds more than the coarsest

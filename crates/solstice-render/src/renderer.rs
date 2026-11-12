@@ -29,6 +29,7 @@ use crate::vg::{
     CullPhase, CullPipelines, CullWork, GBuffer, Hzb, InstanceFilter, PassView, RasterBindings,
     Rasterizer, Resolve, ResolveBindings, ViewSlots, VisibilityBuffer,
 };
+use crate::wind::{FieldParams, Wind, WindField};
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use solstice_asset::paged::{PagedScene, PAGE_BYTES};
 use solstice_asset::LoadedScene;
@@ -120,6 +121,9 @@ pub struct RendererSettings {
     /// of this many steps through the GI volume.
     pub particle_light_interval: u32,
     pub particle_ray_steps: u32,
+    /// Metres from the camera over which swaying in the wind fades out, where it would no longer
+    /// be seen (`docs/weather-effects.md`).
+    pub sway_fade: [f32; 2],
 }
 
 impl Default for RendererSettings {
@@ -140,6 +144,7 @@ impl Default for RendererSettings {
             particle_detail: 1.0,
             particle_light_interval: 1,
             particle_ray_steps: 16,
+            sway_fade: [40.0, 60.0],
         }
     }
 }
@@ -172,6 +177,11 @@ impl RendererSettings {
             Quality::Low => (POOL_LOW, 0.35, 4, 8),
             Quality::Medium => (POOL_MEDIUM, 0.6, 2, 12),
             Quality::High => (POOL_HIGH, 1.0, 1, 16),
+        };
+        self.sway_fade = match quality {
+            Quality::Low => [20.0, 30.0],
+            Quality::Medium => [30.0, 45.0],
+            Quality::High => [40.0, 60.0],
         };
     }
 }
@@ -311,6 +321,10 @@ pub struct Renderer {
     pond_water: Option<PondWater>,
     /// Effects, and the pool their particles live in.
     particles: Particles,
+    /// The wind near the ground, and the pass that fills its field for what sways: made only
+    /// for a scene with something that does.
+    wind: Wind,
+    wind_field: Option<WindField>,
     /// The layout of the lighting bind group, for passes made after the renderer.
     environment_layout: wgpu::BindGroupLayout,
     sized: Option<SizedResources>,
@@ -548,7 +562,7 @@ impl Renderer {
         let hold = streamer.hold_bases();
         view_slots.hold_requests = [hold[HOLD_SHADOWS], hold[HOLD_VOXELS]];
 
-        let cull = CullPipelines::new(gpu, scene.has_skins, scene.regions);
+        let cull = CullPipelines::new(gpu, scene.deform(), scene.regions);
         let masked_capacity = if scene.has_masked {
             MASKED_VISIBLE_CAPACITY
         } else {
@@ -575,7 +589,7 @@ impl Renderer {
             masked_capacity,
             streamer.requests_buffer(),
         );
-        let rasterizer = Rasterizer::new(gpu, scene.has_masked, scene.has_skins, scene.regions);
+        let rasterizer = Rasterizer::new(gpu, scene.has_masked, scene.deform(), scene.regions);
 
         // Views without occlusion culling never read the pyramid, but a binding is required.
         let no_hzb = Target::new(
@@ -632,12 +646,17 @@ impl Renderer {
                 shadow_sampler: shadows.comparison_sampler.clone(),
             },
         );
+        let wind_field = scene
+            .has_sways
+            .then(|| WindField::new(gpu, &scene.wind_field));
         Self {
             settings,
+            wind: Wind::new(),
+            wind_field,
             resolve: Resolve::new(
                 gpu,
                 waterline.resolve_layout(),
-                scene.has_skins,
+                scene.deform(),
                 scene.regions,
                 scene.glow_maps.is_some(),
             ),
@@ -786,6 +805,11 @@ impl Renderer {
     }
 
     /// The weather now, part way to its target while it changes.
+    /// The wind near the ground, as it is this frame.
+    pub fn wind(&self) -> &Wind {
+        &self.wind
+    }
+
     pub fn weather(&self) -> Weather {
         self.clouds.weather()
     }
@@ -980,6 +1004,20 @@ impl Renderer {
             let weather = self.clouds.weather();
             sea.update(gpu, &weather, delta_seconds, self.settings.ocean_resolution);
             sea.record(&mut encoder);
+        }
+
+        // The wind near the ground, before anything that sways in it is drawn.
+        mark(&self.profiler, &mut encoder, section::WIND);
+        self.wind
+            .advance(&self.clouds.weather(), delta_seconds.clamp(0.0, 0.25));
+        if let Some(field) = &self.wind_field {
+            let params = FieldParams::around(
+                Vec2::new(camera.position.x, camera.position.z),
+                &self.wind,
+                true,
+                self.settings.sway_fade,
+            );
+            field.record(gpu, &mut encoder, &params);
         }
 
         mark(&self.profiler, &mut encoder, section::SHADOWS);

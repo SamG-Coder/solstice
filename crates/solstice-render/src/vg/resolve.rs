@@ -67,7 +67,7 @@ impl Resolve {
     pub fn new(
         gpu: &Gpu,
         wetness: &wgpu::BindGroupLayout,
-        skinned: bool,
+        deform: crate::shaders::Deform,
         regions: Option<RegionPlan>,
         glow: bool,
     ) -> Self {
@@ -81,6 +81,8 @@ impl Resolve {
             .storage_read()
             .storage_read()
             .storage_read()
+            .texture_unfilterable()
+            // The wind, for what sways in it.
             .texture_unfilterable();
         if regions.is_some() {
             // The second cluster binding and the pool's far band.
@@ -114,7 +116,7 @@ impl Resolve {
             output_layout = output_layout.texture_array();
         }
         let output_layout = output_layout.build(gpu, "resolve output");
-        let mut source = shaders::expand_for("vg/resolve.wgsl", skinned, regions);
+        let mut source = shaders::expand_for("vg/resolve.wgsl", deform, regions);
         if !glow {
             source = shaders::without_glow(&source);
         }
@@ -178,6 +180,7 @@ impl Resolve {
                     scene.triangles.as_entire_binding(),
                     scene.materials.as_entire_binding(),
                     wgpu::BindingResource::TextureView(&scene.skins.bones_view),
+                    wgpu::BindingResource::TextureView(&scene.wind_field.view),
                 ];
                 if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
                     resources.extend([more.as_entire_binding(), far.as_entire_binding()]);

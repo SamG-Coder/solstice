@@ -2,4 +2,4 @@
 coverage 0.04
 type 0.9
 cirrus 0.75
-wind speed=20 from=260
+wind speed=20 from=260 gusts=0.35 turbulence=0.3

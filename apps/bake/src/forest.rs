@@ -138,7 +138,7 @@ pub fn build(texture_size: u32) -> SceneAsset {
             roughness: 1.0,
             normal_strength: 1.0,
             texture_layer: 1,
-            flags: Material::TWO_SIDED | Material::FOLIAGE,
+            flags: Material::TWO_SIDED | Material::FOLIAGE | Material::SWAYS,
             ..Default::default()
         },
     ];

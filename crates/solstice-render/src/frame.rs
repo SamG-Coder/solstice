@@ -157,6 +157,10 @@ pub enum DebugView {
     Particles = 13,
     /// The light each particle receives, as a white particle would scatter it, without haze.
     ParticleLight = 14,
+    /// The wind near the ground, where something sways in it: brighter where it blows harder,
+    /// its hue the way it blows (`docs/weather-effects.md`). Dark in a scene with nothing
+    /// that sways.
+    Wind = 15,
 }
 
 impl DebugView {
@@ -178,6 +182,7 @@ impl DebugView {
             "motion" => Self::Motion,
             "particles" => Self::Particles,
             "particle-light" => Self::ParticleLight,
+            "wind" => Self::Wind,
             _ => return None,
         })
     }
