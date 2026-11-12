@@ -92,6 +92,7 @@ pub fn paginate_from<E>(
         lights: scene.lights.clone(),
         viewpoint: scene.viewpoint,
         sea: scene.sea.clone(),
+        still_water: scene.still_water.clone(),
         gameplay: scene.gameplay.clone(),
         hierarchy_depth: 1,
         source_triangles: scene.total_source_triangles(),

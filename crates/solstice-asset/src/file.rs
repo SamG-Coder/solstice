@@ -35,6 +35,8 @@ const VERSION: u32 = 4;
 const DEFLATE_LEVEL: u8 = 9;
 /// The optional section holding the scene's [`Sea`]: its level, then its ocean's text.
 const SEA_TAG: [u8; 4] = *b"SEA ";
+/// Still water: a count of ponds, five numbers for each, then the water's description as text.
+const POND_TAG: [u8; 4] = *b"POND";
 /// The optional section holding the scene's gameplay: how many [`GameFile`]s, then each one's
 /// name and text. Written only for scenes that have gameplay.
 const GAME_TAG: [u8; 4] = *b"GAME";
@@ -63,6 +65,7 @@ pub enum DecodeError {
     BadTextures,
     BadPages,
     BadSea,
+    BadStillWater,
     BadGameplay,
     BadCollision,
     BadSkin,
@@ -89,6 +92,7 @@ impl fmt::Display for DecodeError {
             Self::BadTextures => write!(f, "the texture data does not match its stated format"),
             Self::BadPages => write!(f, "the page tables are inconsistent"),
             Self::BadSea => write!(f, "the sea's description is not text"),
+            Self::BadStillWater => write!(f, "the scene's ponds are malformed"),
             Self::BadGameplay => write!(f, "the scene's gameplay files are malformed"),
             Self::BadCollision => write!(f, "the scene's collision shapes are malformed"),
             Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
@@ -289,6 +293,16 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
         let mut contents = sea.level.to_le_bytes().to_vec();
         contents.extend_from_slice(sea.ocean.as_bytes());
         w.section(SEA_TAG, &contents);
+    }
+    if let Some(still) = &scene.still_water {
+        let mut contents = (still.ponds.len() as u32).to_le_bytes().to_vec();
+        for pond in &still.ponds {
+            for value in pond {
+                contents.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        contents.extend_from_slice(still.water.as_bytes());
+        w.section(POND_TAG, &contents);
     }
     if !scene.gameplay.is_empty() {
         w.section(GAME_TAG, &encode_gameplay(&scene.gameplay));
@@ -808,6 +822,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let upper_mip_offsets: Vec<u64> = r.slice()?;
 
     let mut sea = None;
+    let mut still_water = None;
     let mut gameplay = Vec::new();
     let mut collision = None;
     let mut skin = None;
@@ -825,6 +840,31 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             sea = Some(Sea {
                 level: f32::from_le_bytes(*level),
                 ocean: String::from_utf8(text.to_vec()).map_err(|_| DecodeError::BadSea)?,
+            });
+        } else if tag == POND_TAG {
+            let (count, rest) = contents
+                .split_first_chunk::<4>()
+                .ok_or(DecodeError::BadStillWater)?;
+            let count = u32::from_le_bytes(*count) as usize;
+            let numbers = count.checked_mul(20).ok_or(DecodeError::BadStillWater)?;
+            if rest.len() < numbers {
+                return Err(DecodeError::BadStillWater);
+            }
+            let (ponds, text) = rest.split_at(numbers);
+            let ponds: Vec<[f32; 5]> = ponds
+                .chunks_exact(20)
+                .map(|pond| {
+                    std::array::from_fn(|k| {
+                        f32::from_le_bytes(pond[k * 4..k * 4 + 4].try_into().expect("four bytes"))
+                    })
+                })
+                .collect();
+            if ponds.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(DecodeError::BadStillWater);
+            }
+            still_water = Some(crate::scene::StillWater {
+                ponds,
+                water: String::from_utf8(text.to_vec()).map_err(|_| DecodeError::BadStillWater)?,
             });
         } else if tag == GAME_TAG {
             gameplay = decode_gameplay(&contents)?;
@@ -898,6 +938,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         lights,
         viewpoint: (has_viewpoint != 0).then_some(viewpoint),
         sea,
+        still_water,
         gameplay,
         collision,
         hierarchy_depth,
@@ -1297,6 +1338,7 @@ mod tests {
         assert_eq!(a.lights, b.lights);
         assert_eq!(a.viewpoint, b.viewpoint);
         assert_eq!(a.sea, b.sea);
+        assert_eq!(a.still_water, b.still_water);
         assert_eq!(a.meshes, b.meshes);
         assert_eq!(a.instances[0].transform, b.instances[0].transform);
         assert_eq!(a.hierarchy_depth, 3);
@@ -1507,6 +1549,41 @@ mod tests {
         assert_eq!(decode(&encode(&loaded)).unwrap().scene.sea, Some(sea));
         // And a scene without one has none.
         assert_eq!(decode(&encode(&sample_scene())).unwrap().scene.sea, None);
+    }
+
+    #[test]
+    fn ponds_travel_with_their_scene() {
+        let mut loaded = sample_scene();
+        let still = crate::scene::StillWater {
+            ponds: vec![[-2.0, -37.0, 4.0, -23.0, 1.5], [24.0, -6.0, 59.0, 5.0, 1.9]],
+            water: "absorption 2.1 1.5 2.0\nturbidity 0.5\n".to_string(),
+        };
+        loaded.scene.still_water = Some(still.clone());
+        let decoded = decode(&encode(&loaded)).unwrap().scene;
+        assert_eq!(decoded.still_water, Some(still));
+        // Clear water has no description, and a scene without ponds has none.
+        let clear = crate::scene::StillWater {
+            ponds: vec![[0.0, 0.0, 1.0, 1.0, 0.0]],
+            water: String::new(),
+        };
+        loaded.scene.still_water = Some(clear.clone());
+        assert_eq!(
+            decode(&encode(&loaded)).unwrap().scene.still_water,
+            Some(clear)
+        );
+        assert_eq!(
+            decode(&encode(&sample_scene())).unwrap().scene.still_water,
+            None
+        );
+        // A pond that isn't a number is a damaged file, not water to draw.
+        loaded.scene.still_water = Some(crate::scene::StillWater {
+            ponds: vec![[0.0, 0.0, f32::NAN, 1.0, 0.0]],
+            water: String::new(),
+        });
+        assert!(matches!(
+            decode(&encode(&loaded)),
+            Err(DecodeError::BadStillWater)
+        ));
     }
 
     #[test]

@@ -75,7 +75,9 @@ The public export has basins and no water: no mesh, material or node of it descr
 24.13,-5.51,59.39,5.47,1.9;-1.67,-37.3,3.55,-23.07,1.5;-1.67,23.05,3.55,37.28,1.5
 ```
 
-A pond is a level sheet of still, clear water, shaded as the sea's is, with what it reflects and what is seen through it. Nothing is drawn or simulated for it: one pass over the lit scene finds where each pixel's view ray meets a pond. A basin's own walls hide the sheet's edges. A scene with a sea draws the sea and not its ponds, and a scene with neither makes none of this.
+A scene can also carry its own ponds, so that no viewer needs telling: a `pond` line in a scene's text file (see `apps/bake/src/scene_file.rs`), or `SceneAsset::still_water`, which says what the water is like too. Ponds given to the viewer take the place of the scene's own.
+
+A pond is a level sheet of still water, clear unless its scene says otherwise, with what it reflects and what is seen through it. Its reflection is traced along several rays a pixel (four at High quality, two at Medium, one at Low), spread by the water's roughness, so wind-ruffled water blurs its reflection smoothly; what lies under the water is the bed straight behind each pixel, dimmed and tinted by the depth of water over it. Nothing is drawn or simulated for it: one pass over the lit scene finds where each pixel's view ray meets a pond. A basin's own walls hide the sheet's edges. A scene with a sea draws the sea and not its ponds, and a scene with neither makes none of this.
 
 ## Doors
 

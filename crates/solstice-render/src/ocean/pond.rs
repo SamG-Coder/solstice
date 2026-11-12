@@ -123,7 +123,7 @@ impl PondWater {
         let [ar, ag, ab] = water.absorption;
         let [sr, sg, sb] = water.scattering;
         let mut uniform = PondUniform {
-            count: [ponds.len().min(MAX_PONDS) as u32, 0, 0, 0],
+            count: [ponds.len().min(MAX_PONDS) as u32, 1, 0, 0],
             absorption: [ar, ag, ab, 0.0],
             scattering: [sr, sg, sb, 0.0],
             wind: [[0.0; 4]; 2],
@@ -137,6 +137,13 @@ impl PondWater {
         }
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// Sets how many rays each pixel of water reflects along: more for a smoother reflection
+    /// where the wind ruffles the water. Twin of `ponds.count.y` in `ocean/pond.wgsl`.
+    pub fn set_rays(&self, gpu: &Gpu, rays: u32) {
+        gpu.queue
+            .write_buffer(&self.uniform, 4, bytemuck::bytes_of(&rays.max(1)));
     }
 
     /// Sets the wind over the ponds this frame.

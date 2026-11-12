@@ -5,6 +5,8 @@
 //! texture_size 1024
 //! terrain 800 1024 0.5 60         # size, cells per side, height, X where the shore begins
 //! water -0.6 0.02 0.09 0.11       # height, then colour
+//! pond -2 -37 4 -23 1.5           # still water in a basin: corners x z, x z, then its height
+//! pond 24 -6 59 5 1.9 coastal     # and what the ponds' water is like, if not clear: an ocean
 //! camera 40 5 20 1.2 -0.05        # x y z yaw pitch
 //! light 0 2 0 16 40 14 3          # x y z range r g b
 //! model rocks/rock.gltf 0 0 0 45 2     # path x y z yaw_degrees scale
@@ -34,7 +36,9 @@
 use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
-use solstice_asset::{Collide, GameFile, Heightfield, Instance, Light, Material, SceneAsset, Sea};
+use solstice_asset::{
+    Collide, GameFile, Heightfield, Instance, Light, Material, SceneAsset, Sea, StillWater,
+};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_game::{resolve, ActorFile, ActorLine, Blocker, InputMap, SceneGame, GAME_FILE};
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
@@ -86,6 +90,15 @@ enum Command {
     Ocean {
         height: f32,
         ocean: String,
+    },
+    /// Still water in a basin: a level sheet over a rectangle, at `level`. `water` is what the
+    /// scene's ponds hold, if it says: a built-in ocean's name, or a `.ocean` file beside the
+    /// scene.
+    Pond {
+        min: glam::Vec2,
+        max: glam::Vec2,
+        level: f32,
+        water: Option<String>,
     },
     Camera(Viewpoint),
     Light(Light),
@@ -232,6 +245,29 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
             Command::Ocean {
                 height: number(0)?,
                 ocean: values[1].to_string(),
+            }
+        }
+        "pond" => {
+            if values.len() != 6 {
+                expect(5)?;
+            }
+            let (a, b) = (
+                glam::Vec2::new(number(0)?, number(1)?),
+                glam::Vec2::new(number(2)?, number(3)?),
+            );
+            let level = number(4)?;
+            // The viewer drops a pond with a corner or level that isn't a number; a bake says so.
+            if !(a.is_finite() && b.is_finite() && level.is_finite()) {
+                return Err("a pond's corners and level must be finite numbers".into());
+            }
+            if a.x == b.x || a.y == b.y {
+                return Err("a pond's corners must differ along both x and z".into());
+            }
+            Command::Pond {
+                min: a.min(b),
+                max: a.max(b),
+                level,
+                water: values.get(5).map(|water| water.to_string()),
             }
         }
         "water" => {
@@ -851,6 +887,36 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                     ocean,
                 });
             }
+            Some(Command::Pond {
+                min,
+                max,
+                level,
+                water,
+            }) => {
+                let still = scene.still_water.get_or_insert_with(StillWater::default);
+                // Twin of `MAX_PONDS` in the renderer, which draws no more.
+                if still.ponds.len() == 8 {
+                    return Err("a scene has at most 8 ponds".into());
+                }
+                still.ponds.push([min.x, min.y, max.x, max.y, level]);
+                if let Some(water) = water {
+                    // As a sea's: a file's text travels with the scene, a built-in goes by name.
+                    let water = if water.ends_with(".ocean") {
+                        let file = base.join(&water);
+                        std::fs::read_to_string(&file)
+                            .map_err(|e| format!("{}: {e}", file.display()))?
+                    } else {
+                        water
+                    };
+                    if !still.water.is_empty() && still.water != water {
+                        return Err(at(
+                            "a scene's ponds hold one water, and another is already named"
+                                .to_string(),
+                        ));
+                    }
+                    still.water = water;
+                }
+            }
             Some(Command::Camera(viewpoint)) => scene.viewpoint = Some(viewpoint),
             Some(Command::Light(light)) => scene.lights.push(light),
             Some(Command::Model {
@@ -1223,6 +1289,33 @@ mod tests {
             })
         );
         assert!(parse_line("ocean -0.6").is_err());
+    }
+
+    #[test]
+    fn pond_lines_parse_with_their_corners_in_either_order() {
+        assert_eq!(
+            parse_line("pond 4 -23 -2 -37 1.5").unwrap(),
+            Some(Command::Pond {
+                min: glam::Vec2::new(-2.0, -37.0),
+                max: glam::Vec2::new(4.0, -23.0),
+                level: 1.5,
+                water: None,
+            })
+        );
+        assert_eq!(
+            parse_line("pond 0 0 10 5 0.2 coastal").unwrap(),
+            Some(Command::Pond {
+                min: glam::Vec2::ZERO,
+                max: glam::Vec2::new(10.0, 5.0),
+                level: 0.2,
+                water: Some("coastal".to_string()),
+            })
+        );
+        assert!(parse_line("pond 0 0 10 5").is_err());
+        assert!(parse_line("pond nan 0 10 5 0.2").is_err());
+        assert!(parse_line("pond 0 0 10 5 inf").is_err());
+        assert!(parse_line("pond 0 0 0 5 0.2").is_err());
+        assert!(parse_line("pond 0 0 10 5 0.2 coastal more").is_err());
     }
 
     #[test]

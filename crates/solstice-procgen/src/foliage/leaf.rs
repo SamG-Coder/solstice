@@ -23,10 +23,22 @@ pub enum LeafKind {
     /// Needles splayed either side of a shoot, dark blue-green, as on a fir. They are built as
     /// fans of needles; see `tree::add_needle_spray`.
     Needles,
+    /// A long, narrow leaf drawn to a fine point, widest below its middle, a fresh yellow-green
+    /// that is silvery beneath, as on a willow.
+    Willow,
+    /// An oak's leaf: leathery, deep green and glossy above, with a strong pale midrib, widest
+    /// beyond its middle.
+    Oak,
 }
 
 impl LeafKind {
-    pub const ALL: [Self; 3] = [Self::Broadleaf, Self::Birch, Self::Needles];
+    pub const ALL: [Self; 5] = [
+        Self::Broadleaf,
+        Self::Birch,
+        Self::Needles,
+        Self::Willow,
+        Self::Oak,
+    ];
 
     /// The name of this kind's atlas.
     pub fn name(self) -> &'static str {
@@ -34,6 +46,8 @@ impl LeafKind {
             Self::Broadleaf => "broadleaf_leaves",
             Self::Birch => "birch_leaves",
             Self::Needles => "fir_needles",
+            Self::Willow => "willow_leaves",
+            Self::Oak => "oak_leaves",
         }
     }
 
@@ -50,10 +64,23 @@ impl LeafKind {
             Self::Birch => (0.45, 1.2),
             // Nearly as wide along its whole length, rounding off at each end.
             Self::Needles => (0.2, 0.25),
+            // A lance: widest two fifths of the way along, and long in the point.
+            Self::Willow => (0.6, 0.95),
+            // Widest beyond the middle, where an oak leaf's largest lobes are.
+            Self::Oak => (0.75, 0.6),
         };
         let peak = a / (a + b);
         let max = peak.powf(a) * (1.0 - peak).powf(b);
         0.5 * s.clamp(0.0, 1.0).powf(a) * (1.0 - s.clamp(0.0, 1.0)).powf(b) / max
+    }
+
+    /// Fractions of a leaf's length at which it has a full cross-section, between its stalk and
+    /// its tip. A narrow leaf needs one; a broad one two, to round its outline.
+    pub fn rows(self) -> &'static [f32] {
+        match self {
+            Self::Willow => &[0.42],
+            _ => &[0.32, 0.68],
+        }
     }
 
     /// How far the leaf curls down at its tip, as a fraction of its length.
@@ -62,13 +89,17 @@ impl LeafKind {
             Self::Broadleaf => 0.18,
             Self::Birch => 0.12,
             Self::Needles => 0.06,
+            // Long leaves arc over under their own weight.
+            Self::Willow => 0.3,
+            Self::Oak => 0.14,
         }
     }
 
     /// Deepest of the fold along the midrib, as a fraction of half the width.
     pub fn fold(self) -> f32 {
         match self {
-            Self::Broadleaf | Self::Birch => 0.25,
+            Self::Broadleaf | Self::Birch | Self::Oak => 0.25,
+            Self::Willow => 0.35,
             // A shoot's needles splay out in a shallow V on either side.
             Self::Needles => 0.45,
         }
@@ -79,6 +110,8 @@ impl LeafKind {
             Self::Broadleaf => veined(seed, BROADLEAF, 7.0, 0.45),
             Self::Birch => veined(seed, BIRCH, 9.0, 0.4),
             Self::Needles => needles(seed),
+            Self::Willow => veined(seed, WILLOW, 13.0, 0.42),
+            Self::Oak => veined(seed, OAK, 6.0, 0.36),
         }
     }
 }
@@ -103,6 +136,23 @@ const NEEDLES: [Vec3; LEAF_VARIANTS as usize] = [
     Vec3::new(0.030, 0.062, 0.030),
     Vec3::new(0.040, 0.075, 0.045),
     Vec3::new(0.060, 0.085, 0.030),
+];
+
+/// Willow leaves are a light, fresh yellow-green, the youngest nearly lime, and the first to
+/// turn pale gold.
+const WILLOW: [Vec3; LEAF_VARIANTS as usize] = [
+    Vec3::new(0.062, 0.115, 0.024),
+    Vec3::new(0.085, 0.140, 0.028),
+    Vec3::new(0.115, 0.165, 0.036),
+    Vec3::new(0.230, 0.205, 0.045),
+];
+/// Oak leaves in high summer: deep, slightly blue green, the newer growth brighter, and a few
+/// touched with the tan they turn.
+const OAK: [Vec3; LEAF_VARIANTS as usize] = [
+    Vec3::new(0.032, 0.075, 0.018),
+    Vec3::new(0.046, 0.095, 0.020),
+    Vec3::new(0.070, 0.120, 0.024),
+    Vec3::new(0.150, 0.125, 0.035),
 ];
 
 /// Column and position across it at `u`: (variant, -1..1 across the leaf).

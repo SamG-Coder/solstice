@@ -262,6 +262,17 @@ pub struct Sea {
     pub ocean: String,
 }
 
+/// Still water over a scene: ponds, pools and basins, each a level sheet over a rectangle of it
+/// whose basin's own banks shape its edge, and what their water is like.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StillWater {
+    /// Each pond: its least x and z, its greatest x and z, and the water's height, in metres.
+    pub ponds: Vec<[f32; 5]>,
+    /// The name of a built-in ocean, or a whole ocean in its text form, whose absorption and
+    /// scattering colour the water. Empty for clear water.
+    pub water: String,
+}
+
 /// One text file of a scene's gameplay: an actor file, a script, the input actions, or the list
 /// of placed actors. Carried as it was written, by the name it was written under, so the scene
 /// file needs no knowledge of what is in it.
@@ -285,6 +296,8 @@ pub struct SceneAsset {
     pub textures: Vec<TextureLayer>,
     pub viewpoint: Option<Viewpoint>,
     pub sea: Option<Sea>,
+    /// The scene's ponds, if it has any. A scene with a sea draws the sea and not its ponds.
+    pub still_water: Option<StillWater>,
     /// The scene's gameplay, if it has any. Empty for a scene that is only looked at.
     pub gameplay: Vec<GameFile>,
     /// How each instance collides, where the scene says. Instances past its end are

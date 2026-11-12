@@ -28,6 +28,9 @@ const GOLDEN_ANGLE: f32 = 2.399_963;
 pub struct Plant {
     pub wood: Mesh,
     pub leaves: Mesh,
+    /// The youngest shoots, for a species whose [`Species::twigs`] are another colour than its
+    /// bark. Empty otherwise.
+    pub twigs: Mesh,
 }
 
 /// A stem as a curve: points along it, the radius at each, and the direction it grows there.
@@ -54,8 +57,19 @@ impl Stem {
 /// How finely a stem is divided along its length, in metres: about three of its widths, so that
 /// bends stay smooth, but never so fine that twigs cost more than the leaves they carry.
 fn ring_spacing(radius: f32, length: f32) -> f32 {
-    (radius * 6.0).clamp(0.12, 0.6).min(length / 2.0)
+    // The thinnest twigs are all but straight between one leaf and the next.
+    let finest = if radius < 0.008 { 0.2 } else { 0.12 };
+    (radius * 6.0).clamp(finest, 0.6).min(length / 2.0)
 }
+
+/// As [`ring_spacing`], for a shoot that hangs: it turns over in its first few hand's lengths
+/// and is straight from there down, so it needs no more rings than show that turn.
+fn hanging_ring_spacing(length: f32) -> f32 {
+    0.3_f32.min(length / 2.0)
+}
+
+/// Height above the plant's ground below which no hanging shoot grows: it stops there.
+const HANG_FLOOR: f32 = 0.12;
 
 /// Grows one stem by marching along it, turning a little at each step.
 #[allow(clippy::too_many_arguments)]
@@ -68,13 +82,18 @@ fn grow(
     tip_radius: f32,
     level: &Level,
 ) -> Stem {
-    let step = ring_spacing(radius, length);
+    let step = if level.reach > 0.0 {
+        hanging_ring_spacing(length)
+    } else {
+        ring_spacing(radius, length)
+    };
     let segments = ((length / step).ceil() as usize).max(2);
     let step = length / segments as f32;
     let mut points = vec![start];
     let mut radii = vec![radius];
     let mut direction = direction.normalize();
     let mut point = start;
+    let mut grown = 0.0;
     for i in 1..=segments {
         let t = i as f32 / segments as f32;
         let wander = Vec3::new(rng.signed(), rng.signed() * 0.5, rng.signed()) * level.gnarl;
@@ -82,13 +101,21 @@ fn grow(
             + (wander + Vec3::Y * level.upturn - Vec3::Y * level.droop * t * 2.0) * step)
             .normalize();
         point += direction * step;
+        // A hanging shoot ends where it would reach the ground.
+        if level.reach > 0.0 && point.y < HANG_FLOOR && i > 2 {
+            break;
+        }
+        grown += step;
         points.push(point);
         radii.push(radius + (tip_radius - radius) * t.powf(0.8));
+    }
+    if let Some(last) = radii.last_mut() {
+        *last = last.min(tip_radius.max(0.0015));
     }
     Stem {
         points,
         radii,
-        length,
+        length: grown,
     }
 }
 
@@ -120,13 +147,25 @@ impl Species {
                 let parent_length = stems[parent_index].length;
                 let span = level.span.1 - level.span.0;
                 let count = (parent_length * span * level.per_metre).round().max(1.0) as usize;
-                for (t, spin) in shoot_positions(level, count, &mut rng) {
+                let mut positions = shoot_positions(level, count, &mut rng);
+                // A branch does not end in a bare point: its tip carries on as a shoot of the
+                // next level, nearly straight ahead. The trunk's own tip is its leader.
+                if depth > 0 && level.span.1 >= 0.95 && level.whorl == 0 {
+                    positions.push((0.985, rng.range(0.0, TAU)));
+                }
+                let last = positions.len() - 1;
+                for (index, (t, spin)) in positions.into_iter().enumerate() {
+                    let terminal = depth > 0 && index == last && t > 0.98;
                     let (point, along, parent_radius) = stems[parent_index].at(t);
                     let side = perpendicular(along, spin);
                     let along_span = ((t - level.span.0) / span.max(1.0e-6)).clamp(0.0, 1.0);
-                    let angle = level.angle.0
-                        + (level.angle.1 - level.angle.0) * along_span
-                        + rng.signed() * 10.0;
+                    let angle = if terminal {
+                        rng.range(4.0, 16.0)
+                    } else {
+                        level.angle.0
+                            + (level.angle.1 - level.angle.0) * along_span
+                            + rng.signed() * 10.0
+                    };
                     let angle = angle.to_radians();
                     let direction = along * angle.cos() + side * angle.sin();
                     let mut length = parent_length * level.length * rng.range(0.75, 1.2);
@@ -134,6 +173,12 @@ impl Species {
                         length *= self.crown.envelope(along_span);
                     } else {
                         length *= 1.0 - level.taper * along_span;
+                    }
+                    if level.reach > 0.0 {
+                        // It hangs: as long as takes it down to where the curtain ends, ragged
+                        // by half as much again, and no longer than its kind grows.
+                        let drop = point.y - level.reach * rng.range(0.55, 1.6);
+                        length = length.min(drop.max(0.25));
                     }
                     if length < 0.03 {
                         continue;
@@ -156,9 +201,15 @@ impl Species {
         }
 
         let mut wood = Mesh::default();
+        let mut twigs = Mesh::default();
+        let twig_radius = self.twigs.map_or(0.0, |(below, _)| below);
         for (index, stem) in stems.iter().enumerate() {
             let flare = if index == 0 { self.root_flare } else { 0.0 };
-            add_tube(&mut wood, stem, flare, &mut rng);
+            if stem.radii[0] < twig_radius {
+                add_tube(&mut twigs, stem, 0.0, &mut rng);
+            } else {
+                add_tube(&mut wood, stem, flare, &mut rng);
+            }
         }
 
         let crown_center = crown_center(&stems, &generation);
@@ -172,7 +223,11 @@ impl Species {
                 &mut rng,
             );
         }
-        Plant { wood, leaves }
+        Plant {
+            wood,
+            leaves,
+            twigs,
+        }
     }
 }
 
@@ -231,7 +286,14 @@ fn crown_center(stems: &[Stem], leafy: &[usize]) -> Vec3 {
 
 /// A stem's surface: rings of vertices along its curve, closing to a point at its tip.
 fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
-    let sides = ((stem.radii[0] * TAU / 0.035) as usize).clamp(3, 16);
+    // About 3.5 cm to a side, so a twig is a prism and a great trunk is round against the sky.
+    let sides = (((stem.radii[0] * TAU / 0.035) as usize).clamp(3, 16)
+        + ((stem.radii[0] - 0.09).max(0.0) * 60.0) as usize)
+        .min(40);
+    // A thick stem is never a true cylinder: it swells and hollows along its length, and bulges
+    // where old limbs were. Too slight to see on a twig, so thin stems go without.
+    let thick = smoothstep(0.06, 0.2, stem.radii[0]);
+    let bulges = (rng.range(0.0, 100.0), rng.range(0.0, 100.0));
     // Bark wraps a whole number of times, so its seam matches.
     let around = (stem.radii[0] * TAU / BARK_REPEAT).round().max(1.0) * BARK_REPEAT;
     let lobes = rng.range(0.0, TAU);
@@ -260,7 +322,22 @@ fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
             let theta = j as f32 / sides as f32 * TAU;
             let buttress = 1.0 + flare * (0.6 + 0.4 * (theta * 5.0 + lobes).cos());
             let outward = normal * theta.cos() + binormal * theta.sin();
-            let radius = if tip { 0.0 } else { stem.radii[i] * buttress };
+            let lump = if thick > 0.0 {
+                // Read round a circle, so the swelling has no seam.
+                let (c, s) = (theta.cos(), theta.sin());
+                let broad = Vec3::new(c * 1.3, distance * 0.9 + bulges.0, s * 1.3);
+                let fine = Vec3::new(c * 3.1, distance * 2.6 + bulges.1, s * 3.1);
+                1.0 + thick
+                    * (0.075 * crate::noise::fbm(broad, 3, 97)
+                        + 0.03 * crate::noise::fbm(fine, 2, 98))
+            } else {
+                1.0
+            };
+            let radius = if tip {
+                0.0
+            } else {
+                stem.radii[i] * buttress * lump
+            };
             mesh.vertices.push(Vertex {
                 position: stem.points[i] + outward * radius,
                 normal: outward,
@@ -278,9 +355,6 @@ fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
     }
 }
 
-/// Fractions of a leaf's length with a full cross-section, between its stalk and its tip.
-const LEAF_ROWS: [f32; 2] = [0.32, 0.68];
-
 /// Leaves along a stem, alternating around it, with a few at its tip.
 fn add_leaves(mesh: &mut Mesh, stem: &Stem, leaves: &Leaves, crown: Vec3, rng: &mut Rng) {
     let count = (stem.length * leaves.per_metre).round().max(1.0) as usize;
@@ -292,7 +366,7 @@ fn add_leaves(mesh: &mut Mesh, stem: &Stem, leaves: &Leaves, crown: Vec3, rng: &
         let (point, along, radius) = stem.at(t);
         spin += GOLDEN_ANGLE;
         let side = perpendicular(along, spin);
-        let out = (along * 0.6 + side).normalize();
+        let out = (along * leaves.lean + side).normalize();
         let length = rng.range(leaves.length.0, leaves.length.1);
         let mut pick = rng.unit() * total;
         let mut variant = 0;
@@ -419,7 +493,8 @@ fn add_leaf(
         normal: lit(face, base),
         uv: Vec2::new(u(0.0), 0.0),
     });
-    for &s in &LEAF_ROWS {
+    let rows = kind.rows();
+    for &s in rows {
         let center = base + axis * (s * length) + curl(s);
         let half = half_width(s);
         let fold = face * (half * kind.fold());
@@ -444,15 +519,24 @@ fn add_leaf(
         uv: Vec2::new(u(0.0), 1.0),
     });
 
-    // Counter-clockwise seen from the face.
-    let (stalk, l0, c0, r0) = (first, first + 1, first + 2, first + 3);
-    let (l1, c1, r1) = (first + 4, first + 5, first + 6);
-    let point = first + 7;
-    mesh.indices.extend_from_slice(&[
-        stalk, c0, l0, stalk, r0, c0, //
-        l0, c0, c1, l0, c1, l1, c0, r0, r1, c0, r1, c1, //
-        l1, c1, point, c1, r1, point,
-    ]);
+    // Counter-clockwise seen from the face: the stalk's two triangles, two pairs between each
+    // row and the next, and the tip's two.
+    let stalk = first;
+    let row = |k: u32| (first + 1 + k * 3, first + 2 + k * 3, first + 3 + k * 3);
+    let count = rows.len() as u32;
+    let point = first + 1 + count * 3;
+    let (l0, c0, r0) = row(0);
+    mesh.indices
+        .extend_from_slice(&[stalk, c0, l0, stalk, r0, c0]);
+    for k in 0..count - 1 {
+        let (l0, c0, r0) = row(k);
+        let (l1, c1, r1) = row(k + 1);
+        mesh.indices
+            .extend_from_slice(&[l0, c0, c1, l0, c1, l1, c0, r0, r1, c0, r1, c1]);
+    }
+    let (l1, c1, r1) = row(count - 1);
+    mesh.indices
+        .extend_from_slice(&[l1, c1, point, c1, r1, point]);
 }
 
 #[cfg(test)]
@@ -540,11 +624,13 @@ mod tests {
                 hi.y
             );
             assert!(hi.y > species.height * 0.85, "{name} top at {}", hi.y);
+            // A specimen tree, an old oak or a weeping willow, is grown to be stood under: it
+            // has several times the leaves of a tree of the wood.
             assert!(
-                leaves > 16_000 && leaves < 700_000,
+                leaves > 16_000 && leaves < 1_400_000,
                 "{name}: {leaves} leaf triangles"
             );
-            assert!(wood < 150_000, "{name}: {wood} wood triangles");
+            assert!(wood < 320_000, "{name}: {wood} wood triangles");
         }
         assert!(Species::by_name("baobab").is_none());
     }

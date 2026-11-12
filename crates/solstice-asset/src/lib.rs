@@ -22,5 +22,5 @@ pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedSkin, PackedVert
 pub use paged::{LoadedScene, PagedScene};
 pub use scene::{
     Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, SceneAsset,
-    Sea, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
+    Sea, StillWater, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
 };

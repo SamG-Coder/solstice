@@ -8,7 +8,7 @@
 //! bake --scene SCENE.txt [--texture-size N] [--output FILE]
 //! bake --gallery [--texture-size N] [--output FILE]
 //! bake --forest [--texture-size N] [--output FILE]
-//! bake --plants [--species FILE.species]... [--grass FILE.grass]... [--texture-size N] [--output FILE]
+//! bake --plants [--only] [--species FILE.species]... [--grass FILE.grass]... [--texture-size N] [--output FILE]
 //! bake --check-character CHARACTER.glb [--roles RIG.roles]
 //! bake --scene SCENE.txt --show-collision [--output FILE]
 //! ```
@@ -55,6 +55,8 @@ struct Options {
     show_collision: bool,
     /// A row of every species, instead of the demo scene.
     plants: bool,
+    /// Only the species and grass files given, without the built-in ones.
+    only: bool,
     /// Species files to add to the row of plants.
     species: Vec<PathBuf>,
     /// Grass files to add to the row of grass.
@@ -133,6 +135,7 @@ fn parse_args() -> Result<Options, String> {
         forest: false,
         show_collision: false,
         plants: false,
+        only: false,
         species: Vec::new(),
         grass: Vec::new(),
         large_gltf: None,
@@ -194,6 +197,7 @@ fn parse_args() -> Result<Options, String> {
             "--forest" => options.forest = true,
             "--show-collision" => options.show_collision = true,
             "--plants" => options.plants = true,
+            "--only" => options.only = true,
             "--species" => {
                 options.plants = true;
                 options.species.push(PathBuf::from(value()?));
@@ -217,6 +221,7 @@ fn load_scene(options: &Options) -> Result<SceneAsset, String> {
             options.scene_texture_size.unwrap_or(1024),
             &options.species,
             &options.grass,
+            options.only,
         );
     }
     if options.gallery {

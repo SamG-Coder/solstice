@@ -249,7 +249,10 @@ mod native {
             if let Some(level) = options.sea_level {
                 renderer.set_sea_level(level);
             }
-            renderer.set_ponds(&options.ponds);
+            // A scene's own ponds stand unless others are asked for.
+            if !options.ponds.is_empty() {
+                renderer.set_ponds(&options.ponds);
+            }
             spawn_effects(&mut renderer, options);
             (renderer, reader)
         }
@@ -1144,7 +1147,9 @@ mod native {
         if let Some(level) = options.sea_level {
             renderer.set_sea_level(level);
         }
-        renderer.set_ponds(&options.ponds);
+        if !options.ponds.is_empty() {
+            renderer.set_ponds(&options.ponds);
+        }
         spawn_effects(&mut renderer, options);
         let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("flyover"),

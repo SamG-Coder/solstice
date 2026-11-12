@@ -53,8 +53,15 @@ struct Ponds {
 
 // Depth of water over which a pond fades into its basin, in metres.
 const EDGE_FADE: f32 = 0.03;
-// Still water's roughness, as GGX alpha, seen close.
-const STILL_ROUGHNESS: f32 = 0.02;
+// Still water's roughness, as GGX alpha, seen close: a mirror, but for what the ripples do.
+const STILL_ROUGHNESS: f32 = 0.006;
+// The most rays a pixel reflects along (`ponds.count.y` says how many), and how far out along
+// the bell of facet tilts a ray may be drawn from, in standard deviations: the tail beyond
+// brings little light and much noise.
+const MOST_RAYS: u32 = 8u;
+const TILT_LIMIT: f32 = 2.2;
+// The steps of the R2 sequence, which spreads successive samples evenly over a square.
+const R2: vec2f = vec2f(0.7548776662, 0.5698402910);
 // Trains of ripples, as a light air leaves on sheltered water: each a direction, a wavelength in
 // metres and a height in metres.
 const RIPPLES: u32 = 5u;
@@ -155,20 +162,31 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let n_dot_v = max(dot(normal, view), 1.0e-3);
     let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
-    // One reflected ray per pixel, off a facet tilted at random by the surface's roughness;
-    // temporal accumulation gathers them into the blurred reflection.
-    let jitter = vec2f(
-        interleaved_gradient_noise(vec2f(id.xy), frame.frame_index),
-        interleaved_gradient_noise(vec2f(id.yx) + vec2f(31.0, 17.0), frame.frame_index),
+    // A few reflected rays per pixel, each off a facet tilted by the surface's roughness. The
+    // tilts follow a sequence that spreads them evenly, over this pixel's rays and on through
+    // the frames temporal accumulation gathers, each pixel starting somewhere of its own: so
+    // the blurred reflection of a ruffled pond settles smooth, where rays drawn afresh each
+    // frame leave it speckled wherever a dark bank meets a bright sky.
+    let start = vec2f(
+        interleaved_gradient_noise(vec2f(id.xy), 0u),
+        interleaved_gradient_noise(vec2f(id.yx) + vec2f(31.0, 17.0), 0u),
     );
-    let spread = sqrt(-2.0 * log(max(1.0 - jitter.x, 1.0e-4))) * roughness * 0.7071;
+    let rays = clamp(ponds.count.y, 1u, MOST_RAYS);
     let basis = orthonormal_basis(normal);
-    let facet = normalize(normal + (basis[0] * cos(TAU * jitter.y) + basis[1] * sin(TAU * jitter.y)) * spread);
-    var direction = reflect(-view, facet);
-    if dot(direction, normal) <= 0.0 {
-        direction = reflect(-view, normal);
+    var reflected = vec3f(0.0);
+    for (var ray_index = 0u; ray_index < rays; ray_index++) {
+        let sample = f32((frame.frame_index % 4096u) * rays + ray_index);
+        let jitter = fract(start + sample * R2);
+        let tilt = min(sqrt(-2.0 * log(max(1.0 - jitter.x, 1.0e-4))), TILT_LIMIT);
+        let spread = tilt * roughness * 0.7071;
+        let facet = normalize(normal + (basis[0] * cos(TAU * jitter.y) + basis[1] * sin(TAU * jitter.y)) * spread);
+        var direction = reflect(-view, facet);
+        if dot(direction, normal) <= 0.0 {
+            direction = reflect(-view, normal);
+        }
+        reflected += reflection(world, normal, direction);
     }
-    let reflected = reflection(world, normal, direction);
+    reflected /= f32(rays);
 
     // Sunlight at the water, and the shadows of what stands in its way. Shadows show on water
     // by dimming its highlight and the light it scatters from within; what it reflects is
@@ -195,7 +213,37 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let sunlight = sun_light * max(sun.y, 0.0);
     let body = albedo * (skylight + sunlight) / PI * 0.5;
 
-    let underwater = through_water(center, world, view, normal, water, scene_depth, body, extinction);
+    // What is seen through the water. A pond is shallow and its bed slopes up to meet it, so
+    // the sea's way of finding the bed along the bent ray (ocean/optics.wgsl) lands now on the
+    // bed, now on the bank beyond, and the picture breaks into patches with hard edges. Here
+    // the bed is the one straight behind, shifted only as far as the ripples tilt the surface:
+    // it shimmers, and is whole. The light still crosses the water twice, down to the bed in
+    // the sun's bent direction and back up to the eye along the bent view.
+    var underwater = body;
+    if scene_depth > 0.0 {
+        let bed = reconstruct_world(frame, center, scene_depth);
+        let deep = max(world.y - bed.y, 0.0);
+        let bent = refract(-view, normal, 1.0 / 1.33);
+        let sun_in = refract(-frame.sun_direction, vec3f(0.0, 1.0, 0.0), 1.0 / 1.33);
+        let path = deep / max(-bent.y, 0.25);
+        let down = deep / max(-sun_in.y, 0.2);
+        // The ripples' tilt moves what is seen by a share of the depth, never past the bank.
+        let wobble = (normal.xz / max(normal.y, 0.5)) * min(deep, 0.5) * 0.35;
+        let moved = frame.view_proj * vec4f(bed + vec3f(wobble.x, 0.0, wobble.y), 1.0);
+        var uv = center * frame.inv_viewport;
+        if moved.w > 0.0 {
+            let ndc = moved.xy / moved.w;
+            let there = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            let last = vec2i(frame.viewport) - vec2i(1);
+            let depth_there = textureLoad(opaque_depth, clamp(vec2i(there * frame.viewport), vec2i(0), last), 0).r;
+            // Only where that spot too lies under the water.
+            if depth_there > 0.0 && depth_there < water {
+                uv = there;
+            }
+        }
+        let seen = textureSampleLevel(lit, clamp_sampler, uv, 0.0).rgb;
+        underwater = seen * exp(-extinction * (path + down)) + body * (vec3f(1.0) - exp(-extinction * path));
+    }
     var color = mix(underwater, reflected, fresnel) + highlight;
     color = aerial_perspective(color, world, view, reach);
     // Where the water thins to nothing against the basin it fades out rather than ending in a

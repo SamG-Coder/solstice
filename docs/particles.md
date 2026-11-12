@@ -114,7 +114,8 @@ Not in the first version, though the design leaves room for each:
 ### Effects as data
 
 An effect is a text file of one or more emitters. The built-in ones are in
-`crates/solstice-render/particles/`:
+`crates/solstice-render/particles/`: a fountain, motes adrift in still air that shine where they
+cross a shaft of sun, and fireflies for dusk:
 
 ```text
 # crates/solstice-render/particles/rain.particles

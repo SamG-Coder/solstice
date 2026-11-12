@@ -134,6 +134,9 @@ pub struct RendererSettings {
     pub sway_fade: [f32; 2],
     /// The rain's share of drops drawn, and its light volume's cells and their size in metres.
     pub rain: crate::rain::RainQuality,
+    /// Rays each pixel of a pond reflects along: more for a smoother reflection on ruffled
+    /// water.
+    pub pond_reflection_rays: u32,
 }
 
 impl Default for RendererSettings {
@@ -156,6 +159,7 @@ impl Default for RendererSettings {
             particle_ray_steps: 16,
             sway_fade: [40.0, 60.0],
             rain: crate::rain::RainQuality::default(),
+            pond_reflection_rays: 4,
         }
     }
 }
@@ -201,6 +205,11 @@ impl RendererSettings {
                 light_cell: 1.33,
             },
             Quality::High => crate::rain::RainQuality::default(),
+        };
+        self.pond_reflection_rays = match quality {
+            Quality::Low => 1,
+            Quality::Medium => 2,
+            Quality::High => 4,
         };
         self.sway_fade = match quality {
             Quality::Low => [20.0, 30.0],
@@ -342,6 +351,8 @@ pub struct Renderer {
     water: Option<WaterSurface>,
     /// The scene's still water, and what shades it: made when there are ponds and no sea.
     ponds: Vec<Pond>,
+    /// What the ponds' water is like, if the scene says: clear otherwise.
+    pond_ocean: Option<Ocean>,
     pond_water: Option<PondWater>,
     /// Effects, and the pool their particles live in.
     particles: Particles,
@@ -394,7 +405,9 @@ impl Renderer {
             streamer.install_now(gpu, &scene, page, loaded.page(page), &[]);
         }
         streamer.flush(gpu, &scene);
-        Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&loaded.scene.sea)
+        Self::from_parts(gpu, scene, streamer, output_format, settings)
+            .with_sea(&loaded.scene.sea)
+            .with_still_water(&loaded.scene.still_water)
     }
 
     /// Why [`Self::streaming`] can't draw this scene on this GPU within `budget`, if it can't:
@@ -432,7 +445,9 @@ impl Renderer {
             }
             streamer.flush(gpu, &scene);
         }
-        Self::from_parts(gpu, scene, streamer, output_format, settings).with_sea(&paged.sea)
+        Self::from_parts(gpu, scene, streamer, output_format, settings)
+            .with_sea(&paged.sea)
+            .with_still_water(&paged.still_water)
     }
 
     /// For a scene that keeps its tables outside its manifest: takes a pinned page and its
@@ -464,6 +479,31 @@ impl Renderer {
                 Ocean::default()
             });
             self.ocean_request = Some((Some(ocean), 0.0));
+        }
+        self
+    }
+
+    /// Gives the renderer the scene's ponds, if it has any, and the water they hold.
+    fn with_still_water(mut self, still: &Option<solstice_asset::StillWater>) -> Self {
+        if let Some(still) = still {
+            self.ponds = still
+                .ponds
+                .iter()
+                .map(|&[x0, z0, x1, z1, level]| Pond {
+                    min: [x0.min(x1), z0.min(z1)],
+                    max: [x0.max(x1), z0.max(z1)],
+                    level,
+                })
+                .collect();
+            let text = still.water.trim();
+            if !text.is_empty() {
+                match Ocean::by_name(text).map_or_else(|| Ocean::parse(&still.water), Ok) {
+                    Ok(water) => self.pond_ocean = Some(water),
+                    Err(error) => {
+                        log::warn!("the scene's pond water is unreadable ({error}); using clear")
+                    }
+                }
+            }
         }
         self
     }
@@ -733,6 +773,7 @@ impl Renderer {
             sea_level: 0.0,
             water: None,
             ponds: Vec::new(),
+            pond_ocean: None,
             pond_water: None,
             environment_layout,
             sized: None,
@@ -942,7 +983,9 @@ impl Renderer {
             self.pond_water = None;
         } else if self.pond_water.is_none() {
             let water = PondWater::new(gpu, &self.environment_layout);
-            let clear = Ocean::by_name("clear").unwrap_or_default();
+            let clear = self
+                .pond_ocean
+                .unwrap_or_else(|| Ocean::by_name("clear").unwrap_or_default());
             water.set(gpu, &self.ponds, &clear);
             self.pond_water = Some(water);
         }
@@ -1301,6 +1344,7 @@ impl Renderer {
             );
         } else if let (Some(ponds), Some(targets)) = (&mut self.pond_water, &sized.water) {
             ponds.set_wind(gpu, self.wind.now());
+            ponds.set_rays(gpu, self.settings.pond_reflection_rays);
             ponds.record(
                 gpu,
                 &mut encoder,

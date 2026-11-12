@@ -53,8 +53,9 @@ pub struct Weather {
 }
 
 /// The built-in states, by name, as text.
-const BUILT_IN: [(&str, &str); 6] = [
+const BUILT_IN: [(&str, &str); 7] = [
     ("clear", include_str!("../../weather/clear.weather")),
+    ("calm", include_str!("../../weather/calm.weather")),
     ("fair", include_str!("../../weather/fair.weather")),
     ("broken", include_str!("../../weather/broken.weather")),
     ("overcast", include_str!("../../weather/overcast.weather")),
