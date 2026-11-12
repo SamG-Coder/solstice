@@ -893,6 +893,8 @@ pub(crate) fn build_commands(
     let mut land_plan = crate::land::Plan::default();
     let mut water = None;
     let mut circuit = None;
+    // Whether there has been a circuit, and a line of land, to refuse the two together.
+    let (mut has_land, mut has_circuit) = (false, false);
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
     let mut order: Vec<PathBuf> = Vec::new();
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
@@ -910,6 +912,28 @@ pub(crate) fn build_commands(
     } in commands
     {
         let at = |e: String| format!("{origin}: {e}");
+        // A circuit builds its own land, ground and planting: the lines that would build
+        // another, one inside it, are refused wherever in the file they come.
+        let land = match &command {
+            Command::Terrain { .. } => Some("terrain"),
+            Command::Land { .. } => Some("land"),
+            Command::Path { .. } => Some("path"),
+            Command::Yard { .. } => Some("yard"),
+            Command::Clear { .. } => Some("clear"),
+            Command::Meadow(_) => Some("meadow"),
+            Command::Wood { .. } => Some("wood"),
+            Command::Water { .. } => Some("water"),
+            _ => None,
+        };
+        let circuits = matches!(command, Command::Circuit(_));
+        has_land |= land.is_some();
+        has_circuit |= circuits;
+        if (land.is_some() || circuits) && has_land && has_circuit {
+            let word = land.unwrap_or("circuit");
+            return Err(at(format!(
+                "`{word}` with `circuit`: a circuit builds its own land, so leave out `terrain`, `water` and the land's lines"
+            )));
+        }
         match Some(command) {
             None => {}
             Some(Command::TextureSize(size)) => scene.texture_size = size,
@@ -1686,6 +1710,42 @@ mod tests {
         ]);
         let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
         assert_eq!(scene.gameplay.len(), 1);
+    }
+
+    /// A circuit's track: three points.
+    const TRACK: &[u8] = b"p 0 0 0 1 0 0 6 6
+p 0 0 50 1 0 0 6 6
+p 50 0 50 1 0 0 6 6
+";
+
+    #[test]
+    fn a_circuit_and_a_terrain_are_not_both_built() {
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"terrain 400 64 0.3 52\ntrack c.track\ncircuit 900\n",
+            ),
+            (
+                "c.track",
+                b"p 0 0 0 1 0 0 6 6\np 0 0 50 1 0 0 6 6\np 50 0 50 1 0 0 6 6\n",
+            ),
+        ]);
+        let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
+        assert!(error.contains("a circuit builds its own land"), "{error}");
+        assert!(error.contains(":3:"), "on the circuit's line: {error}");
+        // And the other way round, with a line of the land's after the circuit.
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"track c.track
+circuit 900
+wood 0 0 40 9
+",
+            ),
+            ("c.track", TRACK),
+        ]);
+        let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
+        assert!(error.contains(":3: `wood` with `circuit`"), "{error}");
     }
 
     #[test]
