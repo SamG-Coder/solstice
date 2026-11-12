@@ -67,6 +67,7 @@ impl Resolve {
     pub fn new(
         gpu: &Gpu,
         wetness: &wgpu::BindGroupLayout,
+        rain: &wgpu::BindGroupLayout,
         deform: crate::shaders::Deform,
         regions: Option<RegionPlan>,
         glow: bool,
@@ -134,7 +135,7 @@ impl Resolve {
                 "resolve",
                 &module,
                 "main",
-                &[&data_layout, &output_layout, wetness],
+                &[&data_layout, &output_layout, wetness, rain],
             ),
             data_layout,
             output_layout,
@@ -248,6 +249,7 @@ impl Resolve {
         encoder: &mut wgpu::CommandEncoder,
         bindings: &ResolveBindings,
         wetness: &wgpu::BindGroup,
+        rain: &wgpu::BindGroup,
         size: (u32, u32),
     ) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -258,6 +260,7 @@ impl Resolve {
         pass.set_bind_group(0, &bindings.data, &[]);
         pass.set_bind_group(1, &bindings.output, &[]);
         pass.set_bind_group(2, wetness, &[]);
+        pass.set_bind_group(3, rain, &[]);
         pass.dispatch_workgroups(groups_for(size.0, 8), groups_for(size.1, 8), 1);
         if let (Some((pipeline, _)), Some(group)) = (&self.depth, &bindings.depth) {
             pass.set_pipeline(pipeline);

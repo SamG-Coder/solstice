@@ -15,6 +15,7 @@
 #include "gi/screen_trace.wgsl"
 #include "ocean/seabed.wgsl"
 #include "ocean/optics.wgsl"
+#include "rain/rings.wgsl"
 
 // The opaque scene, lit, with its depth and motion.
 @group(0) @binding(0) var lit: texture_2d<f32>;
@@ -125,6 +126,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let footprint = length(next - world) / sqrt(max(abs(view.y), 0.02));
     let calm = textureLoad(water_calm, pixel, 0).xy;
     var normal = wave_normal(calm, footprint, water_depth_at(calm));
+    // Rain rings the water and roughens it (rain/rings.wgsl).
+    let rained = rain_rings(world.xz, frame.time, clouds.rain, footprint);
+    normal = normalize(normal + vec3f(-rained.x, 0.0, -rained.y));
     // Waves turned away from the camera show their backs only at grazing angles; lean them back
     // into view, as the waves in front would hide them.
     let facing = dot(normal, view);
@@ -138,7 +142,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     } else {
         let n_dot_v = max(dot(normal, view), 1.0e-3);
         let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);
-        let roughness = surface_roughness(footprint);
+        let roughness = sqrt(sq(surface_roughness(footprint)) + rained.z);
         // One reflected ray per pixel, off a facet the ripples tilt at random by the surface's
         // roughness; temporal accumulation gathers them into the blurred reflection.
         let jitter = vec2f(

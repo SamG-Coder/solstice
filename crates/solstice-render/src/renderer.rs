@@ -19,6 +19,7 @@ use crate::particles::{
 };
 use crate::post::{PostBindings, PostProcess};
 use crate::profiler::{section, Profiler, SECTIONS};
+use crate::rain::Rain;
 use crate::scene::GpuScene;
 use crate::shadow::{ShadowMaps, CASCADE_COUNT, MOVING_SLOTS};
 use crate::sky::Sky;
@@ -57,7 +58,8 @@ const SLOT_SHADOW: u32 = 2;
 const SLOT_VOXEL: u32 = SLOT_SHADOW + CASCADE_COUNT as u32;
 const SLOT_SEABED: u32 = SLOT_VOXEL + LEVEL_COUNT as u32;
 const SLOT_MOVING_SHADOW: u32 = SLOT_SEABED + 1;
-const SLOT_COUNT: u32 = SLOT_MOVING_SHADOW + MOVING_SLOTS;
+const SLOT_COVER: u32 = SLOT_MOVING_SHADOW + MOVING_SLOTS;
+const SLOT_COUNT: u32 = SLOT_COVER + 1;
 
 /// A named balance between image quality and GPU cost.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +126,8 @@ pub struct RendererSettings {
     /// Metres from the camera over which swaying in the wind fades out, where it would no longer
     /// be seen (`docs/weather-effects.md`).
     pub sway_fade: [f32; 2],
+    /// The rain's share of drops drawn, and its light volume's cells and their size in metres.
+    pub rain: crate::rain::RainQuality,
 }
 
 impl Default for RendererSettings {
@@ -145,6 +149,7 @@ impl Default for RendererSettings {
             particle_light_interval: 1,
             particle_ray_steps: 16,
             sway_fade: [40.0, 60.0],
+            rain: crate::rain::RainQuality::default(),
         }
     }
 }
@@ -177,6 +182,19 @@ impl RendererSettings {
             Quality::Low => (POOL_LOW, 0.35, 4, 8),
             Quality::Medium => (POOL_MEDIUM, 0.6, 2, 12),
             Quality::High => (POOL_HIGH, 1.0, 1, 16),
+        };
+        self.rain = match quality {
+            Quality::Low => crate::rain::RainQuality {
+                detail: 0.35,
+                light_cells: [32, 16, 32],
+                light_cell: 2.0,
+            },
+            Quality::Medium => crate::rain::RainQuality {
+                detail: 0.6,
+                light_cells: [48, 24, 48],
+                light_cell: 1.33,
+            },
+            Quality::High => crate::rain::RainQuality::default(),
         };
         self.sway_fade = match quality {
             Quality::Low => [20.0, 30.0],
@@ -325,6 +343,10 @@ pub struct Renderer {
     /// for a scene with something that does.
     wind: Wind,
     wind_field: Option<WindField>,
+    /// Rain in the air, where it lands and what it leaves on surfaces.
+    rain: Rain,
+    /// Counts the size-dependent resources made, so what binds them knows when they change.
+    sized_generation: usize,
     /// The layout of the lighting bind group, for passes made after the renderer.
     environment_layout: wgpu::BindGroupLayout,
     sized: Option<SizedResources>,
@@ -649,17 +671,28 @@ impl Renderer {
         let wind_field = scene
             .has_sways
             .then(|| WindField::new(gpu, &scene.wind_field));
+        let rain = Rain::new(
+            gpu,
+            &rasterizer,
+            &environment_layout,
+            crate::particles::COLOR_FORMAT,
+            crate::particles::REACTIVE_FORMAT,
+        );
+        let resolve = Resolve::new(
+            gpu,
+            waterline.resolve_layout(),
+            &rain.surface_layout,
+            scene.deform(),
+            scene.regions,
+            scene.glow_maps.is_some(),
+        );
         Self {
             settings,
             wind: Wind::new(),
             wind_field,
-            resolve: Resolve::new(
-                gpu,
-                waterline.resolve_layout(),
-                scene.deform(),
-                scene.regions,
-                scene.glow_maps.is_some(),
-            ),
+            rain,
+            sized_generation: 0,
+            resolve,
             waterline,
             screen_gi: ScreenGi::new(gpu, &environment_layout),
             deferred: DeferredLighting::new(gpu, &environment_layout),
@@ -802,6 +835,9 @@ impl Renderer {
     /// tests, and catching up after a pause.
     pub fn advance_weather(&mut self, seconds: f32) {
         self.clouds.advance(seconds);
+        // What the rain has left behind, as if it had been falling all that while.
+        self.rain
+            .advance(&self.clouds.weather(), &self.wind, seconds);
     }
 
     /// The weather now, part way to its target while it changes.
@@ -930,6 +966,7 @@ impl Renderer {
             if let Some(water) = &mut self.water {
                 water.seabed.mark_stale();
             }
+            self.rain.mark_stale();
         }
         if streamed & (1 << HOLD_VOXELS) != 0 || changes.gi_changed {
             self.volume.mark_stale();
@@ -1019,6 +1056,21 @@ impl Renderer {
             );
             field.record(gpu, &mut encoder, &params);
         }
+        // The rain moves on with the weather and the wind.
+        self.rain.quality = self.settings.rain;
+        let weather = self.clouds.weather();
+        self.rain
+            .advance(&weather, &self.wind, delta_seconds.clamp(0.0, 0.25));
+        let cover_due = self.rain.prepare(
+            gpu,
+            &self.view_slots,
+            SLOT_COVER,
+            camera.position,
+            &self.wind,
+            &weather,
+            self.settings.shadow_lod_threshold,
+            self.frame_seconds,
+        );
 
         mark(&self.profiler, &mut encoder, section::SHADOWS);
         self.shadows.record(
@@ -1067,6 +1119,32 @@ impl Renderer {
                 },
             );
         }
+
+        // Where the rain lands, its light and its ripples, after the shadows that light it and
+        // before the surfaces it wets are resolved.
+        mark(&self.profiler, &mut encoder, section::RAIN);
+        if cover_due {
+            self.rain.record_maps(
+                &mut encoder,
+                &self.cull,
+                &self.scene,
+                &self.aux_cull_scene,
+                &self.aux_work,
+                &self.aux_raster,
+                SLOT_COVER,
+            );
+        }
+        self.rain.record_light(
+            gpu,
+            &mut encoder,
+            &self.environment,
+            &crate::rain::LightInputs {
+                shadow_uniform: &self.shadows.uniform,
+                shadow_maps: &self.shadows.array_view,
+                shadow_sampler: &self.shadows.comparison_sampler,
+                lights: &self.scene.lights,
+            },
+        );
 
         self.volume.record(
             &mut encoder,
@@ -1123,6 +1201,7 @@ impl Renderer {
             &mut encoder,
             &sized.resolve,
             self.waterline.resolve_group(),
+            &self.rain.surface_group,
             render_size,
         );
 
@@ -1233,6 +1312,22 @@ impl Renderer {
             &sized.particles,
             debug == DebugView::Particles,
         );
+
+        // Rain, over everything, as the particles are.
+        mark(&self.profiler, &mut encoder, section::RAIN_DRAW);
+        if self.rain.draws() && debug == DebugView::Lit {
+            self.rain.record_draw(
+                gpu,
+                &mut encoder,
+                &self.frame_uniform,
+                scene_color,
+                sized.particles.reactive(),
+                false,
+                &sized.scene_depth,
+                self.sized_generation,
+            );
+            self.particles.mark_reactive_dirty();
+        }
 
         // From the lit scene to the display.
         mark(&self.profiler, &mut encoder, section::POST);
@@ -1368,6 +1463,7 @@ impl Renderer {
         let scene_depth = scene_depth.clone();
         self.history = None;
         self.frame_index = 0;
+        self.sized_generation += 1;
         self.sized = Some(SizedResources {
             output_size,
             render_size,

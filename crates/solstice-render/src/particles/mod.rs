@@ -59,12 +59,12 @@ const EVENT_CAPACITY: usize = 256;
 /// Seconds a stopped emitter's slice is held after its longest-lived particle should have died.
 const RELEASE_MARGIN: f32 = 0.5;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(crate) const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// The scene's depth and motion as compute passes write them, which solid particles draw into.
 const SCENE_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 const MOTION_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 /// How much of each pixel particles cover, which the temporal filter trusts history less for.
-const REACTIVE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+pub(crate) const REACTIVE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// Twin of `SimParams` in `particles/common.wgsl`.
 #[repr(C)]
@@ -1268,6 +1268,12 @@ impl Particles {
         for &slot in self.draw_order.iter().filter(|&&s| !self.solid_slots[s]) {
             draw_slot(&mut pass, slot);
         }
+        self.reactive_dirty.set(true);
+    }
+
+    /// Notes that something else drew into the reactive mask this frame, so a frame with
+    /// nothing in it clears it.
+    pub(crate) fn mark_reactive_dirty(&self) {
         self.reactive_dirty.set(true);
     }
 

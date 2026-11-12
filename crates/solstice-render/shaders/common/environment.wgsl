@@ -63,6 +63,9 @@ fn toward_horizon(direction: vec3f) -> vec3f {
 
 // Distance over which distant objects dissolve into the air, as extinction per metre.
 const HAZE: f32 = 0.0011;
+// How much thicker a downpour makes the air: heavy rain cuts how far one sees to a kilometre or
+// two, and greys the distance.
+const RAIN_HAZE: f32 = 2.5;
 
 // `color` of a surface at `world`, `distance` from the camera along `view` (towards the camera),
 // seen through the air between: distant things fade towards the sky colour behind them.
@@ -73,7 +76,7 @@ fn aerial_perspective(color: vec3f, world: vec3f, view: vec3f, distance: f32) ->
 // The same, where only `lit` of the air between is lit: under a roof the air scatters almost no
 // light towards the eye, and a room would otherwise fill with the glow of the open sky.
 fn aerial_perspective_lit(color: vec3f, world: vec3f, view: vec3f, distance: f32, lit: f32) -> vec3f {
-    let transmittance = exp(-distance * HAZE);
+    let transmittance = exp(-distance * HAZE * (1.0 + RAIN_HAZE * clouds.rain));
     // How far into the haze this is: nearby haze glows with light from all around, but over a
     // long path the air takes the colour of the sky at the horizon behind the object.
     let far = sq(1.0 - transmittance);

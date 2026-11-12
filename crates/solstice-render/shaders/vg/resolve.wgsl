@@ -12,6 +12,7 @@
 #include "common/sway_vertex.wgsl"
 #include "common/frame.wgsl"
 #include "common/wetness.wgsl"
+#include "rain/surface.wgsl"
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> vis_depth: array<u32>;
@@ -326,7 +327,19 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     }
 
     // Water on the surface, where the sea has been (docs/wetness.md).
-    let wet = wet_surface(albedo, roughness, metallic, normal, surface_normal, cavity, world);
+    // And where the rain has fallen, with the puddles it has left (rain/surface.wgsl).
+    let sea = sea_wetness(roughness, metallic, cavity, world);
+    let rained = rain_wetness(world, surface_normal);
+    // Rain drains through what is porous, sand and soil, which darken but keep only a sheen;
+    // smooth stone and paint take a full film. Puddles are water standing on either.
+    let drains = mix(1.0, RAIN_POROUS_WETNESS, porosity(roughness, metallic));
+    let rain_wet = clamp(
+        max(min(rained.wet, drains), rained.puddle) * (1.0 + (1.0 - cavity) * 0.25),
+        0.0,
+        1.0,
+    );
+    var wet = wet_material(albedo, roughness, metallic, normal, surface_normal, max(sea.x, rain_wet), sea.y);
+    wet = under_puddle(wet, surface_normal, rained);
     albedo = wet.albedo;
     roughness = wet.roughness;
     normal = wet.normal;

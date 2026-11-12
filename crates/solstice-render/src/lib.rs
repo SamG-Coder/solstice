@@ -30,6 +30,7 @@ pub mod ocean;
 pub mod particles;
 pub mod post;
 pub mod profiler;
+pub mod rain;
 pub mod regions;
 pub mod renderer;
 pub mod scene;

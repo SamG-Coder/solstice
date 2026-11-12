@@ -5794,3 +5794,178 @@ fn grass_leaning_in_a_steady_wind_reads_only_how_it_moves_now() {
     assert!(posts > 10, "only {posts} post pixels");
     assert!(most < 40, "the leaning post's motion reads {most}");
 }
+
+/// A floor with a roof standing over part of it, on four posts: a shelter in the rain.
+fn shelter() -> SceneAsset {
+    let mut floor = Mesh::default();
+    for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        floor.vertices.push(Vertex {
+            position: Vec3::new(x * 60.0, 0.0, z * 60.0),
+            normal: Vec3::Y,
+            uv: Vec2::new(x, z),
+        });
+    }
+    floor.indices = vec![0, 2, 1, 0, 3, 2];
+    let options = BuildOptions::default();
+    let mut instances = vec![
+        // The roof: 6 m square, 3 m up.
+        instance(0, Mat4::IDENTITY),
+        Instance {
+            mesh: 1,
+            material: 1,
+            transform: Mat4::IDENTITY,
+        },
+    ];
+    for (x, z) in [(-2.8, -2.8), (2.8, -2.8), (2.8, 2.8), (-2.8, 2.8)] {
+        instances.push(instance(2, Mat4::from_translation(Vec3::new(x, 0.0, z))));
+    }
+    SceneAsset {
+        meshes: vec![
+            build_virtual_mesh(
+                &box_mesh(Vec3::new(-3.0, 3.0, -3.0), Vec3::new(3.0, 3.2, 3.0)),
+                &options,
+            ),
+            build_virtual_mesh(&floor, &options),
+            build_virtual_mesh(
+                &box_mesh(Vec3::new(-0.1, 0.0, -0.1), Vec3::new(0.1, 3.0, 0.1)),
+                &options,
+            ),
+        ],
+        materials: vec![
+            white_material(),
+            // Smooth, so a film shows at once.
+            Material {
+                base_color: [0.5, 0.5, 0.5, 1.0],
+                roughness: 0.5,
+                ..Default::default()
+            },
+        ],
+        instances,
+        ..Default::default()
+    }
+}
+
+/// Renders the shelter after `seconds` of `weather` from `camera`, with `debug`, lit by a grey
+/// day. SOLSTICE_TEST_IMAGES=DIR keeps the image.
+fn render_shelter(
+    gpu: &Gpu,
+    weather: Weather,
+    seconds: f32,
+    debug: DebugView,
+    camera: &Camera,
+) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let settings = RendererSettings {
+        debug_view: debug,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(gpu, &paginate(&shelter()), FORMAT, settings);
+    renderer.set_weather(weather, 0.0);
+    renderer.advance_weather(seconds);
+    let environment = Environment {
+        sun_direction: Vec3::new(0.3, 0.8, 0.4).normalize(),
+        ..Default::default()
+    };
+    let target = test_target(gpu, 128);
+    let view = target.create_view(&Default::default());
+    for _ in 0..10 {
+        renderer.render(gpu, camera, &environment, &view, (128, 128), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, 128);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join(", "));
+    if let Ok(dir) = std::env::var("SOLSTICE_TEST_IMAGES") {
+        let name = format!(
+            "{dir}/shelter_{debug:?}_{:.0}_{:.0}_{:.0}.ppm",
+            weather.rain * 100.0,
+            seconds * 10.0,
+            camera.pitch * 100.0
+        );
+        let mut ppm = format!("P6\n{} {}\n255\n", 128, 128).into_bytes();
+        ppm.extend(pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
+        std::fs::write(name, ppm).unwrap();
+    }
+    pixels
+}
+
+/// Beside the shelter, low, looking under its roof.
+fn beside_the_shelter() -> Camera {
+    Camera {
+        position: Vec3::new(0.0, 1.2, 9.0),
+        pitch: -0.12,
+        fov_y: 50.0_f32.to_radians(),
+        ..Default::default()
+    }
+}
+
+/// How blue a patch of the wetness view is: blue for soaked, grey for dry.
+fn wet_blue(pixels: &[u8], x: u32, y: u32) -> f32 {
+    let [r, _, b] = patch(pixels, 128, x, y, 2);
+    b - r
+}
+
+#[test]
+fn rain_wets_the_open_ground_and_leaves_what_is_sheltered_dry() {
+    let Some(gpu) = request_gpu() else { return };
+    let storm = Weather::by_name("storm").unwrap();
+    let camera = beside_the_shelter();
+    let wet = render_shelter(&gpu, storm, 600.0, DebugView::Wetness, &camera);
+    // The floor in the open, near the camera, and under the roof, beyond it.
+    let open = wet_blue(&wet, 64, 110);
+    let sheltered = wet_blue(&wet, 64, 67);
+    assert!(open > 60.0, "the open floor reads {open}");
+    // Under the roof it is only damp, even in a long storm.
+    assert!(
+        sheltered < open * 0.6,
+        "under the roof reads {sheltered}, the open {open}"
+    );
+    // Without rain, nothing is wet.
+    let clear = Weather::by_name("clear").unwrap();
+    let dry = render_shelter(&gpu, clear, 600.0, DebugView::Wetness, &camera);
+    assert!(wet_blue(&dry, 64, 110) < 5.0);
+}
+
+#[test]
+fn rain_falls_in_the_open_and_not_under_a_roof() {
+    let Some(gpu) = request_gpu() else { return };
+    let storm = Weather::by_name("storm").unwrap();
+    // Standing under the roof, looking out and up at its underside.
+    let camera = Camera {
+        position: Vec3::new(0.0, 1.0, 0.0),
+        pitch: 0.35,
+        fov_y: 70.0_f32.to_radians(),
+        ..Default::default()
+    };
+    // The same storm a moment apart: its drops have moved, and little else has.
+    let now = render_shelter(&gpu, storm, 30.0, DebugView::Lit, &camera);
+    let later = render_shelter(&gpu, storm, 30.3, DebugView::Lit, &camera);
+    let changed = |rows: std::ops::Range<u32>| {
+        let mut count = 0;
+        for y in rows.clone() {
+            for x in 0..128u32 {
+                let i = ((y * 128 + x) * 4) as usize;
+                if (0..3).any(|c| now[i + c].abs_diff(later[i + c]) > 6) {
+                    count += 1;
+                }
+            }
+        }
+        count as f32 / (rows.len() * 128) as f32
+    };
+    // The roof's underside fills the top of the picture; the open air beyond it, the bottom.
+    let roof = changed(0..30);
+    let open = changed(90..128);
+    assert!(open > 0.01, "rain changed only {open} of the open air");
+    assert!(
+        roof < open * 0.2,
+        "under the roof {roof}, in the open {open}"
+    );
+}
