@@ -12,6 +12,7 @@
 #include "lighting/sun_shadow.wgsl"
 #include "gi/screen_trace.wgsl"
 #include "ocean/optics.wgsl"
+#include "rain/rings.wgsl"
 
 // Twin of `MAX_PONDS` in ocean/pond.rs.
 const MAX_PONDS: u32 = 8u;
@@ -130,8 +131,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let next = reconstruct_world(frame, center + vec2f(1.0, 0.0), water);
     let footprint = length(next - world) / sqrt(max(abs(view.y), 0.02));
     let ruffle = ripples(world.xz, footprint);
-    let normal = normalize(vec3f(-ruffle.x, 1.0, -ruffle.y));
-    let roughness = sqrt(STILL_ROUGHNESS * STILL_ROUGHNESS + ruffle.z);
+    // Rain rings the water and roughens it (rain/rings.wgsl).
+    let rained = rain_rings(world.xz, frame.time, clouds.rain, footprint);
+    let normal = normalize(vec3f(-ruffle.x - rained.x, 1.0, -ruffle.y - rained.y));
+    let roughness = sqrt(STILL_ROUGHNESS * STILL_ROUGHNESS + ruffle.z + rained.z);
 
     let n_dot_v = max(dot(normal, view), 1.0e-3);
     let fresnel = WATER_F0 + (1.0 - WATER_F0) * pow(1.0 - n_dot_v, 5.0);

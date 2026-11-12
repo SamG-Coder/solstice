@@ -364,19 +364,52 @@ ready. Tests are mutation-checked as the particle steps were.
      still hold every vertex.
 3. **Water.** Cat's paws and whitecaps on the sea, wind-driven pond ripples with fetch.
    - Seen in: the Cove; ponds in the Zorah and harbour scenes.
-4. **Rain in the air.** Cover map, drops, streaks, splashes, rings, far rain layers, haze and
-   shafts.
-   - Tests: Marshall–Palmer counts and Gunn–Kinzer speeds; no rain under cover; rain leans
-     with the wind; `rain 0` dispatches nothing.
-5. **Rain on surfaces.** Rain wetness with shelter, puddles, the ripple texture, running water,
-   drips, drying.
-   - Tests: sheltered stone stays dry; puddles fill only in hollows and dry afterwards; metal
-     doesn't darken.
-6. **Lightning and thunder.** Strikes, bolt, cloud flashes, the flash light and its shadow map,
+4. **Rain**, in the air and on surfaces, built together as one step. *Built; in review.* You
+   asked that it be done first and that it feel real and wet, so it came before trees and water.
+   - **A change from the plan: no particle simulation for rain.** The particle steps measured
+     about 2 ms for heavy rain on an integrated GPU. Here every drop's place follows from a
+     hash and the clock (`rain/draw.wgsl`): a lattice of drops is carried downwind by the air,
+     each falling through it at its terminal speed, round a column around the camera. Rain
+     costs only its drawing, and a drop stays put however the camera moves. Splashes and drips
+     are drawn the same way.
+   - **Three rings of drops**, coarser outward, to 120 m and more. Each outer streak stands for
+     more drops, so it is drawn wider, stronger and a little longer, and the rain keeps its
+     density on screen into the distance.
+   - **Streaks** are a drop's path over about 1/45 s, whatever the frame rate; at a frame's
+     own length they shrank to ticks on fast displays. They lean with the mean wind that also
+     carries them, so a streak points along its drop's motion.
+   - **Lit** from a small light volume around the camera, worked out once a frame: the sky,
+     the sun through its cascaded shadows and the clouds, scattered onward by the drop's phase
+     function, and the scene's lamps.
+   - **The cover map**: the scene from above, 512² over 128 m, through the shared culling and
+     rasterizing, redrawn only when the camera moves 16 m or geometry streams in. The rain map
+     made from it holds the first surface's height, the depth a puddle can gather (the ground
+     below the ground around it, where level, ignoring what stands on it), and the eaves
+     beside each spot, which drip.
+   - **On surfaces** (`rain/surface.wgsl`), through the sea's wet material:
+     - wet only where the sky reaches, read through a 4×4 tent so the edge of a shelter is
+       soft, not a row of squares; walls read their shelter a little out from them;
+     - walls wet less, more on the windward side, with water running down in streaks; faces
+       turned down not at all; sheltered surfaces grow damp only in a long rain;
+     - porous ground, sand and soil, darkens with only a sheen, as rain drains through it;
+       smooth stone and paint take a full film;
+     - puddles fill hollows of level ground over minutes and drain over a quarter of an hour,
+       their edges wandering; in them the surface is a sheet of water, ringed by the drops.
+   - **On water**: rings on the sea and ponds, worked out where they are seen (the sea's pass
+     already binds as many textures as phones allow), and heavy rain dulling the water's
+     glitter.
+   - **In the air**: heavy rain thickens the haze, so distance greys.
+   - `RendererSettings::rain` by quality; profiler sections `rain` and `rain draw`; the viewer's
+     `--weathered SECONDS` runs the weather on, so a capture can show a soaked scene.
+   - Tests: Marshall and Palmer's drop counts at 10 mm/h; Gunn and Kinzer's speeds within 4%;
+     surfaces soak in a minute of downpour and puddles more slowly; both dry after, faster in
+     wind; the cover map lies under the camera; the uniforms match their shaders; rendered, a
+     roof keeps the floor under it dry while the open floor soaks, and no rain falls under it.
+5. **Lightning and thunder.** Strikes, bolt, cloud flashes, the flash light and its shadow map,
    held exposure, `thunder` in weather files, thunder sound in the page.
    - Tests: strokes' timing and counts; thunder's delay is distance / 343 m/s; a wall throws a
      shadow away from the bolt during a flash; nothing is dispatched between strikes.
-7. **Showing it.** README, captures in the Cove, Forest and Temple, costs, viewer controls
+6. **Showing it.** README, captures in the Cove, Forest and Temple, costs, viewer controls
    (wind strength, rain, a "strike now" key).
 
 ## Decisions

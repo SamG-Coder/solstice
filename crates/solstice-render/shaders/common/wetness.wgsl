@@ -90,33 +90,41 @@ struct WetSurface {
     wetness: f32,
 }
 
-// The surface with base colour `albedo`, `roughness` and `metallic`, shading normal `normal` and
-// the geometry's own normal `surface_normal`, at `world`, as wet as the sea has made it there.
-// Cavities hold water first.
-fn wet_surface(
-    albedo: vec3f,
-    roughness: f32,
-    metallic: f32,
-    normal: vec3f,
-    surface_normal: vec3f,
-    cavity: f32,
-    world: vec3f,
-) -> WetSurface {
-    var out = WetSurface(albedo, roughness, normal, 0.0);
+// How wet the sea has made the surface at `world`, as rough as `roughness` and as metallic as
+// `metallic`, with `cavity`: its wetness, and how far under the water it lies now.
+fn sea_wetness(roughness: f32, metallic: f32, cavity: f32, world: vec3f) -> vec2f {
     // Without a sea, its level lies far below everything, and nothing is wet.
     if frame.sea_level <= -1.0e29 {
-        return out;
+        return vec2f(0.0);
     }
     let porous = porosity(roughness, metallic);
     let heights = water_heights(world.xz);
     let wetness = wetness_at(world.y, heights, porous);
     if wetness <= 0.0 {
-        return out;
+        return vec2f(0.0);
     }
-    let submerged = submerged_at(world.y, heights);
     // Hollows fill first, so a cavity is a little wetter than the surface around it.
     let w = clamp(wetness + (1.0 - cavity) * 0.25 * wetness, 0.0, 1.0);
-    out.wetness = w;
+    return vec2f(w, submerged_at(world.y, heights));
+}
+
+// The surface with base colour `albedo`, `roughness` and `metallic`, shading normal `normal` and
+// the geometry's own normal `surface_normal`, as wet as `w`, and as far under water as
+// `submerged`: from the sea, the rain, or both.
+fn wet_material(
+    albedo: vec3f,
+    roughness: f32,
+    metallic: f32,
+    normal: vec3f,
+    surface_normal: vec3f,
+    w: f32,
+    submerged: f32,
+) -> WetSurface {
+    var out = WetSurface(albedo, roughness, normal, w);
+    if w <= 0.0 {
+        return out;
+    }
+    let porous = porosity(roughness, metallic);
 
     // Pores filling.
     let pores = clamp(w / WET_PORES_FULL, 0.0, 1.0) * porous;
@@ -132,4 +140,18 @@ fn wet_surface(
     let pooling = film * smoothstep(0.5, 0.9, surface_normal.y);
     out.normal = normalize(mix(normal, surface_normal, pooling));
     return out;
+}
+
+// The surface as wet as the sea has made it at `world`. Cavities hold water first.
+fn wet_surface(
+    albedo: vec3f,
+    roughness: f32,
+    metallic: f32,
+    normal: vec3f,
+    surface_normal: vec3f,
+    cavity: f32,
+    world: vec3f,
+) -> WetSurface {
+    let sea = sea_wetness(roughness, metallic, cavity, world);
+    return wet_material(albedo, roughness, metallic, normal, surface_normal, sea.x, sea.y);
 }

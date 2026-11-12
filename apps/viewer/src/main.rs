@@ -3,6 +3,7 @@
 //! ```text
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
+//!        [--weather NAME|FILE [--weathered SECONDS]]
 //!        [--limits webgpu]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
 //! viewer [SCENE] --play [--fly] [--scripts DIR] [--capture out.png --frames N
@@ -241,6 +242,7 @@ mod native {
                 ),
             };
             renderer.set_weather(options.weather, 0.0);
+            renderer.advance_weather(options.weathered);
             if options.ocean.is_some() {
                 renderer.set_ocean(options.ocean, 0.0);
             }
@@ -281,6 +283,9 @@ mod native {
         stability: bool,
         /// The weather to start with: a built-in state's name, or a weather file.
         weather: Weather,
+        /// Seconds the weather has already gone on for, as if they had passed: how long it has
+        /// rained, for one.
+        weathered: f32,
         /// When set, the sun and moon follow the time of day instead of `environment`.
         clock: Option<DayClock>,
         /// An open sea, by name or file, and the level of its calm surface. Scenes with a sea of
@@ -499,6 +504,7 @@ mod native {
             flyover_out: PathBuf::from("screenshots/flyover"),
             stability: false,
             weather: Weather::default(),
+            weathered: 0.0,
             ocean: None,
             sea_level: None,
             ponds: Vec::new(),
@@ -628,6 +634,10 @@ mod native {
                 "--pond" => {
                     let ponds = Pond::parse_list(&value()?).map_err(|e| format!("--pond: {e}"))?;
                     options.ponds.extend(ponds);
+                }
+                "--weathered" => {
+                    options.weathered =
+                        value()?.parse().map_err(|e| format!("--weathered: {e}"))?;
                 }
                 "--weather" => {
                     let name = value()?;
@@ -1117,6 +1127,7 @@ mod native {
 
         let mut renderer = Renderer::new(&gpu, scene, CAPTURE_FORMAT, options.settings);
         renderer.set_weather(options.weather, 0.0);
+        renderer.advance_weather(options.weathered);
         if options.ocean.is_some() {
             renderer.set_ocean(options.ocean, 0.0);
         }
