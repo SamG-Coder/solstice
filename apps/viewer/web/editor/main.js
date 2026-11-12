@@ -183,9 +183,13 @@ const editor = {
       }
     }
     const pick = this.viewer.take_pick();
-    if (pick.length && this.picks.length) {
-      const { resolve, fx, fy } = this.picks.shift();
-      resolve(pickResult(this, pick, fx, fy));
+    if (pick.length) {
+      // An answer to a pick given up on (its tab was hidden) belongs to nobody waiting now.
+      if (this.pickStale) this.pickStale = false;
+      else if (this.picks.length) {
+        const { resolve, fx, fy } = this.picks.shift();
+        resolve(pickResult(this, pick, fx, fy));
+      }
       if (this.picks.length) this.viewer.request_pick(this.picks[0].fx, this.picks[0].fy);
     }
     this.waits = this.waits.filter((w) => {
@@ -259,8 +263,11 @@ const editor = {
   pick(fx, fy) {
     return withinTime(new Promise((resolve) => {
       this.picks.push({ fx, fy, resolve });
-      if (this.picks.length === 1) this.viewer.request_pick(fx, fy);
-    }), () => { this.picks = []; });
+      if (this.picks.length === 1 && !this.pickStale) this.viewer.request_pick(fx, fy);
+    }), () => {
+      this.picks = [];
+      this.pickStale = true;
+    });
   },
 
   /// Resolves after `frames` frames. Frames stop while the tab is hidden, so it gives up after
@@ -329,13 +336,25 @@ function nextTransform(editor, id, shown) {
   // Compared with where it was before any preview began.
   const original = editor.previews.get(id) ?? editor.project.snapshot(id);
   const was = editor.project.shownFrom(original);
+  // Only what changed is tidied; what didn't keeps its value exactly as the file had it.
+  const keep = (value, before, step) => (Math.abs(value - before) < 1e-9 ? before : tidy(value, step));
+  const rotation = shown.rotation ?? [0, 0, 0];
+  const turned = rotation.some((v, k) => Math.abs(v - was.rotation[k]) > 1e-9);
   const out = {
-    position: shown.position.map((v) => tidy(v, 0.0001)),
-    rotation: tidyAngles(shown.rotation ?? [0, 0, 0]),
-    scale: tidy(shown.scale ?? 1, 0.0001),
+    position: shown.position.map((v, k) => keep(v, was.position[k], 0.0001)),
+    rotation: turned ? tidyAngles(rotation) : was.rotation,
+    scale: keep(shown.scale ?? 1, was.scale, 0.0001),
   };
+  if (!(out.scale >= 0.0001) || !Number.isFinite(out.scale)) {
+    throw new CommandError("bad_arguments", "scale must be at least 0.0001");
+  }
+  if (!out.position.every((v) => Number.isFinite(v) && Math.abs(v) < 1e7)) {
+    throw new CommandError("bad_arguments", "positions must be within 10 000 km of the origin");
+  }
+  // A model seated on the ground stays seated until it is moved; then it keeps the height it
+  // was shown at, as both editors' models do, and the project says that height.
   const ground = original.transform.ground;
-  const moved = out.position.some((v, k) => Math.abs(v - was.position[k]) > 1e-4);
+  const moved = out.position.some((v, k) => v !== was.position[k]);
   if (ground !== undefined && !moved) out.ground = ground;
   return out;
 }
@@ -900,7 +919,10 @@ function bindInput(editor) {
     keys.add(e.code);
     if (input.flying) return;
     const ctrl = e.ctrlKey || e.metaKey;
-    if (ctrl && e.code === "KeyZ") {
+    // Nothing is undone under a drag: its previews stand on what is there now.
+    if (ctrl && drag && /^Key[ZY]$/.test(e.code)) {
+      e.preventDefault();
+    } else if (ctrl && e.code === "KeyZ") {
       e.preventDefault();
       editor.call(e.shiftKey ? "history.redo" : "history.undo");
     } else if (ctrl && e.code === "KeyY") {
@@ -1010,18 +1032,43 @@ async function offerDraft(editor) {
     el("draft-restore").onclick = () => {
       el("draft").hidden = true;
       const changes = new Map();
+      const texts = [];
       const visit = (list) => list.forEach((entity) => {
-        if (entity.transform && editor.project.entities.get(entity.id)?.transform
-          && JSON.stringify(entity.transform) !== JSON.stringify(editor.project.entities.get(entity.id).transform)) {
+        const now = editor.project.entities.get(entity.id);
+        if (!now) return;
+        if (entity.transform && now.transform
+          && JSON.stringify(entity.transform) !== JSON.stringify(now.transform)) {
           changes.set(entity.id, entity.transform);
+        }
+        for (const field of ["name", "note"]) {
+          if ((entity[field] ?? "") !== (now[field] ?? "")) texts.push([now, field, now[field], entity[field]]);
         }
         visit(entity.children ?? []);
       });
       visit(draft.entities ?? []);
-      if (changes.size) {
-        editor.commands.history.push({ ...transformStep(editor, changes, `Restore draft (${changes.size})`), by: "user" });
+      const setText = (entity, field, value) => {
+        if (value === undefined || (field === "note" && value === "")) delete entity[field];
+        else entity[field] = value;
+      };
+      texts.forEach(([entity, field, , after]) => setText(entity, field, after));
+      const moved = changes.size ? transformStep(editor, changes, "") : null;
+      if (moved || texts.length) {
+        editor.commands.history.push({
+          label: `Restore draft (${changes.size + texts.length} changes)`,
+          by: "user",
+          undo: () => {
+            moved?.undo();
+            texts.forEach(([entity, field, before]) => setText(entity, field, before));
+            editor.refresh();
+          },
+          redo: () => {
+            moved?.redo();
+            texts.forEach(([entity, field, , after]) => setText(entity, field, after));
+            editor.refresh();
+          },
+        });
       }
-      log.add("info", `Restored ${changes.size} moved entities from the draft.`);
+      log.add("info", `Restored the draft: ${changes.size} moved, ${texts.length} renamed or noted.`);
     };
     el("draft-discard").onclick = async () => {
       el("draft").hidden = true;

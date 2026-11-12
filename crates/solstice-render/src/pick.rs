@@ -134,7 +134,7 @@ impl Picker {
                 .slice(..)
                 .get_mapped_range()
                 .expect("a mapped buffer is readable");
-            *bytemuck::from_bytes(&view[..RESULT_BYTES as usize])
+            bytemuck::pod_read_unaligned(&view[..RESULT_BYTES as usize])
         };
         pipeline.staging.unmap();
         self.busy.store(false, Ordering::Release);
