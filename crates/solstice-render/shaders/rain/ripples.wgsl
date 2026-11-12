@@ -23,7 +23,6 @@ const RING_HEIGHT: f32 = 0.0012;
 // Rings a cell starts a second, at most.
 const RINGS_PER_SECOND: f32 = 1.6;
 
-
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3u) {
     if id.x >= RIPPLE_TEXELS || id.y >= RIPPLE_TEXELS {

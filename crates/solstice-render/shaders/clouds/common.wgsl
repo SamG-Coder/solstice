@@ -32,7 +32,6 @@ const MAX_DISTANCE: f32 = 90000.0;
 // The longest stretch of the layer one ray marches through.
 const MAX_PATH: f32 = 40000.0;
 
-
 // Distance along a ray from height `h` above the ground, rising at `mu` (the sine of its
 // elevation), to where it leaves the sphere at height `shell` that contains it. Written to avoid
 // the cancellation that planet-sized numbers cause in the textbook formula.

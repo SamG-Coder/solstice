@@ -78,7 +78,6 @@ struct Varyings {
     @location(1) color: vec4f,
 }
 
-
 // The rain map's texel holding `xz`: the first surface's height, the puddle's depth, the eave's
 // height, and 1 if anything is there; or nothing, outside it.
 fn rain_map_at(xz: vec2f) -> vec4f {

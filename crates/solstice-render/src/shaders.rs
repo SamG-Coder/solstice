@@ -414,6 +414,8 @@ mod tests {
     }
 
     /// Every shader the renderer makes a module of is an entry point, so the tests above see it.
+    /// Only calls that name their shader as a literal are seen; one with a path in a variable
+    /// must be listed by hand.
     #[test]
     fn every_shader_made_into_a_module_is_listed() {
         let mut unlisted = Vec::new();

@@ -106,7 +106,6 @@ fn worley_fbm(uvw: vec3f, period: i32, seed: u32) -> f32 {
         + worley(uvw * f32(period * 4), period * 4, seed + 2u) * 0.125;
 }
 
-
 // Spreads a value whose 2nd and 98th percentiles are `low` and `high` over 0..1. Each kind of
 // noise here bunches in a narrow band; measured by the cloud_noise example, these bands are
 // stretched to fill the range, so that thresholds in the cloud model mean what they say.
