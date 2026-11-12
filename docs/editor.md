@@ -530,39 +530,56 @@ etc.) and no glue is needed at all. A standalone MCP server is not needed and no
 
 ## Phases
 
-Each phase is one or more reviewable PRs, each demonstrated in Chrome on the 5080 and checked
+The editor is for making scenes and games from nothing, as Unreal's and Unity's are: a blank
+terrain to begin, then land, water, trees, models, lights, weather, actors and their scripts,
+all made and changed in the browser. Editing the site's own scenes comes with it, not instead.
+Every tool is a command as well, so an agent can build a scene as a person does: sculpt,
+plant, place, script and play.
+
+Each phase is one or more reviewable PRs, each shown working in Chrome on the 5080 and checked
 on a phone.
 
-1. **Project format and first slice** (this stage's goal), as three PRs:
-   1. The project format (`solstice-project` crate: types, read, write, schema tests),
-      `bake --convert` and `bake --project`, with `SRCE` written; Cove converted, and baking its
-      project proven to give the same scene as its text.
-   2. `editor.html` and the `editor` build: opens Cove's project and baked scene (the loader
-      moves out of `index.html` into a shared module both pages import); viewport with fly and
-      orbit camera, click to select, move/rotate/scale gizmo with snapping, outliner, details
-      panel with transform fields, undo and redo, `F` to frame, autosave to OPFS.
-   3. The command API (bold rows) on `window.solstice` and WebMCP, and `docs/editor-api.md`.
+1. **Project format and first slice.**
+   1. The project format, `bake --convert` and `bake --project`, with `SRCE` (PR #76).
+   2. `editor.html` and its build: open a scene and its project, a viewport with fly and orbit
+      cameras, GPU picking, move/rotate/scale gizmo with snapping, outliner, details, undo and
+      redo, frame, autosave in the browser, save to a file, and the command API on
+      `window.solstice` and WebMCP (`docs/editor-api.md`).
 
    **Milestone**: Claude, through Claude in Chrome, opens the editor on Cove, lists the
-   courtyard's entities, moves the statue, reads frame stats, undoes, and the user watches it
-   happen.
-2. **A real workflow, and baking in the browser.** `solstice-bake` as a library in pieces with
-   the content-hash cache, run in a Web Worker; Bake in the editor writes the same file the PC
-   does (tested byte for byte). Duplicate and delete (renderer: room to add instances after
-   load), box select, multi-select editing, End to ground, content browser of the project's
-   meshes, weather/time/water panels, output log, `view.capture`, open a folder on disk, zip
-   in and out. Play-in-editor with colliders where things now stand. **Milestone**: rearrange
-   the Cove's courtyard, play through the gate, bake in the browser and load the result in the
-   viewer; open the same folder natively and `bake --project` gives the same file.
-3. **Import.** glTF drop-in, baked in the worker; renderer appends meshes, materials and
-   textures; content browser thumbnails. **Milestone**: drop a Poly Haven scan on the page and
-   place it within ten seconds.
-4. **Land.** Terrain sculpt and paint, paths and yards, foliage painting and generator shapes,
-   ponds and lights with handles. **Milestone**: build a small island scene from the template.
-5. **Games.** Actors and scripts in the editor, Simulate, a script editor with errors in place,
-   the player start, input maps. **Milestone**: make the gate puzzle from scratch in the browser.
-6. **Polish to the bar.** Orthographic views, layouts, the phone layout's gestures, the
-   shortcut sheet, and a pass against the table above.
+   courtyard's entities, moves the statue, reads frame stats and undoes, while you watch.
+2. **A new scene from blank terrain.** File ▸ New makes a project from a template: terrain,
+   sea, sky and a camera. The bake runs in the browser: `solstice-bake` as a library, in a Web
+   Worker, for the terrain, its land bands, the sea and the meadow. The terrain's and the
+   land's settings are edited in the details panel and rebuilt as you change them. The project
+   is kept in the browser or in a folder on disk, and Bake writes the scene file the viewer
+   plays, the same file `bake --project` writes natively. Commands: `project.new`, `bake.run`,
+   `bake.status`, `terrain.set`, `env.set` saved with the scene.
+   **Milestone**: from an empty page, make an island with sand, grass and sea, save it, reopen
+   it, and open it in the viewer; an agent does the same through the API.
+3. **Trees, water and weather.** Woods, meadows and clearings as shapes with handles, planted
+   and regrown in the worker, area by area; tree species and grass from the built-in ones and
+   from species files, edited in a panel; ponds with handles; the scene's weather and time of
+   day saved with it. Commands: `foliage.*`, `species.*`, `pond.*`.
+   **Milestone**: plant a wood with a clearing and a pond on the island.
+4. **Placing things.** A content browser of the built-in models, the scans the site's scenes use,
+   and glTF files dropped on the page and baked in the worker; drag into the viewport onto the
+   ground; duplicate, delete, box select, End to the ground; lights with handles. The renderer
+   takes new meshes, materials, textures and instances after load. Commands: `asset.import`,
+   `object.place`, `object.duplicate`, `object.delete`, `light.*`.
+   **Milestone**: furnish the island with a few Poly Haven scans and a lamp-lit hut.
+5. **Games and scripting.** Actors placed from `.actor` files and new ones made in the editor;
+   their properties in the details panel; a script panel for their Starlark with errors marked
+   where they are, reloaded as you type; input maps; a player start; Play and Simulate in the
+   viewport, with what was edited kept, and the scripts' messages in the output log. Commands:
+   `actor.*`, `script.read`, `script.write`, `play.start`, `play.stop`, `play.input`.
+   **Milestone**: make the gate puzzle from scratch on the island, and play it; an agent writes
+   and fixes a script by reading its errors.
+6. **Sculpting and painting.** Terrain brushes (raise, lower, smooth, flatten, noise) and
+   painting sand, dirt and grass, rebuilt tile by tile; paths and yards with handles.
+   **Milestone**: carve a valley and a road through the island.
+7. **Polish to the bar.** Orthographic views, docking layouts, the phone layout's gestures, the
+   shortcut sheet, selection outlines in the renderer, and a pass against the table above.
 
 ## Coordination
 

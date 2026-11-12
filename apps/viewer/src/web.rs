@@ -67,6 +67,9 @@ pub struct WebViewer {
     /// What scripts logged, and errors, for the page to take.
     #[cfg(feature = "gameplay")]
     messages: Vec<crate::play::Message>,
+    /// Which entity of the scene's project made which instances, for the editor.
+    #[cfg(feature = "editor")]
+    sources: Vec<solstice_asset::Source>,
 }
 
 /// How far around the camera a scene read in parts loads what isn't in view, in metres.
@@ -209,6 +212,8 @@ impl WebViewer {
             play: None,
             #[cfg(feature = "gameplay")]
             messages: Vec::new(),
+            #[cfg(feature = "editor")]
+            sources: scene.sources,
         })
     }
 
@@ -916,4 +921,122 @@ pub fn read_header(bytes: &[u8]) -> Result<Vec<f64>, JsValue> {
         header.manifest_offset as f64,
         header.manifest_bytes as f64,
     ])
+}
+
+/// What the editor's page needs (`docs/editor.md`): the map of which entity made which
+/// instances, moving and hiding instances, the camera's matrices, and picking.
+#[cfg(feature = "editor")]
+#[wasm_bindgen]
+impl WebViewer {
+    /// The ids of the entities the scene's map names, one to a line, in its order. Empty for a
+    /// scene not baked from a project.
+    pub fn source_ids(&self) -> String {
+        let ids: Vec<&str> = self.sources.iter().map(|s| s.id.as_str()).collect();
+        ids.join("\n")
+    }
+
+    /// Each mapped entity's instances, as its first and one past its last, in the map's order.
+    pub fn source_ranges(&self) -> Vec<u32> {
+        self.sources
+            .iter()
+            .flat_map(|s| [s.instances.start, s.instances.end])
+            .collect()
+    }
+
+    /// Each mapped entity's placement as the bake made it, 16 numbers by column, in the map's
+    /// order.
+    pub fn source_placements(&self) -> Vec<f32> {
+        self.sources
+            .iter()
+            .flat_map(|s| s.placement.to_cols_array())
+            .collect()
+    }
+
+    pub fn instance_count(&self) -> u32 {
+        self.renderer.instance_count()
+    }
+
+    /// Where an instance is drawn, 16 numbers by column; empty if there is no such instance.
+    pub fn instance_transform(&self, instance: u32) -> Vec<f32> {
+        self.renderer
+            .instance_transform(instance)
+            .map(|m| m.to_cols_array().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// An instance's bounding sphere in the world: centre x, y, z and radius; empty if none.
+    pub fn instance_bounds(&self, instance: u32) -> Vec<f32> {
+        self.renderer
+            .instance_bounds(instance)
+            .map(|(c, r)| vec![c.x, c.y, c.z, r])
+            .unwrap_or_default()
+    }
+
+    /// Puts an instance at `world` (16 numbers by column) from the next frame. `jump` puts it
+    /// there with no motion between, as an undo should; otherwise it moves there, as a drag does.
+    /// False if there is no such instance or the matrix can't be inverted.
+    pub fn set_instance_transform(&mut self, instance: u32, world: &[f32], jump: bool) -> bool {
+        let Ok(columns) = <[f32; 16]>::try_from(world) else {
+            return false;
+        };
+        let world = glam::Mat4::from_cols_array(&columns);
+        if !world.is_finite() || world.determinant().abs() < 1e-12 {
+            return false;
+        }
+        if jump {
+            self.renderer.place_instance(instance, world)
+        } else {
+            self.renderer.move_instance(instance, world)
+        }
+    }
+
+    /// Makes an instance movable while it is dragged, and static again after, so the cached
+    /// shadows and GI are redrawn once at the end rather than every frame of the drag.
+    pub fn set_instance_movable(&mut self, instance: u32, movable: bool) -> bool {
+        self.renderer.set_instance_movable(instance, movable)
+    }
+
+    pub fn set_instance_hidden(&mut self, instance: u32, hidden: bool) -> bool {
+        self.renderer.set_instance_hidden(instance, hidden)
+    }
+
+    /// The camera's view and projection, 16 numbers by column each, for the page to draw the
+    /// gizmo over the scene and turn the mouse into rays. The projection has reversed depth and
+    /// no far plane.
+    pub fn view_projection(&self) -> Vec<f32> {
+        let camera = &self.camera.camera;
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let mut out = camera.view().to_cols_array().to_vec();
+        out.extend(camera.projection(aspect).to_cols_array());
+        out
+    }
+
+    /// How fast the camera flies, in metres a second (Shift goes five times faster).
+    pub fn set_camera_speed(&mut self, metres_per_second: f32) {
+        if metres_per_second.is_finite() && metres_per_second > 0.0 {
+            self.camera.speed = metres_per_second;
+        }
+    }
+
+    pub fn camera_speed(&self) -> f32 {
+        self.camera.speed
+    }
+
+    /// Asks what is under a point of the canvas, as fractions of its width and height from the
+    /// top left. `take_pick` gives the answer a frame or two later.
+    pub fn request_pick(&mut self, x: f32, y: f32) {
+        self.renderer.request_pick(x, y);
+    }
+
+    /// The last pick's answer, once: the instance (or -1 for the sky) and its reversed depth.
+    /// Empty while it isn't ready.
+    pub fn take_pick(&mut self) -> Vec<f64> {
+        match self.renderer.take_pick() {
+            None => Vec::new(),
+            Some(picked) => vec![
+                picked.instance.map_or(-1.0, f64::from),
+                f64::from(picked.depth),
+            ],
+        }
+    }
 }

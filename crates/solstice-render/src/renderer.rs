@@ -321,6 +321,8 @@ pub struct Renderer {
     view_slots: ViewSlots,
     cull: CullPipelines,
     main_work: CullWork,
+    /// The editor's picks; idle, and free, unless one is asked for.
+    picker: crate::pick::Picker,
     aux_work: CullWork,
     aux_cull_scene: wgpu::BindGroup,
     aux_raster: RasterBindings,
@@ -616,6 +618,17 @@ impl Renderer {
         self.scene.skins.set(pose, bones, true)
     }
 
+    /// Asks what is under a point of the screen, as fractions of its width and height from the
+    /// top left, on the next frame. [`Self::take_pick`] gives the answer a frame or two later.
+    pub fn request_pick(&mut self, x: f32, y: f32) {
+        self.picker.request((x, y));
+    }
+
+    /// What the last pick found, once it has been read back.
+    pub fn take_pick(&mut self) -> Option<crate::pick::Picked> {
+        self.picker.take()
+    }
+
     /// An instance's bounding sphere in the world, as its centre and radius.
     pub fn instance_bounds(&self, instance: u32) -> Option<(Vec3, f32)> {
         self.scene.instance_table.world_sphere(instance)
@@ -758,6 +771,7 @@ impl Renderer {
             view_slots,
             cull,
             main_work,
+            picker: Default::default(),
             aux_work,
             aux_cull_scene,
             aux_raster,
@@ -1288,6 +1302,14 @@ impl Renderer {
             &self.rain.surface_group,
             render_size,
         );
+        self.picker.record(
+            gpu,
+            &mut encoder,
+            &sized.visibility.depth,
+            &sized.visibility.ids,
+            &self.main_work.visible,
+            render_size,
+        );
 
         // Lighting.
         mark(&self.profiler, &mut encoder, section::CLOUDS_ON_SCREEN);
@@ -1459,6 +1481,7 @@ impl Renderer {
         self.particles.map_stats();
         self.aux_work.map_stats();
         self.streamer.map_requests();
+        self.picker.request_map();
         if let Some(profiler) = &mut self.profiler {
             profiler.request_map();
         }
