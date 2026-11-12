@@ -5481,3 +5481,316 @@ fn the_webgpu_default_limits_draw_what_a_desktop_gpu_does() {
         );
     }
 }
+
+/// A closed box from `min` to `max`, its faces flat-shaded.
+fn box_mesh(min: Vec3, max: Vec3) -> Mesh {
+    let mut mesh = Mesh::default();
+    let faces = [
+        (Vec3::X, Vec3::Z, Vec3::Y),
+        (Vec3::NEG_X, Vec3::Y, Vec3::Z),
+        (Vec3::Y, Vec3::X, Vec3::Z),
+        (Vec3::NEG_Y, Vec3::Z, Vec3::X),
+        (Vec3::Z, Vec3::Y, Vec3::X),
+        (Vec3::NEG_Z, Vec3::X, Vec3::Y),
+    ];
+    let centre = (min + max) * 0.5;
+    let half = (max - min) * 0.5;
+    for (normal, u, v) in faces {
+        let base = mesh.vertices.len() as u32;
+        for (a, b) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            mesh.vertices.push(Vertex {
+                position: centre + (normal + u * a + v * b) * half,
+                normal,
+                uv: Vec2::new(a, b),
+            });
+        }
+        // Counter-clockwise seen from outside.
+        let outward = (u.cross(v)).dot(normal) > 0.0;
+        let quad = if outward {
+            [0, 1, 2, 0, 2, 3]
+        } else {
+            [0, 2, 1, 0, 3, 2]
+        };
+        mesh.indices.extend(quad.iter().map(|i| base + i));
+    }
+    mesh
+}
+
+/// A slender post standing on a grey floor, the post's material swaying in the wind if `sways`.
+fn post_in_a_field(sways: bool) -> SceneAsset {
+    let mut floor = Mesh::default();
+    for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        floor.vertices.push(Vertex {
+            position: Vec3::new(x * 50.0, 0.0, z * 50.0),
+            normal: Vec3::Y,
+            uv: Vec2::new(x, z),
+        });
+    }
+    floor.indices = vec![0, 2, 1, 0, 3, 2];
+    let options = BuildOptions::default();
+    SceneAsset {
+        meshes: vec![
+            build_virtual_mesh(
+                &box_mesh(Vec3::new(-0.04, 0.0, -0.04), Vec3::new(0.04, 0.8, 0.04)),
+                &options,
+            ),
+            build_virtual_mesh(&floor, &options),
+        ],
+        materials: vec![
+            Material {
+                base_color: [1.0; 4],
+                flags: if sways { Material::SWAYS } else { 0 },
+                ..Default::default()
+            },
+            Material {
+                base_color: [0.2, 0.2, 0.2, 1.0],
+                ..Default::default()
+            },
+        ],
+        instances: vec![
+            instance(0, Mat4::IDENTITY),
+            Instance {
+                mesh: 1,
+                material: 1,
+                transform: Mat4::IDENTITY,
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// Renders `scene` in `weather` seen from just south of the origin, looking north, with `debug`,
+/// for `frames` frames `seconds` apart, and reads back the last.
+fn render_in_wind(
+    gpu: &Gpu,
+    scene: &SceneAsset,
+    weather: Weather,
+    debug: DebugView,
+    frames: u32,
+    seconds: f32,
+) -> Vec<u8> {
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let settings = RendererSettings {
+        debug_view: debug,
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(gpu, &paginate(scene), FORMAT, settings);
+    renderer.set_weather(weather, 0.0);
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.5, 2.5),
+        fov_y: 40.0_f32.to_radians(),
+        ..Default::default()
+    };
+    let target = test_target(gpu, 128);
+    let view = target.create_view(&Default::default());
+    for _ in 0..frames {
+        renderer.render(gpu, &camera, &darkness(), &view, (128, 128), seconds);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    let pixels = read_pixels(gpu, &target, 128);
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+    pixels
+}
+
+/// A wind from the west, `speed` m/s at cloud height, as steady or gusty as asked.
+fn westerly(speed: f32, gusts: f32) -> Weather {
+    Weather {
+        wind_speed: speed,
+        wind_from: 270.0,
+        gusts,
+        turbulence: 0.0,
+        ..Weather::by_name("clear").unwrap()
+    }
+}
+
+/// The mean column of the post's white pixels in rows `rows`, from the albedo view.
+fn post_column(pixels: &[u8], rows: std::ops::Range<u32>) -> f32 {
+    let (mut sum, mut count) = (0.0, 0.0);
+    for y in rows {
+        for x in 0..128 {
+            if pixels[((y * 128 + x) * 4) as usize] > 200 {
+                sum += x as f32;
+                count += 1.0;
+            }
+        }
+    }
+    assert!(count > 0.0, "no post in those rows");
+    sum / count
+}
+
+#[test]
+fn grass_that_sways_leans_downwind_and_nothing_else_does() {
+    let Some(gpu) = request_gpu() else { return };
+    let wind = westerly(14.0, 0.0);
+    let swaying = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Albedo,
+        6,
+        1.0 / 60.0,
+    );
+    let standing = render_in_wind(
+        &gpu,
+        &post_in_a_field(false),
+        wind,
+        DebugView::Albedo,
+        6,
+        1.0 / 60.0,
+    );
+    // Its foot stays where it stands; its top leans towards +X, the right of the picture.
+    // The post stands from row 99 up to row 43, the horizon at row 64.
+    let (top, foot) = (44..56, 90..98);
+    let lean = post_column(&swaying, top.clone()) - post_column(&standing, top.clone());
+    let slip = post_column(&swaying, foot.clone()) - post_column(&standing, foot);
+    assert!(lean > 3.0, "the top moved {lean} pixels");
+    assert!(
+        slip.abs() < lean * 0.3,
+        "the foot moved {slip} pixels, the top {lean}"
+    );
+    // In still air it stands up straight.
+    let still = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        westerly(0.0, 0.0),
+        DebugView::Albedo,
+        6,
+        1.0 / 60.0,
+    );
+    assert_eq!(still, standing);
+    // Unflagged, a gale moves nothing.
+    let gale = render_in_wind(
+        &gpu,
+        &post_in_a_field(false),
+        westerly(40.0, 1.0),
+        DebugView::Albedo,
+        6,
+        1.0 / 60.0,
+    );
+    assert_eq!(gale, standing);
+}
+
+#[test]
+fn swaying_grass_says_how_it_moved_and_the_ground_does_not() {
+    let Some(gpu) = request_gpu() else { return };
+    // Gusty, and frames a tenth of a second apart, so it moves a good way from frame to frame.
+    let wind = westerly(14.0, 1.0);
+    let motion = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Motion,
+        12,
+        0.1,
+    );
+    let albedo = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Albedo,
+        12,
+        0.1,
+    );
+    // How far a pixel's motion reads from "no motion": the grey of the nearest floor, which
+    // never moves.
+    let still = ((127 * 128 + 64) * 4) as usize;
+    let moved = |i: usize| -> u32 {
+        u32::from(motion[i].abs_diff(motion[still]))
+            + u32::from(motion[i + 1].abs_diff(motion[still + 1]))
+    };
+    let (mut post, mut posts, mut floor, mut floors) = (0, 0, 0, 0);
+    for y in 44..128u32 {
+        for x in 0..128u32 {
+            let i = ((y * 128 + x) * 4) as usize;
+            if albedo[i] > 240 {
+                post += moved(i);
+                posts += 1;
+            } else if (100..150).contains(&albedo[i]) && !(40..100).contains(&x) {
+                // Floor well clear of the post, whose edges blend with it, and of the far edge,
+                // which blends with the sky.
+                floor += moved(i);
+                floors += 1;
+            }
+        }
+    }
+    assert!(
+        posts > 20 && floors > 100,
+        "{posts} post and {floors} floor pixels"
+    );
+    let post = post as f32 / posts as f32;
+    let floor = floor as f32 / floors as f32;
+    assert!(post > 3.0, "the post's motion reads {post}");
+    assert!(floor < 2.0, "the floor's motion reads {floor}");
+    assert!(
+        post > floor * 10.0,
+        "the post reads {post}, the floor {floor}"
+    );
+    // Standing still, the same post in the same wind reads no motion: below the horizon, where
+    // it stands against the floor, it reads as the floor does.
+    let standing = render_in_wind(
+        &gpu,
+        &post_in_a_field(false),
+        wind,
+        DebugView::Motion,
+        12,
+        0.1,
+    );
+    let mut most = 0;
+    for i in (68 * 128 * 4..standing.len()).step_by(4) {
+        most = most.max(
+            u32::from(standing[i].abs_diff(standing[still]))
+                + u32::from(standing[i + 1].abs_diff(standing[still + 1])),
+        );
+    }
+    assert!(most <= 2, "motion {most} with nothing moving");
+}
+
+#[test]
+fn grass_leaning_in_a_steady_wind_reads_only_how_it_moves_now() {
+    let Some(gpu) = request_gpu() else { return };
+    // A steady wind leans the post well over, but from one frame to the next only its shimmer
+    // moves it. Motion that took the lean itself for movement would read many times more.
+    let wind = westerly(14.0, 0.0);
+    let motion = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Motion,
+        12,
+        1.0 / 60.0,
+    );
+    let albedo = render_in_wind(
+        &gpu,
+        &post_in_a_field(true),
+        wind,
+        DebugView::Albedo,
+        12,
+        1.0 / 60.0,
+    );
+    let still = ((127 * 128 + 64) * 4) as usize;
+    let mut most = 0;
+    let mut posts = 0;
+    for y in 44..64u32 {
+        for x in 0..128u32 {
+            let i = ((y * 128 + x) * 4) as usize;
+            if albedo[i] > 240 {
+                posts += 1;
+                most = most.max(
+                    u32::from(motion[i].abs_diff(motion[still]))
+                        + u32::from(motion[i + 1].abs_diff(motion[still + 1])),
+                );
+            }
+        }
+    }
+    assert!(posts > 10, "only {posts} post pixels");
+    assert!(most < 40, "the leaning post's motion reads {most}");
+}

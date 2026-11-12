@@ -5,6 +5,6 @@ base 800
 thickness 7000
 density 2
 cirrus 0.6
-wind speed=16 from=230
+wind speed=16 from=230 gusts=0.85 turbulence=0.7
 evolution 2
 rain 1

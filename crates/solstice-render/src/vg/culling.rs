@@ -539,7 +539,7 @@ pub struct CullPipelines {
 }
 
 impl CullPipelines {
-    pub fn new(gpu: &Gpu, skinned: bool, regions: Option<RegionPlan>) -> Self {
+    pub fn new(gpu: &Gpu, deform: crate::shaders::Deform, regions: Option<RegionPlan>) -> Self {
         let mut scene_layout = LayoutBuilder::new()
             .uniform_dynamic()
             .storage_read()
@@ -564,7 +564,7 @@ impl CullPipelines {
             .storage_write()
             .build(gpu, "cull control");
 
-        let cull = shaders::module_for(&gpu.device, "vg/cull.wgsl", skinned, regions);
+        let cull = shaders::module_for(&gpu.device, "vg/cull.wgsl", deform, regions);
         let control = shaders::module(&gpu.device, "vg/cull_control.wgsl");
         let cull_layouts = [&scene_layout, &work_layout];
         Self {

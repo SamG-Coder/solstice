@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The sections of a frame, in the order they run.
-pub const SECTIONS: [&str; 23] = [
+pub const SECTIONS: [&str; 24] = [
     "sky",
     "clouds",
     "ocean",
+    "wind",
     "shadows",
     "wet line",
     "gi cull",
@@ -41,34 +42,36 @@ pub mod section {
     pub const CLOUDS: usize = 1;
     /// The sea's waves.
     pub const OCEAN: usize = 2;
-    pub const SHADOWS: usize = 3;
+    /// The wind near the ground, for what sways in it.
+    pub const WIND: usize = 3;
+    pub const SHADOWS: usize = 4;
     /// Where the sea stands and has stood, for wetness.
-    pub const WATERLINE: usize = 4;
-    pub const GI_CULL: usize = 5;
-    pub const GI_VOXELIZE: usize = 6;
-    pub const GI_FLOOD: usize = 7;
-    pub const GI_WRITE: usize = 8;
+    pub const WATERLINE: usize = 5;
+    pub const GI_CULL: usize = 6;
+    pub const GI_VOXELIZE: usize = 7;
+    pub const GI_FLOOD: usize = 8;
+    pub const GI_WRITE: usize = 9;
     /// The local lights' shadow maps, traced through the volume.
-    pub const LIGHT_SHADOWS: usize = 9;
-    pub const GI_LIGHT: usize = 10;
+    pub const LIGHT_SHADOWS: usize = 10;
+    pub const GI_LIGHT: usize = 11;
     /// Culling and rasterizing what was visible last frame, then the occlusion pyramid.
-    pub const CULL_FIRST: usize = 11;
-    pub const RASTER_FIRST: usize = 12;
+    pub const CULL_FIRST: usize = 12;
+    pub const RASTER_FIRST: usize = 13;
     /// Culling and rasterizing what that revealed.
-    pub const CULL_SECOND: usize = 13;
-    pub const RASTER_SECOND: usize = 14;
-    pub const RESOLVE: usize = 15;
-    pub const CLOUDS_ON_SCREEN: usize = 16;
-    pub const SCREEN_GI: usize = 17;
-    pub const LIGHTING: usize = 18;
+    pub const CULL_SECOND: usize = 14;
+    pub const RASTER_SECOND: usize = 15;
+    pub const RESOLVE: usize = 16;
+    pub const CLOUDS_ON_SCREEN: usize = 17;
+    pub const SCREEN_GI: usize = 18;
+    pub const LIGHTING: usize = 19;
     /// The sea's surface, drawn and shaded.
-    pub const WATER: usize = 19;
+    pub const WATER: usize = 20;
     /// Spawning and moving particles.
-    pub const PARTICLES: usize = 20;
+    pub const PARTICLES: usize = 21;
     /// Drawing them over the scene.
-    pub const PARTICLE_DRAW: usize = 21;
-    pub const POST: usize = 22;
-    pub const END: usize = 23;
+    pub const PARTICLE_DRAW: usize = 22;
+    pub const POST: usize = 23;
+    pub const END: usize = 24;
 }
 const QUERY_COUNT: u32 = SECTIONS.len() as u32 + 1;
 const BYTES: u64 = QUERY_COUNT as u64 * 8;

@@ -48,7 +48,7 @@ fn main(
         for (var v = lane; v < vertex_count; v += GROUP_SIZE) {
             let packed = load_vertex(cluster.vertex_offset + v);
             let posed = posed_position(instance, cluster, v, decode_position(instance, packed));
-            let world = transform_point(instance, posed);
+            let world = place_vertex(instance, posed);
             let clip = view.raster_view_proj * vec4f(world, 1.0);
             cover_vertex(v, packed, entry.instance, clip.w);
             let ndc = clip.xyz / clip.w;

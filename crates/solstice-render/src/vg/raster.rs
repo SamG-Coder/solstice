@@ -4,7 +4,7 @@ use super::culling::{CullWork, ViewSlots};
 use crate::gpu::{Gpu, LayoutBuilder};
 use crate::regions::RegionPlan;
 use crate::scene::GpuScene;
-use crate::shaders;
+use crate::shaders::{self, Deform};
 
 /// Format of the colour attachment that exists only to satisfy WebGPU's rule that a
 /// render pass have at least one attachment. Nothing is ever written to it.
@@ -168,7 +168,7 @@ fn visibility_pipeline(
 }
 
 impl Rasterizer {
-    pub fn new(gpu: &Gpu, has_masked: bool, skinned: bool, regions: Option<RegionPlan>) -> Self {
+    pub fn new(gpu: &Gpu, has_masked: bool, deform: Deform, regions: Option<RegionPlan>) -> Self {
         let mut raster_layout = LayoutBuilder::new()
             .visibility(wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::VERTEX_FRAGMENT)
             .uniform_dynamic()
@@ -177,6 +177,8 @@ impl Rasterizer {
             .storage_read()
             .storage_read()
             .storage_read()
+            .texture_unfilterable()
+            // The wind, for what sways in it.
             .texture_unfilterable();
         if regions.is_some() {
             // The second cluster binding, and the pool's middle and far bands.
@@ -192,7 +194,7 @@ impl Rasterizer {
             .build(gpu, "visibility");
 
         let software_module =
-            shaders::module_for(&gpu.device, "vg/raster_sw.wgsl", skinned, regions);
+            shaders::module_for(&gpu.device, "vg/raster_sw.wgsl", deform, regions);
         let software = gpu.compute_pipeline(
             "software raster",
             &software_module,
@@ -201,7 +203,7 @@ impl Rasterizer {
         );
 
         let hardware_module =
-            shaders::module_for(&gpu.device, "vg/raster_hw_fragment.wgsl", skinned, regions);
+            shaders::module_for(&gpu.device, "vg/raster_hw_fragment.wgsl", deform, regions);
         let hardware = visibility_pipeline(
             gpu,
             "hardware raster",
@@ -218,7 +220,7 @@ impl Rasterizer {
             .storage_read()
             .build(gpu, "software depth merge");
         let depth_module =
-            shaders::module_for(&gpu.device, "vg/raster_sw_depth.wgsl", skinned, regions);
+            shaders::module_for(&gpu.device, "vg/raster_sw_depth.wgsl", deform, regions);
         let software_depth = gpu.compute_pipeline(
             "software depth raster",
             &depth_module,
@@ -289,15 +291,15 @@ impl Rasterizer {
                 .sampler()
                 .build(gpu, "masked raster");
             let software_module =
-                shaders::module_for(&gpu.device, "vg/raster_sw_masked.wgsl", skinned, regions);
+                shaders::module_for(&gpu.device, "vg/raster_sw_masked.wgsl", deform, regions);
             let depth_module = shaders::module_for(
                 &gpu.device,
                 "vg/raster_sw_depth_masked.wgsl",
-                skinned,
+                deform,
                 regions,
             );
             let module =
-                shaders::module_for(&gpu.device, "vg/raster_hw_masked.wgsl", skinned, regions);
+                shaders::module_for(&gpu.device, "vg/raster_hw_masked.wgsl", deform, regions);
             Masked {
                 software: gpu.compute_pipeline(
                     "masked software raster",
@@ -453,6 +455,7 @@ impl Rasterizer {
                     work.visible.as_entire_binding(),
                     work.state().as_entire_binding(),
                     wgpu::BindingResource::TextureView(&scene.skins.bones_view),
+                    wgpu::BindingResource::TextureView(&scene.wind_field.view),
                 ];
                 if let (Some(more), Some(far)) = (&scene.clusters_more, &scene.pool_far) {
                     resources.extend([
