@@ -297,8 +297,8 @@ its direction wandering from place to place. A gust is seen crossing the meadow,
 then bending the rain.
 
 - **Grass** bends along an arc as a blade does, by the drag of the wind, and shimmers; gusts roll
-  over a meadow as waves. **Trees** lean and sway from their trunks, their branches bob in their
-  own time around the crown, and their leaves flutter. Both are bent where their vertices are
+  over a meadow as waves. **Trees** lean with the gusts and rock from their trunks, their branches
+  bend whole and swing a little behind, and their leaves flutter. Both are bent where their vertices are
   placed, in culling, both rasterizers and resolve, with true motion vectors.
 - **Water**: gusts roughen the sea's short waves as they cross it, as cat's paws; ponds ripple
   with the wind over them.

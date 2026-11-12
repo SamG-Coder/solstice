@@ -277,6 +277,13 @@ impl Meadow {
 
     /// The patch's blades, with the ground at Y = 0 and the patch spanning `0..size` in X and Z.
     pub fn mesh(&self) -> Mesh {
+        self.mesh_where(&|_, _| 1.0)
+    }
+
+    /// The patch's blades where `vigour`, at a spot's X and Z, is above zero, and shorter where
+    /// it is low: grass thinning out and dwindling towards the edge of where it grows, so that
+    /// patches of other shapes than a square can be cut from the same breed.
+    pub fn mesh_where(&self, vigour: &dyn Fn(f32, f32) -> f32) -> Mesh {
         let mut rng = Rng::new(self.seed, 1);
         let mut mesh = Mesh::default();
         let tufts = (self.size * self.size * self.tufts_per_square_metre).round() as u32;
@@ -293,6 +300,12 @@ impl Meadow {
             }
             let count = self.blades_per_tuft.0
                 + rng.index((self.blades_per_tuft.1 - self.blades_per_tuft.0 + 1) as usize) as u32;
+            let strength = vigour(center.x, center.z).min(1.0);
+            let (count, tuft_height) = if strength > 0.0 {
+                (count, tuft_height * (0.45 + 0.55 * strength))
+            } else {
+                (0, tuft_height)
+            };
             for _ in 0..count {
                 // Blades rise from a crown a few centimetres across and fan outward from it,
                 // the outer ones leaning furthest.
@@ -329,6 +342,9 @@ impl Meadow {
             let plants = (self.size * self.size * weed.per_square_metre).round() as u32;
             for _ in 0..plants {
                 let root = Vec3::new(rng.range(0.0, self.size), 0.0, rng.range(0.0, self.size));
+                if vigour(root.x, root.z) <= 0.0 {
+                    continue;
+                }
                 weed.add_plant(
                     &mut mesh,
                     &mut rng,
@@ -353,13 +369,20 @@ impl Meadow {
             } else {
                 rng.index(DRY as usize) as u32
             };
+            let height = rng.range(self.undergrowth_height.0, self.undergrowth_height.1);
+            let width = rng.range(self.width.0, self.width.1) * 0.8;
+            let lean = rng.range(0.1, 0.7);
+            // Short shoots reach a little past the tufts, so the edge frays rather than stops.
+            if vigour(root.x, root.z) <= -0.25 {
+                continue;
+            }
             self.add_blade(
                 &mut mesh,
                 root,
                 Vec3::new(angle.cos(), 0.0, angle.sin()),
-                rng.range(self.undergrowth_height.0, self.undergrowth_height.1),
-                rng.range(self.width.0, self.width.1) * 0.8,
-                rng.range(0.1, 0.7),
+                height,
+                width,
+                lean,
                 variant,
             );
         }

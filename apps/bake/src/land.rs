@@ -6,22 +6,23 @@
 //! coast wherever it wanders, and each border meanders by its own noise, as a beach's edge and
 //! a field's do. Paths and yards are dirt wherever they lie.
 //!
-//! The terrain is drawn as a mesh for each kind of ground. Each border is where a smooth field
-//! crosses zero: how far past the sand's wandering edge a spot lies, and how far past the dirt's
-//! or a path's. Where a border is near, a cell of the terrain is cut into smaller ones, and each
-//! small triangle is cut along the line where the field crosses zero, as contour lines are
-//! drawn, so a border is a smooth curve, not a row of teeth. The small cells' corners lie on
-//! the big cell's own triangles, and a cut along an edge depends only on that edge's ends, so no
-//! crack opens anywhere.
+//! Each border is where a smooth field crosses zero: how far past the sand's wandering edge a
+//! spot lies, and how far past the dirt's or a path's. The terrain is one mesh whose texture
+//! coordinates hold how much of each kind of ground there is at each point, sand and dirt, the
+//! rest being grass, easing from one to the other over a metre or so either side of a border.
+//! Its material blends the three textures there ([`Material::BLENDS`]), each laid by the
+//! world's x and z, with what stands proud in each showing first, as grass grows through the
+//! edge of a path and sand drifts into the hollows of turf.
 //!
-//! Grass patches stand only where all of a patch is grass, leaving the ground's own short turf
-//! along the edge of the dirt, as a mown verge; they sway in the wind. Trees and bushes are
-//! scattered by dart throwing over grass, clear of paths, yards and the places the file keeps
-//! clear, and sway too.
+//! Grass patches fill the meadow. Where its edge is near, a patch is cut to the shape of the
+//! grass there, from a few ragged shapes, and the grass dwindles towards its edge, so the
+//! meadow ends as a frayed line, not a row of squares. Loose clumps stand on the turf beyond.
+//! They sway in the wind. Trees and bushes are scattered by dart throwing over grass, clear of
+//! paths, yards and the places the file keeps clear, and sway too.
 
 use glam::{Mat4, Vec2, Vec3};
 use solstice_asset::{Instance, Material, SceneAsset};
-use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh, Vertex};
+use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 use solstice_procgen::foliage::bark::BARK_TILE_METRES;
 use solstice_procgen::foliage::grass::Meadow;
 use solstice_procgen::foliage::tree::Species;
@@ -29,14 +30,13 @@ use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
 use solstice_procgen::surfaces;
-use std::collections::HashMap;
 
 /// The kinds of ground, in the order of [`Plan::kind`]'s answers.
 pub const SAND: usize = 0;
 pub const DIRT: usize = 1;
 pub const GRASS: usize = 2;
-/// How many smaller cells a side a cell is cut into where kinds meet.
-const FINE: u32 = 4;
+/// How far either side of a border two kinds of ground blend, in metres.
+const BLEND_WIDTH: f32 = 2.0;
 /// How far each border wanders either way, in metres.
 const SAND_WANDER: f32 = 4.0;
 const DIRT_WANDER: f32 = 2.5;
@@ -120,262 +120,33 @@ fn kind_of((sand, dirt): (f32, f32)) -> usize {
     }
 }
 
-/// A point of the terrain, with its normal and both border fields there.
-#[derive(Clone, Copy, Debug)]
-struct Point {
-    p: Vec3,
-    n: Vec3,
-    fields: (f32, f32),
+fn smoothstep(low: f32, high: f32, x: f32) -> f32 {
+    let t = ((x - low) / (high - low)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
-impl Point {
-    fn lerp(self, other: Point, t: f32) -> Point {
-        Point {
-            p: self.p.lerp(other.p, t),
-            n: self.n.lerp(other.n, t).normalize_or(Vec3::Y),
-            fields: (
-                self.fields.0 + (other.fields.0 - self.fields.0) * t,
-                self.fields.1 + (other.fields.1 - self.fields.1) * t,
-            ),
-        }
-    }
+/// How much of the ground is sand and how much dirt, for a pair of border fields; the rest is
+/// grass. Each is half at its border, as [`kind_of`] draws it.
+pub fn shares((sand, dirt): (f32, f32)) -> Vec2 {
+    let sand = 1.0 - smoothstep(-BLEND_WIDTH, BLEND_WIDTH, sand);
+    let dirt = (1.0 - sand) * (1.0 - smoothstep(-BLEND_WIDTH, BLEND_WIDTH, dirt));
+    Vec2::new(sand, dirt)
 }
 
-/// Cuts a convex polygon where `field` crosses zero: the part below it, and the part above.
-fn split(polygon: &[Point], field: impl Fn(&Point) -> f32) -> (Vec<Point>, Vec<Point>) {
-    let (mut below, mut above) = (Vec::new(), Vec::new());
-    for (i, &a) in polygon.iter().enumerate() {
-        let b = polygon[(i + 1) % polygon.len()];
-        let (fa, fb) = (field(&a), field(&b));
-        if fa < 0.0 {
-            below.push(a);
-        } else {
-            above.push(a);
-        }
-        if (fa < 0.0) != (fb < 0.0) {
-            // Worked out from the same end whichever way round the edge is walked, so the
-            // triangles either side of it share the point exactly.
-            // A crossing within a hair of either end is that end, so no sliver of a triangle is
-            // left that would collapse on one side of the edge and not the other.
-            let snap = |t: f32| {
-                if t < 0.02 {
-                    0.0
-                } else if t > 0.98 {
-                    1.0
-                } else {
-                    t
-                }
-            };
-            let crossing = if (a.p.x, a.p.z) < (b.p.x, b.p.z) {
-                a.lerp(b, snap(fa / (fa - fb)))
-            } else {
-                b.lerp(a, snap(fb / (fb - fa)))
-            };
-            below.push(crossing);
-            above.push(crossing);
-        }
-    }
-    (below, above)
-}
-
-/// A mesh being built for one kind of ground, sharing vertices by position.
-#[derive(Default)]
-struct KindMesh {
-    mesh: Mesh,
-    at: HashMap<(i64, i64), u32>,
-}
-
-impl KindMesh {
-    fn vertex(&mut self, p: Vec3, normal: Vec3) -> u32 {
-        let key = ((p.x * 4096.0).round() as i64, (p.z * 4096.0).round() as i64);
-        *self.at.entry(key).or_insert_with(|| {
-            self.mesh.vertices.push(Vertex {
-                position: p,
-                normal,
-                uv: Vec2::new(p.x, p.z),
-            });
-            self.mesh.vertices.len() as u32 - 1
-        })
-    }
-
-    fn triangle(&mut self, corners: [(Vec3, Vec3); 3]) {
-        let [a, b, c] = corners.map(|(p, n)| self.vertex(p, n));
-        if a != b && b != c && a != c {
-            self.mesh.indices.extend([a, b, c]);
-        }
-    }
-
-    /// A convex polygon, as a fan of triangles.
-    fn polygon(&mut self, points: &[Point]) {
-        for i in 1..points.len().saturating_sub(1) {
-            self.triangle([
-                (points[0].p, points[0].n),
-                (points[i].p, points[i].n),
-                (points[i + 1].p, points[i + 1].n),
-            ]);
-        }
-    }
-}
-
-/// Lays one small triangle down on the meshes of the kinds it covers, cut along its borders.
-fn lay(meshes: &mut [KindMesh; 3], triangle: [Point; 3]) {
-    // Cut every piece along both borders in turn, so that where one border's cut lands on the
-    // other's, both pieces either side have the point: then each piece is one kind.
-    let mut pieces = vec![triangle.to_vec()];
-    for field in [|p: &Point| p.fields.0, |p: &Point| p.fields.1] {
-        pieces = pieces
-            .into_iter()
-            .flat_map(|piece| {
-                let (below, above) = split(&piece, field);
-                [below, above]
-            })
-            .filter(|piece| piece.len() >= 3)
-            .collect();
-    }
-    for piece in pieces {
-        let n = piece.len() as f32;
-        let mean = piece.iter().fold((0.0, 0.0), |m, p| {
-            (m.0 + p.fields.0 / n, m.1 + p.fields.1 / n)
-        });
-        meshes[kind_of(mean)].polygon(&piece);
-    }
-}
-
-/// The terrain `size` metres across in `cells` a side, a mesh for each kind of ground, from the
-/// ground's `height` and the border `fields` at each spot (see [`Plan::fields`]).
-pub fn zoned_terrain(
+/// The terrain, `size` wide with `cells` quads a side, with each point's shares of sand and
+/// dirt in its texture coordinates.
+pub fn blended_terrain(
     size: f32,
     cells: u32,
-    height: &(dyn Fn(f32, f32) -> f32 + Sync),
+    height: &dyn Fn(f32, f32) -> f32,
     fields: &(dyn Fn(Vec2) -> (f32, f32) + Sync),
-) -> [Mesh; 3] {
-    let step = size / cells as f32;
-    let half = size * 0.5;
-    let normal_at = |x: f32, z: f32| {
-        let e = step * 0.5;
-        Vec3::new(
-            height(x - e, z) - height(x + e, z),
-            2.0 * e,
-            height(x, z - e) - height(x, z + e),
-        )
-        .normalize()
-    };
-    // Which cells are cut finely: those a border comes near.
-    let far = |f: (f32, f32)| f.0.abs() > step * 1.5 && f.1.abs() > step * 1.5;
-    let at = |column: u32, row: u32, dx: f32, dz: f32| {
-        Vec2::new(
-            (column as f32 + dx) * step - half,
-            (row as f32 + dz) * step - half,
-        )
-    };
-    let fine: Vec<bool> = (0..cells * cells)
-        .map(|index| {
-            let (column, row) = (index % cells, index / cells);
-            let samples = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)]
-                .map(|(dx, dz)| fields(at(column, row, dx, dz)));
-            let kinds = samples.map(kind_of);
-            !(kinds.iter().all(|&k| k == kinds[0]) && samples.into_iter().all(far))
-        })
-        .collect();
-    let is_fine = |column: i64, row: i64| {
-        column >= 0
-            && row >= 0
-            && (column as u32) < cells
-            && (row as u32) < cells
-            && fine[(row as u32 * cells + column as u32) as usize]
-    };
-    let mut meshes: [KindMesh; 3] = Default::default();
-    for row in 0..cells {
-        for column in 0..cells {
-            let x0 = column as f32 * step - half;
-            let z0 = row as f32 * step - half;
-            let corner = |dx: f32, dz: f32| {
-                let (x, z) = (x0 + dx * step, z0 + dz * step);
-                Point {
-                    p: Vec3::new(x, height(x, z), z),
-                    n: normal_at(x, z),
-                    fields: fields(Vec2::new(x, z)),
-                }
-            };
-            // The cell's corners: a b on its near row, c d on its far one, as the plain
-            // terrain lays them, split a-c-b, b-c-d.
-            let (a, b, c, d) = (
-                corner(0.0, 0.0),
-                corner(1.0, 0.0),
-                corner(0.0, 1.0),
-                corner(1.0, 1.0),
-            );
-            // A point of the cell on its own two triangles, so that whatever is laid on it
-            // meets its neighbours along their shared edges exactly.
-            let on_cell = |u: f32, v: f32| {
-                let y = if u + v <= 1.0 {
-                    a.p.y + (b.p.y - a.p.y) * u + (c.p.y - a.p.y) * v
-                } else {
-                    d.p.y + (c.p.y - d.p.y) * (1.0 - u) + (b.p.y - d.p.y) * (1.0 - v)
-                };
-                let (x, z) = (x0 + u * step, z0 + v * step);
-                Point {
-                    p: Vec3::new(x, y, z),
-                    n: normal_at(x, z),
-                    fields: fields(Vec2::new(x, z)),
-                }
-            };
-            let small = 1.0 / FINE as f32;
-            let (col, rw) = (column as i64, row as i64);
-            if !fine[(row * cells + column) as usize] {
-                let k = kind_of(fields(Vec2::new(x0 + step * 0.5, z0 + step * 0.5)));
-                // Beside a finely cut cell, the shared edge carries its points too, or a
-                // T-junction would open along it: the cell is laid as a fan from its middle
-                // round its edge, a to c to d to b, with every point the neighbours have.
-                let sides = [
-                    (is_fine(col - 1, rw), (0.0, 0.0), (0.0, 1.0)),
-                    (is_fine(col, rw + 1), (0.0, 1.0), (1.0, 1.0)),
-                    (is_fine(col + 1, rw), (1.0, 1.0), (1.0, 0.0)),
-                    (is_fine(col, rw - 1), (1.0, 0.0), (0.0, 0.0)),
-                ];
-                if !sides.iter().any(|s| s.0) {
-                    meshes[k].triangle([(a.p, a.n), (c.p, c.n), (b.p, b.n)]);
-                    meshes[k].triangle([(b.p, b.n), (c.p, c.n), (d.p, d.n)]);
-                    continue;
-                }
-                let mut rim = Vec::new();
-                for (cut, from, to) in sides {
-                    let steps = if cut { FINE } else { 1 };
-                    for n in 0..steps {
-                        let t = n as f32 / steps as f32;
-                        rim.push(on_cell(
-                            from.0 + (to.0 - from.0) * t,
-                            from.1 + (to.1 - from.1) * t,
-                        ));
-                    }
-                }
-                let middle = on_cell(0.5, 0.5);
-                for n in 0..rim.len() {
-                    let (p, q) = (rim[n], rim[(n + 1) % rim.len()]);
-                    meshes[k].triangle([(middle.p, middle.n), (p.p, p.n), (q.p, q.n)]);
-                }
-                continue;
-            }
-            // Where a border is near: smaller cells on the big cell's own two triangles, each
-            // cut along the border.
-            for j in 0..FINE {
-                for i in 0..FINE {
-                    let (u0, v0) = (i as f32 * small, j as f32 * small);
-                    let (u1, v1) = (u0 + small, v0 + small);
-                    let (p, q, r, s) = (
-                        on_cell(u0, v0),
-                        on_cell(u1, v0),
-                        on_cell(u0, v1),
-                        on_cell(u1, v1),
-                    );
-                    // The small cells' diagonals follow the big one's, so none crosses it.
-                    lay(&mut meshes, [p, r, q]);
-                    lay(&mut meshes, [q, r, s]);
-                }
-            }
-        }
-    }
-    meshes.map(|m| m.mesh)
+) -> Mesh {
+    use rayon::prelude::*;
+    let mut mesh = crate::meshes::terrain(size, cells, height);
+    mesh.vertices
+        .par_iter_mut()
+        .for_each(|v| v.uv = shares(fields(Vec2::new(v.position.x, v.position.z))));
+    mesh
 }
 
 /// A texture layer for `surface`, added to the scene.
@@ -396,50 +167,48 @@ pub fn add(
 ) -> i32 {
     let kind_at = |p: Vec2| plan.kind(p, inland(p.x, p.y));
     let fields = |p: Vec2| plan.fields(p, inland(p.x, p.y));
-    println!("  zoning the land...");
-    let meshes = zoned_terrain(size, cells, height, &fields);
-    let sand = layer(scene, surfaces::sand(0));
-    let dirt = layer(scene, surfaces::dirt(0));
-    let grass = layer(scene, surfaces::grass(0));
-    // Darkened as each is seen in the field, so they sit beside the scans: damp sand about 0.35
-    // albedo, earth darker, turf darker still.
-    for (mesh, (texture, tone)) in meshes
-        .iter()
-        .zip([(sand, 0.68), (dirt, 0.62), (grass, 0.75)])
-    {
-        if mesh.indices.is_empty() {
-            continue;
-        }
-        println!("    {} triangles", mesh.indices.len() / 3);
+    println!("  laying the land...");
+    let mesh = blended_terrain(size, cells, &|x, z| height(x, z), &fields);
+    // Grass first, then sand and dirt, in consecutive layers and materials, as the blend reads
+    // them. Each darkened as it is seen in the field, so they sit beside the scans: turf about
+    // 0.75 of its texture, damp sand 0.68, earth 0.62.
+    let first = scene.textures.len() as i32;
+    for surface in [surfaces::grass(0), surfaces::sand(0), surfaces::dirt(0)] {
+        layer(scene, surface);
+    }
+    for (k, tone) in [0.75, 0.68, 0.62].into_iter().enumerate() {
         scene.materials.push(Material {
             base_color: [tone, tone, tone, 1.0],
             roughness: 1.0,
             uv_scale: 1.0 / TILE_METRES,
             normal_strength: 1.0,
-            texture_layer: texture,
+            texture_layer: first + k as i32,
             macro_variation: 1.0,
+            flags: if k == 0 { Material::BLENDS } else { 0 },
             ..Default::default()
         });
-        scene.instances.push(Instance {
-            mesh: scene.meshes.len() as u32,
-            material: scene.materials.len() as u32 - 1,
-            transform: Mat4::IDENTITY,
-        });
-        scene
-            .meshes
-            .push(build_virtual_mesh(mesh, &BuildOptions::default()));
     }
+    scene.instances.push(Instance {
+        mesh: scene.meshes.len() as u32,
+        material: scene.materials.len() as u32 - 3,
+        transform: Mat4::IDENTITY,
+    });
+    scene
+        .meshes
+        .push(build_virtual_mesh(&mesh, &BuildOptions::default()));
     if let Some(radius) = plan.meadow {
         add_meadow(scene, plan, radius, height, &kind_at);
     }
     if !plan.woods.is_empty() {
         add_woods(scene, plan, height, &kind_at);
     }
-    sand
+    // The sand's layer.
+    first + 1
 }
 
-/// Different grass patches, laid at random so no repeat shows.
+/// Different grass patches, laid at random so no repeat shows: whole ones, and of each shape.
 const PATCH_VARIANTS: u32 = 4;
+const SHAPE_VARIANTS: u32 = 3;
 
 /// A small, fast hash for placement.
 fn hash(x: i32, z: i32, channel: u32) -> u32 {
@@ -452,9 +221,9 @@ fn hash(x: i32, z: i32, channel: u32) -> u32 {
 }
 
 /// A patch whose local square is `0..size`, laid on the ground with its corner at (x, z),
-/// sheared to the ground's slope so every blade grows straight up from it, and turned a
-/// quarter turn at random.
-fn patch_transform(x: f32, z: f32, size: f32, turn: u32, height: &dyn Fn(f32, f32) -> f32) -> Mat4 {
+/// sheared to the ground's slope so every blade grows straight up from it, and turned by `turn`
+/// radians about its middle.
+fn patch_transform(x: f32, z: f32, size: f32, turn: f32, height: &dyn Fn(f32, f32) -> f32) -> Mat4 {
     let half = size * 0.5;
     let (cx, cz) = (x + half, z + half);
     let h = height(cx, cz);
@@ -468,11 +237,164 @@ fn patch_transform(x: f32, z: f32, size: f32, turn: u32, height: &dyn Fn(f32, f3
     );
     Mat4::from_translation(Vec3::new(cx, h, cz))
         * shear
-        * Mat4::from_rotation_y(turn as f32 * std::f32::consts::FRAC_PI_2)
+        * Mat4::from_rotation_y(turn)
         * Mat4::from_translation(Vec3::new(-half, 0.0, -half))
 }
 
-/// Grass patches over the grass within `radius` of the origin, each wholly on grass.
+/// The shapes a meadow's patches are cut to where its edge is near, besides a whole square.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shape {
+    /// Grass over the near half, its edge across the middle.
+    Half,
+    /// Grass in a quarter round about one corner.
+    Corner,
+    /// Grass but for a quarter round about the far corner.
+    Notched,
+    /// A round clump in the middle.
+    Clump,
+    /// Grass all over but frayed along the sides in this mask, [`NORTH`] and so on: a whole
+    /// patch at the meadow's rim, where the cells beyond have no grass patch.
+    Rim(u8),
+}
+
+/// The sides of a patch's own square: towards +Z, +X, -Z and -X.
+const NORTH: u8 = 1;
+const EAST: u8 = 2;
+const SOUTH: u8 = 4;
+const WEST: u8 = 8;
+
+/// The shapes for cells the grass only partly covers.
+const SHAPES: [Shape; 4] = [Shape::Half, Shape::Corner, Shape::Notched, Shape::Clump];
+/// The rims, one for each set of open sides up to a turn: one side, two beside each other, two
+/// opposite, three, and all four.
+const RIMS: [Shape; 5] = [
+    Shape::Rim(NORTH),
+    Shape::Rim(NORTH | EAST),
+    Shape::Rim(NORTH | SOUTH),
+    Shape::Rim(NORTH | EAST | SOUTH),
+    Shape::Rim(NORTH | EAST | SOUTH | WEST),
+];
+/// How far in from an open side a rim's grass reaches before its fray, in metres.
+const RIM_DEPTH: f32 = 0.45;
+
+impl Shape {
+    /// How far inside the shape a spot of the patch lies, in metres, before its edge frays:
+    /// above zero is grass.
+    fn inside(self, u: f32, v: f32, size: f32) -> f32 {
+        match self {
+            Shape::Half => size * 0.55 - v,
+            Shape::Corner => size * 0.7 - Vec2::new(u, v).length(),
+            Shape::Notched => Vec2::new(size - u, size - v).length() - size * 0.45,
+            Shape::Clump => size * 0.4 - Vec2::new(u - size * 0.5, v - size * 0.5).length(),
+            Shape::Rim(open) => [(NORTH, size - v), (EAST, size - u), (SOUTH, v), (WEST, u)]
+                .into_iter()
+                .filter(|&(side, _)| open & side != 0)
+                .map(|(_, d)| d - RIM_DEPTH)
+                .fold(size, f32::min),
+        }
+    }
+
+    /// How the grass grows at a spot of a patch of this shape: above zero where it does,
+    /// dwindling over its last half metre, the edge frayed inward by noise so no two patches end
+    /// alike.
+    fn vigour(self, u: f32, v: f32, size: f32, seed: u32) -> f32 {
+        // A broad wander, so a row of patches doesn't line its edges up, and a finer one.
+        let wander = fbm(
+            Vec3::new(u * 0.8, seed as f32 * 3.1, v * 0.8),
+            2,
+            711 + seed,
+        ) * 0.7;
+        let fray = fbm(
+            Vec3::new(u * 2.5, seed as f32 * 3.1, v * 2.5),
+            3,
+            709 + seed,
+        ) * 0.25;
+        // Only ever inward, so no grass grows past the plain edge the fit was judged by.
+        let fray = (wander + fray).min(0.0);
+        (self.inside(u, v, size) + fray) / 0.5
+    }
+}
+
+/// Spots of a patch at which its fit to the ground is judged: near its corners, the middles of
+/// its sides, and its middle, in its own `0..1` square.
+const PROBES: [(f32, f32); 9] = [
+    (0.1, 0.1),
+    (0.5, 0.1),
+    (0.9, 0.1),
+    (0.1, 0.5),
+    (0.5, 0.5),
+    (0.9, 0.5),
+    (0.1, 0.9),
+    (0.5, 0.9),
+    (0.9, 0.9),
+];
+
+/// The shape and turn that best fit a patch whose probes are `grass` where the ground is grass:
+/// the one covering the most of it without reaching over anything else, by the shapes' plain
+/// edges. None where no shape fits.
+fn fit(grass: [bool; 9], size: f32) -> Option<(Shape, u32)> {
+    let mut best = None;
+    let mut most = 0;
+    for shape in SHAPES {
+        for turn in 0..4u32 {
+            let mut covered = 0;
+            let mut fits = true;
+            for (n, &(u, v)) in PROBES.iter().enumerate() {
+                // The spot of the patch's own square that lands on this probe once turned.
+                let (u, v) = turned(u, v, turn);
+                if shape.inside(u * size, v * size, size) > 0.0 {
+                    if grass[n] {
+                        covered += 1;
+                    } else {
+                        fits = false;
+                    }
+                }
+            }
+            if fits && covered > most {
+                most = covered;
+                best = Some((shape, turn));
+            }
+        }
+    }
+    best
+}
+
+/// The rim and turn whose open sides, once turned, are `open`: middles of a side of the cell
+/// where the rim's grass stops short of it. None for no open side.
+fn rim(open: u8, size: f32) -> Option<(Shape, u32)> {
+    const SIDES: [(u8, (f32, f32)); 4] = [
+        (NORTH, (0.5, 0.99)),
+        (EAST, (0.99, 0.5)),
+        (SOUTH, (0.5, 0.01)),
+        (WEST, (0.01, 0.5)),
+    ];
+    for shape in RIMS {
+        for turn in 0..4u32 {
+            let opens = SIDES
+                .iter()
+                .filter(|&&(_, (u, v))| {
+                    let (u, v) = turned(u, v, turn);
+                    shape.inside(u * size, v * size, size) < 0.0
+                })
+                .fold(0, |mask, &(side, _)| mask | side);
+            if opens == open {
+                return Some((shape, turn));
+            }
+        }
+    }
+    None
+}
+
+/// Which spot of a patch's own `0..1` square lands on `(u, v)` once the patch is turned by
+/// `turn` quarter turns about its middle, as [`patch_transform`] turns it.
+fn turned(u: f32, v: f32, turn: u32) -> (f32, f32) {
+    let r = Mat4::from_rotation_y(-(turn as f32) * std::f32::consts::FRAC_PI_2)
+        .transform_vector3(Vec3::new(u - 0.5, 0.0, v - 0.5));
+    (r.x + 0.5, r.z + 0.5)
+}
+
+/// Grass patches over the grass within `radius` of the origin: whole ones where it is all grass,
+/// cut to its shape along its edge, and loose clumps on the turf beyond.
 fn add_meadow(
     scene: &mut SceneAsset,
     plan: &Plan,
@@ -482,7 +404,9 @@ fn add_meadow(
 ) {
     println!("  growing the meadow...");
     let meadow = Meadow::default();
+    let size = meadow.size;
     let first_mesh = scene.meshes.len() as u32;
+    // Whole patches, then each shape's.
     for seed in 0..PATCH_VARIANTS {
         let mesh = Meadow {
             seed,
@@ -493,6 +417,26 @@ fn add_meadow(
             .meshes
             .push(build_virtual_mesh(&mesh, &BuildOptions::default()));
     }
+    for shape in SHAPES.into_iter().chain(RIMS) {
+        for seed in 0..SHAPE_VARIANTS {
+            let mesh = Meadow {
+                seed: 100 + seed,
+                ..meadow.clone()
+            }
+            .mesh_where(&|u, v| shape.vigour(u, v, size, seed));
+            scene
+                .meshes
+                .push(build_virtual_mesh(&mesh, &BuildOptions::default()));
+        }
+    }
+    let shaped_mesh = |shape: Shape, seed: u32| {
+        let which = SHAPES
+            .iter()
+            .chain(&RIMS)
+            .position(|&s| s == shape)
+            .expect("a shape with meshes") as u32;
+        first_mesh + PATCH_VARIANTS + which * SHAPE_VARIANTS + seed
+    };
     let blades = layer(scene, meadow.atlas(0));
     scene.materials.push(Material {
         base_color: [1.0; 4],
@@ -503,35 +447,104 @@ fn add_meadow(
         ..Default::default()
     });
     let material = scene.materials.len() as u32 - 1;
-    let size = meadow.size;
     let cells = (radius * 2.0 / size) as i32;
-    let mut placed = 0;
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let (mut whole, mut shaped, mut loose) = (0, 0, 0);
+    // First what grows in each cell: a whole patch, a shaped one, or none.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Cell {
+        Bare,
+        Whole,
+        Shaped(Shape, u32),
+    }
+    let cell_at = |i: i32, j: i32| {
+        let (x, z) = (i as f32 * size - radius, j as f32 * size - radius);
+        let centre = Vec2::new(x + size * 0.5, z + size * 0.5);
+        if centre.length() > radius {
+            return Cell::Bare;
+        }
+        // Which of the patch's probes stand on grass that may be planted.
+        let grass = PROBES
+            .map(|(u, v)| plan.may_plant(Vec2::new(x + u * size, z + v * size), 0.15, kind_at));
+        if grass.iter().all(|&g| g) && plan.may_plant(centre, size * 0.5, kind_at) {
+            Cell::Whole
+        } else if let Some((shape, turn)) = fit(grass, size) {
+            Cell::Shaped(shape, turn)
+        } else {
+            Cell::Bare
+        }
+    };
+    let grid: Vec<Cell> = (0..cells * cells)
+        .map(|n| cell_at(n % cells, n / cells))
+        .collect();
+    let at = |i: i32, j: i32| {
+        if i < 0 || j < 0 || i >= cells || j >= cells {
+            Cell::Bare
+        } else {
+            grid[(j * cells + i) as usize]
+        }
+    };
     for j in 0..cells {
         for i in 0..cells {
             let (x, z) = (i as f32 * size - radius, j as f32 * size - radius);
             let centre = Vec2::new(x + size * 0.5, z + size * 0.5);
-            if centre.length() > radius {
-                continue;
+            match at(i, j) {
+                Cell::Whole => {
+                    // Frayed on the sides that face no grass patch, so the meadow's rim is never
+                    // a square's straight side.
+                    let open = [(NORTH, 0, 1), (EAST, 1, 0), (SOUTH, 0, -1), (WEST, -1, 0)]
+                        .into_iter()
+                        .filter(|&(_, di, dj)| at(i + di, j + dj) == Cell::Bare)
+                        .fold(0, |mask, (side, _, _)| mask | side);
+                    let (mesh, turn) = match rim(open, size) {
+                        Some((shape, turn)) => {
+                            (shaped_mesh(shape, hash(i, j, 2) % SHAPE_VARIANTS), turn)
+                        }
+                        None => (
+                            first_mesh + hash(i, j, 0) % PATCH_VARIANTS,
+                            hash(i, j, 1) % 4,
+                        ),
+                    };
+                    scene.instances.push(Instance {
+                        mesh,
+                        material,
+                        transform: patch_transform(x, z, size, turn as f32 * quarter, height),
+                    });
+                    whole += 1;
+                    continue;
+                }
+                Cell::Shaped(shape, turn) => {
+                    scene.instances.push(Instance {
+                        mesh: shaped_mesh(shape, hash(i, j, 2) % SHAPE_VARIANTS),
+                        material,
+                        transform: patch_transform(x, z, size, turn as f32 * quarter, height),
+                    });
+                    shaped += 1;
+                }
+                Cell::Bare => {}
             }
-            // All of the patch, its corners and middle, on grass and clear.
-            let whole = [(0.0, 0.0), (size, 0.0), (0.0, size), (size, size)]
-                .iter()
-                .all(|&(dx, dz)| kind_at(Vec2::new(x + dx, z + dz)) == GRASS)
-                && plan.may_plant(centre, size * 0.5, kind_at);
-            if !whole {
-                continue;
+            // Now and then a loose clump on the turf near the edge, set anywhere and turned any
+            // way, so the edge has outliers, as a meadow's does.
+            if centre.length() <= radius && hash(i, j, 3).is_multiple_of(2) {
+                let jitter = Vec2::new(
+                    (hash(i, j, 4) % 1000) as f32 / 1000.0 - 0.5,
+                    (hash(i, j, 5) % 1000) as f32 / 1000.0 - 0.5,
+                ) * size;
+                let at = centre + jitter;
+                if plan.may_plant(at, size * 0.4, kind_at) {
+                    let turn = (hash(i, j, 6) % 1000) as f32 / 1000.0 * std::f32::consts::TAU;
+                    let corner = at - Vec2::splat(size * 0.5);
+                    scene.instances.push(Instance {
+                        mesh: shaped_mesh(Shape::Clump, hash(i, j, 7) % SHAPE_VARIANTS),
+                        material,
+                        transform: patch_transform(corner.x, corner.y, size, turn, height),
+                    });
+                    loose += 1;
+                }
             }
-            let variant = hash(i, j, 0) % PATCH_VARIANTS;
-            let turn = hash(i, j, 1) % 4;
-            scene.instances.push(Instance {
-                mesh: first_mesh + variant,
-                material,
-                transform: patch_transform(x, z, size, turn, height),
-            });
-            placed += 1;
         }
     }
-    println!("    {placed} grass patches");
+    println!("    {whole} whole grass patches, {shaped} shaped to the edge, {loose} loose clumps");
 }
 
 /// Trees and bushes over the grass of each wood, scattered by dart throwing: each its own space,
@@ -683,120 +696,137 @@ mod tests {
     }
 
     #[test]
-    fn the_zoned_terrain_is_watertight() {
-        let height = |x: f32, z: f32| (x * 0.3).sin() + (z * 0.2).cos();
-        let fields = |p: Vec2| (p.x + 0.5 * p.y - 0.3, p.length() - 6.0);
-        let meshes = zoned_terrain(20.0, 20, &height, &fields);
-        // Every edge between two triangles, across all three kinds' meshes, is used by exactly
-        // two of them, and every edge on the square's rim by one: no crack, no T-junction.
-        let key = |v: &Vertex| {
-            (
-                (v.position.x * 1024.0).round() as i64,
-                (v.position.z * 1024.0).round() as i64,
-            )
-        };
-        type Edge = ((i64, i64), (i64, i64));
-        let mut uses: HashMap<Edge, u32> = HashMap::new();
-        for m in &meshes {
-            for t in m.indices.chunks_exact(3) {
-                for (i, j) in [(0, 1), (1, 2), (2, 0)] {
-                    let (a, b) = (
-                        key(&m.vertices[t[i] as usize]),
-                        key(&m.vertices[t[j] as usize]),
-                    );
-                    if a != b {
-                        *uses.entry((a.min(b), a.max(b))).or_default() += 1;
-                    }
-                }
-            }
-        }
-        let rim = |k: (i64, i64)| k.0.abs() == 10 * 1024 || k.1.abs() == 10 * 1024;
-        for ((a, b), count) in &uses {
-            let on_rim = rim(*a) && rim(*b) && (a.0 == b.0 || a.1 == b.1);
-            let expected = if on_rim { 1 } else { 2 };
-            assert_eq!(*count, expected, "edge {a:?} to {b:?}");
-        }
-        // And each kind's heights lie on the plain terrain's surface: its vertices at the cells'
-        // corners are the plain terrain's own.
-        for m in &meshes {
-            for v in &m.vertices {
-                let (x, z) = (v.position.x, v.position.z);
-                if (x - x.round()).abs() < 1.0e-4 && (z - z.round()).abs() < 1.0e-4 {
-                    assert!((v.position.y - height(x.round(), z.round())).abs() < 1.0e-4);
+    fn the_shares_ease_across_each_border() {
+        // Deep in each kind, all of it; at a border, half each; and never more than all.
+        assert_eq!(shares((-5.0, -5.0)), Vec2::new(1.0, 0.0));
+        assert_eq!(shares((5.0, -5.0)), Vec2::new(0.0, 1.0));
+        assert_eq!(shares((5.0, 5.0)), Vec2::new(0.0, 0.0));
+        assert!((shares((0.0, -5.0)).x - 0.5).abs() < 1.0e-6);
+        assert!((shares((5.0, 0.0)).y - 0.5).abs() < 1.0e-6);
+        for a in -20..20 {
+            for b in -20..20 {
+                let fields = (a as f32 * 0.2, b as f32 * 0.2);
+                let s = shares(fields);
+                assert!(s.x >= 0.0 && s.y >= 0.0 && s.x + s.y <= 1.0 + 1.0e-6);
+                // Beyond the blend, all of it is the kind drawn there.
+                if fields.0.abs() >= BLEND_WIDTH && fields.1.abs() >= BLEND_WIDTH {
+                    let all = [s.x, s.y, 1.0 - s.x - s.y];
+                    assert!((all[kind_of(fields)] - 1.0).abs() < 1.0e-6, "{fields:?}");
                 }
             }
         }
     }
 
     #[test]
-    fn the_zoned_terrain_has_no_cracks_and_its_borders_are_fine() {
+    fn the_blended_terrain_carries_the_shares() {
         let height = |x: f32, z: f32| (x * 0.3).sin() + (z * 0.2).cos();
-        // A sand border running diagonally across the square, and a curved dirt one.
-        let fields = |p: Vec2| (p.x + 0.5 * p.y - 0.3, p.length() - 6.0);
-        let meshes = zoned_terrain(20.0, 20, &height, &fields);
-        // Every triangle's area adds up to the square's, so nothing overlaps and nothing is
-        // missing: across the whole terrain, the kinds tile it.
-        let area: f32 = meshes
-            .iter()
-            .map(|m| {
-                m.indices
-                    .chunks_exact(3)
-                    .map(|t| {
-                        let [a, b, c] = [t[0], t[1], t[2]].map(|i| m.vertices[i as usize].position);
-                        let (a, b, c) = (
-                            Vec2::new(a.x, a.z),
-                            Vec2::new(b.x, b.z),
-                            Vec2::new(c.x, c.z),
-                        );
-                        ((b - a).perp_dot(c - a) * 0.5).abs()
-                    })
-                    .sum::<f32>()
-            })
-            .sum();
-        assert!((area - 400.0).abs() < 0.01, "{area}");
-        // Every triangle faces up.
-        for m in &meshes {
-            for t in m.indices.chunks_exact(3) {
-                let [a, b, c] = [t[0], t[1], t[2]].map(|i| m.vertices[i as usize].position);
-                assert!((b - a).cross(c - a).y > 0.0);
-            }
-        }
-        // Each vertex where small cells meet a whole cell's edge lies on that edge's straight
-        // line: every vertex lies on the plain terrain's triangles. Checked by the grass and sand
-        // meshes sharing their border vertices at the same heights.
-        let at = |m: &Mesh| -> HashMap<(i64, i64), f32> {
-            m.vertices
-                .iter()
-                .map(|v| {
-                    (
-                        (
-                            (v.position.x * 1024.0).round() as i64,
-                            (v.position.z * 1024.0).round() as i64,
-                        ),
-                        v.position.y,
-                    )
-                })
-                .collect()
-        };
-        let (sand, grass) = (at(&meshes[SAND]), at(&meshes[GRASS]));
-        let mut shared = 0;
-        for (key, y) in &sand {
-            if let Some(other) = grass.get(key) {
-                assert!((y - other).abs() < 1.0e-4);
-                shared += 1;
-            }
-        }
-        assert!(shared > 20);
-        // The borders are cut along the fields: every vertex of the sand lies on its side of the
-        // straight line, and the grass's outside the circle, to within the chords that draw it.
-        for v in &meshes[SAND].vertices {
-            assert!(v.position.x + 0.5 * v.position.z - 0.3 <= 1.0e-4);
-        }
-        for v in &meshes[GRASS].vertices {
+        let fields = |p: Vec2| (p.x - 2.0, p.length() - 6.0);
+        let mesh = blended_terrain(20.0, 20, &height, &fields);
+        assert!(!mesh.vertices.is_empty());
+        for v in &mesh.vertices {
             let p = Vec2::new(v.position.x, v.position.z);
-            assert!(
-                p.length() >= 6.0 - 1.0e-2 && v.position.x + 0.5 * v.position.z - 0.3 >= -1.0e-4
+            assert_eq!(v.uv, shares(fields(p)));
+            assert!((v.position.y - height(p.x, p.y)).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn shaped_patches_only_cover_grass() {
+        let size = 2.0;
+        let covers = |grass: [bool; 9]| {
+            let (shape, turn) = fit(grass, size).expect("a shape fits");
+            for (n, &(u, v)) in PROBES.iter().enumerate() {
+                let (u, v) = turned(u, v, turn);
+                if shape.inside(u * size, v * size, size) > 0.0 {
+                    assert!(grass[n], "{shape:?} turned {turn} reaches over probe {n}");
+                }
+            }
+            shape
+        };
+        // Grass along any one side: a half patch, turned to lie along it.
+        let near = [true, true, true, true, true, true, false, false, false];
+        assert_eq!(covers(near), Shape::Half);
+        let left = [true, true, false, true, true, false, true, true, false];
+        assert_eq!(covers(left), Shape::Half);
+        // Grass at one corner alone: a corner.
+        let corner = [false, false, false, false, false, true, false, true, true];
+        assert_eq!(covers(corner), Shape::Corner);
+        // All but one corner: notched.
+        let notched = [true, true, true, true, true, true, true, true, false];
+        assert_eq!(covers(notched), Shape::Notched);
+        // No grass, no patch.
+        assert_eq!(fit([false; 9], size), None);
+    }
+
+    #[test]
+    fn every_set_of_open_sides_has_a_rim() {
+        let size = 2.0;
+        assert_eq!(rim(0, size), None);
+        for open in 1..16u8 {
+            let (shape, turn) = rim(open, size).expect("a rim");
+            // Its grass reaches the closed sides' middles, and stops short of the open ones'.
+            for (side, (u, v)) in [
+                (NORTH, (0.5, 0.99)),
+                (EAST, (0.99, 0.5)),
+                (SOUTH, (0.5, 0.01)),
+                (WEST, (0.01, 0.5)),
+            ] {
+                let (u, v) = turned(u, v, turn);
+                let grows = shape.inside(u * size, v * size, size) > 0.0;
+                assert_eq!(
+                    grows,
+                    open & side == 0,
+                    "open {open:04b}, {shape:?} turned {turn}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn turning_matches_the_patch_transform() {
+        // A spot of the patch, turned with the patch, lands where `turned` says.
+        let size = 2.0;
+        for turn in 0..4u32 {
+            let m = patch_transform(
+                0.0,
+                0.0,
+                size,
+                turn as f32 * std::f32::consts::FRAC_PI_2,
+                &|_, _| 0.0,
             );
+            for &(u, v) in &PROBES {
+                let (pu, pv) = turned(u, v, turn);
+                let landed = m.transform_point3(Vec3::new(pu * size, 0.0, pv * size));
+                assert!(
+                    (landed.x - u * size).abs() < 1.0e-4 && (landed.z - v * size).abs() < 1.0e-4,
+                    "turn {turn}: {landed:?} for {u} {v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_meadow_grown_everywhere_is_the_whole_patch() {
+        let meadow = Meadow::default();
+        let (whole, all) = (meadow.mesh(), meadow.mesh_where(&|_, _| 1.0));
+        assert_eq!(whole.indices, all.indices);
+        assert_eq!(whole.vertices.len(), all.vertices.len());
+        for (a, b) in whole.vertices.iter().zip(&all.vertices) {
+            assert_eq!((a.position, a.normal, a.uv), (b.position, b.normal, b.uv));
+        }
+    }
+
+    #[test]
+    fn a_shaped_patch_has_grass_only_inside_its_frayed_edge() {
+        let meadow = Meadow::default();
+        let size = meadow.size;
+        let whole = meadow.mesh();
+        let half = meadow.mesh_where(&|u, v| Shape::Half.vigour(u, v, size, 0));
+        assert!(!half.vertices.is_empty());
+        assert!(half.vertices.len() < whole.vertices.len() * 3 / 4);
+        // Nothing grows from beyond the half's frayed edge, nor much past it as blades lean.
+        for v in &half.vertices {
+            assert!(v.position.z < size * 0.55 + 0.125 + 0.6, "{}", v.position.z);
         }
     }
 }

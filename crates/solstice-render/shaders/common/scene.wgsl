@@ -95,6 +95,9 @@ struct VisibleCluster {
 const MATERIAL_TWO_SIDED: u32 = 1u;
 const MATERIAL_FOLIAGE: u32 = 2u;
 const MATERIAL_MASKED: u32 = 4u;
+// Twin of Material::BLENDS: ground of three kinds, this material's and the next two's,
+// blended by the shares the mesh's texture coordinates hold (land.rs).
+const MATERIAL_BLENDS: u32 = 32u;
 // Twins of the INSTANCE_ flags in scene.rs.
 const INSTANCE_TWO_SIDED: u32 = 0x80000000u;
 const INSTANCE_MOVABLE: u32 = 0x40000000u;
@@ -104,7 +107,8 @@ const INSTANCE_MASKED: u32 = 0x08000000u;
 const INSTANCE_SWAYS: u32 = 0x04000000u;
 const INSTANCE_TREE: u32 = 0x02000000u;
 const INSTANCE_FLUTTERS: u32 = 0x01000000u;
-const INSTANCE_MATERIAL_MASK: u32 = 0x00ffffffu;
+const INSTANCE_BLENDS: u32 = 0x00800000u;
+const INSTANCE_MATERIAL_MASK: u32 = 0x007fffffu;
 
 fn instance_material(i: Instance) -> u32 {
     return i.material & INSTANCE_MATERIAL_MASK;

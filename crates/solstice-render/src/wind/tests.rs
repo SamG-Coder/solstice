@@ -660,6 +660,37 @@ fn a_tree_leans_from_its_foot_and_its_leaves_stay_on_it() {
 }
 
 #[test]
+fn a_branch_moves_whole_not_in_waves() {
+    let Some(gpu) = request_gpu() else { return };
+    let eye = Vec3::new(0.0, 2.0, -20.0);
+    // A branch rising out from the trunk, and the trunk at each of its points' heights.
+    let branch: Vec<Vec3> = (2..=8)
+        .map(|i| Vec3::new(i as f32 * 0.5, 6.0 + i as f32 * 0.4, 0.4))
+        .collect();
+    let trunk: Vec<Vec3> = branch.iter().map(|p| Vec3::new(0.0, p.y, 0.0)).collect();
+    // At several moments, in a fresh wind: every point of the branch moves off the trunk the same
+    // way, by more the further out it is, so the branch bends as one rather than rippling.
+    for steps in [20, 47, 90] {
+        let wind = blown(&weather(12.0, 250.0, 0.0, 0.0), steps, 1.0 / 30.0);
+        let (field, _) = fill(&gpu, &wind, Vec2::ZERO, true, [40.0, 60.0]);
+        let on = probe(&gpu, &field, tree_words(false), &branch, eye);
+        let under = probe(&gpu, &field, tree_words(false), &trunk, eye);
+        let own: Vec<Vec3> = on
+            .iter()
+            .zip(&under)
+            .map(|(b, t)| offset(b) - offset(t))
+            .collect();
+        let way = own.last().unwrap().normalize();
+        let mut last = 0.0;
+        for o in &own[2..] {
+            assert!(o.normalize().dot(way) > 0.999, "{own:?}");
+            assert!(o.length() >= last, "{own:?}");
+            last = o.length();
+        }
+    }
+}
+
+#[test]
 fn a_far_tree_stands_still_and_a_calm_one_too() {
     let Some(gpu) = request_gpu() else { return };
     let gale = blown(&weather(30.0, 270.0, 0.5, 0.5), 10, 0.1);

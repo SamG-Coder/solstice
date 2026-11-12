@@ -90,6 +90,10 @@ impl Material {
     /// sways by its height above the mesh's ground, its branches by their reach from the trunk
     /// along y, and, if it is [`Material::FOLIAGE`] too, its leaves flutter.
     pub const TREE: u32 = 16;
+    /// Ground of three kinds blended: this material's, and the next two materials', whose
+    /// texture layers come right after this one's. The mesh's texture coordinates hold how much
+    /// of the second and the third there is, and every texture is laid by the world's x and z.
+    pub const BLENDS: u32 = 32;
     /// `flags` above this bit hold one more than the material's layer in [`GlowMaps`], or zero
     /// for a material whose emissive colour is even all over.
     pub const GLOW_SHIFT: u32 = 16;
