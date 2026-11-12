@@ -14,6 +14,7 @@ solstice-builder = { path = "crates/solstice-builder" }
 solstice-import = { path = "crates/solstice-import" }
 solstice-physics = { path = "crates/solstice-physics" }
 solstice-procgen = { path = "crates/solstice-procgen" }
+solstice-project = { path = "crates/solstice-project" }
 solstice-render = { path = "crates/solstice-render" }
 solstice-game = { path = "crates/solstice-game" }
 solstice-script = { path = "crates/solstice-script" }
@@ -40,6 +41,10 @@ pollster = "0.4"
 rapier3d = { version = "0.36", features = ["enhanced-determinism"] }
 rayon = "1"
 rustc-hash = "2"
+# The editor's project files (docs/editor.md). Both were already built, through Starlark.
+serde = { version = "1", features = ["derive"] }
+# `float_roundtrip` reads every number back exactly as it was written.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 wgpu = "30"
 
 # Geometry processing is unusably slow unoptimised, even while debugging the renderer.

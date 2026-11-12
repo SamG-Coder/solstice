@@ -273,6 +273,7 @@ dependencies = [
  "solstice-import",
  "solstice-physics",
  "solstice-procgen",
+ "solstice-project",
  "solstice-script",
 ]
 
@@ -3249,6 +3250,14 @@ dependencies = [
  "rayon",
  "solstice-asset",
  "solstice-builder",
+]
+
+[[package]]
+name = "solstice-project"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
