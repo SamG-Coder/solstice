@@ -29,6 +29,8 @@ pub mod surface;
 pub mod waterline;
 pub mod waves;
 
+use crate::text::number;
+
 pub use pond::Pond;
 pub use sea::Sea;
 pub use spectrum::SeaState;
@@ -201,13 +203,6 @@ impl Ocean {
             fetch: mix(self.fetch, to.fetch),
         }
     }
-}
-
-fn number(text: &str) -> Result<f32, String> {
-    text.parse::<f32>()
-        .ok()
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| format!("{text:?} is not a number"))
 }
 
 #[cfg(test)]

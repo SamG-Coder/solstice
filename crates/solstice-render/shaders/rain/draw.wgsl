@@ -78,16 +78,6 @@ struct Varyings {
     @location(1) color: vec4f,
 }
 
-fn hash4(a: u32, b: u32, c: u32) -> vec4f {
-    let h = pcg(a + pcg(b + pcg(c)));
-    return vec4f(
-        hash_to_unit(h),
-        hash_to_unit(h ^ 0x9e3779b9u),
-        hash_to_unit(h ^ 0x85ebca6bu),
-        hash_to_unit(h ^ 0xc2b2ae35u),
-    );
-}
-
 // The rain map's texel holding `xz`: the first surface's height, the puddle's depth, the eave's
 // height, and 1 if anything is there; or nothing, outside it.
 fn rain_map_at(xz: vec2f) -> vec4f {

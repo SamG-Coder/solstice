@@ -6,23 +6,7 @@ use crate::frame::FrameUniform;
 use reference::{is_dead, spawn, spawn_elapsed, step};
 use std::collections::{HashMap, HashSet};
 
-fn request_gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    match pollster::block_on(Gpu::request(
-        &instance,
-        None,
-        wgpu::PowerPreference::HighPerformance,
-    )) {
-        Ok(gpu) => Some(gpu),
-        Err(error) => {
-            eprintln!("skipping GPU test: {error}");
-            None
-        }
-    }
-}
+use crate::gpu::test_gpu as request_gpu;
 
 /// A pool on the GPU, failing the test on any GPU error.
 struct Rig {

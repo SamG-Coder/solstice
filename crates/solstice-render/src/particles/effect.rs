@@ -28,6 +28,8 @@
 //! Every module has a default, so an emitter names only what differs. The built-in effects are
 //! files of exactly this kind, in `particles/` beside this crate.
 
+use crate::text::number;
+
 /// The most emitters one effect may have.
 pub const MAX_EMITTERS_PER_EFFECT: usize = 8;
 /// The largest budget a sorted emitter may have: its whole list is sorted in one workgroup's
@@ -512,13 +514,6 @@ fn is_name(word: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn number(word: &str) -> Result<f32, String> {
-    word.parse::<f32>()
-        .ok()
-        .filter(|v| v.is_finite())
-        .ok_or_else(|| format!("{word:?} is not a number"))
 }
 
 /// A number, a parameter, or a number times a parameter.
