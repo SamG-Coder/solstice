@@ -7,6 +7,44 @@
 texture_size 2048
 terrain 900 1024 0.3 52
 ocean -0.6 coastal
+
+# ---- The land in bands: sand along the water, a strip of dirt, then grass across the bowl
+# ---- between the cliffs. The courtyard and the paths from the gate are trodden dirt.
+land 10 5
+yard -21 -21 21 21
+path 23 0 58 -6 3.2
+path 45 -4 63 -36 2.2
+# Nothing grows on the fort, the cliffs or the boulders at their feet.
+clear 0 0 33
+clear -92 -60 16
+clear -92 0 16
+clear -92 60 16
+clear -110 -110 32
+clear -55 -104 22
+clear 0 -104 22
+clear 45 -110 22
+clear -75 98 26
+clear -25 104 24
+clear 20 106 22
+clear 70 112 22
+clear -32 -79 11
+clear -51 3 11
+clear -60 51 11
+clear -22 76 10
+clear 16 95 10
+clear 31 -24 4
+clear 32 27 4
+clear 33 -13 3
+clear -7 33 3
+clear 6 -34 3
+clear -36 -30 4
+# Grass you can walk through, around the fort and back to the cliffs.
+meadow 75
+# Two groves behind the fort, between it and the back cliff, and a few trees standing apart.
+wood -58 -38 20 7
+wood -52 30 18 7
+wood 8 -66 14 9
+wood 6 64 12 9
 camera 66 1.5 -41 2.31 0.03
 
 # ---- Towers on the four corners. Each is wider than the walls, which hides the joints.
