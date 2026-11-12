@@ -13,6 +13,7 @@
 #include "gi/screen_trace.wgsl"
 #include "ocean/optics.wgsl"
 #include "rain/rings.wgsl"
+#include "common/wind.wgsl"
 
 // Twin of `MAX_PONDS` in ocean/pond.rs.
 const MAX_PONDS: u32 = 8u;
@@ -29,6 +30,8 @@ struct Ponds {
     count: vec4u,
     absorption: vec4f,
     scattering: vec4f,
+    // The wind over the water, packed (common/wind.wgsl, `unpack_wind`).
+    wind: array<vec4f, 2>,
     ponds: array<Pond, MAX_PONDS>,
 }
 
@@ -65,16 +68,30 @@ const RIPPLE_DIRECTION: array<vec2f, 5> = array<vec2f, 5>(
 const RIPPLE_LENGTH: array<f32, 5> = array<f32, 5>(1.9, 1.1, 0.63, 0.37, 0.21);
 const RIPPLE_HEIGHT: array<f32, 5> = array<f32, 5>(0.0022, 0.0013, 0.0007, 0.0004, 0.00022);
 
+// How hard the wind ruffles still water, against a breeze of this speed, 10 m up, in m/s; the
+// least ruffling still air leaves; and the most a gale raises on a pond.
+const RUFFLE_BREEZE: f32 = 5.0;
+const RUFFLE_STILL: f32 = 0.15;
+const RUFFLE_MOST: f32 = 2.5;
+
 // The ripples' slope at `at`, for a pixel `footprint` metres across, and the mean square of the
-// slopes too fine to show in it, which roughen the surface instead.
+// slopes too fine to show in it, which roughen the surface instead. The wind raises them: the
+// trains running with it most, those across it little, and harder where a gust is crossing, so
+// gusts show on the water as dark, ruffled patches running downwind, as cat's paws do.
 fn ripples(at: vec2f, footprint: f32) -> vec3f {
+    let air = unpack_wind(ponds.wind[0], ponds.wind[1]);
+    let wind = wind_velocity(air, at);
+    let speed = length(wind);
+    let toward = wind / max(speed, 1.0e-3);
+    let strength = clamp(speed * speed / (RUFFLE_BREEZE * RUFFLE_BREEZE), RUFFLE_STILL, RUFFLE_MOST);
     var slope = vec2f(0.0);
     var hidden = 0.0;
     for (var i = 0u; i < RIPPLES; i++) {
         let k = TAU / RIPPLE_LENGTH[i];
         // Deep-water waves: the shorter, the slower.
         let phase = dot(RIPPLE_DIRECTION[i], at) * k - sqrt(9.81 * k) * frame.time;
-        let steepness = RIPPLE_HEIGHT[i] * k;
+        let along = max(dot(RIPPLE_DIRECTION[i], toward), 0.0);
+        let steepness = RIPPLE_HEIGHT[i] * k * strength * (0.25 + 0.75 * along * along);
         // A ripple shows while a pixel covers under half of it.
         let shown = 1.0 - smoothstep(0.25, 0.5, footprint / RIPPLE_LENGTH[i]);
         slope += RIPPLE_DIRECTION[i] * (steepness * cos(phase) * shown);

@@ -1240,6 +1240,7 @@ impl Renderer {
                 &sea.ocean(),
                 sea.waves(),
                 sea.slopes(),
+                self.wind.now(),
             );
             water.record(
                 gpu,
@@ -1258,6 +1259,7 @@ impl Renderer {
                 &self.shadows,
             );
         } else if let (Some(ponds), Some(targets)) = (&mut self.pond_water, &sized.water) {
+            ponds.set_wind(gpu, self.wind.now());
             ponds.record(
                 gpu,
                 &mut encoder,

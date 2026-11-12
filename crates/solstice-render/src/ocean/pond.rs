@@ -73,8 +73,12 @@ struct PondUniform {
     count: [u32; 4],
     absorption: [f32; 4],
     scattering: [f32; 4],
+    wind: [[f32; 4]; 2],
     ponds: [[[f32; 4]; 2]; MAX_PONDS],
 }
+
+/// Where the wind lies in `PondUniform`, so that it can be written each frame alone.
+const WIND_OFFSET: u64 = 48;
 
 /// Shades the scene's ponds over the lit scene.
 pub struct PondWater {
@@ -122,6 +126,7 @@ impl PondWater {
             count: [ponds.len().min(MAX_PONDS) as u32, 0, 0, 0],
             absorption: [ar, ag, ab, 0.0],
             scattering: [sr, sg, sb, 0.0],
+            wind: [[0.0; 4]; 2],
             ponds: [[[0.0; 4]; 2]; MAX_PONDS],
         };
         for (slot, pond) in uniform.ponds.iter_mut().zip(ponds) {
@@ -132,6 +137,15 @@ impl PondWater {
         }
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// Sets the wind over the ponds this frame.
+    pub fn set_wind(&self, gpu: &Gpu, wind: &crate::wind::WindSnapshot) {
+        gpu.queue.write_buffer(
+            &self.uniform,
+            WIND_OFFSET,
+            bytemuck::cast_slice(&wind.packed()),
+        );
     }
 
     /// Shades the ponds over `scene` into `targets`.

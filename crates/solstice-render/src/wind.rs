@@ -77,6 +77,15 @@ pub struct WindSnapshot {
 }
 
 impl WindSnapshot {
+    /// Packed into two vectors, as the water's uniforms carry it: the mean wind, gusts and
+    /// turbulence; then the air's offset and the time. Twin of `unpack_wind`.
+    pub fn packed(&self) -> [[f32; 4]; 2] {
+        [
+            [self.mean[0], self.mean[1], self.gusts, self.turbulence],
+            [self.offset[0], self.offset[1], self.time, 0.0],
+        ]
+    }
+
     /// The wind 10 m up at `p`, the world's (x, z), in m/s as (east, south). Twin of
     /// `wind_velocity` in `common/wind.wgsl`.
     pub fn velocity_at(&self, p: Vec2) -> Vec2 {

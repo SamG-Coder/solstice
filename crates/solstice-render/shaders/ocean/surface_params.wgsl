@@ -20,4 +20,7 @@ struct SurfaceParams {
     // the height of its top, and how far down it reaches.
     seabed_view_proj: mat4x4f,
     seabed: vec4f,
+    // The wind near the water, packed (common/wind.wgsl, `unpack_wind`): its gusts roughen the
+    // water as they cross it.
+    wind: array<vec4f, 2>,
 }

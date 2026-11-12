@@ -45,6 +45,7 @@ struct SurfaceUniform {
     slopes: [[f32; 4]; 8],
     seabed_view_proj: [[f32; 4]; 4],
     seabed: [f32; 4],
+    wind: [[f32; 4]; 2],
 }
 
 /// One patch, as the vertex shader reads it.
@@ -399,6 +400,7 @@ impl WaterSurface {
     /// Chooses this frame's patches for a camera at `camera`, over a sea at `sea_level`. The
     /// seabed map must have been placed for this frame first.
     /// `slopes` is the sea's table of unresolved slopes, from `spectrum::unresolved_slopes`.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         gpu: &Gpu,
@@ -407,6 +409,7 @@ impl WaterSurface {
         ocean: &Ocean,
         waves: &OceanWaves,
         slopes: &[f32; SLOPE_TABLE_SIZE],
+        wind: &crate::wind::WindSnapshot,
     ) {
         let mut patches = grid::select(camera, sea_level, self.cells);
         patches.truncate(MAX_PATCHES);
@@ -457,6 +460,7 @@ impl WaterSurface {
                 0.0,
                 0.0,
             ],
+            wind: wind.packed(),
         };
         gpu.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
