@@ -44,12 +44,16 @@ pub fn build(
     texture_size: u32,
     species_files: &[PathBuf],
     grass_files: &[PathBuf],
+    only: bool,
 ) -> Result<SceneAsset, String> {
+    // With `only`, just the files given, for looking at one plant while it is being written.
     let mut species: Vec<(String, Species)> = Species::names()
+        .filter(|_| !only)
         .map(|name| (name.to_string(), Species::by_name(name).unwrap()))
         .collect();
     species.extend(read_all(species_files, Species::parse)?);
     let mut breeds: Vec<(String, Meadow)> = Meadow::names()
+        .filter(|_| !only)
         .map(|name| (name.to_string(), Meadow::by_name(name).unwrap()))
         .collect();
     breeds.extend(read_all(grass_files, Meadow::parse)?);
@@ -131,6 +135,23 @@ pub fn build(
                     transform,
                 });
                 scene.meshes.push(build_virtual_mesh(mesh, &options));
+            }
+            // Young shoots of another colour than the bark, where a species has them.
+            if let (Some((_, [r, g, b])), false) = (species.twigs, plant.twigs.indices.is_empty()) {
+                println!("  and {} twig triangles", plant.twigs.triangle_count());
+                scene.materials.push(Material {
+                    base_color: [r, g, b, 1.0],
+                    roughness: 0.6,
+                    ..Default::default()
+                });
+                scene.instances.push(Instance {
+                    mesh: scene.meshes.len() as u32,
+                    material: scene.materials.len() as u32 - 1,
+                    transform,
+                });
+                scene
+                    .meshes
+                    .push(build_virtual_mesh(&plant.twigs, &options));
             }
         }
     }

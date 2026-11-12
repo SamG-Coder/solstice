@@ -124,6 +124,7 @@ A scene file places many models, or individual pieces of a modular kit, in one w
 ```text
 terrain 900 1024 0.3 52                       # size, cells, height, X where the shore begins
 water -0.6 0.015 0.06 0.075                   # height, then colour
+pond -2 -37 4 -23 1.5                         # still water in a basin: corners x z, x z, height
 camera 66 1.5 -41 2.31 0.03                   # x y z yaw pitch
 model rocks/rock.gltf 30 0 10 45 1.5          # path x y z yaw_degrees scale
 model rocks/rock.gltf 9 ground:0.2 4 45 1.5    # on the terrain, lowest 20% buried
@@ -142,6 +143,11 @@ python scripts/fetch-scans.py scenes/cove.txt 2k
 ```bash
 cargo run --release -p bake -- --scene scenes/cove.txt --output assets/cove.solstice
 ```
+
+A `pond` is a level sheet of still water over a rectangle, whose basin's own banks shape its
+edge: it mirrors what stands round it, ripples with the wind, and shows its bed through water
+that deepens. The ponds travel in the scene file, so every viewer shows them. A sixth value names
+what the water is like, a built-in ocean or an `.ocean` file, where it should not be clear.
 
 ![The assembled fort, seen from the beach](docs/cove.png)
 
@@ -181,13 +187,31 @@ thickness 2600
 wind speed=10 from=240
 ```
 
-The built-in files are oak, birch, fir and bush; meadow, lawn, dry, tall and verge grass; and clear,
-fair, broken, overcast, storm and cirrus weather. To see every tree and breed of grass side by
-side, with any files of your own:
+The built-in files are oak, old oak, willow, birch, fir and bush; meadow, lawn, dry, tall and verge
+grass; and clear, calm, fair, broken, overcast, storm and cirrus weather. To see every tree and
+breed of grass side by side, with any files of your own (`--only` leaves the built-in ones out):
 
 ```bash
 cargo run --release -p bake -- --plants --species my.species --grass my.grass --output assets/plants.solstice
 ```
+
+A weeping tree is a few more words in its species: a level whose shoots `droop` hard hangs
+straight down, and `reach` says how far above the ground they stop, so that each withe is as long
+as its height allows. `lean` on the leaves lays them along the shoot, and `twigs` gives the
+youngest wood a colour of its own, as a willow's golden shoots have.
+
+```text
+# Abridged from crates/solstice-procgen/species/willow.species
+level per_metre=4.5 span=0.08..1 angle=62 length=2.9 radius=0.42 droop=3 reach=0.8
+leaves willow_leaves per_metre=26 length=0.09..0.14 width=0.17 lean=1.7
+twigs below=0.012 color=0.2,0.175,0.055
+```
+
+![Weeping willows and old oaks mirrored in a pond](docs/willows.jpg)
+
+The willows and old oaks, the ponds and the calm weather were made for
+[Solstice Garden](https://github.com/SamG-Coder/solstice-garden), a garden to walk in built with
+this engine.
 
 ![Oaks and firs at the edge of the wood](docs/wood.jpg)
 
@@ -301,7 +325,8 @@ then bending the rain.
   bend whole and swing a little behind, and their leaves flutter. Both are bent where their vertices are
   placed, in culling, both rasterizers and resolve, with true motion vectors.
 - **Water**: gusts roughen the sea's short waves as they cross it, as cat's paws; ponds ripple
-  with the wind over them.
+  with the wind over them, and in still air are mirrors, each pixel reflecting along several rays
+  so that ruffled water blurs what it mirrors without grain.
 - **Rain** falls at its measured speeds, as many drops and as big as the rain rate says, leaning
   with the wind, lit by the sky, the shadowed sun and lamps. It costs only its drawing: no drop
   is simulated. It splashes, rings the water, drips from eaves, and thickens the haze. A map of
@@ -360,7 +385,8 @@ the ones it keeps, so that a meadow covers as much from far away as close up. Tr
 their species: levels of branches spiral round their parents at the golden angle, or grow in
 whorls on conifers; the crown's outline sets how long the trunk's branches are at each height.
 Barks are surfaces of the procedural library, with a texel per millimetre; oak bark is matched to
-a photoscan by colour statistics and the steepness of its normals.
+a photoscan by colour statistics and the steepness of its normals. A thick trunk is not a smooth
+cylinder: it swells and hollows, and each shoot ends in a tuft of leaves rather than a bare tip.
 
 ### Where WebGPU forced a different design from Unreal
 

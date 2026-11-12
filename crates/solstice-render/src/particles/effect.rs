@@ -37,10 +37,17 @@ pub const MAX_SORTED: u32 = 4096;
 pub const CURVE_ENTRIES: usize = 32;
 
 /// The built-in effects, by name, as text.
-const BUILT_IN: [(&str, &str); 1] = [(
-    "fountain",
-    include_str!("../../particles/fountain.particles"),
-)];
+const BUILT_IN: [(&str, &str); 3] = [
+    (
+        "fountain",
+        include_str!("../../particles/fountain.particles"),
+    ),
+    ("motes", include_str!("../../particles/motes.particles")),
+    (
+        "fireflies",
+        include_str!("../../particles/fireflies.particles"),
+    ),
+];
 
 /// A number, or a number times one of its effect's parameters.
 #[derive(Clone, Copy, Debug, PartialEq)]

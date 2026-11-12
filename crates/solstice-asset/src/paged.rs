@@ -109,6 +109,8 @@ pub struct PagedScene {
     pub lights: Vec<Light>,
     pub viewpoint: Option<Viewpoint>,
     pub sea: Option<Sea>,
+    /// The scene's ponds, if it has any.
+    pub still_water: Option<crate::scene::StillWater>,
     /// The scene's gameplay files, if it has any.
     pub gameplay: Vec<GameFile>,
     /// Where its collision shapes are, if it has any: only those playing fetch them.

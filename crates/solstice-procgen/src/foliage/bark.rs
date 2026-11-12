@@ -36,10 +36,20 @@ pub enum Bark {
     Pine,
     /// Beech: smooth grey with fine wavy wrinkles running around the stem, and lichen.
     Beech,
+    /// Weeping willow: grey-brown and deeply furrowed like an oak's, its corky ridges paler and
+    /// yellower, with tan inner bark showing in the furrows and moss where it stays damp.
+    Willow,
 }
 
 impl Bark {
-    pub const ALL: [Self; 5] = [Self::Oak, Self::Birch, Self::Fir, Self::Pine, Self::Beech];
+    pub const ALL: [Self; 6] = [
+        Self::Oak,
+        Self::Birch,
+        Self::Fir,
+        Self::Pine,
+        Self::Beech,
+        Self::Willow,
+    ];
 
     /// The name of this bark in the surface library.
     pub fn name(self) -> &'static str {
@@ -49,6 +59,7 @@ impl Bark {
             Self::Fir => "fir_bark",
             Self::Pine => "pine_bark",
             Self::Beech => "beech_bark",
+            Self::Willow => "willow_bark",
         }
     }
 
@@ -64,6 +75,7 @@ impl Bark {
             Self::Fir => fir(seed),
             Self::Pine => pine(seed),
             Self::Beech => beech(seed),
+            Self::Willow => willow(seed),
         }
         .with_tile_metres(BARK_TILE_METRES)
     }
@@ -143,7 +155,45 @@ fn oak_shape(seed: u32) -> impl Fn(f32, f32) -> (f32, f32, f32, f32) + Send + Sy
     }
 }
 
+/// The colours of a deeply furrowed bark, whose shape is an oak's.
+#[derive(Clone, Copy)]
+struct Furrowed {
+    /// The ridges, streaked between these two along the stem.
+    ridge: (Vec3, Vec3),
+    /// Deep in a fissure.
+    fissure: Vec3,
+    /// How much of the lichen and of the moss the shape allows shows.
+    lichen: f32,
+    moss: f32,
+}
+
 fn oak(seed: u32) -> Surface {
+    furrowed(
+        seed,
+        Furrowed {
+            ridge: (Vec3::new(0.12, 0.095, 0.075), Vec3::new(0.17, 0.11, 0.075)),
+            fissure: Vec3::new(0.016, 0.011, 0.004),
+            lichen: 0.9,
+            moss: 0.85,
+        },
+    )
+}
+
+fn willow(seed: u32) -> Surface {
+    furrowed(
+        seed + 400,
+        Furrowed {
+            // Greyer and paler than oak, the ridges weathered almost to ash in places.
+            ridge: (Vec3::new(0.135, 0.12, 0.1), Vec3::new(0.2, 0.165, 0.115)),
+            // The furrows show tan inner bark rather than black.
+            fissure: Vec3::new(0.045, 0.028, 0.012),
+            lichen: 0.45,
+            moss: 1.0,
+        },
+    )
+}
+
+fn furrowed(seed: u32, tones: Furrowed) -> Surface {
     let shape = oak_shape(seed);
     let shade_shape = oak_shape(seed);
     let grit = noise(160, 660, 2, seed + 12);
@@ -168,25 +218,21 @@ fn oak(seed: u32) -> Surface {
             // Warm brown bark, streaked along the stem from grey-brown to reddish, paler on
             // the crumbly high points.
             let streak = streaks.at(u, v);
-            let bark = Vec3::new(0.12, 0.095, 0.075)
-                .lerp(Vec3::new(0.17, 0.11, 0.075), streak * 0.5 + 0.5)
+            let bark = tones.ridge.0.lerp(tones.ridge.1, streak * 0.5 + 0.5)
                 * (1.0 + 0.3 * broad.at(u, v))
                 * (1.0 + 0.25 * blotches.at(u, v));
             let mut color = bark * (1.0 + (relief.fine * 200.0).clamp(-0.5, 0.55));
-            color = color.lerp(
-                Vec3::new(0.016, 0.011, 0.004),
-                smoothstep(0.2, 0.75, fissure),
-            );
+            color = color.lerp(tones.fissure, smoothstep(0.2, 0.75, fissure));
             // Lichen from pale grey-cream to grey-green, grainy within.
             let tone = lichen_tone.at(u, v) * 0.5 + 0.5;
             let crust = Vec3::new(0.34, 0.31, 0.23).lerp(Vec3::new(0.22, 0.24, 0.17), tone)
                 * (1.0 + 0.25 * speckle.at(u, v));
-            color = color.lerp(crust, lichen * 0.9);
+            color = color.lerp(crust, lichen * tones.lichen);
             // Moss is dark olive, grainy with its tiny leaves and the shade between them.
             let grain = (speckle.at(u, v) * 0.5 + crumbs.at(u, v) * 0.6 + 0.5).clamp(0.0, 1.0);
             let cushion = Vec3::new(0.025, 0.03, 0.01).lerp(Vec3::new(0.09, 0.1, 0.04), grain)
                 * (1.0 + (relief.fine * 250.0).clamp(-0.5, 0.6));
-            color = color.lerp(cushion, moss * 0.85);
+            color = color.lerp(cushion, (moss * tones.moss).min(0.92));
             color *= 1.0 + 0.15 * speckle.at(u, v);
             Shade {
                 color,

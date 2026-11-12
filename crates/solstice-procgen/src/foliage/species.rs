@@ -27,8 +27,10 @@ use std::f32::consts::PI;
 use std::fmt::Write as _;
 
 /// The built-in species, by name, as text.
-const BUILT_IN: [(&str, &str); 4] = [
+const BUILT_IN: [(&str, &str); 6] = [
     ("oak", include_str!("../../species/oak.species")),
+    ("old_oak", include_str!("../../species/old_oak.species")),
+    ("willow", include_str!("../../species/willow.species")),
     ("birch", include_str!("../../species/birch.species")),
     ("fir", include_str!("../../species/fir.species")),
     ("bush", include_str!("../../species/bush.species")),
@@ -94,6 +96,10 @@ pub struct Level {
     pub gnarl: f32,
     /// Children in each ring, for branches in whorls as on a conifer, or 0 for a spiral.
     pub whorl: u32,
+    /// For shoots that hang, as a weeping willow's do: the height above the plant's ground at
+    /// which they end, give or take, so that a curtain of them stops short of the grass however
+    /// high each began. Their `length` is then the longest any grows. 0 for shoots that don't.
+    pub reach: f32,
 }
 
 impl Default for Level {
@@ -109,6 +115,7 @@ impl Default for Level {
             droop: 0.0,
             gnarl: 0.3,
             whorl: 0,
+            reach: 0.0,
         }
     }
 }
@@ -129,6 +136,9 @@ pub struct Leaves {
     /// How far leaf normals lean out from the centre of the crown, which lights a crown as one
     /// soft mass rather than thousands of separately facing leaves.
     pub crown_normals: f32,
+    /// How far each leaf points along its shoot rather than out from it: 0 stands square to the
+    /// shoot, 0.6 is most trees', and more lays leaves along it, as a willow's hang.
+    pub lean: f32,
 }
 
 impl Default for Leaves {
@@ -140,6 +150,7 @@ impl Default for Leaves {
             width: 0.55,
             variants: [0.4, 0.3, 0.2, 0.1],
             crown_normals: 0.45,
+            lean: 0.6,
         }
     }
 }
@@ -158,6 +169,10 @@ pub struct Species {
     /// Branching levels, starting with those on the trunk.
     pub levels: Vec<Level>,
     pub leaves: Leaves,
+    /// The youngest shoots, if they are not yet barked: stems thinner than this radius where
+    /// they start, in metres, are grown as a mesh of their own, `Plant::twigs`, to be given
+    /// this colour: a willow's withes are olive-gold, a dogwood's red.
+    pub twigs: Option<(f32, [f32; 3])>,
 }
 
 impl Default for Species {
@@ -171,6 +186,7 @@ impl Default for Species {
             bark: Bark::Oak,
             levels: Vec::new(),
             leaves: Leaves::default(),
+            twigs: None,
         }
     }
 }
@@ -239,6 +255,20 @@ impl Species {
                         Bark::by_name(name).ok_or_else(|| at(format!("unknown bark {name:?}")))?;
                 }
                 "level" => species.levels.push(level(&rest).map_err(at)?),
+                "twigs" => {
+                    let mut below = 0.01;
+                    let mut colour = [0.2, 0.17, 0.08];
+                    for (key, value) in pairs(&rest).map_err(at)? {
+                        match key {
+                            "below" => below = number(value).map_err(at)?,
+                            "color" => {
+                                colour = super::text::color(value).map_err(at)?.to_array();
+                            }
+                            _ => return Err(at(format!("unknown twigs setting {key}"))),
+                        }
+                    }
+                    species.twigs = Some((below, colour));
+                }
                 "leaves" => {
                     species.leaves = leaves(&rest).map_err(at)?;
                     have_leaves = true;
@@ -278,7 +308,7 @@ impl Species {
         for l in &self.levels {
             let _ = writeln!(
                 text,
-                "level per_metre={} span={} angle={} length={} taper={} radius={} upturn={} droop={} gnarl={} whorl={}",
+                "level per_metre={} span={} angle={} length={} taper={} radius={} upturn={} droop={} gnarl={} whorl={} reach={}",
                 l.per_metre,
                 range_text(l.span),
                 range_text(l.angle),
@@ -288,13 +318,14 @@ impl Species {
                 l.upturn,
                 l.droop,
                 l.gnarl,
-                l.whorl
+                l.whorl,
+                l.reach
             );
         }
         let v = self.leaves.variants;
         let _ = writeln!(
             text,
-            "leaves {} per_metre={} length={} width={} variants={},{},{},{} normals={}",
+            "leaves {} per_metre={} length={} width={} variants={},{},{},{} normals={} lean={}",
             self.leaves.kind.name(),
             self.leaves.per_metre,
             range_text(self.leaves.length),
@@ -303,8 +334,12 @@ impl Species {
             v[1],
             v[2],
             v[3],
-            self.leaves.crown_normals
+            self.leaves.crown_normals,
+            self.leaves.lean
         );
+        if let Some((below, [r, g, b])) = self.twigs {
+            let _ = writeln!(text, "twigs below={below} color={r},{g},{b}");
+        }
         text
     }
 }
@@ -334,6 +369,7 @@ fn level(words: &[&str]) -> Result<Level, String> {
             "upturn" => level.upturn = number(value)?,
             "droop" => level.droop = number(value)?,
             "gnarl" => level.gnarl = number(value)?,
+            "reach" => level.reach = number(value)?,
             "whorl" => {
                 level.whorl = value
                     .parse()
@@ -360,6 +396,7 @@ fn leaves(words: &[&str]) -> Result<Leaves, String> {
             "length" => leaves.length = range(value)?,
             "width" => leaves.width = number(value)?,
             "normals" => leaves.crown_normals = number(value)?,
+            "lean" => leaves.lean = number(value)?,
             "variants" => {
                 let values: Vec<f32> = value.split(',').map(number).collect::<Result<_, _>>()?;
                 leaves.variants = values.try_into().map_err(|_| {
