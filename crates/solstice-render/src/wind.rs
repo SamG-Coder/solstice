@@ -33,6 +33,10 @@ pub const FIELD_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 /// The farthest the wind carries a point of grass, as a share of its height. Twin of
 /// `GRASS_REACH` in `common/sway.wgsl`, which culling grows bounds by.
 pub const GRASS_REACH: f32 = 0.65;
+/// The farthest the wind carries a point of a tree, as a share of its height plus a reach, in
+/// metres. Twins of `TREE_REACH` and `TREE_REACH_BASE` in `common/sway.wgsl`.
+pub const TREE_REACH: f32 = 0.1;
+pub const TREE_REACH_BASE: f32 = 0.6;
 
 /// The wind 10 m up as a share of the weather's wind at cloud height.
 pub const GROUND_SHARE: f32 = 0.5;

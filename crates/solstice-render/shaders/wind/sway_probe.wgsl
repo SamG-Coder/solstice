@@ -40,9 +40,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let w = wind_params();
     let s = vertex_sway(w, instance, probe.local, world, probe.eye);
     results[id.x] = ProbeResult(
-        vec4f(bend_offset(s.now, s.height), s.height),
-        vec4f(bend_offset(s.before, s.height), 0.0),
+        vec4f(s.now, sway_height(instance, probe.local)),
+        vec4f(s.before, 0.0),
         vec4f(swayed_position(instance, probe.local, world, probe.eye) - world, 0.0),
-        vec4f(bend_direction(s.now, vec3f(0.0, 1.0, 0.0)), 0.0),
+        vec4f(bend_direction(s.bend, vec3f(0.0, 1.0, 0.0)), 0.0),
     );
 }

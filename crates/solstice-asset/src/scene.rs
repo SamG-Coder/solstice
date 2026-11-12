@@ -53,8 +53,8 @@ pub struct Material {
     pub base_color: [f32; 4],
     /// RGB radiance.
     pub emissive: [f32; 3],
-    /// [`Material::TWO_SIDED`], [`Material::FOLIAGE`], [`Material::MASKED`] and
-    /// [`Material::SWAYS`]. Older files hold zero here.
+    /// [`Material::TWO_SIDED`], [`Material::FOLIAGE`], [`Material::MASKED`],
+    /// [`Material::SWAYS`] and [`Material::TREE`]. Older files hold zero here.
     pub flags: u32,
     pub roughness: f32,
     pub metallic: f32,
@@ -86,6 +86,10 @@ impl Material {
     /// ground, `y = 0`, so the mesh is made standing on it (`docs/weather-effects.md`). Older
     /// files never sway.
     pub const SWAYS: u32 = 8;
+    /// With [`Material::SWAYS`], sways as a tree rather than as grass: its trunk leans and
+    /// sways by its height above the mesh's ground, its branches by their reach from the trunk
+    /// along y, and, if it is [`Material::FOLIAGE`] too, its leaves flutter.
+    pub const TREE: u32 = 16;
     /// `flags` above this bit hold one more than the material's layer in [`GlowMaps`], or zero
     /// for a material whose emissive colour is even all over.
     pub const GLOW_SHIFT: u32 = 16;

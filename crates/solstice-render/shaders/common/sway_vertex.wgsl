@@ -115,28 +115,134 @@ fn bend_direction(b: Bend, n: vec3f) -> vec3f {
 }
 
 // What the wind does to one vertex of a swaying instance: the bend now and a frame ago.
+// Trees, from their own trunk's base at y = 0 in the mesh. Their trunk leans with the wind's
+// drag, saturating, and sways at its own slow rate, its offset growing with the square of the
+// height; their branches bob and swing by their reach from the trunk, each around the crown in
+// its own phase, faster; their leaves flutter, fastest. All in metres, for 10 m of height or a
+// metre of reach, per (m/s)² or m/s of wind 10 m up.
+const TREE_LEAN: f32 = 0.0008;
+const TREE_LEAN_SATURATION: f32 = 20.0;
+const TREE_SWAY: f32 = 0.012;
+const TREE_BRANCH: f32 = 0.004;
+const TREE_FLUTTER: f32 = 0.012;
+// A tree's sway can be seen further off than grass's: it fades out this much further. Its
+// branches' bob and its leaves' flutter are small, and are worked out only nearer, within
+// these shares of that.
+const TREE_FADE_REACH: f32 = 1.5;
+const TREE_BRANCH_REACH: f32 = 0.7;
+const TREE_FLUTTER_REACH: f32 = 0.35;
+// How far from a tree's axis its trunk reaches, flare included, in metres: branches bob only
+// beyond it.
+const TRUNK_RADIUS: f32 = 0.5;
+
+// A small hash of an instance's place in the world, so each tree keeps its own rhythm.
+fn instance_seed(i: Instance) -> f32 {
+    let origin = vec2f(i.world_0.w, i.world_2.w);
+    return fract(sin(dot(origin, vec2f(12.9898, 78.233))) * 43758.5453);
+}
+
+// Where the wind carries the vertex `local` of a tree, at rest at `world`, in the wind `wind` at
+// `time`, seen from `seen_from` metres, as an offset in the world.
+fn tree_offset(w: WindParams, i: Instance, local: vec3f, world: vec3f, wind: vec2f, time: f32, seen_from: f32) -> vec3f {
+    let speed = length(wind);
+    let fade = 1.0 - smoothstep(w.fade.x * TREE_FADE_REACH, w.fade.y * TREE_FADE_REACH, seen_from);
+    if speed < 1.0e-3 || fade <= 0.0 {
+        return vec3f(0.0);
+    }
+    let along = wind / speed;
+    let across = vec2f(-along.y, along.x);
+    let scale = i.max_scale;
+    let height = max(local.y, 0.0) * scale;
+    let reach = length(local.xz) * scale;
+    let seed = instance_seed(i);
+
+    // The trunk: a steady lean, and a slow sway with and across the wind.
+    let drag = speed * speed;
+    let lean = TREE_LEAN * drag / (1.0 + drag / (TREE_LEAN_SATURATION * TREE_LEAN_SATURATION));
+    let rate = 0.3 + 0.25 * seed;
+    let sway = TREE_SWAY * speed * sin(TAU * rate * time + seed * TAU);
+    let sideways = 0.5 * TREE_SWAY * speed * sin(TAU * rate * 0.77 * time + seed * 17.0);
+    let up = sq(height / 10.0);
+    var offset = vec3f(along.x, 0.0, along.y) * (lean + sway) * up
+        + vec3f(across.x, 0.0, across.y) * sideways * up;
+    // Bending, not shearing: the top comes down a little as it leans.
+    offset.y -= 0.5 * dot(offset.xz, offset.xz) / max(height, 0.5);
+
+    // Branches, each around the crown in its own phase: which way a branch points from the
+    // trunk, and how high it is, set its phase, smoothly, so all of one branch moves together.
+    let far = w.fade.y * TREE_FADE_REACH;
+    if seen_from < far * TREE_BRANCH_REACH && reach > TRUNK_RADIUS {
+        let way = local.xz / max(length(local.xz), 1.0e-5);
+        let phase = 2.5 * (3.0 * way.y - 4.0 * way.y * way.y * way.y) * cos(seed * 20.0)
+            + 2.5 * way.x * sin(seed * 20.0) + 1.3 * sin(height * 0.8 + way.x * 2.0);
+        let branch_rate = 1.4 + 0.5 * seed;
+        // Only beyond the trunk: its own bark, a short way from its axis, moves with it whole.
+        let off_trunk = smoothstep(TRUNK_RADIUS, TRUNK_RADIUS * 3.0, reach);
+        let out = reach * sqrt(reach) * TREE_BRANCH * speed * off_trunk
+            * (1.0 - smoothstep(far * TREE_BRANCH_REACH * 0.7, far * TREE_BRANCH_REACH, seen_from));
+        offset += vec3f(along.x, 0.0, along.y) * out * (0.6 + 0.4 * sin(TAU * branch_rate * time + phase));
+        offset.y += out * 0.5 * sin(TAU * branch_rate * 1.3 * time + phase * 1.3);
+    }
+
+    // Leaves flutter, each its own way: the phase turns over a few centimetres.
+    if instance_flutters(i) && seen_from < far * TREE_FLUTTER_REACH {
+        let q = world * 7.0;
+        let strength = TREE_FLUTTER * (0.15 + 0.85 * min(speed / 10.0, 1.5))
+            * (1.0 - smoothstep(far * TREE_FLUTTER_REACH * 0.6, far * TREE_FLUTTER_REACH, seen_from));
+        let f = TAU * 7.0 * time;
+        offset += strength * vec3f(
+            sin(f + q.x * 1.3 + q.y * 0.7),
+            sin(f * 1.13 + q.z * 1.1 + q.x * 0.5),
+            sin(f * 0.91 + q.y * 1.2 + q.z * 0.8),
+        );
+    }
+
+    // Never beyond what culling allows for (common/sway.wgsl).
+    let most = (TREE_REACH * max(local.y, 0.0) + TREE_REACH_BASE) * scale;
+    let moved = length(offset);
+    if moved > most {
+        offset *= most / moved;
+    }
+    return offset * fade;
+}
+
+// What the wind does to one vertex of a swaying instance: where it carries it now and a frame
+// ago, from where it stands at rest, and the bend now, which turns its normal.
 struct Sway {
-    now: Bend,
-    before: Bend,
-    height: f32,
+    now: vec3f,
+    before: vec3f,
+    bend: Bend,
 }
 
-// The bend now of the vertex `local` in its mesh and `world` at rest, seen from `eye`, with
-// the wind there in `wind`. The rasterizers need only this; resolve also needs last frame's,
-// and both come here for this one, so they place the vertex alike.
-fn vertex_bend(w: WindParams, i: Instance, local: vec3f, world: vec3f, eye: vec3f, wind: vec4f) -> Bend {
-    return grass_bend(w, wind.xy, w.time, world, sway_height(i, local), distance(eye, world));
-}
-
-// The sway of the vertex `local` in its mesh and `world` at rest, seen from `eye`.
-fn vertex_sway(w: WindParams, i: Instance, local: vec3f, world: vec3f, eye: vec3f) -> Sway {
-    let wind = wind_sample(w, world.xz);
+// Where the wind carries the vertex `local` in its mesh, `world` at rest, seen from `eye`, in
+// the wind `wind` (10 m up) at `time`, with the bend that turns its normal. Grass bends as a
+// blade; a tree sways as a tree. The rasterizers and resolve both come here, so they place the
+// vertex alike.
+fn sway_now(w: WindParams, i: Instance, local: vec3f, world: vec3f, eye: vec3f, wind: vec2f, time: f32) -> Sway {
+    let seen_from = distance(eye, world);
+    if instance_tree(i) {
+        return Sway(tree_offset(w, i, local, world, wind, time, seen_from), vec3f(0.0), Bend(vec2f(1.0, 0.0), 0.0));
+    }
     let height = sway_height(i, local);
-    return Sway(
-        vertex_bend(w, i, local, world, eye, wind),
-        grass_bend(w, wind.zw, w.previous_time, world, height, distance(eye, world)),
-        height,
-    );
+    let bend = grass_bend(w, wind, time, world, height, seen_from);
+    return Sway(bend_offset(bend, height), vec3f(0.0), bend);
+}
+
+// Where an instance's wind is read: a tree's at its trunk, so all of it moves together.
+fn wind_at(w: WindParams, i: Instance, world: vec3f) -> vec4f {
+    if instance_tree(i) {
+        return wind_sample(w, vec2f(i.world_0.w, i.world_2.w));
+    }
+    return wind_sample(w, world.xz);
+}
+
+// The sway of the vertex `local` in its mesh and `world` at rest, seen from `eye`, now and a
+// frame ago.
+fn vertex_sway(w: WindParams, i: Instance, local: vec3f, world: vec3f, eye: vec3f) -> Sway {
+    let wind = wind_at(w, i, world);
+    var now = sway_now(w, i, local, world, eye, wind.xy, w.time);
+    now.before = sway_now(w, i, local, world, eye, wind.zw, w.previous_time).now;
+    return now;
 }
 
 // Where a vertex goes now, from where it stands at rest, `world`, seen from `eye`. Instances
@@ -149,6 +255,5 @@ fn swayed_position(i: Instance, local: vec3f, world: vec3f, eye: vec3f) -> vec3f
     if w.sway == 0.0 {
         return world;
     }
-    let bend = vertex_bend(w, i, local, world, eye, wind_sample(w, world.xz));
-    return world + bend_offset(bend, sway_height(i, local));
+    return world + sway_now(w, i, local, world, eye, wind_at(w, i, world).xy, w.time).now;
 }
