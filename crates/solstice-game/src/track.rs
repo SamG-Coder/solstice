@@ -135,10 +135,19 @@ impl Track {
         let mut name = String::new();
         let mut samples = Vec::new();
         let mut sectors = Vec::new();
+        let mut named = None;
         for (line, words) in lines(text) {
             let error = |message: String| FileError { line, message };
             match words[0] {
-                "name" if words.len() >= 2 => name = words[1..].join(" "),
+                "name" if words.len() >= 2 => {
+                    if let Some(first) = named {
+                        return Err(error(format!(
+                            "a second name: the first is on line {first}"
+                        )));
+                    }
+                    named = Some(line);
+                    name = words[1..].join(" ");
+                }
                 "name" => return Err(error("expected `name NAME`".to_owned())),
                 "sector" => {
                     let [_, index] = words[..] else {
@@ -180,6 +189,11 @@ impl Track {
                             Some(("r", bands)) => (&mut sample.right_bands, bands),
                             _ => return Err(error(format!("`{word}` should be l=... or r=..."))),
                         };
+                        if !side.is_empty() {
+                            return Err(error(format!(
+                                "`{word}`: a side's bands are given once, as l=A,B"
+                            )));
+                        }
                         for band in bands.split(',') {
                             side.push(parse_band(band).map_err(&error)?);
                         }
@@ -537,6 +551,17 @@ pub(crate) mod tests {
             ("p 0 0 0 1 0 0 6 6 x=kerb:3", 1, "l=... or r=..."),
             ("p 0 0 0 1 0 0 6 6 l=kerb", 1, "SURFACE:WIDTH"),
             ("lap 3", 1, "unknown line `lap`"),
+            (
+                "name A
+name B",
+                2,
+                "a second name: the first is on line 1",
+            ),
+            (
+                "p 0 0 0 1 0 0 6 6 l=kerb:1 l=grass:3",
+                1,
+                "a side's bands are given once",
+            ),
             (
                 "p 0 0 0 1 0 0 6 6\np 1 0 0 1 0 0 6 6",
                 1,

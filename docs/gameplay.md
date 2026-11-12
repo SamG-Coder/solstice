@@ -1070,8 +1070,9 @@ Built for a racing game on the engine,
   - Anti-lock brakes, traction control and stability control, each a line in the car's file.
     Stability control watches the rear tyres' slip angle: past the angle they grip best at,
     it eases the engine, lets go of the rear brakes and brakes the outside front wheel.
-  - A `.vehicle` file holds a car's numbers. `tests/gt.vehicle` is a rear-engined GT racing
-    car, and its tests hold it to what its class does (`tests/rear_engined.rs`).
+  - A `.vehicle` file holds a car's numbers, each given once. `tests/gt.vehicle` is a
+    rear-engined GT racing car, and its tests hold it to what its class does
+    (`tests/rear_engined.rs`).
 - **The driver** (`driver.rs`) is between the player and the car, as in every driving game.
   A key is a wheel hard over; a wheel hard over at speed is a spin. So steering eases, a full
   push gives less lock the faster the car goes, and past a few degrees of slide the wheel
@@ -1093,7 +1094,8 @@ Built for a racing game on the engine,
   actors; a scene without one leaves them out, so its keys press nothing more. They are
   `throttle`, `brake`, `steer`, `handbrake`, `shift_up`, `shift_down`, `reset`, `camera`,
   `look_back`, `look_round`, `look_over`, and `autopilot`, which hands the car to a driver of its own that follows the
-  track's centre line at a speed the bends ahead allow. That is for showing a circuit off,
+  track's centre line at a speed the bends ahead allow, changing gear itself even for a
+  `manual` car (the player has their own gearbox back when they take over). That is for showing a circuit off,
   and for trying one headless: `viewer SCENE --play --press autopilot@40 --frames 5000`.
 - **Building one.** `circuit SIZE` in a scene file builds a whole circuit from the scene's
   track (`apps/bake/src/circuit`): an island whose height follows the road, with cliffs, the

@@ -350,6 +350,8 @@ impl Play {
         let circuit = track.clone();
         // Whether the car is driving itself round the circuit, and where on it it last was.
         let (mut itself, mut last_at) = (false, None);
+        // Whether the player's own gearbox is automatic, while the car drives itself.
+        let mut players_gearbox = true;
         schedule.add(TickGroup::PrePhysics, "driving", move |world| {
             let Some(entity) = driven else {
                 return;
@@ -363,9 +365,20 @@ impl Play {
                 drive::asked(world.input())
             };
             let reset = !away && world.input().pressed("reset");
-            if !away && world.input().pressed("autopilot") {
+            // With no circuit there is nothing to drive round: the key does nothing.
+            if !away && circuit.is_some() && world.input().pressed("autopilot") {
                 itself = !itself;
                 last_at = None;
+                // The driver it is handed to changes gear itself, whatever gearbox the
+                // player had; handed back, the player has their own again.
+                if let Ok(mut car) = world.entities.get::<&mut Car>(entity) {
+                    if itself {
+                        players_gearbox = car.driver.automatic;
+                        car.driver.automatic = true;
+                    } else {
+                        car.driver.automatic = players_gearbox;
+                    }
+                }
             }
             if let (true, Some(track)) = (itself, &circuit) {
                 let car = world

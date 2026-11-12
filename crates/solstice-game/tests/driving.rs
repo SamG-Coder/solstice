@@ -505,6 +505,55 @@ actor car.actor -200 0 30 0 instances=1+6
 }
 
 #[test]
+fn a_manual_car_driving_itself_changes_gear_and_the_player_gets_their_gearbox_back() {
+    let track_text = square_track();
+    let scene = "input keys.input
+track square.track
+actor car.actor -200 0 30 0 instances=1+6
+";
+    let manual = CAR.replace("vehicle gt.vehicle", "vehicle gt.vehicle manual");
+    let mut play = Play::load(
+        &files(&[
+            (GAME_FILE, scene),
+            ("car.actor", &manual),
+            ("gt.vehicle", ""),
+            ("keys.input", KEYS),
+            ("square.track", &track_text),
+        ]),
+        |id| baked(id).map(|at| Mat4::from_translation(Vec3::new(-200.0, 0.0, 30.0)) * at),
+        Some(&floor()),
+    )
+    .unwrap_or_else(|e| panic!("{e:?}"));
+    let gearbox = |play: &Play| {
+        let world = &play.world().entities;
+        let mut query = world.query::<&Car>();
+        let car = query.iter().next().expect("a car");
+        (car.driver.automatic, car.vehicle.gear())
+    };
+    let mut devices = Devices::new();
+    run(&mut play, &mut devices, 0.5);
+    assert!(!gearbox(&play).0, "the player's car is manual");
+    devices.key("KeyP", true);
+    run(&mut play, &mut devices, 0.1);
+    devices.key("KeyP", false);
+    let mut highest = 0;
+    for _ in 0..(12.0 / STEP_SECONDS) as u32 {
+        play.frame(STEP_SECONDS, &mut devices, |_, _| {});
+        highest = highest.max(gearbox(&play).1);
+    }
+    assert!(gearbox(&play).0, "its own driver changes gear");
+    assert!(highest >= 3, "it got no higher than gear {highest} in 12 s");
+    // Handed back, the gearbox is the player's again, and stays in the gear it was in.
+    devices.key("KeyP", true);
+    run(&mut play, &mut devices, 0.1);
+    devices.key("KeyP", false);
+    let (automatic, now) = gearbox(&play);
+    assert!(!automatic);
+    run(&mut play, &mut devices, 2.0);
+    assert_eq!(gearbox(&play).1, now, "nothing changes gear for the player");
+}
+
+#[test]
 fn a_car_that_falls_far_below_its_track_is_put_back_on_it() {
     // The square circuit forty metres up, over a floor at nought: the car is put down beside
     // the track with nothing under it but the floor far below.
