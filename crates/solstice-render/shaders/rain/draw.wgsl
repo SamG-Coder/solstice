@@ -204,6 +204,13 @@ fn falling(corner: u32, ring: u32, index: u32) -> Varyings {
     if below.w > 0.5 && y < below.x + 0.02 {
         return none;
     }
+    // Ended where it met the sea.
+    if y < frame.sea_level {
+        return none;
+    }
+    // The column of air fades out at its top and bottom, so that looking straight up or down
+    // no edge to the rain shows where the lattice wraps round.
+    fade *= smoothstep(0.0, height * 0.15, y - bottom) * smoothstep(0.0, height * 0.15, bottom + height - y);
     let distance = length(head - camera);
     fade *= smoothstep(NEAREST, NEAREST * 2.5, distance) * through_air(distance);
     // A far drop seen against the sky shows about the sky's own light, and vanishes into it:
@@ -244,11 +251,12 @@ fn splashing(corner: u32, index: u32) -> Varyings {
     let at = hash4(u32(i32(cell.x)) + cycle * 7919u, u32(i32(cell.y)), 23u);
     let xz = (cell + at.xy) * SPLASH_SPACING;
     let surface = rain_map_at(xz);
-    if surface.w < 0.5 {
+    // On the sea, at its surface; over open sea the cover map has nothing, but the sea is there.
+    let has_sea = frame.sea_level > -1.0e29;
+    if surface.w < 0.5 && !has_sea {
         return none;
     }
-    // On the sea, at its surface.
-    let ground = max(surface.x, frame.sea_level);
+    let ground = select(frame.sea_level, max(surface.x, frame.sea_level), surface.w > 0.5);
     let d = hash4(cycle, droplet, cell_index);
     let angle = (f32(droplet) + d.x) * TAU / f32(SPLASH_DROPLETS);
     let out_speed = 0.4 + 0.8 * d.y;

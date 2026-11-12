@@ -134,6 +134,11 @@ impl RainState {
     /// ground, which dries what the rain leaves faster.
     pub fn advance(&mut self, weather: &Weather, wind_speed: f32, seconds: f32) {
         let seconds = seconds.max(0.0);
+        // The rain's own clock starts afresh each time it starts, so it stays precise in the
+        // shaders, which take it as f32.
+        if !self.active() {
+            self.time = 0.0;
+        }
         self.time += f64::from(seconds);
         self.rate = rate_for(weather.rain);
         let pace = self.rate / (self.rate + RATE_HALF_SOAK);
@@ -597,9 +602,9 @@ impl Rain {
         let cell = self.quality.light_cell;
         let light_origin = (camera / cell).floor() * cell
             - Vec3::new(cells[0] as f32, cells[1] as f32, cells[2] as f32) * cell * 0.5;
-        // Streaks are a drop's path over the time an eye or a camera smears it: about 1/45 s,
-        // whatever the frame rate. At a frame's own length they would shrink to ticks on a
-        // fast display.
+        // Streaks are a drop's path over the time an eye or a camera smears it: 1/45 s at any
+        // frame rate above 45, and a frame's length below, to 1/30 s. At a frame's own length
+        // they would shrink to ticks on a fast display.
         let exposure = (1.0 / 45.0_f32).max(frame_seconds.min(1.0 / 30.0));
         self.params = RainUniform {
             map: [
@@ -696,7 +701,8 @@ impl Rain {
         environment: &wgpu::BindGroup,
         inputs: &LightInputs<'_>,
     ) {
-        if self.state.rate <= 0.0 {
+        // Lit while anything of it is drawn, drips after the rain included.
+        if !self.state.active() {
             return;
         }
         let cells = self.quality.light_cells;
@@ -753,10 +759,13 @@ impl Rain {
             groups_for(cells[1], 4),
             groups_for(cells[2], 4),
         );
-        pass.set_pipeline(&self.ripple_pipeline);
-        pass.set_bind_group(0, &self.ripple_group, &[]);
-        let groups = groups_for(RIPPLE_TEXELS, 8);
-        pass.dispatch_workgroups(groups, groups, 1);
+        // Rings only while it rains: after, puddles lie still.
+        if self.state.rate > 0.0 {
+            pass.set_pipeline(&self.ripple_pipeline);
+            pass.set_bind_group(0, &self.ripple_group, &[]);
+            let groups = groups_for(RIPPLE_TEXELS, 8);
+            pass.dispatch_workgroups(groups, groups, 1);
+        }
     }
 
     /// Whether any rain is drawn this frame.

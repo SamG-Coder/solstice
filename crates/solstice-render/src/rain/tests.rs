@@ -142,3 +142,14 @@ fn the_uniform_lays_out_as_its_shader_twin() {
     );
     crate::shaders::assert_twin!("rain/map.wgsl", "MapParams", MapUniform, [top, reach, _pad]);
 }
+
+#[test]
+fn the_rains_clock_starts_afresh_with_each_rain() {
+    let soaked = after(RainState::default(), 1.0, 0.0, 600.0);
+    assert!(soaked.time > 590.0);
+    let dried = after(soaked, 0.0, 0.0, 7200.0);
+    assert!(!dried.active());
+    let again = after(dried, 1.0, 0.0, 1.0);
+    // A second of the new rain, not hours since the first began.
+    assert!(again.time < 1.5, "{}", again.time);
+}
