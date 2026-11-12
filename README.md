@@ -82,7 +82,8 @@ turns the sky around the scene. The page also takes `?time=HH:MM` and `?day-leng
 
 The native viewer takes `--weather NAME` or a weather file, and **C** moves to the next kind of
 weather. `--time HH:MM` starts a clock, with `--day N` (day of the year), `--latitude DEGREES` and
-`--day-length SECONDS`; **T** moves the clock on an hour.
+`--day-length SECONDS`; **T** moves the clock on an hour. While a game is played, C and T are the
+game's keys, as **C** changes a car's view; they are the viewer's again while flying (**V**).
 
 ## Your own models
 

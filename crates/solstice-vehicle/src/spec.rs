@@ -23,6 +23,7 @@
 
 use crate::tyre::Tyre;
 use glam::Vec3;
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 
 /// A mistake in a `.vehicle` file, and the line it is on.
@@ -348,6 +349,8 @@ impl VehicleSpec {
     pub fn parse(text: &str) -> Result<Self, SpecError> {
         let mut spec = Self::gt();
         let mut torque: Vec<(f32, f32)> = Vec::new();
+        // Each setting, and the line it was given on: a second would silently win.
+        let mut given: HashMap<String, usize> = HashMap::new();
         for (index, line) in text.lines().enumerate() {
             let words: Vec<&str> = line
                 .split('#')
@@ -368,6 +371,25 @@ impl VehicleSpec {
                 }
                 values.iter().map(|w| number(w).map_err(&error)).collect()
             };
+            let settings: Vec<String> = match keyword {
+                // A line for each point of the curve.
+                "torque" => Vec::new(),
+                "front" | "rear" | "tyre" | "engine" | "gearbox" | "diff" | "aero" | "steering"
+                | "geometry" | "assists" => values
+                    .iter()
+                    .filter_map(|word| word.split_once('='))
+                    .map(|(key, _)| format!("{keyword} {key}"))
+                    .collect(),
+                _ => vec![keyword.to_owned()],
+            };
+            for setting in settings {
+                if let Some(first) = given.get(&setting) {
+                    return Err(error(format!(
+                        "`{setting}` is given twice: first on line {first}"
+                    )));
+                }
+                given.insert(setting, index + 1);
+            }
             match keyword {
                 "mass" => spec.mass = numbers(1, "KILOGRAMS")?[0],
                 "inertia" => spec.inertia = Vec3::from_slice(&numbers(3, "PITCH YAW ROLL")?),
@@ -987,6 +1009,30 @@ mod tests {
             ("body 1 1 1", 1, "body SX SY SZ at"),
             ("tyre along=2.5,0", 1, "C between 1 and 2"),
             ("aero balance=1.4", 1, "share"),
+            (
+                "mass 1200
+mass 1300",
+                2,
+                "`mass` is given twice: first on line 1",
+            ),
+            (
+                "gears 3 2
+
+gears 3 2 1",
+                3,
+                "`gears` is given twice",
+            ),
+            (
+                "front spring=1
+front spring=2",
+                2,
+                "`front spring` is given twice",
+            ),
+            (
+                "engine idle=900 idle=950",
+                1,
+                "`engine idle` is given twice",
+            ),
         ];
         for (text, line, part) in cases {
             let error = VehicleSpec::parse(text).unwrap_err();
