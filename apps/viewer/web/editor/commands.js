@@ -46,6 +46,9 @@ function check(name, schema, args) {
       case "string[]":
         if (!Array.isArray(value) || !value.every((v) => typeof v === "string")) fail();
         break;
+      case "object":
+        if (value !== null && (typeof value !== "object" || Array.isArray(value))) fail();
+        break;
       default: break;
     }
     out[key] = value;
@@ -61,6 +64,7 @@ function jsonSchema(schema) {
     boolean: { type: "boolean" },
     vec3: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
     "string[]": { type: "array", items: { type: "string" } },
+    object: { type: ["object", "null"] },
   };
   return {
     type: "object",
@@ -104,6 +108,13 @@ export class History {
     return step;
   }
 
+  /// Forgets every step, as a new scene does.
+  clear() {
+    this.#done = [];
+    this.#undone = [];
+    this.onChange();
+  }
+
   /// What can be undone, oldest first, and what can be redone, next first.
   list() {
     const describe = (step) => ({ label: step.label, by: step.by });
@@ -136,6 +147,8 @@ export class Commands {
           `no command \`${name}\`; solstice.help() lists them`);
       }
       const checked = check(name, command.args ?? {}, args ?? {});
+      // While a newly baked scene is put in place there is no viewer to act on: wait for it.
+      await this.context.whenReady?.();
       const outcome = await command.run(checked, this.context, by);
       const { step, result } = outcome && "step" in outcome ? outcome : { step: null, result: outcome };
       if (step) this.history.push({ ...step, by });

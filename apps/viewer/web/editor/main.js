@@ -9,7 +9,8 @@ import {
   eulerFromColumns, scale as scaleVector, sub, tidy, tidyAngles,
 } from "./math.js";
 import { Details, Outliner } from "./panels.js";
-import { Project, kindOf } from "./project.js";
+import { Project, kindOf, writeScene } from "./project.js";
+import { Baker, SETTINGS, blankScene, checkSetting } from "./scenes.js";
 
 const params = new URLSearchParams(location.search);
 const el = (id) => document.getElementById(id);
@@ -17,7 +18,9 @@ const canvas = el("view");
 const overlay = el("overlay-canvas");
 const context = overlay.getContext("2d");
 
-const sceneName = params.get("scene") ?? "cove";
+/// The scene's name: from ?scene= for one served beside the page, ?draft= for one kept in this
+/// browser, or "untitled" for a new one (?new).
+let sceneName = params.get("draft") ?? (params.has("new") ? "untitled" : params.get("scene") ?? "cove");
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
 const sceneBase = params.get("scenes") ?? "assets/";
 const API_VERSION = 1;
@@ -47,44 +50,78 @@ function fail(text) {
   log.add("error", text);
 }
 
-async function main() {
-  if (!navigator.gpu || !(await requestAdapter())) {
-    fail("This browser has no WebGPU adapter for this GPU. Try a recent Chrome or Edge.");
-    return;
-  }
-  const wasm = await import("../editor-wasm/solstice_viewer.js");
-  await wasm.default();
-  el("loading-text").textContent = "Loading scene…";
-  const resize = () => {
-    const ratio = Math.min(window.devicePixelRatio || 1, 2);
-    const box = canvas.getBoundingClientRect();
-    return [Math.max(1, Math.round(box.width * ratio)), Math.max(1, Math.round(box.height * ratio)), ratio];
-  };
-  [canvas.width, canvas.height] = resize();
-  const { viewer, streamer, file } = await openScene(wasm, canvas, {
-    url: `${sceneBase}${sceneName}.solstice`,
-    geometryBudget: (Number(params.get("geometry-mb")) || 128) * 1048576,
-    textureBudget: (Number(params.get("texture-mb")) || 64) * 1048576,
+/// The viewer's module, once loaded, and the budgets every scene is opened with.
+let wasm = null;
+const budgets = {
+  geometryBudget: (Number(params.get("geometry-mb")) || 128) * 1048576,
+  textureBudget: (Number(params.get("texture-mb")) || 64) * 1048576,
+};
+const baker = new Baker(params.get("content") ?? "content/");
+
+const fitCanvas = () => {
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const box = canvas.getBoundingClientRect();
+  return [Math.max(1, Math.round(box.width * ratio)), Math.max(1, Math.round(box.height * ratio)), ratio];
+};
+
+/// Opens a baked scene on the canvas: from `url`, or from `bytes` the bake just gave.
+async function openViewer(source) {
+  [canvas.width, canvas.height] = fitCanvas();
+  return openScene(wasm, canvas, {
+    ...source,
+    ...budgets,
     onStage: (text) => { el("loading-text").textContent = text; },
     onDownload: (received) => {
       if (received !== null) el("loading-text").textContent = `Downloading scene: ${(received / 1e6).toFixed(0)} MB`;
     },
   });
+}
 
-  // The project: the scene file beside the baked scene, if there is one.
-  let sceneJson = null;
-  const projectUrl = params.get("project") ?? `${sceneBase}${sceneName}.scene`;
-  try {
-    const response = await fetch(projectUrl);
-    if (response.ok) sceneJson = await response.text();
-  } catch { /* none */ }
-  const project = new Project(sceneJson ? JSON.parse(sceneJson) : null, viewer);
-  if (!project.saveable) {
-    log.add("warn", `No project at ${projectUrl}: each instance is listed alone, and can be moved but not saved.`);
-  } else if (viewer.source_ids() === "") {
+async function main() {
+  if (!navigator.gpu || !(await requestAdapter())) {
+    fail("This browser has no WebGPU adapter for this GPU. Try a recent Chrome or Edge.");
+    return;
+  }
+  wasm = await import("../editor-wasm/solstice_viewer.js");
+  await wasm.default();
+
+  // A new scene, or one kept in this browser, is baked here; one served beside the page comes
+  // baked, with its project beside it.
+  let scene = null;
+  let opened;
+  if (params.has("new") || params.has("draft")) {
+    scene = params.has("draft") ? JSON.parse(await readDraft(sceneName) ?? "null") : blankScene();
+    if (!scene) {
+      fail(`There is no scene called ${sceneName} kept in this browser.`);
+      return;
+    }
+    el("loading-text").textContent = "Baking the scene…";
+    const baked = await baker.bake(writeScene(scene), `${sceneName}.scene`);
+    opened = { ...await openViewer({ bytes: baked.bytes }), source: { bytes: baked.bytes } };
+    log.add("info", `Baked ${sceneName} in ${(baked.ms / 1000).toFixed(1)} s.`);
+  } else {
+    const url = `${sceneBase}${sceneName}.solstice`;
+    opened = { ...await openViewer({ url }), source: { url } };
+    const projectUrl = params.get("project") ?? `${sceneBase}${sceneName}.scene`;
+    try {
+      const response = await fetch(projectUrl);
+      if (response.ok) scene = JSON.parse(await response.text());
+    } catch { /* none */ }
+    if (!scene) {
+      log.add("warn", `No project at ${projectUrl}: each instance is listed alone, and can be moved but not saved.`);
+    }
+  }
+  const project = new Project(scene, opened.viewer);
+  if (scene && opened.viewer.source_ids() === "" && project.entities.size) {
     log.add("warn", "This scene was baked without the map of its entities (bake it with --project): nothing can be picked or moved.");
   }
-  editor.start(viewer, streamer, file, project, sceneJson, resize);
+  editor.source = opened.source;
+  editor.start(opened.viewer, opened.streamer, opened.file, project, fitCanvas);
+  // A new scene is kept in this browser from the start, and a reload opens it again.
+  if (params.has("new")) {
+    keepAsDraft(editor);
+    history.replaceState(null, "", `?draft=${sceneName}`);
+  }
 }
 
 /// Everything the editor holds, and the commands that change it.
@@ -126,12 +163,11 @@ const editor = {
     this.previews.clear();
   },
 
-  start(viewer, streamer, file, project, sceneJson, resize) {
+  start(viewer, streamer, file, project, resize) {
     this.viewer = viewer;
     this.streamer = streamer;
     this.file = file;
     this.project = project;
-    this.savedJson = sceneJson;
     this.resize = resize;
     this.commands = new Commands(this);
     defineCommands(this.commands, this);
@@ -154,6 +190,117 @@ const editor = {
     requestAnimationFrame((now) => this.tick(now, now));
   },
 
+  /// Puts a newly baked scene in place of the one shown, keeping the camera, the selection and
+  /// what is hidden.
+  async swap(bytes, scene) {
+    const camera = Array.from(this.viewer.camera());
+    const old = this.viewer;
+    // One canvas holds one viewer: the old one goes first, and no frame is drawn, nor command
+    // run, until the new one is there (`whenReady`).
+    let ready;
+    this.ready = new Promise((resolve) => { ready = resolve; });
+    this.viewer = null;
+    // A drag or a scrub in progress belonged to the scene being left.
+    this.previews.clear();
+    // Picks waiting on the old viewer will never be answered by it.
+    for (const pick of this.picks) pick.resolve({ id: null, instance: null, point: null });
+    this.picks = [];
+    this.pickStale = false;
+    old.free();
+    let opened;
+    try {
+      opened = await openViewer({ bytes });
+      this.source = { bytes };
+    } catch (error) {
+      // The new scene can't be shown: show the last one again, so the editor goes on working.
+      opened = await openViewer(this.source);
+      scene = this.project.scene;
+      this.viewer = opened.viewer;
+      this.streamer = opened.streamer;
+      this.file = opened.file;
+      this.viewer.set_camera(...camera);
+      this.project = new Project(scene, this.viewer);
+      ready();
+      this.refresh();
+      throw error;
+    }
+    this.viewer = opened.viewer;
+    this.streamer = opened.streamer;
+    this.file = opened.file;
+    this.viewer.set_camera(...camera);
+    this.project = new Project(scene, this.viewer);
+    this.selection = new Set([...this.selection].filter((id) => this.project.entities.has(id)));
+    for (const id of this.hidden) {
+      for (const instance of this.project.instancesOf(id)) this.viewer.set_instance_hidden(instance, true);
+    }
+    ready();
+    this.refresh();
+  },
+
+  /// Resolves once a viewer is shown: at once, but for while a new scene is put in place.
+  whenReady() {
+    return this.viewer ? Promise.resolve() : this.ready;
+  },
+
+  /// The bake: what is in flight, whether another is wanted after it, and how the last went.
+  bake: { running: null, again: false, timer: null, lastMs: null, lastError: null, generation: 0 },
+
+  /// Bakes the scene again soon, after a change to what only a bake makes, such as the terrain.
+  /// Changes close together bake once.
+  rebakeSoon() {
+    clearTimeout(this.bake.timer);
+    this.bake.timer = setTimeout(() => {
+      this.bake.timer = null;
+      this.rebake();
+    }, 400);
+    el("hint").textContent = "Baking soon…";
+  },
+
+  /// Bakes the scene as it is now and shows it. Resolves when what was asked for is shown.
+  async rebake() {
+    clearTimeout(this.bake.timer);
+    this.bake.timer = null;
+    if (this.bake.running) {
+      this.bake.again = true;
+      await this.bake.running;
+      return this.bake.running;
+    }
+    const generation = this.bake.generation;
+    const run = (async () => {
+      do {
+        this.bake.again = false;
+        el("hint").textContent = "Baking…";
+        const text = writeScene(this.project.scene);
+        try {
+          const baked = await baker.bake(text, `${sceneName}.scene`);
+          // New, while it baked: this scene is gone.
+          if (generation !== this.bake.generation) return;
+          // Changed while it baked: what was baked is out of date, so bake again.
+          if (this.bake.again || writeScene(this.project.scene) !== text) {
+            this.bake.again = true;
+            continue;
+          }
+          await this.swap(baked.bytes, this.project.scene);
+          this.bake.lastMs = baked.ms;
+          this.bake.lastError = null;
+          el("hint").textContent = `Baked in ${(baked.ms / 1000).toFixed(1)} s`;
+          log.add("info", `Baked ${sceneName} in ${(baked.ms / 1000).toFixed(1)} s.`);
+        } catch (error) {
+          this.bake.lastError = error.message ?? String(error);
+          el("hint").textContent = "The bake failed: see the log";
+          log.add("error", `The bake failed: ${this.bake.lastError}`);
+        }
+      } while (this.bake.again);
+    })();
+    this.bake.running = run;
+    try {
+      await run;
+    } finally {
+      if (this.bake.running === run) this.bake.running = null;
+    }
+    return null;
+  },
+
   refresh() {
     this.outliner.render();
     this.details.render();
@@ -165,6 +312,10 @@ const editor = {
   },
 
   tick(now, previous) {
+    if (!this.viewer) {
+      requestAnimationFrame((next) => this.tick(next, now));
+      return;
+    }
     const delta = Math.min((now - previous) / 1000, 0.1);
     this.streamer.pump();
     const fly = this.input.flying ? this.input.axes() : [0, 0, 0];
@@ -720,6 +871,115 @@ function defineCommands(commands, editor) {
       return { frames: editor.frames };
     },
   });
+  commands.define("scene.settings", {
+    description: "The settings a scene has one of: its terrain, land bands, sea, texture size and starting camera, as the project holds them. Each is null if the scene has none.",
+    run: () => {
+      const scene = editor.project.scene;
+      return {
+        terrain: scene.terrain ?? null,
+        land: scene.land ?? null,
+        sea: scene.sea ?? null,
+        texture_size: scene.texture_size ?? 1024,
+        camera: scene.camera ?? null,
+        fields: Object.fromEntries(Object.entries(SETTINGS).map(([name, setting]) =>
+          [name, { description: setting.description, fields: setting.fields }])),
+      };
+    },
+  });
+  commands.define("scene.set", {
+    description: "Changes the scene's settings: `terrain` { size, cells, height, shore_x }, `land` { sand, dirt }, `sea` { level, ocean }, each whole, or null to take it away. One undo step. The scene bakes again in the browser; bake.run waits for it.",
+    changes: true,
+    args: {
+      terrain: { type: "object", description: "{ size, cells, height, shore_x }: metres across, cells along a side (8 to 1024; more takes longer), hill height in metres, and the x where the shore begins (the sea lies towards +X). Null for no ground." },
+      land: { type: "object", description: "{ sand, dirt }: metres of sand from the water, then of dirt; grass beyond. Null for plain ground." },
+      sea: { type: "object", description: "{ level, ocean }: the calm sea's height, and a built-in ocean (coastal). Null for no sea." },
+    },
+    example: { terrain: { size: 256, cells: 128, height: 6, shore_x: 40 } },
+    run: (args) => {
+      if (!editor.project.saveable) throw new CommandError("not_a_project", "this scene has no project to change");
+      // Models and actors are read from files, which the bake in the browser can't read yet.
+      const placed = [...editor.project.entities.values()].find((e) => e.mesh || e.actor);
+      if (placed) {
+        throw new CommandError("not_bakeable_here",
+          `this scene places ${placed.name} from a file, which the browser can't bake yet: change it in the project and bake it with bake --project`);
+      }
+      if (!Object.keys(args).length) throw new CommandError("bad_arguments", "scene.set takes terrain, land or sea");
+      for (const [name, value] of Object.entries(args)) {
+        const problem = checkSetting(name, value);
+        if (problem) throw new CommandError("bad_arguments", problem);
+      }
+      const scene = editor.project.scene;
+      const before = Object.fromEntries(Object.keys(args).map((name) => [name, structuredClone(scene[name] ?? null)]));
+      const apply = (values) => {
+        for (const [name, value] of Object.entries(values)) {
+          if (value === null) delete scene[name];
+          else scene[name] = structuredClone(value);
+        }
+        editor.refresh();
+        editor.rebakeSoon();
+      };
+      apply(args);
+      return {
+        result: { baking: true },
+        step: { label: `Change ${Object.keys(args).join(" and ")}`, undo: () => apply(before), redo: () => apply(args) },
+      };
+    },
+  });
+  commands.define("bake.run", {
+    description: "Bakes the scene in the browser now, or waits for the bake already asked for, and shows it. Gives how long it took and any error.",
+    run: async () => {
+      await editor.rebake();
+      if (editor.bake.lastError) throw new CommandError("bake_failed", editor.bake.lastError);
+      return { ms: Math.round(editor.bake.lastMs ?? 0), instances: editor.viewer.instance_count() };
+    },
+  });
+  commands.define("bake.status", {
+    description: "Whether a bake is running or waiting to, and how the last one went.",
+    run: () => ({
+      running: Boolean(editor.bake.running),
+      waiting: Boolean(editor.bake.timer) && !editor.bake.running,
+      last_ms: editor.bake.lastMs === null ? null : Math.round(editor.bake.lastMs),
+      last_error: editor.bake.lastError,
+    }),
+  });
+  commands.define("project.new", {
+    description: "Starts a new scene from blank terrain: an island of sand, dirt and grass in a coastal sea, baked in the browser and kept there as it changes. The scene shown now is left; save it first if it has changes.",
+    args: {
+      name: { type: "string", description: "Its name: letters, digits, - and _ (default untitled)." },
+      replace: { type: "boolean", description: "Replace a scene of that name kept in this browser. Without it, an existing one is refused." },
+      discard: { type: "boolean", description: "Leave the scene shown now even though it has unsaved changes. Without it, they stop New." },
+    },
+    example: { name: "island" },
+    run: async ({ name = "untitled", replace = false, discard = false }) => {
+      if (!/^[\w-]+$/.test(name)) throw new CommandError("bad_arguments", "a name is letters, digits, - and _");
+      // A scene kept in the browser is its own save; a served one with changes isn't saved.
+      const unsaved = editor.dirty && !params.has("draft") && !location.search.includes("draft=");
+      if (unsaved && !discard) {
+        throw new CommandError("unsaved_changes", "the scene shown has unsaved changes: save it, or pass discard: true");
+      }
+      if (!replace && name !== sceneName && await readDraft(name)) {
+        throw new CommandError("exists", `a scene called ${name} is kept in this browser already: pass replace: true, or choose another name`);
+      }
+      // Whatever was baking belongs to the scene being left.
+      clearTimeout(editor.bake.timer);
+      editor.bake.timer = null;
+      editor.bake.generation += 1;
+      await editor.bake.running;
+      await flushAutosave(editor);
+      const scene = blankScene();
+      const baked = await baker.bake(writeScene(scene), `${name}.scene`);
+      sceneName = name;
+      editor.commands.history.clear();
+      editor.selection.clear();
+      editor.hidden.clear();
+      await editor.swap(baked.bytes, scene);
+      editor.viewer.set_camera(...scene.camera.position, scene.camera.yaw_radians, scene.camera.pitch_radians);
+      keepAsDraft(editor);
+      history.replaceState(null, "", `?draft=${name}`);
+      log.add("info", `New scene ${name}, baked in ${(baked.ms / 1000).toFixed(1)} s.`);
+      return { scene: name, ms: Math.round(baked.ms) };
+    },
+  });
   commands.define("project.get", {
     description: "The scene's project file as it would be saved, and whether it has changes not yet saved.",
     run: () => ({
@@ -781,6 +1041,7 @@ function bindInput(editor) {
 
   overlay.addEventListener("contextmenu", (e) => e.preventDefault());
   overlay.addEventListener("pointerdown", (e) => {
+    if (!editor.viewer) return;
     overlay.focus();
     const m = fraction(e);
     const camera = editor.camera();
@@ -816,6 +1077,7 @@ function bindInput(editor) {
     drag = { kind: "click", start: m, additive: e.ctrlKey || e.metaKey || e.shiftKey };
   });
   overlay.addEventListener("pointermove", (e) => {
+    if (!editor.viewer) return;
     const m = fraction(e);
     if (!drag) {
       const primary = editor.primary();
@@ -862,7 +1124,7 @@ function bindInput(editor) {
     const was = drag;
     drag = null;
     input.flying = false;
-    if (!was) return;
+    if (!was || !editor.viewer) return;
     if (was.kind === "gizmo") {
       const changes = new Map();
       if (was.last) {
@@ -900,6 +1162,7 @@ function bindInput(editor) {
   overlay.addEventListener("pointercancel", () => finish(null));
   overlay.addEventListener("wheel", (e) => {
     e.preventDefault();
+    if (!editor.viewer) return;
     if (input.flying) {
       // As in Unreal: the wheel while looking sets how fast the camera flies.
       const speed = editor.viewer.camera_speed() * (e.deltaY < 0 ? 1.25 : 0.8);
@@ -948,7 +1211,8 @@ function bindInput(editor) {
     const [width, height] = editor.resize();
     if (width !== canvas.width || height !== canvas.height) {
       [canvas.width, canvas.height] = [width, height];
-      editor.viewer.resize(width, height);
+      // A viewer being put in place is opened at the canvas's size then.
+      editor.viewer?.resize(width, height);
     }
   }).observe(canvas);
 }
@@ -978,6 +1242,16 @@ function bindToolbar(editor) {
   el("undo").addEventListener("click", () => editor.call("history.undo"));
   el("redo").addEventListener("click", () => editor.call("history.redo"));
   el("save").addEventListener("click", () => save(editor));
+  el("new").addEventListener("click", async () => {
+    const kept = location.search.includes("draft=");
+    if (editor.dirty && !kept && !confirm("Leave this scene's unsaved changes for a new scene?")) return;
+    el("hint").textContent = "Baking a new scene…";
+    // A new scene takes the first free name: untitled, untitled-2...
+    let name = "untitled";
+    for (let n = 2; name !== sceneName && await readDraft(name); n += 1) name = `untitled-${n}`;
+    const outcome = await editor.call("project.new", { name, discard: true });
+    if (!outcome.ok) log.add("error", outcome.error.message);
+  });
   for (const mode of ["move", "rotate", "scale"]) {
     el(`mode-${mode}`).addEventListener("click", () => editor.call("gizmo.set", { mode }));
   }
@@ -995,37 +1269,66 @@ function bindToolbar(editor) {
 
 // ---- Saving: to the browser as you go, and to a file when asked.
 
-const DRAFT = `${sceneName}.scene`;
+const draftFile = (name = sceneName) => `${name}.scene`;
 
 async function draftDirectory() {
   const root = await navigator.storage?.getDirectory?.();
   return root ? root.getDirectoryHandle("drafts", { create: true }) : null;
 }
 
+/// A scene kept in this browser, as its file's text, or null.
+async function readDraft(name) {
+  try {
+    const folder = await draftDirectory();
+    return await (await (await folder?.getFileHandle(draftFile(name)))?.getFile())?.text() ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/// Writes any autosave still waiting, before the scene it belongs to is left.
+async function flushAutosave(editor) {
+  if (!autosaveTimer) return;
+  clearTimeout(autosaveTimer);
+  autosaveTimer = null;
+  await writeDraft(editor);
+}
+
+/// Keeps the scene in this browser now, as autosave does after each change.
+function keepAsDraft(editor) {
+  editor.dirty = true;
+  scheduleAutosave(editor);
+}
+
 let autosaveTimer = null;
+
+async function writeDraft(editor) {
+  try {
+    const folder = await draftDirectory();
+    if (!folder) return;
+    const writable = await (await folder.getFileHandle(draftFile(), { create: true })).createWritable();
+    await writable.write(editor.project.toJson());
+    await writable.close();
+    el("hint").textContent = "Draft kept in this browser";
+  } catch (error) {
+    log.add("warn", `Couldn't keep a draft in this browser: ${error.message ?? error}`);
+  }
+}
 function scheduleAutosave(editor) {
   if (!editor.project.saveable) return;
   clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(async () => {
-    try {
-      const folder = await draftDirectory();
-      if (!folder) return;
-      const writable = await (await folder.getFileHandle(DRAFT, { create: true })).createWritable();
-      await writable.write(editor.project.toJson());
-      await writable.close();
-      el("hint").textContent = "Draft kept in this browser";
-    } catch (error) {
-      log.add("warn", `Couldn't keep a draft in this browser: ${error.message ?? error}`);
-    }
+  autosaveTimer = setTimeout(() => {
+    autosaveTimer = null;
+    writeDraft(editor);
   }, 800);
 }
 
 /// Offers to bring back a draft left from an earlier visit, if it differs from the scene served.
 async function offerDraft(editor) {
-  if (!editor.project.saveable) return;
+  if (!editor.project.saveable || params.has("draft") || params.has("new")) return;
   try {
     const folder = await draftDirectory();
-    const text = await (await (await folder?.getFileHandle(DRAFT))?.getFile())?.text();
+    const text = await (await (await folder?.getFileHandle(draftFile()))?.getFile())?.text();
     if (!text || text === editor.project.toJson()) return;
     const draft = JSON.parse(text);
     el("draft").hidden = false;
@@ -1072,7 +1375,7 @@ async function offerDraft(editor) {
     };
     el("draft-discard").onclick = async () => {
       el("draft").hidden = true;
-      await folder.removeEntry(DRAFT).catch(() => {});
+      await folder.removeEntry(draftFile()).catch(() => {});
     };
   } catch { /* no draft */ }
 }

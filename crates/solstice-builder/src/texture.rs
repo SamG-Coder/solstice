@@ -243,6 +243,16 @@ pub fn compress_textures(scene: &mut SceneAsset) {
     }
     let size = scene.texture_size;
     for layer in &mut scene.textures {
+        // A layer made ready and compressed already, as the editor's bake is given
+        // (`solstice-bake`'s textures), is a quarter the size of a raw one and stays as it is.
+        let raw_bytes = size as usize * size as usize * 4;
+        if layer
+            .color_mips
+            .first()
+            .is_some_and(|mip| mip.len() != raw_bytes)
+        {
+            continue;
+        }
         for (level, mip) in layer.color_mips.iter_mut().enumerate() {
             *mip = encode_bc7(mip, size >> level);
         }

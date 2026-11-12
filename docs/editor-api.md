@@ -23,7 +23,7 @@ solstice.version                 // 1, raised when a command changes
 Every call returns `{ ok: true, result }` or `{ ok: false, error: { code, message } }`, and never
 throws. Error codes are `unknown_command`, `bad_arguments` (a missing, misspelt or mistyped
 argument, named in the message), `unknown_id`, `no_transform`, `nothing_selected`,
-`nothing_to_frame`, `not_drawing` (a `pick` or `wait` while the tab is hidden, which draws no
+`nothing_to_frame`, `not_a_project`, `bake_failed`, `not_drawing` (a `pick` or `wait` while the tab is hidden, which draws no
 frames: bring it to the front) and `failed`.
 
 Changes an agent makes are steps in the same history as a person's, marked `agent` in
@@ -59,6 +59,19 @@ await solstice.call("stats.frame");          // fps, frame time, triangles, GPU 
 await solstice.call("log.read", { level: "error" });
 await solstice.call("history.undo");
 ```
+
+Building a scene from blank terrain:
+
+```js
+await solstice.call("project.new", { name: "island" });   // baked in the browser in a few seconds
+await solstice.call("scene.set", { terrain: { size: 256, cells: 128, height: 12, shore_x: 30 } });
+await solstice.call("scene.set", { land: { sand: 18, dirt: 8 } });
+await solstice.call("bake.run");                          // waits for the bake, and shows it
+await solstice.call("project.get");                       // the scene's file, to save or read
+```
+
+A new scene is kept in the browser as it changes (`editor.html?draft=NAME` opens it again), and
+its bake in the browser gives the same file `bake --project` gives for it on a PC.
 
 ## Commands
 
@@ -277,6 +290,50 @@ Resolves after some frames have been drawn, or once streaming has settled, so st
 ### `project.get`
 
 The scene's project file as it would be saved, and whether it has changes not yet saved.
+
+No arguments.
+
+### `project.new`
+
+Starts a new scene from blank terrain: an island of sand, dirt and grass in a coastal sea, baked in the browser and kept there as it changes. The scene shown now is left; save it first if it has changes.
+
+| Argument | Type | Needed | Meaning |
+|---|---|---|---|
+| `name` | string |  | Its name: letters, digits, - and _ (default untitled). |
+
+```js
+await solstice.call("project.new", {"name":"island"})
+```
+
+### `scene.settings`
+
+The settings a scene has one of: its terrain, land bands, sea, texture size and starting camera, as the project holds them, with each field's range. Each is null if the scene has none.
+
+No arguments.
+
+### `scene.set`
+
+Changes the scene's settings, each given whole, or null to take it away. One undo step. The scene bakes again in the browser; `bake.run` waits for it.
+
+| Argument | Type | Needed | Meaning |
+|---|---|---|---|
+| `terrain` | object or null |  | `{ size, cells, height, shore_x }`: metres across (16 to 4096), cells along a side (8 to 1024; more takes longer), hill height in metres, and the x where the shore begins (the sea lies towards +X). Null for no ground. |
+| `land` | object or null |  | `{ sand, dirt }`: metres of sand from the water, then of dirt; grass beyond. Null for plain ground. |
+| `sea` | object or null |  | `{ level, ocean }`: the calm sea's height, and a built-in ocean (`coastal`). Null for no sea. |
+
+```js
+await solstice.call("scene.set", {"terrain":{"size":256,"cells":128,"height":6,"shore_x":40}})
+```
+
+### `bake.run`
+
+Bakes the scene in the browser now, or waits for the bake already asked for, and shows it. Gives how long it took; a bake that fails is a `bake_failed` error with the bake's message.
+
+No arguments.
+
+### `bake.status`
+
+Whether a bake is running or waiting to, and how the last one went.
 
 No arguments.
 

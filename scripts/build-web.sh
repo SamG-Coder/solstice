@@ -31,6 +31,16 @@ RUSTFLAGS="-C target-feature=+simd128"   cargo build --release --target wasm32-u
 # crate builds again.
 cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features --features editor
 "$bindgen" --target web --no-typescript --out-dir dist/editor-wasm target/wasm32-unknown-unknown/release/solstice_viewer.wasm
+# The editor's bake, built for the browser (apps/bake-web), which its Web Worker loads only when
+# it first bakes; and the surfaces a land is laid with, which take minutes to make, made here once
+# for every visitor (`bake --surfaces`). A local build reuses any already in assets/content.
+cargo build --release --target wasm32-unknown-unknown -p bake-web
+"$bindgen" --target web --no-typescript --out-dir dist/bake-wasm target/wasm32-unknown-unknown/release/solstice_bake_web.wasm
+if [ ! -e assets/content/surface-grass-0-1024.solstice ]; then
+  cargo run --release -p bake -- --surfaces assets/content
+fi
+mkdir -p dist/content
+cp assets/content/*.solstice dist/content/
 cp apps/viewer/web/index.html apps/viewer/web/editor.html apps/viewer/web/loader.js dist/
 cp -r apps/viewer/web/editor dist/
 # Scene files are already compressed where it helps, part by part, so that the page can fetch

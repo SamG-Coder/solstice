@@ -3,6 +3,7 @@
 // anything itself.
 
 import { kindOf } from "./project.js";
+import { SETTINGS } from "./scenes.js";
 
 const ICONS = {
   folder: "▤", mesh: "◆", actor: "●", light: "✦", blocker: "▭", wood: "♣", clear: "○",
@@ -141,8 +142,58 @@ function numberField(label, value, step, onChange, onScrub) {
   return make("label", { className: "number" }, [name, input]);
 }
 
+/// What each setting and field is called on the panel.
+const LABELS = {
+  terrain: "Terrain", land: "Land", sea: "Sea",
+  size: "Size (m)", cells: "Cells", height: "Hills (m)", shore_x: "Shore x",
+  sand: "Sand (m)", dirt: "Dirt (m)", level: "Level (m)", ocean: "Ocean",
+};
+
+/// What a setting starts as when it is turned on.
+const STARTING = {
+  terrain: { size: 256, cells: 128, height: 3, shore_x: 64 },
+  land: { sand: 10, dirt: 5 },
+  sea: { level: -0.6, ocean: "coastal" },
+};
+
 export class Details {
   #element;
+
+  /// The scene's own settings, shown when nothing is selected: each a section that can be
+  /// turned on or off, whose fields bake the scene again when changed.
+  #renderScene() {
+    const scene = this.editor.project.scene;
+    this.#element.append(make("p", {
+      className: "empty",
+      textContent: "Nothing selected: these are the scene's own settings. A change bakes the scene again.",
+    }));
+    for (const [name, setting] of Object.entries(SETTINGS)) {
+      const value = scene[name];
+      const toggle = make("input", { type: "checkbox", checked: Boolean(value), title: `Has ${name}` });
+      toggle.addEventListener("click", (e) => e.stopPropagation());
+      toggle.addEventListener("change", () =>
+        this.editor.call("scene.set", { [name]: toggle.checked ? (value ?? STARTING[name]) : null }));
+      const summary = make("summary", {}, [toggle, ` ${LABELS[name]}`]);
+      const rows = [];
+      if (value) {
+        for (const [key, field] of Object.entries(setting.fields)) {
+          const set = (v) => this.editor.call("scene.set", { [name]: { ...value, [key]: v } });
+          let input;
+          if (field.names) {
+            input = make("select", {}, field.names.map((n) => make("option", { value: n, textContent: n, selected: n === value[key] })));
+            input.addEventListener("change", () => set(input.value));
+          } else {
+            input = numberField("·", value[key], field.step, (v) => {
+              const clamped = Math.min(field.max, Math.max(field.min, field.integer ? Math.round(v) : v));
+              if (clamped !== value[key]) set(clamped);
+            }, () => {});
+          }
+          rows.push(make("div", { className: "field" }, [make("span", { className: "name", textContent: LABELS[key] ?? key }), input]));
+        }
+      }
+      this.#element.append(make("details", { open: Boolean(value), title: setting.description }, [summary, ...rows]));
+    }
+  }
 
   constructor(element, editor) {
     this.#element = element;
@@ -154,7 +205,8 @@ export class Details {
     const ids = [...selection];
     this.#element.replaceChildren();
     if (ids.length === 0) {
-      this.#element.append(make("p", { className: "empty", textContent: "Select something to see its details." }));
+      if (project.saveable) this.#renderScene();
+      else this.#element.append(make("p", { className: "empty", textContent: "Select something to see its details." }));
       return;
     }
     if (ids.length > 1) {

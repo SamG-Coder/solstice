@@ -9,7 +9,6 @@ use solstice_game::{Blocker, Track};
 use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
-use solstice_procgen::surfaces;
 
 /// How many shades of rubber there are, from the faint edge of the racing line to its middle.
 const SHADES: usize = 5;
@@ -157,11 +156,11 @@ impl Paints {
         let stone = scene.textures.len() as i32;
         scene
             .textures
-            .push(surfaces::asphalt(0).bake(scene.texture_size));
+            .push(crate::textures::surface("asphalt", scene.texture_size));
         let grit = scene.textures.len() as i32;
         scene
             .textures
-            .push(surfaces::gravel(0).bake(scene.texture_size));
+            .push(crate::textures::surface("gravel", scene.texture_size));
         // Rubber darkens the road and fills its grain, shade by shade towards the middle of
         // the line.
         let rubber = std::array::from_fn(|shade| {
