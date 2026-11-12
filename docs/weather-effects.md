@@ -363,16 +363,23 @@ ready. Tests are mutation-checked as the particle steps were.
    so every shadow cascade redrew them each frame. Instead trees sway as grass does, where
    their vertices are placed, from the same wind, read at the trunk so a whole tree moves
    together (`common/sway_vertex.wgsl`, `tree_offset`):
-   - the trunk leans with the wind's drag, saturating in a gale, and sways at its own slow
-     rate, 0.3–0.55 Hz, with and across the wind; its offset grows with the square of the
-     height, and the top comes down as it leans, so it bends rather than shears;
-   - branches bob and swing by their reach from the trunk, faster, each around the crown in its
-     own phase, so a crown never moves as one block;
-   - leaves flutter, fastest, each its own way;
+   - the trunk leans with the wind's drag, following the gusts and saturating in a gale, and
+     sways about that at its own slow rate, 0.25–0.37 Hz, mostly along the wind and a fifth as
+     much across it, in step, so the crown rocks rather than circling; its offset grows with
+     the square of the height, and the top comes down as it leans, so it bends rather than
+     shears;
+   - branches are pushed downwind by their reach from the trunk, dipping as they go, and swing
+     a little behind the trunk, 0.4–0.55 Hz, each part of the crown slightly later than the
+     next. A branch's phase depends only on which way it points, never on its height, so every
+     branch moves whole. An earlier version phased branches by height too, and swung them up
+     and down at another rate than along the wind: branches rippled and tips traced loops, and
+     in the Cove trees looked to dance. The sway and the push grow with the drag up to a fresh
+     wind and stop growing at 12 m/s;
+   - leaves flutter, fastest, each spray its own way;
    - a tree's sway fades out at 60–90 m on High; its branches' bob and its leaves' flutter,
      being small, are worked out only nearer.
    - `Material::TREE` (16) with `SWAYS`, and `INSTANCE_TREE` and `INSTANCE_FLUTTERS` for
-     leaves; the material mask is now 24 bits. The Forest's trees and bushes carry it.
+     leaves; the material mask is now 24 bits, and 23 since `INSTANCE_BLENDS` (land.rs). The Forest's trees and bushes carry it.
    - Culling grows a tree's spheres by 0.1 of their top's height plus 0.6 m, but sizes a
      swaying cluster by its own sphere when choosing a rasterizer. Sized by the grown sphere,
      the wood's tiny leaf clusters left the software rasterizer for the hardware one, which

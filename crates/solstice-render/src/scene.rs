@@ -62,6 +62,9 @@ pub(crate) const INSTANCE_SWAYS: u32 = 1 << 26;
 pub(crate) const INSTANCE_TREE: u32 = 1 << 25;
 /// A tree's leaves, which flutter: [`Material::TREE`] and [`Material::FOLIAGE`].
 pub(crate) const INSTANCE_FLUTTERS: u32 = 1 << 24;
+/// Ground of three kinds blended, from its material's [`Material::BLENDS`]: the material and
+/// the two after it, whose texture layers follow its own (`apps/bake/src/land.rs`).
+pub(crate) const INSTANCE_BLENDS: u32 = 1 << 23;
 
 impl GpuInstance {
     /// Places the instance at `world`. Where it was drawn last stays as `prev_world`.
@@ -470,7 +473,7 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
         index.push(Some(out.len() as u32));
         // The bits above hold the INSTANCE_ flags.
         let source = scene.materials.get(instance.material as usize);
-        debug_assert!(instance.material < INSTANCE_FLUTTERS, "too many materials");
+        debug_assert!(instance.material < INSTANCE_BLENDS, "too many materials");
         let world = instance.transform;
         let linear = Mat3::from_mat4(world);
         let normal = Mat4::from_mat3(linear.inverse().transpose());
@@ -496,6 +499,11 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
                 }
                 | if source.is_some_and(|m| m.flags & Material::SWAYS != 0) {
                     INSTANCE_SWAYS
+                } else {
+                    0
+                }
+                | if source.is_some_and(|m| m.flags & Material::BLENDS != 0) {
+                    INSTANCE_BLENDS
                 } else {
                     0
                 }

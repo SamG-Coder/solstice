@@ -152,6 +152,50 @@ fn hide_tiling(tint: vec3f, color: vec4f, uv: vec2f, duv_dx: vec2f, duv_dy: vec2
     return tint * mixed * mix(1.0, variation, strength);
 }
 
+// Ground blended of three kinds (land.rs): shares below this are left out, which is only near
+// the ends of the blend (land.rs's BLEND_WIDTH), where breakup has faded out; how much each
+// texture's relief counts against its share; and over how much of the difference between the
+// leading score and the rest the others still show, which sets how crisp the meeting is.
+const BLEND_LEAST: f32 = 0.002;
+const BLEND_RELIEF: f32 = 0.5;
+const BLEND_DEPTH: f32 = 0.25;
+// How far the noise that breaks borders up moves each kind's share.
+const BLEND_BREAKUP: f32 = 0.6;
+
+// One textured material's surface at `uv`, before it meets the light.
+struct Layer {
+    albedo: vec3f,
+    cavity: f32,
+    roughness: f32,
+    metallic: f32,
+    // The normal map's tilt, in the tangent frame, scaled by its strength.
+    tangent: vec2f,
+}
+
+fn layer_of(m: Material, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f) -> Layer {
+    let tier = m.texture_tier;
+    let layer = i32(m.texture_slot);
+    let sample_dx = duv_dx * frame.mip_scale;
+    let sample_dy = duv_dy * frame.mip_scale;
+    let color = sample_color(tier, uv, layer, sample_dx, sample_dy);
+    let normal_map = sample_normal(tier, uv, layer, sample_dx, sample_dy);
+    let material_map = sample_material(tier, uv, layer, sample_dx, sample_dy);
+    var albedo = m.base_color.rgb;
+    if m.macro_variation > 0.0 {
+        albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, tier, layer, m.macro_variation);
+    } else {
+        albedo *= color.rgb;
+    }
+    return Layer(
+        albedo,
+        // A cut-out material's alpha is its coverage.
+        select(color.a, 1.0, (m.flags & MATERIAL_MASKED) != 0u),
+        clamp(m.roughness * material_map.r * 2.0, 0.04, 1.0),
+        m.metallic * material_map.g,
+        (normal_map * 2.0 - vec2f(1.0)) * m.normal_strength,
+    );
+}
+
 fn hash_color(value: u32) -> vec3f {
     let h = pcg(value);
     return vec3f(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0 * 0.8 + 0.2;
@@ -287,26 +331,65 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var cavity = 1.0;
     var metallic = material.metallic;
     if material.texture_layer >= 0 {
-        let tier = material.texture_tier;
-        let layer = i32(material.texture_slot);
-        let sample_dx = duv_dx * frame.mip_scale;
-        let sample_dy = duv_dy * frame.mip_scale;
-        let color = sample_color(tier, uv, layer, sample_dx, sample_dy);
-        let normal_map = sample_normal(tier, uv, layer, sample_dx, sample_dy);
-        let material_map = sample_material(tier, uv, layer, sample_dx, sample_dy);
-        if material.macro_variation > 0.0 {
-            albedo = hide_tiling(albedo, color, uv, sample_dx, sample_dy, tier, layer, material.macro_variation);
-        } else {
-            albedo *= color.rgb;
+        var duv_x = duv_dx;
+        var duv_y = duv_dy;
+        var surface = layer_of(material, uv, duv_dx, duv_dy);
+        if (material.flags & MATERIAL_BLENDS) != 0u {
+            // Ground of three kinds blended (land.rs): this material's, and the two after it.
+            // The mesh's texture coordinates hold how much of the second and third there is, and
+            // every texture is laid by the world's x and z.
+            let index = instance_material(instance);
+            let raw = uv / max(material.uv_scale, 1.0e-6);
+            let shares = vec3f(1.0 - raw.x - raw.y, raw.x, raw.y);
+            // Where kinds meet, each border breaks up into tongues and islands a metre or two
+            // across, as sand blows over a path and grass creeps onto it, not one smooth line.
+            var breakup = vec3f(0.0);
+            if max(shares.x, max(shares.y, shares.z)) < 0.999 {
+                let p = vec3f(world.x, 0.0, world.z);
+                let sand = gradient_noise(p * 0.45, 811u).x + 0.5 * gradient_noise(p * 1.3, 812u).x;
+                let dirt = gradient_noise(p * 0.45 + 17.0, 813u).x + 0.5 * gradient_noise(p * 1.3 + 17.0, 814u).x;
+                // Faded out with each share, so a kind leaves off smoothly before it is skipped.
+                breakup = vec3f(0.0, sand, dirt) * BLEND_BREAKUP
+                    * smoothstep(vec3f(BLEND_LEAST), vec3f(0.1), shares);
+            }
+            var layers: array<Layer, 3>;
+            var scores = vec3f(-1.0);
+            for (var k = 0u; k < 3u; k++) {
+                if shares[k] <= BLEND_LEAST {
+                    continue;
+                }
+                let m = materials[index + k];
+                let scale = m.uv_scale;
+                layers[k] = layer_of(m, world.xz * scale, dp_dx.xz * scale, dp_dy.xz * scale);
+                // Each texture's relief, from its cavity: what stands proud shows first where
+                // two kinds meet, so grass shows on the bumps and sand settles in the hollows.
+                scores[k] = shares[k] + breakup[k] + layers[k].cavity * BLEND_RELIEF;
+            }
+            let top = max(scores.x, max(scores.y, scores.z));
+            let weights = max(scores - vec3f(top - BLEND_DEPTH), vec3f(0.0));
+            let blend = weights / max(weights.x + weights.y + weights.z, 1.0e-5);
+            surface = Layer(vec3f(0.0), 0.0, 0.0, 0.0, vec2f(0.0));
+            for (var k = 0u; k < 3u; k++) {
+                if blend[k] > 0.0 {
+                    surface.albedo += layers[k].albedo * blend[k];
+                    surface.cavity += layers[k].cavity * blend[k];
+                    surface.roughness += layers[k].roughness * blend[k];
+                    surface.metallic += layers[k].metallic * blend[k];
+                    surface.tangent += layers[k].tangent * blend[k];
+                }
+            }
+            // The tangent frame follows the world's x and z, as all three are laid.
+            duv_x = dp_dx.xz;
+            duv_y = dp_dy.xz;
         }
-        // A cut-out material's alpha is its coverage.
-        cavity = select(color.a, 1.0, (material.flags & MATERIAL_MASKED) != 0u);
-        roughness = clamp(roughness * material_map.r * 2.0, 0.04, 1.0);
-        metallic *= material_map.g;
+        albedo = surface.albedo;
+        cavity = surface.cavity;
+        roughness = surface.roughness;
+        metallic = surface.metallic;
 
         // Normal mapping without stored tangents (Mikkelsen 2010): the tangent frame
         // comes from the same analytic derivatives used for texture filtering.
-        let tangent_xy = (normal_map * 2.0 - vec2f(1.0)) * material.normal_strength;
+        let tangent_xy = surface.tangent;
         let tangent_z = sqrt(max(1.0 - dot(tangent_xy, tangent_xy), 0.0));
         let perp_y = cross(dp_dy, normal);
         let perp_x = cross(normal, dp_dx);
@@ -314,8 +397,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         // downwards, which makes that negative on any surface facing the camera, and left as it
         // is that would turn every bump into a dent.
         let pixel_area = select(-1.0, 1.0, dot(cross(dp_dx, dp_dy), normal) >= 0.0);
-        let tangent = (perp_y * duv_dx.x + perp_x * duv_dy.x) * pixel_area;
-        let bitangent = (perp_y * duv_dx.y + perp_x * duv_dy.y) * pixel_area;
+        let tangent = (perp_y * duv_x.x + perp_x * duv_y.x) * pixel_area;
+        let bitangent = (perp_y * duv_x.y + perp_x * duv_y.y) * pixel_area;
         let scale = max(dot(tangent, tangent), dot(bitangent, bitangent));
         if scale > 1.0e-20 {
             let inv = 1.0 / sqrt(scale);

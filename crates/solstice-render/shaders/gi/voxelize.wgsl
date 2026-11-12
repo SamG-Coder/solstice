@@ -223,6 +223,28 @@ fn specks(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) gro
     }
 }
 
+// A triangle's albedo, from its first vertex. Ground blended of three kinds (land.rs) mixes the
+// three materials' colours by the shares its texture coordinates hold, each laid by x and z.
+fn voxel_albedo(instance: Instance, material: Material, vertex0: PackedVertex, world0: vec3f) -> vec3f {
+    if material.texture_layer < 0 {
+        return material.base_color.rgb;
+    }
+    let uv = decode_uv(instance, vertex0);
+    if (material.flags & MATERIAL_BLENDS) == 0u {
+        return material.base_color.rgb
+            * textureSampleLevel(color_textures, material_sampler, uv * material.uv_scale, material.texture_layer, COLOR_MIP).rgb;
+    }
+    let shares = vec3f(1.0 - uv.x - uv.y, uv.x, uv.y);
+    let index = instance_material(instance);
+    var albedo = vec3f(0.0);
+    for (var k = 0u; k < 3u; k++) {
+        let m = materials[index + k];
+        albedo += shares[k] * m.base_color.rgb
+            * textureSampleLevel(color_textures, material_sampler, world0.xz * m.uv_scale, m.texture_layer, COLOR_MIP).rgb;
+    }
+    return albedo;
+}
+
 fn voxelize_speck(entry: VisibleCluster) {
     let cluster = clusters[entry.cluster];
     let instance = instances[entry.instance];
@@ -235,11 +257,7 @@ fn voxelize_speck(entry: VisibleCluster) {
     let world1 = transform_point(instance, decode_position(instance, vertex1));
     let world2 = transform_point(instance, decode_position(instance, vertex2));
 
-    var albedo = material.base_color.rgb;
-    if material.texture_layer >= 0 {
-        let uv = decode_uv(instance, vertex0) * material.uv_scale;
-        albedo *= textureSampleLevel(color_textures, material_sampler, uv, material.texture_layer, COLOR_MIP).rgb;
-    }
+    let albedo = voxel_albedo(instance, material, vertex0, world0);
     let face = cross(world1 - world0, world2 - world0);
     let face_length = length(face);
     var normal = vec3f(0.0, 1.0, 0.0);
@@ -286,11 +304,7 @@ fn voxelize_cluster_triangle(item: u32, t: u32) {
         let world1 = transform_point(instance, decode_position(instance, vertex1));
         let world2 = transform_point(instance, decode_position(instance, vertex2));
 
-        var albedo = material.base_color.rgb;
-        if material.texture_layer >= 0 {
-            let uv = decode_uv(instance, vertex0) * material.uv_scale;
-            albedo *= textureSampleLevel(color_textures, material_sampler, uv, material.texture_layer, COLOR_MIP).rgb;
-        }
+        let albedo = voxel_albedo(instance, material, vertex0, world0);
         let face = cross(world1 - world0, world2 - world0);
         let face_length = length(face);
         if face_length <= 0.0 {

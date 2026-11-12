@@ -115,16 +115,21 @@ fn bend_direction(b: Bend, n: vec3f) -> vec3f {
 }
 
 // What the wind does to one vertex of a swaying instance: the bend now and a frame ago.
-// Trees, from their own trunk's base at y = 0 in the mesh. Their trunk leans with the wind's
-// drag, saturating, and sways at its own slow rate, its offset growing with the square of the
-// height; their branches bob and swing by their reach from the trunk, each around the crown in
-// its own phase, faster; their leaves flutter, fastest. All in metres, for 10 m of height or a
-// metre of reach, per (m/s)² or m/s of wind 10 m up.
+// Trees, from their own trunk's base at y = 0 in the mesh. A tree moves mostly as one: its trunk
+// leans with the wind's drag, saturating, and follows the gusts as they come, with a slow sway at
+// its own rate along the wind and a little across it, its offset growing with the square of the
+// height. Its branches are pushed further by their reach from the trunk and swing a little behind
+// it, each part of the crown slightly later than the next, but every branch whole, without waves
+// running along it. Its leaves flutter, fastest. All in metres, for 10 m of height or a metre of
+// reach, per (m/s)² or m/s of wind 10 m up.
 const TREE_LEAN: f32 = 0.0008;
 const TREE_LEAN_SATURATION: f32 = 20.0;
-const TREE_SWAY: f32 = 0.012;
-const TREE_BRANCH: f32 = 0.004;
+const TREE_SWAY: f32 = 0.008;
+const TREE_BRANCH: f32 = 0.006;
 const TREE_FLUTTER: f32 = 0.012;
+// Wind speeds past which the sway and the branches' push grow no further, in m/s: the crown
+// streamlines, its leaves folding back.
+const TREE_STIR_SATURATION: f32 = 12.0;
 // A tree's sway can be seen further off than grass's: it fades out this much further. Its
 // branches' bob and its leaves' flutter are small, and are worked out only nearer, within
 // these shares of that.
@@ -156,12 +161,18 @@ fn tree_offset(w: WindParams, i: Instance, local: vec3f, world: vec3f, wind: vec
     let reach = length(local.xz) * scale;
     let seed = instance_seed(i);
 
-    // The trunk: a steady lean, and a slow sway with and across the wind.
+    // The trunk: a lean that follows the gusts, and a slow sway about it at the tree's own rate,
+    // about once in three to four seconds for a tree of ten metres. Across the wind it moves
+    // only a little, at the same rate, so the crown rocks to and fro rather than round in loops.
     let drag = speed * speed;
     let lean = TREE_LEAN * drag / (1.0 + drag / (TREE_LEAN_SATURATION * TREE_LEAN_SATURATION));
-    let rate = 0.3 + 0.25 * seed;
-    let sway = TREE_SWAY * speed * sin(TAU * rate * time + seed * TAU);
-    let sideways = 0.5 * TREE_SWAY * speed * sin(TAU * rate * 0.77 * time + seed * 17.0);
+    // A breeze barely stirs a tree; this grows with the drag, the speed squared, until a fresh
+    // wind, then with the speed, until a gale.
+    let stir = min(speed, TREE_STIR_SATURATION) * min(speed / 10.0, 1.0);
+    let rate = 0.25 + 0.12 * seed;
+    let swing = TAU * rate * time + seed * TAU;
+    let sway = TREE_SWAY * stir * sin(swing);
+    let sideways = 0.2 * TREE_SWAY * stir * sin(swing);
     let up = sq(height / 10.0);
     var offset = vec3f(along.x, 0.0, along.y) * (lean + sway) * up
         + vec3f(across.x, 0.0, across.y) * sideways * up;
@@ -172,26 +183,28 @@ fn tree_offset(w: WindParams, i: Instance, local: vec3f, world: vec3f, wind: vec
     // trunk, and how high it is, set its phase, smoothly, so all of one branch moves together.
     let far = w.fade.y * TREE_FADE_REACH;
     if seen_from < far * TREE_BRANCH_REACH && reach > TRUNK_RADIUS {
+        // Which way a branch points from the trunk sets how far behind the trunk it swings, by
+        // under a quarter of a swing across the crown, smoothly, so neighbours move nearly
+        // together. Not its height, nor anything else that changes along it: a branch moves
+        // whole, bending, not in waves.
         let way = local.xz / max(length(local.xz), 1.0e-5);
-        let phase = 2.5 * (3.0 * way.y - 4.0 * way.y * way.y * way.y) * cos(seed * 20.0)
-            + 2.5 * way.x * sin(seed * 20.0) + 1.3 * sin(height * 0.8 + way.x * 2.0);
-        // Branches bob slowly, about once in one to two seconds: they are long and springy, and
-        // only twigs move faster.
-        let branch_rate = 0.55 + 0.35 * seed;
+        let phase = 0.6 + 0.7 * dot(way, vec2f(cos(seed * 20.0), sin(seed * 20.0)));
+        // Branches swing a little faster than the trunk, about once in two seconds.
+        let branch_rate = 0.4 + 0.15 * seed;
         // Only beyond the trunk: its own bark, a short way from its axis, moves with it whole.
         let off_trunk = smoothstep(TRUNK_RADIUS, TRUNK_RADIUS * 3.0, reach);
-        // A breeze barely stirs them; the bob grows with the drag, the speed squared, until a
-        // fresh wind, then with the speed.
-        let stir = speed * min(speed / 10.0, 1.0);
-        let out = reach * sqrt(reach) * TREE_BRANCH * stir * off_trunk
+        let out = min(reach, 5.0) * TREE_BRANCH * stir * off_trunk
             * (1.0 - smoothstep(far * TREE_BRANCH_REACH * 0.7, far * TREE_BRANCH_REACH, seen_from));
-        offset += vec3f(along.x, 0.0, along.y) * out * (0.6 + 0.4 * sin(TAU * branch_rate * time + phase));
-        offset.y += out * 0.5 * sin(TAU * branch_rate * 1.3 * time + phase * 1.3);
+        // Pushed downwind, and dipping a little as it is: one motion, so its tip rocks to and fro
+        // rather than tracing loops.
+        let push = out * (0.75 + 0.25 * sin(TAU * branch_rate * time + seed * TAU - phase));
+        offset += vec3f(along.x, -0.3, along.y) * push;
     }
 
-    // Leaves flutter, each its own way: the phase turns over a few centimetres.
+    // Leaves flutter, each spray its own way: the phase turns over a few tens of centimetres, so
+    // a leaf moves whole on its twig rather than rippling.
     if instance_flutters(i) && seen_from < far * TREE_FLUTTER_REACH {
-        let q = world * 7.0;
+        let q = world * 2.5;
         // Leaves only flutter hard in a stiff wind: by the drag, from almost nothing in a breeze.
         let strength = TREE_FLUTTER * min(sq(speed / 10.0), 1.5)
             * (1.0 - smoothstep(far * TREE_FLUTTER_REACH * 0.6, far * TREE_FLUTTER_REACH, seen_from));
