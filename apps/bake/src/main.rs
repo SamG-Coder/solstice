@@ -13,12 +13,17 @@
 //! bake --scene SCENE.txt --show-collision [--output FILE]
 //! bake --project SCENE.scene [--texture-size N] [--output FILE]
 //! bake --convert SCENE.txt
+//! bake --surfaces FOLDER [--texture-size N]
 //! ```
 //!
 //! `--project` bakes a scene of an editor project (`docs/editor.md`), to the project's
 //! `build/SCENE.solstice` unless `--output` says otherwise. `--convert` bakes nothing: it writes
 //! a scene's text as a project's `SCENE.scene` beside it, and lists it in the `solstice.project`
 //! there.
+//!
+//! `--surfaces` writes the surfaces a land is laid with, each as a scene file holding one
+//! compressed texture layer, for the editor's bake in the browser to take ready-made rather than
+//! spend minutes making (`solstice_bake::textures`): `surface-NAME-0-SIZE.solstice`.
 //!
 //! `--check-character` bakes nothing: it checks a rigged character as the export tool wrote it
 //! (`tools/blender/solstice_export.py`), prints what it holds and what is wrong with it, and
@@ -29,20 +34,15 @@
 //!
 //! Textures are block compressed unless `--raw-textures` is given.
 
-mod circuit;
 mod collision_view;
-mod foliage;
 mod forest;
 mod gallery;
-mod land;
-mod meshes;
 mod plants;
-mod project;
 mod scene;
-mod scene_file;
 
 use scene::Quality;
 use solstice_asset::SceneAsset;
+use solstice_bake::{project, scene_file};
 use solstice_import::{import_gltf, ImportOptions};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -66,6 +66,8 @@ struct Options {
     gallery: bool,
     /// The procedural meadow and wood, instead of the demo scene.
     forest: bool,
+    /// A folder to write the land's surfaces to, ready-made for the editor.
+    surfaces: Option<PathBuf>,
     /// Bakes what the scene collides with, instead of how it looks.
     show_collision: bool,
     /// A row of every species, instead of the demo scene.
@@ -151,6 +153,7 @@ fn parse_args() -> Result<Options, String> {
         raw_textures: false,
         gallery: false,
         forest: false,
+        surfaces: None,
         show_collision: false,
         plants: false,
         only: false,
@@ -218,6 +221,7 @@ fn parse_args() -> Result<Options, String> {
             "--raw-textures" => options.raw_textures = true,
             "--gallery" => options.gallery = true,
             "--forest" => options.forest = true,
+            "--surfaces" => options.surfaces = Some(PathBuf::from(value()?)),
             "--show-collision" => options.show_collision = true,
             "--plants" => options.plants = true,
             "--only" => options.only = true,
@@ -336,10 +340,38 @@ fn check_character(path: &std::path::Path, roles: Option<&PathBuf>) -> Result<()
     }
 }
 
+/// The surfaces a scene's land is laid with: its bands, and the plain terrain's sand.
+const LAND_SURFACES: [&str; 3] = ["grass", "sand", "dirt"];
+
+/// Writes each of the land's surfaces, compressed, as a scene file of one layer.
+fn write_surfaces(folder: &Path, size: u32) -> Result<(), String> {
+    use solstice_bake::textures;
+    std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    for name in LAND_SURFACES {
+        let start = Instant::now();
+        let bytes = textures::encode_layer(textures::surface(name, size), size);
+        let path = folder.join(format!(
+            "{}-{size}.solstice",
+            textures::surface_key(name, 0)
+        ));
+        std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!(
+            "wrote {} ({:.1} MB) in {:.1}s",
+            path.display(),
+            bytes.len() as f64 / 1e6,
+            start.elapsed().as_secs_f32()
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let mut options = parse_args()?;
     if options.scene_file.is_some() && options.project_scene.is_some() {
         return Err("give --scene or --project, not both".into());
+    }
+    if let Some(folder) = &options.surfaces {
+        return write_surfaces(folder, options.scene_texture_size.unwrap_or(1024));
     }
     if let Some(path) = &options.convert {
         let written = project::convert_file(path)?;

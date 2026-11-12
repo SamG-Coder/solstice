@@ -34,7 +34,6 @@ use solstice_procgen::foliage::grass::Meadow;
 use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
-use solstice_procgen::surfaces;
 
 /// How far beyond the road and what lies beside it the land is kept level with it: room for
 /// the verge and the barrier.
@@ -663,9 +662,11 @@ fn lay(scene: &mut SceneAsset, pieces: &[[Vec3; 4]], material: u32) {
     }
 }
 
-fn textured(scene: &mut SceneAsset, surface: solstice_procgen::surface::Surface, tint: f32) -> u32 {
+fn textured(scene: &mut SceneAsset, surface: &str, tint: f32) -> u32 {
     let layer = scene.textures.len() as i32;
-    scene.textures.push(surface.bake(scene.texture_size));
+    scene
+        .textures
+        .push(crate::textures::surface(surface, scene.texture_size));
     scene.materials.push(Material {
         base_color: [tint, tint, tint, 1.0],
         roughness: 1.0,
@@ -697,9 +698,9 @@ pub fn build(scene: &mut SceneAsset, track: &Track, size: f32) -> Built {
     let land = Land::new(&island, &road, size);
 
     println!("  textures...");
-    let grass = textured(scene, surfaces::grass(0), 1.0);
-    let rock = textured(scene, surfaces::rock(0), 0.8);
-    let sand = textured(scene, surfaces::sand(0), 0.68);
+    let grass = textured(scene, "grass", 1.0);
+    let rock = textured(scene, "rock", 0.8);
+    let sand = textured(scene, "sand", 0.68);
 
     // ---- The land, in its three kinds.
     println!("  land...");

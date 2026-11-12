@@ -27,7 +27,6 @@ use solstice_procgen::foliage::grass::Meadow;
 use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
-use solstice_procgen::surfaces;
 
 /// The kinds of ground, in the order of [`Plan::kind`]'s answers.
 pub const SAND: usize = 0;
@@ -147,9 +146,11 @@ pub fn blended_terrain(
     mesh
 }
 
-/// A texture layer for `surface`, added to the scene.
-fn layer(scene: &mut SceneAsset, surface: solstice_procgen::surface::Surface) -> i32 {
-    scene.textures.push(surface.bake(scene.texture_size));
+/// A texture layer for the built-in surface `name`, added to the scene.
+fn layer(scene: &mut SceneAsset, name: &str) -> i32 {
+    scene
+        .textures
+        .push(crate::textures::surface(name, scene.texture_size));
     scene.textures.len() as i32 - 1
 }
 
@@ -171,8 +172,8 @@ pub fn add(
     // them. Each darkened as it is seen in the field, so they sit beside the scans: turf about
     // 0.75 of its texture, damp sand 0.68, earth 0.62.
     let first = scene.textures.len() as i32;
-    for surface in [surfaces::grass(0), surfaces::sand(0), surfaces::dirt(0)] {
-        layer(scene, surface);
+    for name in ["grass", "sand", "dirt"] {
+        layer(scene, name);
     }
     for (k, tone) in [0.75, 0.68, 0.62].into_iter().enumerate() {
         scene.materials.push(Material {
@@ -435,7 +436,13 @@ fn add_meadow(
             .expect("a shape with meshes") as u32;
         first_mesh + PATCH_VARIANTS + which * SHAPE_VARIANTS + seed
     };
-    let blades = layer(scene, meadow.atlas(0));
+    let texture_size = scene.texture_size;
+    scene.textures.push(crate::textures::layer(
+        "grass-atlas-default-0",
+        texture_size,
+        || meadow.atlas(0).bake(texture_size),
+    ));
+    let blades = scene.textures.len() as i32 - 1;
     scene.materials.push(crate::foliage::blades(blades));
     let material = scene.materials.len() as u32 - 1;
     let cells = (radius * 2.0 / size) as i32;

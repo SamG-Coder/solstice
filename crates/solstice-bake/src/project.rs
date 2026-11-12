@@ -43,7 +43,25 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     let name = path
         .file_name()
         .map_or(String::new(), |n| n.to_string_lossy().into());
-    scene_file::build_commands(&folder, lower(&scene, &name)?, texture_size)
+    build_scene(&scene, &name, &folder, texture_size)
+}
+
+/// Builds a project's scene, already read, with its files named relative to `folder`. `name`
+/// names the scene in errors.
+pub fn build_scene(
+    scene: &Scene,
+    name: &str,
+    folder: &Path,
+    texture_size: Option<u32>,
+) -> Result<(SceneAsset, Vec<String>), String> {
+    scene_file::build_commands(folder, lower(scene, name)?, texture_size)
+}
+
+/// A built scene as its file holds it: textures compressed, paged and encoded, as `bake` writes
+/// it and the editor's bake in the browser does too.
+pub fn encode(mut scene: SceneAsset) -> Vec<u8> {
+    solstice_builder::compress_textures(&mut scene);
+    solstice_asset::file::encode(&solstice_builder::paginate(&scene))
 }
 
 /// The commands a scene says, in the order the scene text would have them: its settings, then

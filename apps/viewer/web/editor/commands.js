@@ -46,6 +46,9 @@ function check(name, schema, args) {
       case "string[]":
         if (!Array.isArray(value) || !value.every((v) => typeof v === "string")) fail();
         break;
+      case "object":
+        if (value !== null && (typeof value !== "object" || Array.isArray(value))) fail();
+        break;
       default: break;
     }
     out[key] = value;
@@ -61,6 +64,7 @@ function jsonSchema(schema) {
     boolean: { type: "boolean" },
     vec3: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
     "string[]": { type: "array", items: { type: "string" } },
+    object: { type: ["object", "null"] },
   };
   return {
     type: "object",
@@ -102,6 +106,13 @@ export class History {
     this.#done.push(step);
     this.onChange();
     return step;
+  }
+
+  /// Forgets every step, as a new scene does.
+  clear() {
+    this.#done = [];
+    this.#undone = [];
+    this.onChange();
   }
 
   /// What can be undone, oldest first, and what can be redone, next first.

@@ -71,6 +71,14 @@ export class SceneFile {
     this.#onDownload = onDownload;
   }
 
+  /// A scene file already in memory, as the editor's bake gives it.
+  static fromBytes(bytes) {
+    const file = new SceneFile("memory");
+    file.#whole = bytes;
+    file.bytesFetched = bytes.length;
+    return file;
+  }
+
   async read(start, end, signal) {
     if (this.#whole) return this.#whole.subarray(start, end);
     const response = await fetch(this.#url, { headers: { Range: `bytes=${start}-${end - 1}` }, signal });
@@ -425,7 +433,10 @@ export async function requestAdapter() {
 /// streamer's options; and `onDownload`, `onTablesProgress` and `onStage` to follow it.
 export async function openScene(wasm, canvas, options) {
   const { WebViewer, header_bytes, read_header } = wasm;
-  const file = new SceneFile(options.url, options.onDownload);
+  // `bytes` opens a scene file already in memory instead of `url`.
+  const file = options.bytes
+    ? SceneFile.fromBytes(options.bytes)
+    : new SceneFile(options.url, options.onDownload);
   const tables = options.tablesUrl ? new SceneFile(options.tablesUrl, options.onDownload) : file;
   const [manifestOffset, manifestBytes] = read_header(await tables.read(0, header_bytes()));
   const manifestEnd = manifestOffset + manifestBytes;

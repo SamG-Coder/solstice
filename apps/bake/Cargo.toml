@@ -6,17 +6,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+solstice-bake.workspace = true
 solstice-project.workspace = true
-solstice-anim.workspace = true
 solstice-asset.workspace = true
 solstice-builder.workspace = true
 solstice-game.workspace = true
-solstice-script.workspace = true
 solstice-import.workspace = true
 solstice-procgen.workspace = true
 glam.workspace = true
 rayon.workspace = true
-rustc-hash.workspace = true
 
-[dev-dependencies]
-solstice-physics.workspace = true

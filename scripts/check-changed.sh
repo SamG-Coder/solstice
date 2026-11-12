@@ -35,7 +35,7 @@ case "$result" in
     web=false
     for name in $result; do
       packages+=(-p "$name")
-      [[ "$name" == viewer ]] && web=true
+      [[ "$name" == viewer || "$name" == bake-web ]] && web=true
     done
     ;;
 esac
@@ -48,5 +48,11 @@ if [[ "$web" == true ]]; then
   cargo clippy --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features -- -D warnings
   cargo build --release --target wasm32-unknown-unknown -p viewer --lib
   cargo clippy --release --target wasm32-unknown-unknown -p viewer --lib -- -D warnings
+  # The editor's own build, and its bake for the browser (docs/editor.md).
+  cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features --features editor
+  cargo clippy --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features --features editor -- -D warnings
+  cargo build --release --target wasm32-unknown-unknown -p bake-web
+  cargo clippy --release --target wasm32-unknown-unknown -p bake-web -- -D warnings
+  node apps/viewer/web/editor/test.mjs
 fi
 echo "All checks passed for: $result"

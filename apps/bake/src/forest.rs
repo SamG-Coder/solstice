@@ -1,9 +1,9 @@
 //! A meadow at the edge of a wood, to show procedural foliage.
 
-use crate::meshes;
 use glam::{Mat4, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Material, SceneAsset};
+use solstice_bake::meshes;
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_procgen::foliage::bark::Bark;
 use solstice_procgen::foliage::grass::Meadow;
@@ -133,7 +133,7 @@ pub fn build(texture_size: u32) -> SceneAsset {
             macro_variation: 1.0,
             ..Default::default()
         },
-        crate::foliage::blades(1),
+        solstice_bake::foliage::blades(1),
     ];
 
     // Each plant is two meshes, wood then leaves, placed together.
@@ -156,8 +156,8 @@ pub fn build(texture_size: u32) -> SceneAsset {
         let leaf: LeafKind = species.leaves.kind;
         let bark_layer = layers.layer(bark.name(), || bark.surface(0));
         let leaf_layer = layers.layer(leaf.name(), || leaf.atlas(0));
-        materials.push(crate::foliage::bark(bark_layer));
-        materials.push(crate::foliage::leaves(leaf_layer));
+        materials.push(solstice_bake::foliage::bark(bark_layer));
+        materials.push(solstice_bake::foliage::leaves(leaf_layer));
         grown.push(Grown {
             first_mesh,
             variants,

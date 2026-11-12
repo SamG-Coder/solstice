@@ -2,10 +2,10 @@
 //! species, then any species files given, each followed by a second plant grown from another
 //! seed; and in front of them a square of every built-in breed of grass, then any grass files.
 
-use crate::meshes;
 use glam::{Mat4, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Material, SceneAsset, TextureLayer};
+use solstice_bake::meshes;
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_procgen::foliage::bark::BARK_TILE_METRES;
 use solstice_procgen::foliage::grass::Meadow;

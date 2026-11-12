@@ -44,7 +44,6 @@ use solstice_game::{resolve, ActorFile, ActorLine, Blocker, InputMap, SceneGame,
 use solstice_import::{append_model, import_gltf, ImportOptions, ModelPlacements};
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
-use solstice_procgen::surfaces;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -496,7 +495,7 @@ fn add_terrain(scene: &mut SceneAsset, size: f32, cells: u32, height: f32, shore
     let layer = scene.textures.len() as i32;
     scene
         .textures
-        .push(surfaces::sand(0).bake(scene.texture_size));
+        .push(crate::textures::surface("sand", scene.texture_size));
     scene.materials.push(Material {
         // Darkened to about 0.35 albedo, as damp beach sand is, so that it sits correctly next to
         // scanned materials and does not skew auto exposure.

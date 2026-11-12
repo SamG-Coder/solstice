@@ -1,9 +1,9 @@
 //! Lays out the demo scene: a ruined temple in a desert canyon.
 
-use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use rayon::prelude::*;
 use solstice_asset::{Instance, Light, Material, SceneAsset, Viewpoint};
+use solstice_bake::meshes;
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 use solstice_procgen::noise::{fbm, random};
 use solstice_procgen::surface::TILE_METRES;

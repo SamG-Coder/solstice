@@ -1,9 +1,9 @@
 //! A scene showing every surface in the procedural library, for judging how each one looks.
 
-use crate::meshes;
 use glam::{Mat4, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Material, SceneAsset};
+use solstice_bake::meshes;
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_procgen::surfaces;
 

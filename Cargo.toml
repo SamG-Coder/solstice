@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 solstice-anim = { path = "crates/solstice-anim" }
 solstice-asset = { path = "crates/solstice-asset" }
+solstice-bake = { path = "crates/solstice-bake" }
 solstice-builder = { path = "crates/solstice-builder" }
 solstice-import = { path = "crates/solstice-import" }
 solstice-physics = { path = "crates/solstice-physics" }

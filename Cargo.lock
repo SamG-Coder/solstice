@@ -265,16 +265,23 @@ version = "0.2.0"
 dependencies = [
  "glam 0.33.12",
  "rayon",
- "rustc-hash 2.1.3",
- "solstice-anim",
  "solstice-asset",
+ "solstice-bake",
  "solstice-builder",
  "solstice-game",
  "solstice-import",
- "solstice-physics",
  "solstice-procgen",
  "solstice-project",
- "solstice-script",
+]
+
+[[package]]
+name = "bake-web"
+version = "0.2.0"
+dependencies = [
+ "console_error_panic_hook",
+ "solstice-bake",
+ "solstice-project",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3189,6 +3196,24 @@ dependencies = [
  "bytemuck",
  "glam 0.33.12",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "solstice-bake"
+version = "0.2.0"
+dependencies = [
+ "glam 0.33.12",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "solstice-anim",
+ "solstice-asset",
+ "solstice-builder",
+ "solstice-game",
+ "solstice-import",
+ "solstice-physics",
+ "solstice-procgen",
+ "solstice-project",
+ "solstice-script",
 ]
 
 [[package]]

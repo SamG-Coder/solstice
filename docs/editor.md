@@ -548,15 +548,33 @@ on a phone.
 
    **Milestone**: Claude, through Claude in Chrome, opens the editor on Cove, lists the
    courtyard's entities, moves the statue, reads frame stats and undoes, while you watch.
-2. **A new scene from blank terrain.** File ▸ New makes a project from a template: terrain,
-   sea, sky and a camera. The bake runs in the browser: `solstice-bake` as a library, in a Web
-   Worker, for the terrain, its land bands, the sea and the meadow. The terrain's and the
-   land's settings are edited in the details panel and rebuilt as you change them. The project
-   is kept in the browser or in a folder on disk, and Bake writes the scene file the viewer
-   plays, the same file `bake --project` writes natively. Commands: `project.new`, `bake.run`,
-   `bake.status`, `terrain.set`, `env.set` saved with the scene.
-   **Milestone**: from an empty page, make an island with sand, grass and sea, save it, reopen
-   it, and open it in the viewer; an agent does the same through the API.
+2. **A new scene from blank terrain.** New makes a scene from a template: terrain, land bands
+   and a coastal sea, seen from offshore. With nothing selected, the details panel shows the
+   scene's own settings (terrain, land, sea), and a change bakes the scene again in the
+   browser and shows it, keeping the camera and the selection. The scene is kept in the browser
+   as it changes (`editor.html?draft=NAME`), and saved to a file as any other. Commands:
+   `project.new`, `scene.settings`, `scene.set`, `bake.run`, `bake.status`.
+
+   How the bake runs in the browser: the scene building moved out of `apps/bake` into the
+   `solstice-bake` library, built for wasm as `apps/bake-web` (7.7 MB, fetched only when the
+   editor first bakes) and run in a Web Worker. What it measured, one thread:
+
+   | | Native | Browser |
+   |---|---|---|
+   | The three land surfaces at 1024², generated | 2.5 min | far longer |
+   | A 400 m terrain of 512 cells (524 k triangles), clusters built | 45 s | — |
+   | A 256 m terrain of 128 cells, with land and sea, from ready-made surfaces | — | 1.7–2.5 s |
+   | The same, 256 cells | — | 15 s |
+
+   So the surfaces, which are the same in every scene, are made once by `bake --surfaces` (in
+   the site's build) and fetched ready-made, 4.2 MB each, as ordinary scene files of one
+   compressed layer (`solstice_bake::textures`). A new scene's terrain is 2 m cells, which bakes
+   in about two seconds; finer terrain waits on a faster cluster builder or on baking the
+   terrain in tiles across workers. A scene baked in the browser is byte for byte the one
+   `bake --project` makes of the same project natively (checked: the same SHA-256).
+
+   **Milestone**: from an empty page, make an island with sand, grass and sea, change it, reload
+   and find it kept; an agent does the same through the API.
 3. **Trees, water and weather.** Woods, meadows and clearings as shapes with handles, planted
    and regrown in the worker, area by area; tree species and grass from the built-in ones and
    from species files, edited in a panel; ponds with handles; the scene's weather and time of
