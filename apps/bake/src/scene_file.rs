@@ -18,6 +18,12 @@
 //! input cove/play.input                # the input actions, if not the built-in ones
 //! track circuit/circuit.track          # a circuit: its centre line, and what lies beside it
 //! circuit 1900                         # the land, road and planting round that track, this wide
+//! land 10 6                            # the terrain in bands: sand this far in, then dirt, then grass
+//! path 22 0 60 -30 3                   # a dirt path: from x z, to x z, width
+//! yard -21 -21 21 21                   # a dirt yard: opposite corners x z
+//! clear -68 0 40                       # nothing planted within this radius of x z
+//! meadow 110                           # real grass on the grass, this far from the origin
+//! wood -10 -60 30 7                    # trees over the grass: centre x z, radius, spacing
 //! ```
 //!
 //! Actors, their scripts and the input actions travel inside the scene file, as its gameplay
@@ -42,6 +48,30 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, PartialEq)]
 enum Command {
     TextureSize(u32),
+    /// The terrain in bands of sand, dirt and grass (`land.rs`).
+    Land {
+        sand: f32,
+        dirt: f32,
+    },
+    Path {
+        from: glam::Vec2,
+        to: glam::Vec2,
+        width: f32,
+    },
+    Yard {
+        from: glam::Vec2,
+        to: glam::Vec2,
+    },
+    Clear {
+        at: glam::Vec2,
+        radius: f32,
+    },
+    Meadow(f32),
+    Wood {
+        at: glam::Vec2,
+        radius: f32,
+        spacing: f32,
+    },
     Terrain {
         size: f32,
         cells: u32,
@@ -143,6 +173,47 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
         "texture_size" => {
             expect(1)?;
             Command::TextureSize(number(0)? as u32)
+        }
+        "land" => {
+            expect(2)?;
+            Command::Land {
+                sand: number(0)?,
+                dirt: number(1)?,
+            }
+        }
+        "path" => {
+            expect(5)?;
+            Command::Path {
+                from: glam::Vec2::new(number(0)?, number(1)?),
+                to: glam::Vec2::new(number(2)?, number(3)?),
+                width: number(4)?,
+            }
+        }
+        "yard" => {
+            expect(4)?;
+            Command::Yard {
+                from: glam::Vec2::new(number(0)?, number(1)?),
+                to: glam::Vec2::new(number(2)?, number(3)?),
+            }
+        }
+        "clear" => {
+            expect(3)?;
+            Command::Clear {
+                at: glam::Vec2::new(number(0)?, number(1)?),
+                radius: number(2)?,
+            }
+        }
+        "meadow" => {
+            expect(1)?;
+            Command::Meadow(number(0)?)
+        }
+        "wood" => {
+            expect(4)?;
+            Command::Wood {
+                at: glam::Vec2::new(number(0)?, number(1)?),
+                radius: number(2)?,
+                spacing: number(3)?,
+            }
         }
         "ocean" => {
             expect(2)?;
@@ -319,17 +390,29 @@ fn terrain_height(x: f32, z: f32, amplitude: f32, shore_x: f32) -> f32 {
         let t = (offshore / SHELF_WIDTH).clamp(0.0, 1.0);
         t * t * (3.0 - 2.0 * t)
     };
+    let (cove, island) = offshore(x, z, shore_x);
+    broad + ripples - shelf(cove).max(shelf(island)) * SEABED_DEPTH
+}
+
+/// How far out to sea a spot lies from where the shore begins: across the cove, and round the
+/// rest of the island. Negative inland.
+fn offshore(x: f32, z: f32, shore_x: f32) -> (f32, f32) {
     // Bays and points, so that the waterline wanders rather than running ruler-straight.
     let wander = fbm(Vec3::new(0.0, 7.0, z) * 0.011, 4, 305) * 28.0;
-    let cove = shelf(x - shore_x - wander);
+    let cove = x - shore_x - wander;
     // The coast round the rest of the island, sampled around a circle so that it wanders
     // seamlessly: broad headlands and bays, with smaller points along them.
     let radius = x.hypot(z);
     let around = Vec3::new(x, 0.0, z) / radius.max(1.0);
     let headlands = fbm(around * 1.6 + Vec3::new(0.0, 3.0, 0.0), 3, 307) * 45.0;
     let points = fbm(around * 7.0 + Vec3::new(0.0, 11.0, 0.0), 3, 309) * 14.0;
-    let island = shelf(radius - ISLAND_RADIUS - headlands - points);
-    broad + ripples - cove.max(island) * SEABED_DEPTH
+    (cove, radius - ISLAND_RADIUS - headlands - points)
+}
+
+/// How far inland a spot lies from where the shore begins, the nearer coast's.
+fn inland(x: f32, z: f32, shore_x: f32) -> f32 {
+    let (cove, island) = offshore(x, z, shore_x);
+    -cove.max(island)
 }
 
 /// The most samples a side the ground's collision has, and about how far apart, in metres.
@@ -700,6 +783,7 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
         ..Default::default()
     };
     let mut terrain = None;
+    let mut land_plan = crate::land::Plan::default();
     let mut water = None;
     let mut circuit = None;
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
@@ -718,6 +802,20 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
         match command {
             None => {}
             Some(Command::TextureSize(size)) => scene.texture_size = size,
+            Some(Command::Land { sand, dirt }) => {
+                land_plan.banded = true;
+                land_plan.sand = sand;
+                land_plan.dirt = dirt;
+            }
+            Some(Command::Path { from, to, width }) => land_plan.paths.push((from, to, width)),
+            Some(Command::Yard { from, to }) => land_plan.yards.push((from, to)),
+            Some(Command::Clear { at, radius }) => land_plan.clear.push((at, radius)),
+            Some(Command::Meadow(radius)) => land_plan.meadow = Some(radius),
+            Some(Command::Wood {
+                at,
+                radius,
+                spacing,
+            }) => land_plan.woods.push((at, radius, spacing)),
             Some(Command::Terrain {
                 size,
                 cells,
@@ -935,7 +1033,18 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
 
     scene.collide.resize(scene.instances.len(), Collide::Auto);
     if let Some((size, cells, height, shore_x)) = terrain {
-        let ground_layer = add_terrain(&mut scene, size, cells, height, shore_x);
+        let ground_layer = if land_plan.banded {
+            crate::land::add(
+                &mut scene,
+                &land_plan,
+                size,
+                cells,
+                &|x, z| terrain_height(x, z, height, shore_x),
+                &|x, z| inland(x, z, shore_x),
+            )
+        } else {
+            add_terrain(&mut scene, size, cells, height, shore_x)
+        };
         if let Some((level, color)) = water {
             add_water(&mut scene, level, color, ground_layer);
         }
