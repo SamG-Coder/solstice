@@ -83,3 +83,19 @@ fn luminance(c: vec3f) -> f32 {
 fn sq(x: f32) -> f32 {
     return x * x;
 }
+
+/// Four independent numbers from 0 to 1 for three integers.
+fn hash4(a: u32, b: u32, c: u32) -> vec4f {
+    let h = pcg(a + pcg(b + pcg(c)));
+    return vec4f(
+        hash_to_unit(h),
+        hash_to_unit(h ^ 0x9e3779b9u),
+        hash_to_unit(h ^ 0x85ebca6bu),
+        hash_to_unit(h ^ 0xc2b2ae35u),
+    );
+}
+
+/// `x` mapped from the range `low` to `high` onto `new_low` to `new_high`, unclamped.
+fn remap(x: f32, low: f32, high: f32, new_low: f32, new_high: f32) -> f32 {
+    return new_low + (x - low) / (high - low) * (new_high - new_low);
+}

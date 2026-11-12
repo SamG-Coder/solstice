@@ -37,7 +37,7 @@ use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{
-    Collide, GameFile, Heightfield, Instance, Light, Material, SceneAsset, Sea, StillWater,
+    Collide, GameFile, Heightfield, Instance, Light, Material, SceneAsset, Sea, Source, StillWater,
 };
 use solstice_builder::{build_virtual_mesh, BuildOptions};
 use solstice_game::{resolve, ActorFile, ActorLine, Blocker, InputMap, SceneGame, GAME_FILE};
@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 /// One line of a scene file, parsed.
 #[derive(Debug, PartialEq)]
-enum Command {
+pub(crate) enum Command {
     TextureSize(u32),
     /// The terrain in bands of sand, dirt and grass (`land.rs`).
     Land {
@@ -108,7 +108,8 @@ enum Command {
         /// If set, `position.y` is ignored and the model stands on the terrain, with this
         /// fraction of its height below ground.
         seat: Option<f32>,
-        yaw_degrees: f32,
+        /// Degrees about X, Y and Z: see [`placement_transform`].
+        rotation: Vec3,
         scale: f32,
         collide: Collide,
         /// Whether it bends: it keeps its skeleton and follows a pose.
@@ -118,7 +119,7 @@ enum Command {
         path: String,
         name: String,
         position: Vec3,
-        yaw_degrees: f32,
+        rotation: Vec3,
         scale: f32,
         collide: Collide,
     },
@@ -130,7 +131,7 @@ enum Command {
     Circuit(f32),
 }
 
-fn parse_line(line: &str) -> Result<Option<Command>, String> {
+pub(crate) fn parse_line(line: &str) -> Result<Option<Command>, String> {
     let line = line.split('#').next().unwrap_or("").trim();
     let mut words = line.split_whitespace();
     let Some(keyword) = words.next() else {
@@ -283,7 +284,7 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 path: values[0].to_string(),
                 name: values[1].to_string(),
                 position: Vec3::new(number(2)?, number(3)?, number(4)?),
-                yaw_degrees: number(5)?,
+                rotation: Vec3::new(0.0, number(5)?, 0.0),
                 scale: number(6)?,
                 collide,
             }
@@ -321,7 +322,7 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 path: values[0].to_string(),
                 position: Vec3::new(number(1)?, height, number(3)?),
                 seat,
-                yaw_degrees: number(4)?,
+                rotation: Vec3::new(0.0, number(4)?, 0.0),
                 scale: number(5)?,
                 collide,
                 skinned,
@@ -400,12 +401,12 @@ fn model_points(scene: &SceneAsset) -> Vec<Vec3> {
 fn seat_height(
     points: &[Vec3],
     position: Vec3,
-    yaw_degrees: f32,
+    rotation: Vec3,
     scale: f32,
     buried: f32,
     ground: impl Fn(f32, f32) -> f32,
 ) -> f32 {
-    let transform = placement_transform(Vec3::new(position.x, 0.0, position.z), yaw_degrees, scale);
+    let transform = placement_transform(Vec3::new(position.x, 0.0, position.z), rotation, scale);
     let placed: Vec<Vec3> = points
         .iter()
         .map(|&p| transform.transform_point3(p))
@@ -559,8 +560,20 @@ fn add_water(scene: &mut SceneAsset, height: f32, color: [f32; 3], ripples_layer
         .push(build_virtual_mesh(&far, &BuildOptions::default()));
 }
 
-fn placement_transform(position: Vec3, yaw_degrees: f32, scale: f32) -> Mat4 {
-    let rotation = Quat::from_rotation_y(yaw_degrees.to_radians());
+/// Places something: turned by `rotation`, degrees about X, Y and Z applied as yaw (Y), then
+/// pitch (X), then roll (Z), and scaled evenly.
+fn placement_transform(position: Vec3, rotation: Vec3, scale: f32) -> Mat4 {
+    let rotation = if rotation.x == 0.0 && rotation.z == 0.0 {
+        // Exactly as scenes were always placed, so their bakes don't change by a bit.
+        Quat::from_rotation_y(rotation.y.to_radians())
+    } else {
+        Quat::from_euler(
+            glam::EulerRot::YXZ,
+            rotation.y.to_radians(),
+            rotation.x.to_radians(),
+            rotation.z.to_radians(),
+        )
+    };
     Mat4::from_scale_rotation_translation(Vec3::splat(scale), rotation, position)
 }
 
@@ -578,8 +591,9 @@ fn placements_of<'a>(
     models.entry(full).or_default()
 }
 
-/// A placement that waits for its height: position, yaw, scale, buried share, how it collides.
-type Seated = (Vec3, f32, f32, f32, Collide);
+/// A placement that waits for its height: position, rotation, scale, buried share, how it
+/// collides, and which entity placed it.
+type Seated = (Vec3, Vec3, f32, f32, Collide, Option<String>);
 
 /// An actor's mesh: the model's path relative to the scene, its scale, and which named part.
 type ActorMesh = (String, f32, Option<String>, f32, Option<String>);
@@ -591,11 +605,13 @@ enum Placed {
     Part(usize),
 }
 
-/// How each placement of a model collides, in the order placed.
+/// How each placement of a model collides, and which entity placed it, in the order placed.
 #[derive(Default)]
 struct PlacedCollision {
     whole: Vec<Collide>,
     parts: Vec<Collide>,
+    whole_owners: Vec<Option<String>>,
+    part_owners: Vec<Option<String>>,
 }
 
 /// A scene's gameplay, gathered while its file is read.
@@ -821,10 +837,53 @@ fn bake_clips(
     Ok(out)
 }
 
+/// One command to build, and where it came from.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Sourced {
+    pub command: Command,
+    /// Where to point an error: `scene.txt:12`, or an entity's name and id.
+    pub origin: String,
+    /// The entity it is, if it came from a project: the scene file maps which entity made
+    /// which instances.
+    pub owner: Option<String>,
+}
+
+/// Reads a scene's text into the commands it holds.
+pub(crate) fn parse_text(path: &Path, text: &str) -> Result<Vec<Sourced>, String> {
+    let mut commands = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let origin = format!("{}:{}", path.display(), number + 1);
+        if let Some(command) = parse_line(line).map_err(|e| format!("{origin}: {e}"))? {
+            commands.push(Sourced {
+                command,
+                origin,
+                owner: None,
+            });
+        }
+    }
+    Ok(commands)
+}
+
 /// Builds the scene described by the file at `path`. Returns it with any import warnings.
 pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<String>), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let base = path.parent().unwrap_or(Path::new("."));
+    build_commands(base, parse_text(path, &text)?, texture_size)
+}
+
+/// The id under which the scene file maps the terrain's instances, and all that grows on it.
+pub(crate) const TERRAIN_SOURCE: &str = "terrain";
+/// The id under which it maps a circuit's land, road and planting.
+pub(crate) const CIRCUIT_SOURCE: &str = "circuit";
+
+/// Builds a scene from its commands, with files named relative to `base`. Returns it with any
+/// import warnings. Commands from a project are mapped to the instances they made.
+pub(crate) fn build_commands(
+    base: &Path,
+    commands: Vec<Sourced>,
+    texture_size: Option<u32>,
+) -> Result<(SceneAsset, Vec<String>), String> {
+    let mapped = commands.iter().any(|c| c.owner.is_some());
 
     let mut scene = SceneAsset {
         texture_size: 1024,
@@ -846,35 +905,36 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     // Each model an actor animates, and the `.anim` file it does so with.
     let mut animations: Vec<(PathBuf, String)> = Vec::new();
     let mut collides: HashMap<PathBuf, PlacedCollision> = HashMap::new();
-    for (number, line) in text.lines().enumerate() {
-        let at = |e: String| format!("{}:{}: {e}", path.display(), number + 1);
-        let command = parse_line(line).map_err(at)?;
+    for Sourced {
+        command,
+        origin,
+        owner,
+    } in commands
+    {
+        let at = |e: String| format!("{origin}: {e}");
         // A circuit builds its own land, ground and planting: the lines that would build
         // another, one inside it, are refused wherever in the file they come.
-        let lands = matches!(
-            command,
-            Some(
-                Command::Terrain { .. }
-                    | Command::Land { .. }
-                    | Command::Path { .. }
-                    | Command::Yard { .. }
-                    | Command::Clear { .. }
-                    | Command::Meadow(_)
-                    | Command::Wood { .. }
-                    | Command::Water { .. }
-            )
-        );
-        let circuits = matches!(command, Some(Command::Circuit(_)));
-        has_land |= lands;
+        let land = match &command {
+            Command::Terrain { .. } => Some("terrain"),
+            Command::Land { .. } => Some("land"),
+            Command::Path { .. } => Some("path"),
+            Command::Yard { .. } => Some("yard"),
+            Command::Clear { .. } => Some("clear"),
+            Command::Meadow(_) => Some("meadow"),
+            Command::Wood { .. } => Some("wood"),
+            Command::Water { .. } => Some("water"),
+            _ => None,
+        };
+        let circuits = matches!(command, Command::Circuit(_));
+        has_land |= land.is_some();
         has_circuit |= circuits;
-        if (lands || circuits) && has_land && has_circuit {
-            let word = line.split_whitespace().next().unwrap_or_default();
+        if (land.is_some() || circuits) && has_land && has_circuit {
+            let word = land.unwrap_or("circuit");
             return Err(at(format!(
-                "`{word}` with `circuit`: a circuit builds its own land, so leave out `terrain`, \
-                 `water` and the land's lines"
+                "`{word}` with `circuit`: a circuit builds its own land, so leave out `terrain`, `water` and the land's lines"
             )));
         }
-        match command {
+        match Some(command) {
             None => {}
             Some(Command::TextureSize(size)) => scene.texture_size = size,
             Some(Command::Land { sand, dirt }) => {
@@ -950,7 +1010,7 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 path: model,
                 position,
                 seat,
-                yaw_degrees,
+                rotation,
                 scale,
                 collide,
                 skinned,
@@ -961,18 +1021,17 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 }
                 let placements = placements_of(&mut order, &mut models, base, model);
                 match seat {
-                    Some(buried) => seated.entry(full).or_default().push((
-                        position,
-                        yaw_degrees,
-                        scale,
-                        buried,
-                        collide,
-                    )),
+                    Some(buried) => seated
+                        .entry(full)
+                        .or_default()
+                        .push((position, rotation, scale, buried, collide, owner)),
                     None => {
                         placements
                             .whole
-                            .push(placement_transform(position, yaw_degrees, scale));
-                        collides.entry(full).or_default().whole.push(collide);
+                            .push(placement_transform(position, rotation, scale));
+                        let placed = collides.entry(full).or_default();
+                        placed.whole.push(collide);
+                        placed.whole_owners.push(owner);
                     }
                 }
             }
@@ -980,16 +1039,18 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 path: model,
                 name,
                 position,
-                yaw_degrees,
+                rotation,
                 scale,
                 collide,
             }) => {
-                let transform = placement_transform(position, yaw_degrees, scale);
+                let transform = placement_transform(position, rotation, scale);
                 let full = base.join(&model);
                 placements_of(&mut order, &mut models, base, model)
                     .parts
                     .push((name, transform));
-                collides.entry(full).or_default().parts.push(collide);
+                let placed = collides.entry(full).or_default();
+                placed.parts.push(collide);
+                placed.part_owners.push(owner);
             }
             Some(Command::Actor(actor)) => {
                 let (position, yaw) = (actor.position, actor.yaw_degrees);
@@ -1003,18 +1064,21 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                         animations.push((full.clone(), animation));
                     }
                     let placements = placements_of(&mut order, &mut models, base, model);
-                    let transform = placement_transform(position, yaw + mesh_yaw, scale);
+                    let transform =
+                        placement_transform(position, Vec3::new(0.0, yaw + mesh_yaw, 0.0), scale);
                     // An actor bumps into things with its own collider, not its mesh.
                     let collide = collides.entry(full.clone()).or_default();
                     let placed = match part {
                         Some(name) => {
                             placements.parts.push((name, transform));
                             collide.parts.push(Collide::None);
+                            collide.part_owners.push(owner);
                             Placed::Part(placements.parts.len() - 1)
                         }
                         None => {
                             placements.whole.push(transform);
                             collide.whole.push(Collide::None);
+                            collide.whole_owners.push(owner);
                             Placed::Whole(placements.whole.len() - 1)
                         }
                     };
@@ -1057,19 +1121,18 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             let ground = |x: f32, z: f32| terrain_height(x, z, amplitude, shore_x).max(water_level);
             let points = model_points(&imported.scene);
             let placements = models.get_mut(model).expect("registered while parsing");
-            for &(position, yaw_degrees, scale, buried, collide) in list {
-                let y = seat_height(&points, position, yaw_degrees, scale, buried, ground);
+            for (position, rotation, scale, buried, collide, owner) in list {
+                let (position, rotation, scale) = (*position, *rotation, *scale);
+                let y = seat_height(&points, position, rotation, scale, *buried, ground);
                 println!("  at {:.0} {:.0}: height {y:.2}", position.x, position.z);
                 placements.whole.push(placement_transform(
                     Vec3::new(position.x, y, position.z),
-                    yaw_degrees,
+                    rotation,
                     scale,
                 ));
-                collides
-                    .entry(model.clone())
-                    .or_default()
-                    .whole
-                    .push(collide);
+                let placed = collides.entry(model.clone()).or_default();
+                placed.whole.push(*collide);
+                placed.whole_owners.push(owner.clone());
             }
         }
         let ranges = append_model(&mut scene, imported, &models[model])
@@ -1112,6 +1175,17 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 scene.collide[instance as usize] = *how;
             }
         }
+        for (range, owner) in ranges
+            .iter()
+            .zip(collide.whole_owners.iter().chain(&collide.part_owners))
+        {
+            if let Some(id) = owner {
+                scene.sources.push(Source {
+                    id: id.clone(),
+                    instances: range.clone(),
+                });
+            }
+        }
     }
     // A circuit's land, road and planting are built from its track, which also gives the
     // ground to drive on and the barriers to stop at.
@@ -1129,8 +1203,15 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
             .ok_or_else(|| format!("{name}: not read"))?;
         let track = solstice_game::Track::parse(&text).map_err(|e| format!("{name}: {e}"))?;
         scene.collide.resize(scene.instances.len(), Collide::Auto);
+        let first = scene.instances.len() as u32;
         let built = crate::circuit::build(&mut scene, &track, size);
         scene.collide.resize(scene.instances.len(), Collide::None);
+        if mapped {
+            scene.sources.push(Source {
+                id: CIRCUIT_SOURCE.to_owned(),
+                instances: first..scene.instances.len() as u32,
+            });
+        }
         scene.ground = Some(built.ground);
         gameplay.game.blockers.extend(built.blockers);
     }
@@ -1138,6 +1219,7 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
 
     scene.collide.resize(scene.instances.len(), Collide::Auto);
     if let Some((size, cells, height, shore_x)) = terrain {
+        let first = scene.instances.len() as u32;
         let ground_layer = if land_plan.banded {
             crate::land::add(
                 &mut scene,
@@ -1156,7 +1238,14 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
         // The ground collides as a grid of heights, and water not at all.
         scene.collide.resize(scene.instances.len(), Collide::None);
         scene.ground = Some(ground_heights(size, height, shore_x));
+        if mapped {
+            scene.sources.push(Source {
+                id: TERRAIN_SOURCE.to_owned(),
+                instances: first..scene.instances.len() as u32,
+            });
+        }
     }
+    scene.sources.sort_by_key(|source| source.instances.start);
     Ok((scene, warnings))
 }
 
@@ -1234,7 +1323,7 @@ mod tests {
                 path: "a/b.gltf".to_string(),
                 position: Vec3::new(1.0, 2.0, 3.0),
                 seat: None,
-                yaw_degrees: 90.0,
+                rotation: Vec3::new(0.0, 90.0, 0.0),
                 scale: 0.5,
                 collide: Collide::Auto,
                 skinned: false,
@@ -1263,13 +1352,13 @@ mod tests {
 
     #[test]
     fn seating_on_flat_ground_rests_the_lowest_point_on_it() {
-        let y = seat_height(&column(), Vec3::ZERO, 0.0, 1.0, 0.0, |_, _| 2.0);
+        let y = seat_height(&column(), Vec3::ZERO, Vec3::ZERO, 1.0, 0.0, |_, _| 2.0);
         assert!((y - 2.0).abs() < 1.0e-5);
     }
 
     #[test]
     fn burying_sinks_the_model_by_that_share_of_its_height() {
-        let y = seat_height(&column(), Vec3::ZERO, 0.0, 1.0, 0.2, |_, _| 0.0);
+        let y = seat_height(&column(), Vec3::ZERO, Vec3::ZERO, 1.0, 0.2, |_, _| 0.0);
         assert!(
             (y + 1.0).abs() < 1.0e-5,
             "the ring at height 1 is at ground level: {y}"
@@ -1279,7 +1368,7 @@ mod tests {
     #[test]
     fn seating_leaves_no_gap_on_a_slope() {
         let ground = |x: f32, _: f32| x * 0.5;
-        let y = seat_height(&column(), Vec3::ZERO, 0.0, 1.0, 0.2, ground);
+        let y = seat_height(&column(), Vec3::ZERO, Vec3::ZERO, 1.0, 0.2, ground);
         for point in &column()[..3] {
             assert!(
                 point.y + y <= ground(point.x, point.z) + 1.0e-5,
@@ -1296,7 +1385,7 @@ mod tests {
                 path: "kit.gltf".to_string(),
                 name: "wall_01".to_string(),
                 position: Vec3::new(1.0, 2.0, 3.0),
-                yaw_degrees: 90.0,
+                rotation: Vec3::new(0.0, 90.0, 0.0),
                 scale: 2.0,
                 collide: Collide::Auto,
             })
@@ -1474,8 +1563,9 @@ mod tests {
         assert_eq!(game.actors[0].instances, Some(2..4));
         assert_eq!(game.actors[1].instances, Some(4..6));
         let second_node = scene.instances[3].transform.transform_point3(Vec3::ZERO);
-        let expected = placement_transform(Vec3::new(20.0, 0.0, 3.0), 90.0, 2.0)
-            .transform_point3(Vec3::new(0.0, 2.0, 0.0));
+        let expected =
+            placement_transform(Vec3::new(20.0, 0.0, 3.0), Vec3::new(0.0, 90.0, 0.0), 2.0)
+                .transform_point3(Vec3::new(0.0, 2.0, 0.0));
         assert!(second_node.abs_diff_eq(expected, 1.0e-3), "{second_node}");
 
         // And it plays: drawn first where it was baked.

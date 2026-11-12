@@ -1655,6 +1655,13 @@ mod native {
                                 }
                             }
                         }
+                        // While someone is played, and not left to fly the camera, the keys
+                        // are the game's: C changes a car's view, so it is not the weather's.
+                        let played = self
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.play.as_ref())
+                            .is_some_and(|(play, _)| play.play.has_player() && !play.play.flying());
                         match event.state {
                             ElementState::Pressed => {
                                 self.keys.insert(code);
@@ -1662,11 +1669,11 @@ mod native {
                                     self.set_mouse_capture(false);
                                 }
                                 // Cycles through the built-in weather, easing into each.
-                                if code == KeyCode::KeyC {
+                                if code == KeyCode::KeyC && !played {
                                     self.next_weather();
                                 }
                                 // Moves the clock on an hour, starting one if there is none.
-                                if code == KeyCode::KeyT {
+                                if code == KeyCode::KeyT && !played {
                                     let fixed = self.options.environment;
                                     let clock = self.options.clock.get_or_insert_with(|| {
                                         let mut clock = DayClock::new(TimeOfDay::default(), 0.0);

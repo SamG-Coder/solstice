@@ -19,6 +19,8 @@
 //! files of exactly this kind, in `weather/` beside this crate. [`Weather::observed`] turns a
 //! live report of cloud cover and wind into a state, so the sky can follow real weather.
 
+use crate::text::number;
+
 /// What the sky is doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Weather {
@@ -368,13 +370,6 @@ impl WeatherCycle {
         self.current = options[(self.random() * 1.999) as usize];
         self.remaining = self.dwell();
         Some(self.current)
-    }
-}
-
-fn number(text: &str) -> Result<f32, String> {
-    match text.parse::<f32>() {
-        Ok(value) if value.is_finite() => Ok(value),
-        _ => Err(format!("{text:?} is not a number")),
     }
 }
 

@@ -142,6 +142,9 @@ pub const ENTRY_POINTS: &[&str] = &[
     "vg/raster_hw_fragment.wgsl",
     "vg/raster_sw.wgsl",
     "vg/raster_sw_depth.wgsl",
+    "vg/raster_sw_masked.wgsl",
+    "vg/raster_sw_depth_masked.wgsl",
+    "vg/raster_hw_masked.wgsl",
     "vg/shadow_merge.wgsl",
     "vg/speck_depth.wgsl",
     "vg/hzb_seed.wgsl",
@@ -408,6 +411,43 @@ mod tests {
             .filter_map(|path| validate(path).err())
             .collect();
         assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// Every shader the renderer makes a module of is an entry point, so the tests above see it.
+    /// Only calls that name their shader as a literal are seen; one with a path in a variable
+    /// must be listed by hand.
+    #[test]
+    fn every_shader_made_into_a_module_is_listed() {
+        let mut unlisted = Vec::new();
+        let mut folders = vec![std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ))];
+        while let Some(folder) = folders.pop() {
+            for entry in std::fs::read_dir(&folder).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    folders.push(path);
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for call in ["module(", "module_for("] {
+                    for (at, _) in text.match_indices(call) {
+                        // The first string after the call, within its arguments, is the path.
+                        let rest = &text[at + call.len()..];
+                        let Some(open) = rest[..rest.len().min(160)].find('"') else {
+                            continue;
+                        };
+                        let name = &rest[open + 1..];
+                        let name = &name[..name.find('"').unwrap()];
+                        if name.ends_with(".wgsl") && !ENTRY_POINTS.contains(&name) {
+                            unlisted.push(format!("{}: {name}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(unlisted.is_empty(), "not in ENTRY_POINTS: {unlisted:?}");
     }
 
     /// Every shader `module_for` is used on, in the form scenes with nothing skinned get.

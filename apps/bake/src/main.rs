@@ -11,7 +11,14 @@
 //! bake --plants [--only] [--species FILE.species]... [--grass FILE.grass]... [--texture-size N] [--output FILE]
 //! bake --check-character CHARACTER.glb [--roles RIG.roles]
 //! bake --scene SCENE.txt --show-collision [--output FILE]
+//! bake --project SCENE.scene [--texture-size N] [--output FILE]
+//! bake --convert SCENE.txt
 //! ```
+//!
+//! `--project` bakes a scene of an editor project (`docs/editor.md`), to the project's
+//! `build/SCENE.solstice` unless `--output` says otherwise. `--convert` bakes nothing: it writes
+//! a scene's text as a project's `SCENE.scene` beside it, and lists it in the `solstice.project`
+//! there.
 //!
 //! `--check-character` bakes nothing: it checks a rigged character as the export tool wrote it
 //! (`tools/blender/solstice_export.py`), prints what it holds and what is wrong with it, and
@@ -30,6 +37,7 @@ mod gallery;
 mod land;
 mod meshes;
 mod plants;
+mod project;
 mod scene;
 mod scene_file;
 
@@ -44,6 +52,12 @@ struct Options {
     output: PathBuf,
     gltf: Option<PathBuf>,
     scene_file: Option<PathBuf>,
+    /// A scene of an editor project.
+    project_scene: Option<PathBuf>,
+    /// A scene's text to convert into a project's scene.
+    convert: Option<PathBuf>,
+    /// Whether `--output` was given.
+    output_given: bool,
     import: ImportOptions,
     /// Replaces the size a scene file asks for.
     scene_texture_size: Option<u32>,
@@ -129,6 +143,9 @@ fn parse_args() -> Result<Options, String> {
         output: PathBuf::from("assets/temple.solstice"),
         gltf: None,
         scene_file: None,
+        project_scene: None,
+        convert: None,
+        output_given: false,
         import: ImportOptions::default(),
         scene_texture_size: None,
         raw_textures: false,
@@ -157,8 +174,13 @@ fn parse_args() -> Result<Options, String> {
                     other => return Err(format!("unknown quality: {other}")),
                 };
             }
-            "--output" => options.output = PathBuf::from(value()?),
+            "--output" => {
+                options.output = PathBuf::from(value()?);
+                options.output_given = true;
+            }
             "--scene" => options.scene_file = Some(PathBuf::from(value()?)),
+            "--project" => options.project_scene = Some(PathBuf::from(value()?)),
+            "--convert" => options.convert = Some(PathBuf::from(value()?)),
             "--check-character" => options.check_character = Some(PathBuf::from(value()?)),
             "--roles" => options.roles = Some(PathBuf::from(value()?)),
             "--gltf" => options.gltf = Some(PathBuf::from(value()?)),
@@ -234,8 +256,16 @@ fn load_scene(options: &Options) -> Result<SceneAsset, String> {
     if options.gallery {
         return Ok(gallery::build(options.scene_texture_size.unwrap_or(1024)));
     }
-    if let Some(path) = &options.scene_file {
-        let (scene, mut warnings) = scene_file::build(path, options.scene_texture_size)?;
+    if let Some(path) = options
+        .scene_file
+        .as_ref()
+        .or(options.project_scene.as_ref())
+    {
+        let (scene, mut warnings) = if options.scene_file.is_some() {
+            scene_file::build(path, options.scene_texture_size)?
+        } else {
+            project::build(path, options.scene_texture_size)?
+        };
         warnings.sort();
         warnings.dedup();
         for warning in warnings {
@@ -307,7 +337,22 @@ fn check_character(path: &std::path::Path, roles: Option<&PathBuf>) -> Result<()
 }
 
 fn main() -> Result<(), String> {
-    let options = parse_args()?;
+    let mut options = parse_args()?;
+    if options.scene_file.is_some() && options.project_scene.is_some() {
+        return Err("give --scene or --project, not both".into());
+    }
+    if let Some(path) = &options.convert {
+        let written = project::convert_file(path)?;
+        println!("wrote {}", written.display());
+        return Ok(());
+    }
+    if let (Some(scene), false) = (&options.project_scene, options.output_given) {
+        let stem = scene.file_stem().ok_or("--project takes a .scene file")?;
+        options.output = project::project_folder(scene)?
+            .join("build")
+            .join(stem)
+            .with_extension("solstice");
+    }
     if let Some(path) = &options.check_character {
         return check_character(path, options.roles.as_ref());
     }

@@ -539,6 +539,29 @@ pub fn groups_for(count: u32, group_size: u32) -> u32 {
     count.div_ceil(group_size)
 }
 
+/// A GPU for the crate's own tests, or `None`, said on stderr, where there is none to have.
+///
+/// Devices are made one at a time: made at once from many test threads, the Vulkan loader,
+/// validation layer and driver on Windows can crash or deadlock.
+#[cfg(test)]
+pub(crate) fn test_gpu() -> Option<Gpu> {
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = MAKING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    pollster::block_on(Gpu::request(
+        &instance,
+        None,
+        wgpu::PowerPreference::HighPerformance,
+    ))
+    .map_err(|error| eprintln!("skipping GPU test: {error}"))
+    .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,6 +40,7 @@ pub mod shadow;
 pub mod skin;
 pub mod sky;
 pub mod streaming;
+mod text;
 pub mod time_of_day;
 pub mod vg;
 pub mod wind;

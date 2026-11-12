@@ -2,8 +2,8 @@
 //! blade in it. The GPU tests pass trivially, with a note, if no GPU is available.
 
 use super::*;
+use crate::gpu::test_gpu as request_gpu;
 use crate::scene::INSTANCE_SWAYS;
-use std::sync::Arc;
 
 fn weather(speed: f32, from: f32, gusts: f32, turbulence: f32) -> Weather {
     Weather {
@@ -215,28 +215,6 @@ fn records_lay_out_as_their_shader_twins() {
         FieldParams,
         [now, previous, origin, texel, sway, fade, _pad]
     );
-}
-
-fn request_gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    match pollster::block_on(Gpu::request(
-        &instance,
-        None,
-        wgpu::PowerPreference::HighPerformance,
-    )) {
-        Ok(gpu) => {
-            gpu.device
-                .on_uncaptured_error(Arc::new(|error: wgpu::Error| panic!("GPU error: {error}")));
-            Some(gpu)
-        }
-        Err(error) => {
-            eprintln!("skipping GPU test: {error}");
-            None
-        }
-    }
 }
 
 /// Reads `buffer`'s first `bytes` back from the GPU.

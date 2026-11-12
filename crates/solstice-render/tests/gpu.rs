@@ -19,25 +19,21 @@ use std::sync::{Arc, Mutex};
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 fn request_gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::PRIMARY,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    match pollster::block_on(Gpu::request(
-        &instance,
-        None,
-        wgpu::PowerPreference::HighPerformance,
-    )) {
-        Ok(gpu) => Some(gpu),
-        Err(error) => {
-            eprintln!("skipping GPU test: {error}");
-            None
-        }
-    }
+    request_gpu_with(None)
 }
 
 /// A GPU asking for no more than `limits`, as a small one is given, or `None` if there is none.
 fn request_gpu_within(limits: &wgpu::Limits) -> Option<Gpu> {
+    request_gpu_with(Some(limits))
+}
+
+/// Devices are made one at a time: made at once from many test threads, the Vulkan loader,
+/// validation layer and driver on Windows can crash or deadlock.
+fn request_gpu_with(limits: Option<&wgpu::Limits>) -> Option<Gpu> {
+    static MAKING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = MAKING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -46,7 +42,7 @@ fn request_gpu_within(limits: &wgpu::Limits) -> Option<Gpu> {
         &instance,
         None,
         wgpu::PowerPreference::HighPerformance,
-        Some(limits),
+        limits,
     ))
     .map_err(|error| eprintln!("skipping GPU test: {error}"))
     .ok()

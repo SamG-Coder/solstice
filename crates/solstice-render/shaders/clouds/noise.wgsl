@@ -9,6 +9,8 @@
 // weather (512^2): R is where cloud can form, in clumps. G varies the kind of cloud from place to
 //   place. B is long, fibrous streaks for cirrus.
 
+#include "common/math.wgsl"
+
 @group(0) @binding(0) var volume_out: texture_storage_3d<rgba8unorm, write>;
 @group(0) @binding(1) var map_out: texture_storage_2d<rgba8unorm, write>;
 
@@ -102,10 +104,6 @@ fn worley_fbm(uvw: vec3f, period: i32, seed: u32) -> f32 {
     return worley(uvw * f32(period), period, seed) * 0.625
         + worley(uvw * f32(period * 2), period * 2, seed + 1u) * 0.25
         + worley(uvw * f32(period * 4), period * 4, seed + 2u) * 0.125;
-}
-
-fn remap(x: f32, low: f32, high: f32, new_low: f32, new_high: f32) -> f32 {
-    return new_low + (x - low) / (high - low) * (new_high - new_low);
 }
 
 // Spreads a value whose 2nd and 98th percentiles are `low` and `high` over 0..1. Each kind of
