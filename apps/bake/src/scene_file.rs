@@ -255,10 +255,18 @@ fn parse_line(line: &str) -> Result<Option<Command>, String> {
                 glam::Vec2::new(number(0)?, number(1)?),
                 glam::Vec2::new(number(2)?, number(3)?),
             );
+            let level = number(4)?;
+            // The viewer drops a pond with a corner or level that isn't a number; a bake says so.
+            if !(a.is_finite() && b.is_finite() && level.is_finite()) {
+                return Err("a pond's corners and level must be finite numbers".into());
+            }
+            if a.x == b.x || a.y == b.y {
+                return Err("a pond's corners must differ along both x and z".into());
+            }
             Command::Pond {
                 min: a.min(b),
                 max: a.max(b),
-                level: number(4)?,
+                level,
                 water: values.get(5).map(|water| water.to_string()),
             }
         }
@@ -886,6 +894,10 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
                 water,
             }) => {
                 let still = scene.still_water.get_or_insert_with(StillWater::default);
+                // Twin of `MAX_PONDS` in the renderer, which draws no more.
+                if still.ponds.len() == 8 {
+                    return Err("a scene has at most 8 ponds".into());
+                }
                 still.ponds.push([min.x, min.y, max.x, max.y, level]);
                 if let Some(water) = water {
                     // As a sea's: a file's text travels with the scene, a built-in goes by name.
@@ -1300,6 +1312,9 @@ mod tests {
             })
         );
         assert!(parse_line("pond 0 0 10 5").is_err());
+        assert!(parse_line("pond nan 0 10 5 0.2").is_err());
+        assert!(parse_line("pond 0 0 10 5 inf").is_err());
+        assert!(parse_line("pond 0 0 0 5 0.2").is_err());
         assert!(parse_line("pond 0 0 10 5 0.2 coastal more").is_err());
     }
 

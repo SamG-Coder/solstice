@@ -532,11 +532,14 @@ impl WebViewer {
     }
 
     /// Lays still water over the scene: ponds written `x0,z0,x1,z1,level`, with `;` between
-    /// them. Returns false, changing nothing, if they can't be read.
+    /// them, in place of the scene's own. Returns false, changing nothing, if they can't be
+    /// read. Naming none, as `?ponds=;` does, keeps the scene's own, as the native viewer does.
     pub fn set_ponds(&mut self, ponds: &str) -> bool {
         match solstice_render::Pond::parse_list(ponds) {
             Ok(ponds) => {
-                self.renderer.set_ponds(&ponds);
+                if !ponds.is_empty() {
+                    self.renderer.set_ponds(&ponds);
+                }
                 true
             }
             Err(error) => {

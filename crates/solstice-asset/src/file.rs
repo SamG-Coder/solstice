@@ -851,7 +851,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
                 return Err(DecodeError::BadStillWater);
             }
             let (ponds, text) = rest.split_at(numbers);
-            let ponds = ponds
+            let ponds: Vec<[f32; 5]> = ponds
                 .chunks_exact(20)
                 .map(|pond| {
                     std::array::from_fn(|k| {
@@ -859,6 +859,9 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
                     })
                 })
                 .collect();
+            if ponds.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(DecodeError::BadStillWater);
+            }
             still_water = Some(crate::scene::StillWater {
                 ponds,
                 water: String::from_utf8(text.to_vec()).map_err(|_| DecodeError::BadStillWater)?,
@@ -1572,6 +1575,15 @@ mod tests {
             decode(&encode(&sample_scene())).unwrap().scene.still_water,
             None
         );
+        // A pond that isn't a number is a damaged file, not water to draw.
+        loaded.scene.still_water = Some(crate::scene::StillWater {
+            ponds: vec![[0.0, 0.0, f32::NAN, 1.0, 0.0]],
+            water: String::new(),
+        });
+        assert!(matches!(
+            decode(&encode(&loaded)),
+            Err(DecodeError::BadStillWater)
+        ));
     }
 
     #[test]
