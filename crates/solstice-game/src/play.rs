@@ -365,7 +365,8 @@ impl Play {
                 drive::asked(world.input())
             };
             let reset = !away && world.input().pressed("reset");
-            if !away && world.input().pressed("autopilot") {
+            // With no circuit there is nothing to drive round: the key does nothing.
+            if !away && circuit.is_some() && world.input().pressed("autopilot") {
                 itself = !itself;
                 last_at = None;
                 // The driver it is handed to changes gear itself, whatever gearbox the
