@@ -36,6 +36,9 @@
 // Measured leaf spectra transmit about as much as they reflect across visible light (Jacquemoud
 // and Ustin 2019), slightly less towards blue.
 const FOLIAGE_TRANSMITTANCE: vec3f = vec3f(0.8, 0.8, 0.6);
+// The share of a flash's illuminance that the whole lit cloud deck sends down onto a surface,
+// besides what comes straight from the flash, as a Lambertian albedo-weighted term.
+const FLASH_DECK: f32 = 0.12;
 
 // A short ray through the depth buffer towards the sun. Catches the small-scale shadowing
 // of dense geometry, which is finer than any shadow map texel.
@@ -165,7 +168,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let pixel_angle = length(direction - normalize(next.xyz / next.w - frame.camera_position));
             sky += sky_bodies(direction, pixel_angle);
         }
-        sky = sky * cloud.a + cloud.rgb;
+        sky = sky * cloud.a + cloud.rgb + flash_glow(direction);
         textureStore(output, pixel, vec4f(sky, 1.0));
         return;
     }
@@ -203,6 +206,22 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let shadow = sun_shadow(world, -normal, distance, noise);
         let transmitted = surface.diffuse * FOLIAGE_TRANSMITTANCE / PI * -sun_facing;
         color += transmitted * sun_irradiance_at(world) * shadow;
+    }
+
+    // A flash of lightning: its light comes from the cloud it lit, that way, through whatever
+    // stands between, which a short trace through the GI volume's distance field finds; and
+    // from the whole lit cloud deck above, as the sky's light does. Only during a flash.
+    if clouds.flash.w > 0.0 {
+        let toward = clouds.flash.xyz;
+        let flash = FLASH_COLOR * clouds.flash.w;
+        if dot(normal, toward) > 0.0 {
+            // A ray that runs out of steps among surfaces got away only partly.
+            let blocked = trace_volume(world + normal * 0.25, toward, 0.1, 80.0, 24u);
+            let open = select(blocked.escaped, 0.0, blocked.hit);
+            color += shade_light(surface, view, toward) * flash * open;
+        }
+        let gi_open = textureLoad(gi_tex, pixel, 0).a;
+        color += surface.diffuse * flash * FLASH_DECK * (normal.y * 0.5 + 0.5) * gi_open;
     }
 
     // Local lights: those that reach this pixel's tile.

@@ -57,6 +57,8 @@ struct CloudUniform {
     enabled: f32,
     shadow_origin: [f32; 2],
     wind_direction: [f32; 2],
+    /// A flash of lightning: towards it from the camera, and the illuminance it gives the scene.
+    flash: [f32; 4],
 }
 
 /// What lighting passes need to see the clouds.
@@ -106,6 +108,8 @@ pub struct Clouds {
     enabled: bool,
     /// When set, the weather changes by itself.
     cycle: Option<WeatherCycle>,
+    /// The flash of lightning this frame, if any (`lightning.rs`).
+    flash: [f32; 4],
 }
 
 fn volume(gpu: &Gpu, label: &str, size: u32) -> wgpu::Texture {
@@ -351,6 +355,7 @@ impl Clouds {
             panorama_pass,
             screen_pipeline,
             current: weather,
+            flash: [0.0; 4],
             target: weather,
             transition_seconds: 0.0,
             wind_offset: Vec2::ZERO,
@@ -464,9 +469,17 @@ impl Clouds {
             enabled: if self.enabled { 1.0 } else { 0.0 },
             shadow_origin: corner.into(),
             wind_direction: wind.normalize_or(Vec2::X).into(),
+            flash: self.flash,
         };
         gpu.queue
             .write_buffer(&self.params, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// Sets the flash of lightning for this frame, from the next `update`.
+    pub fn set_flash(&mut self, flash: Option<crate::lightning::Flash>) {
+        self.flash = flash.map_or([0.0; 4], |f| {
+            [f.direction.x, f.direction.y, f.direction.z, f.illuminance]
+        });
     }
 
     /// Creates the on-screen targets for a render `size`, which skip pixels `depth` covers.
@@ -590,8 +603,27 @@ mod tests {
 
     #[test]
     fn the_uniform_matches_its_shader_twin() {
-        // Seventeen scalars and pairs, padded by WGSL to a multiple of 16 bytes.
-        assert_eq!(std::mem::size_of::<CloudUniform>(), 64);
+        crate::shaders::assert_twin!(
+            "lighting/deferred.wgsl",
+            "CloudParams",
+            CloudUniform,
+            [
+                wind_offset,
+                evolution,
+                coverage,
+                cloud_type,
+                base,
+                top,
+                density,
+                cirrus,
+                rain,
+                shadow_extent,
+                enabled,
+                shadow_origin,
+                wind_direction,
+                flash,
+            ]
+        );
     }
 
     #[test]

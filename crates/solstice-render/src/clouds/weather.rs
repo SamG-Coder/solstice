@@ -48,6 +48,8 @@ pub struct Weather {
     pub evolution: f32,
     /// How heavily it rains, `0..1`: darkens cloud bases and greys the air.
     pub rain: f32,
+    /// How often lightning strikes, in strikes a minute: 0 for none (`lightning.rs`).
+    pub thunder: f32,
 }
 
 /// The built-in states, by name, as text.
@@ -110,6 +112,7 @@ impl Weather {
             turbulence: 0.4,
             evolution: 1.0,
             rain: 0.0,
+            thunder: 0.0,
         }
     }
 
@@ -140,6 +143,7 @@ impl Weather {
                 "cirrus" => weather.cirrus = single()?.clamp(0.0, 1.0),
                 "evolution" => weather.evolution = single()?.max(0.0),
                 "rain" => weather.rain = single()?.clamp(0.0, 1.0),
+                "thunder" => weather.thunder = single()?.max(0.0),
                 "wind" => {
                     for word in rest {
                         let (key, value) = word
@@ -165,7 +169,7 @@ impl Weather {
     /// Writes this state in the form [`Weather::parse`] reads.
     pub fn to_text(&self) -> String {
         format!(
-            "coverage {}\ntype {}\nbase {}\nthickness {}\ndensity {}\ncirrus {}\nwind speed={} from={} gusts={} turbulence={}\nevolution {}\nrain {}\n",
+            "coverage {}\ntype {}\nbase {}\nthickness {}\ndensity {}\ncirrus {}\nwind speed={} from={} gusts={} turbulence={}\nevolution {}\nrain {}\nthunder {}\n",
             self.coverage,
             self.cloud_type,
             self.base,
@@ -177,7 +181,8 @@ impl Weather {
             self.gusts,
             self.turbulence,
             self.evolution,
-            self.rain
+            self.rain,
+            self.thunder,
         )
     }
 
@@ -198,6 +203,7 @@ impl Weather {
             wind_from: (self.wind_from + turn * t).rem_euclid(360.0),
             evolution: mix(self.evolution, to.evolution),
             rain: mix(self.rain, to.rain),
+            thunder: mix(self.thunder, to.thunder),
         }
     }
 
@@ -280,6 +286,12 @@ impl Weather {
             turbulence: if storm { 0.7 } else { 0.4 },
             evolution: 1.0 + rain,
             rain,
+            // Thunderstorms: 95 is slight or moderate, 96 to 99 heavy, with hail.
+            thunder: match code {
+                95 => 2.0,
+                96..=99 => 4.0,
+                _ => 0.0,
+            },
         }
     }
 }

@@ -446,6 +446,29 @@ impl WebViewer {
         self.clock.place.north = -degrees.to_radians();
     }
 
+    /// Thunder from strikes since the last call, for the page to sound, as JSON: a list of
+    /// `{delay, distance, loudness, rumble, ground}`, seconds until it is heard, metres off,
+    /// 0 to 1, seconds it rolls, and whether the bolt reached the ground.
+    pub fn take_thunder(&mut self) -> String {
+        let parts: Vec<String> = self
+            .renderer
+            .take_thunder()
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"delay\":{:.3},\"distance\":{:.0},\"loudness\":{:.3},\"rumble\":{:.2},\"ground\":{}}}",
+                    t.delay, t.distance, t.loudness, t.rumble, t.to_ground
+                )
+            })
+            .collect();
+        format!("[{}]", parts.join(","))
+    }
+
+    /// Makes lightning strike ahead on the next frame, whatever the weather.
+    pub fn strike_lightning(&mut self) {
+        self.renderer.strike_lightning();
+    }
+
     /// Names of the built-in weather, separated by commas.
     pub fn weather_names() -> String {
         Weather::names().collect::<Vec<_>>().join(",")

@@ -425,10 +425,37 @@ ready. Tests are mutation-checked as the particle steps were.
      surfaces soak in a minute of downpour and puddles more slowly; both dry after, faster in
      wind; the cover map lies under the camera; the uniforms match their shaders; rendered, a
      roof keeps the floor under it dry while the open floor soaks, and no rain falls under it.
-5. **Lightning and thunder.** Strikes, bolt, cloud flashes, the flash light and its shadow map,
-   held exposure, `thunder` in weather files, thunder sound in the page.
-   - Tests: strokes' timing and counts; thunder's delay is distance / 343 m/s; a wall throws a
-     shadow away from the bolt during a flash; nothing is dispatched between strikes.
+5. **Lightning and thunder.** *Built; in review.*
+   - **Strikes** (`lightning.rs`): a Poisson process at the weather's new `thunder` rate, in
+     strikes a minute (the storm has 3; `Weather::observed` gives 2 for code 95, 4 for 96–99).
+     A third reach the ground with a bolt, the rest light the cloud. Flashes fall 0.6–9 km
+     off. To the ground: one to five return strokes 30–90 ms apart, each a spike decaying over
+     about 45 ms, the last with a continuing current glowing for a quarter of a second.
+   - **The light** goes to every lighting pass through the clouds' uniform (`flash`):
+     - the sky and clouds glow towards the flash and a little everywhere, through
+       `sky_radiance`, so reflections, water, rain and the GI see it too;
+     - surfaces facing it are lit directly, shadowed by a trace through the GI volume's distance
+       field, with the lit cloud deck's light from above; the trace runs only during a flash;
+     - a flash is never brighter than twenty times the light already about, so by night it lights
+       the scene brilliantly, not to a white sheet, and by day it is a sharp flicker.
+   - **Exposure holds** while a flash lasts, as an eye stays dazzled.
+   - **The bolt** (`lightning/bolt.wgsl`): a jagged channel from the cloud base to the ground
+     with branches dying out, a white-hot core in a glow, blooming, hidden by what stands in
+     front, dimmed by the air.
+   - **Not done from the plan:** a shadow map from the bolt's direction. The distance-field
+     trace gives the same hard edge at the GI volume's resolution, costs nothing between
+     flashes, and works on phones; the clouds' own march is not lit from within either: the
+     flash's glow is laid over the clouds' light instead.
+   - **Thunder**, made in the page from filtered noise, no sound files: heard after the flash at
+     its distance over 343 m/s; a near bolt cracks then rumbles, a far one only rolls, longer.
+     Silent until "Sound (thunder)" is ticked under Extras. **L** calls a strike down ahead.
+   - The viewer's `--strike-at FRAME` makes one strike during a capture.
+   - Tests: no thunder, no lightning; strikes come about as often as asked; thunder follows
+     the flash by its distance at the speed of sound, far thunder longer and quieter; a flash
+     to the ground is one to five strokes 30–90 ms apart, each flashing and fading, its bolt
+     running from the cloud base to the ground; a nearer flash lights more, by the square of
+     the distance, but never beyond its cap; a strike can be asked for; weather files read and
+     write `thunder`.
 6. **Showing it.** README, captures in the Cove, Forest and Temple, costs, viewer controls
    (wind strength, rain, a "strike now" key).
 

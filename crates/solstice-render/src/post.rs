@@ -62,6 +62,8 @@ struct TonemapParams {
 
 /// Post-processing pipelines, created once per output format.
 pub struct PostProcess {
+    /// Holds exposure where it is, as an eye stays dazzled through a flash of lightning.
+    pub hold_exposure: bool,
     taa_layout: wgpu::BindGroupLayout,
     taa: wgpu::ComputePipeline,
     bloom_layout: wgpu::BindGroupLayout,
@@ -249,6 +251,7 @@ impl PostProcess {
             taa_layout,
             bloom_layout,
             exposure_layout,
+            hold_exposure: false,
             tonemap_layout,
             tonemap,
         }
@@ -433,7 +436,11 @@ impl PostProcess {
             &self.exposure_params,
             0,
             bytemuck::bytes_of(&ExposureParams {
-                delta_seconds,
+                delta_seconds: if self.hold_exposure {
+                    0.0
+                } else {
+                    delta_seconds
+                },
                 first_frame: u32::from(frame_index == 0),
                 compensation: 1.2,
                 brightest_average: daylight_illuminance * BRIGHTEST_AVERAGE_PER_SUN,

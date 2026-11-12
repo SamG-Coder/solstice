@@ -98,10 +98,29 @@ fn aerial_perspective_lit(color: vec3f, world: vec3f, view: vec3f, distance: f32
     return mix(haze_color * lit, color, transmittance);
 }
 
+// Lightning's light: bluish white, and how much of a flash's illuminance the glowing cloud
+// deck sends towards each direction of the sky, as radiance: about its illuminance over π,
+// gathered towards the flash.
+const FLASH_COLOR: vec3f = vec3f(0.82, 0.88, 1.0);
+const FLASH_SKY: f32 = 0.3;
+
+// The glow of the clouds lit from within by a flash of lightning, seen towards `direction`:
+// brightest towards the flash, and a little all over the cloud deck, which it lights from
+// above. Nothing between flashes.
+fn flash_glow(direction: vec3f) -> vec3f {
+    if clouds.flash.w <= 0.0 {
+        return vec3f(0.0);
+    }
+    let toward = max(dot(direction, clouds.flash.xyz), 0.0);
+    let lobe = 0.15 + 1.5 * pow(toward, 8.0);
+    let above = smoothstep(-0.1, 0.2, direction.y);
+    return FLASH_COLOR * clouds.flash.w * FLASH_SKY * lobe * above;
+}
+
 // Radiance of the sky towards `direction`, clouds included, excluding the sun disc.
 fn sky_radiance(direction: vec3f) -> vec3f {
     let cloud = textureSampleLevel(cloud_sky, repeat_sampler, sky_view_uv(direction), 0.0);
-    return clear_sky_radiance(direction) * cloud.a + cloud.rgb;
+    return clear_sky_radiance(direction) * cloud.a + cloud.rgb + flash_glow(direction);
 }
 
 // How much of the sun is above the horizon seen from `radius` (km from the planet's centre):

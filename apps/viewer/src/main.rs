@@ -3,7 +3,7 @@
 //! ```text
 //! viewer [SCENE] [--capture out.png] [--frames N] [--size WxH]
 //!        [--camera x,y,z,yaw,pitch] [--debug MODE] [--sun x,y,z] [--unpack-textures]
-//!        [--weather NAME|FILE [--weathered SECONDS]]
+//!        [--weather NAME|FILE [--weathered SECONDS]] [--strike-at FRAME]
 //!        [--limits webgpu]
 //! viewer [SCENE] --flyover PATH.txt --out DIR [--stability] [--no-taa] [--size WxH] [--quality Q] [--low-power]
 //! viewer [SCENE] --play [--fly] [--scripts DIR] [--capture out.png --frames N
@@ -286,6 +286,8 @@ mod native {
         /// Seconds the weather has already gone on for, as if they had passed: how long it has
         /// rained, for one.
         weathered: f32,
+        /// A frame of a capture on which lightning strikes, whatever the weather.
+        strike_at: Option<u32>,
         /// When set, the sun and moon follow the time of day instead of `environment`.
         clock: Option<DayClock>,
         /// An open sea, by name or file, and the level of its calm surface. Scenes with a sea of
@@ -505,6 +507,7 @@ mod native {
             stability: false,
             weather: Weather::default(),
             weathered: 0.0,
+            strike_at: None,
             ocean: None,
             sea_level: None,
             ponds: Vec::new(),
@@ -634,6 +637,10 @@ mod native {
                 "--pond" => {
                     let ponds = Pond::parse_list(&value()?).map_err(|e| format!("--pond: {e}"))?;
                     options.ponds.extend(ponds);
+                }
+                "--strike-at" => {
+                    options.strike_at =
+                        Some(value()?.parse().map_err(|e| format!("--strike-at: {e}"))?);
                 }
                 "--weathered" => {
                     options.weathered =
@@ -887,6 +894,9 @@ mod native {
         }
         let mut clock = options.clock;
         for frame in 0..options.frames {
+            if options.strike_at == Some(frame) {
+                renderer.strike_lightning();
+            }
             camera.position += camera.right() * options.capture_motion;
             if let Some(reader) = &mut reader {
                 reader.pump(&mut renderer);
