@@ -1175,14 +1175,21 @@ pub(crate) fn build_commands(
                 scene.collide[instance as usize] = *how;
             }
         }
-        for (range, owner) in ranges
+        let placements = &models[model];
+        let placed = placements
+            .whole
+            .iter()
+            .chain(placements.parts.iter().map(|(_, at)| at));
+        for ((range, owner), placement) in ranges
             .iter()
             .zip(collide.whole_owners.iter().chain(&collide.part_owners))
+            .zip(placed)
         {
             if let Some(id) = owner {
                 scene.sources.push(Source {
                     id: id.clone(),
                     instances: range.clone(),
+                    placement: *placement,
                 });
             }
         }
@@ -1210,6 +1217,7 @@ pub(crate) fn build_commands(
             scene.sources.push(Source {
                 id: CIRCUIT_SOURCE.to_owned(),
                 instances: first..scene.instances.len() as u32,
+                placement: Mat4::IDENTITY,
             });
         }
         scene.ground = Some(built.ground);
@@ -1242,6 +1250,7 @@ pub(crate) fn build_commands(
             scene.sources.push(Source {
                 id: TERRAIN_SOURCE.to_owned(),
                 instances: first..scene.instances.len() as u32,
+                placement: Mat4::IDENTITY,
             });
         }
     }

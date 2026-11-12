@@ -124,6 +124,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "post/exposure.wgsl",
     "post/bloom.wgsl",
     "post/tonemap.wgsl",
+    "editor/pick.wgsl",
 ];
 
 /// Entry-point files: the ones compiled into shader modules. Everything else exists
@@ -131,6 +132,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
 #[cfg(test)]
 pub const ENTRY_POINTS: &[&str] = &[
     "vg/cull.wgsl",
+    "editor/pick.wgsl",
     "wind/field.wgsl",
     "wind/sway_probe.wgsl",
     "rain/map.wgsl",

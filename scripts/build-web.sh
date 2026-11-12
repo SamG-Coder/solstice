@@ -26,13 +26,24 @@ cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-defau
 "$bindgen" --target web --no-typescript --out-dir dist/pkg   target/wasm32-unknown-unknown/release/solstice_viewer.wasm
 RUSTFLAGS="-C target-feature=+simd128"   cargo build --release --target wasm32-unknown-unknown -p viewer --lib --target-dir target/web-play
 "$bindgen" --target web --no-typescript --out-dir dist/play   target/web-play/wasm32-unknown-unknown/release/solstice_viewer.wasm
-cp apps/viewer/web/index.html dist/
+# The editor (docs/editor.md): a third build, of the plain viewer with the editor's API, which
+# only editor.html loads. Built after the plain one in the same folder, so only the viewer's own
+# crate builds again.
+cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-default-features --features editor
+"$bindgen" --target web --no-typescript --out-dir dist/editor-wasm target/wasm32-unknown-unknown/release/solstice_viewer.wasm
+cp apps/viewer/web/index.html apps/viewer/web/editor.html apps/viewer/web/loader.js dist/
+cp -r apps/viewer/web/editor dist/
 # Scene files are already compressed where it helps, part by part, so that the page can fetch
 # any part alone. Hard links keep big scenes from taking disk space twice.
 for scene in assets/*.solstice; do
   # None in CI: there, scenes are served by their own sites.
   [ -e "$scene" ] || continue
   ln -f "$scene" "dist/assets/$(basename "$scene")" 2>/dev/null || cp "$scene" "dist/assets/"
+done
+# Each scene's project scene, for the editor to open beside its bake.
+for project in assets/*.scene; do
+  [ -e "$project" ] || continue
+  cp "$project" dist/assets/
 done
 # Games kept as folders of text, to play on scenes baked without them (?game=NAME): each
 # folder in scenes/ with a scene.game of its own.

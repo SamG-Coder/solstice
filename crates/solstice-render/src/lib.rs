@@ -29,6 +29,7 @@ pub mod lightning;
 pub mod motion;
 pub mod ocean;
 pub mod particles;
+pub mod pick;
 pub mod post;
 pub mod profiler;
 pub mod rain;

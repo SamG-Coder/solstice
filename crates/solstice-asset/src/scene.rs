@@ -274,13 +274,18 @@ pub struct StillWater {
 }
 
 /// Which entity of an editor project made which instances (`docs/editor.md`), so the editor can
-/// turn a click on an instance into the thing to select.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// turn a click on an instance into the thing to select, and move what it made together.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Source {
     /// The entity's id in its project, or `terrain` or `circuit` for all that the scene's land
     /// made.
     pub id: String,
     pub instances: std::ops::Range<u32>,
+    /// Where the bake placed the entity: each of its instances is this times the instance's
+    /// place in the model. It holds what the project doesn't say, such as the height a model
+    /// was seated at on the ground, or the turn and scale an actor's file gives its mesh.
+    /// Identity for the land.
+    pub placement: glam::Mat4,
 }
 
 /// One text file of a scene's gameplay: an actor file, a script, the input actions, or the list

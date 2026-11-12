@@ -20,6 +20,9 @@ required-features = ["gameplay"]
 [features]
 default = ["gameplay"]
 gameplay = ["dep:solstice-game"]
+# The editor's page (docs/editor.md): picking, moving instances and the map of what made them.
+# Only `editor.html` loads a build with it.
+editor = []
 
 [dependencies]
 solstice-asset.workspace = true

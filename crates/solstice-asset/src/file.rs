@@ -38,8 +38,8 @@ const SEA_TAG: [u8; 4] = *b"SEA ";
 /// Still water: a count of ponds, five numbers for each, then the water's description as text.
 const POND_TAG: [u8; 4] = *b"POND";
 /// The optional section saying which entity of an editor project made which instances: how many
-/// [`Source`]s, then each one's first instance, its end, and its id's length and text. Written
-/// only for scenes baked from a project.
+/// [`Source`]s, then each one's first instance, its end, its placement (16 floats, by column),
+/// and its id's length and text. Written only for scenes baked from a project.
 const SOURCE_TAG: [u8; 4] = *b"SRCE";
 /// The optional section holding the scene's gameplay: how many [`GameFile`]s, then each one's
 /// name and text. Written only for scenes that have gameplay.
@@ -726,13 +726,13 @@ fn encode_gameplay(files: &[GameFile]) -> Vec<u8> {
 fn encode_sources(sources: &[Source]) -> Vec<u8> {
     let mut bytes = (sources.len() as u32).to_le_bytes().to_vec();
     for source in sources {
-        for number in [
-            source.instances.start,
-            source.instances.end,
-            source.id.len() as u32,
-        ] {
+        for number in [source.instances.start, source.instances.end] {
             bytes.extend_from_slice(&number.to_le_bytes());
         }
+        for value in source.placement.to_cols_array() {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(source.id.len() as u32).to_le_bytes());
         bytes.extend_from_slice(source.id.as_bytes());
     }
     bytes
@@ -747,17 +747,22 @@ fn decode_sources(mut bytes: &[u8], instances: u32) -> Result<Vec<Source>, Decod
         Ok(u32::from_le_bytes(*word))
     }
     let count = number(&mut bytes)? as usize;
-    // Each takes at least twelve bytes, so a count beyond that is a lie, not a large map.
-    if count > bytes.len() / 12 {
+    // Each takes at least 76 bytes, so a count beyond that is a lie, not a large map.
+    if count > bytes.len() / 76 {
         return Err(DecodeError::BadSources);
     }
     let mut sources = Vec::with_capacity(count);
     for _ in 0..count {
-        let (start, end, len) = (
-            number(&mut bytes)?,
-            number(&mut bytes)?,
-            number(&mut bytes)?,
-        );
+        let (start, end) = (number(&mut bytes)?, number(&mut bytes)?);
+        let mut columns = [0.0; 16];
+        for value in &mut columns {
+            *value = f32::from_bits(number(&mut bytes)?);
+        }
+        let placement = Mat4::from_cols_array(&columns);
+        if !placement.is_finite() {
+            return Err(DecodeError::BadSources);
+        }
+        let len = number(&mut bytes)?;
         let (id, rest) = bytes
             .split_at_checked(len as usize)
             .ok_or(DecodeError::BadSources)?;
@@ -768,6 +773,7 @@ fn decode_sources(mut bytes: &[u8], instances: u32) -> Result<Vec<Source>, Decod
         sources.push(Source {
             id: String::from_utf8(id.to_vec()).map_err(|_| DecodeError::BadSources)?,
             instances: start..end,
+            placement,
         });
     }
     Ok(sources)
@@ -1609,10 +1615,12 @@ mod tests {
             Source {
                 id: "a91fXq2b".into(),
                 instances: 0..1,
+                placement: Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0)),
             },
             Source {
                 id: "terrain".into(),
                 instances: 1..count,
+                placement: Mat4::IDENTITY,
             },
         ];
         loaded.scene.sources = sources.clone();
@@ -1636,6 +1644,7 @@ mod tests {
         let good = encode_sources(&[Source {
             id: "a91fXq2b".into(),
             instances: 0..2,
+            placement: Mat4::IDENTITY,
         }]);
         assert!(decode_sources(&good, 2).is_ok());
         // Cut short anywhere.
@@ -1651,11 +1660,18 @@ mod tests {
         huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(decode_sources(&huge, 2), Err(DecodeError::BadSources));
         let mut long = good.clone();
-        long[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        long[76..80].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(decode_sources(&long, 2), Err(DecodeError::BadSources));
         // An id that isn't text, and a range that runs backwards.
         let mut bad_text = good.clone();
-        bad_text[16] = 0xff;
+        bad_text[80] = 0xff;
+        assert_eq!(decode_sources(&bad_text, 2), Err(DecodeError::BadSources));
+        let mut not_a_number = good.clone();
+        not_a_number[12..16].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert_eq!(
+            decode_sources(&not_a_number, 2),
+            Err(DecodeError::BadSources)
+        );
         assert_eq!(decode_sources(&bad_text, 2), Err(DecodeError::BadSources));
         let mut backwards = good;
         backwards[4..8].copy_from_slice(&2u32.to_le_bytes());

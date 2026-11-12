@@ -6152,3 +6152,55 @@ fn indirect_light_leaves_no_trail_behind_what_moves() {
         "the ball left a trail in the indirect light: {trail:.1} on a floor of {floor:.1}"
     );
 }
+
+/// The editor's pick finds the instance under a point of the screen, and nothing on the sky.
+#[test]
+fn a_pick_finds_the_instance_under_a_point() {
+    let Some(gpu) = request_gpu() else { return };
+    let ball = build_virtual_mesh(&sphere(4), &BuildOptions::default());
+    // Three balls in a row across the view: instance 0 left, 1 in the middle, 2 right.
+    let scene = SceneAsset {
+        meshes: vec![ball],
+        materials: vec![white_material()],
+        instances: [-3.0, 0.0, 3.0]
+            .iter()
+            .map(|&x| instance(0, Mat4::from_translation(Vec3::new(x, 0.0, 0.0))))
+            .collect(),
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 10.0),
+        ..Default::default()
+    };
+    let size = 256;
+    let mut renderer = Renderer::new(&gpu, &paginate(&scene), FORMAT, Default::default());
+    let target = test_target(&gpu, size);
+    let view = target.create_view(&Default::default());
+    let mut pick = |x: f32, y: f32| {
+        renderer.request_pick(x, y);
+        for _ in 0..4 {
+            renderer.render(&gpu, &camera, &darkness(), &view, (size, size), 1.0 / 60.0);
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            if let Some(picked) = renderer.take_pick() {
+                return picked;
+            }
+        }
+        panic!("the pick at {x}, {y} never came back");
+    };
+    // A frame first, so the depth history exists.
+    pick(0.5, 0.5);
+    let middle = pick(0.5, 0.5);
+    assert_eq!(middle.instance, Some(1));
+    // The ball's near face is 9 m away: reversed depth is near / distance.
+    let distance = camera.near / middle.depth;
+    assert!(
+        (distance - 9.0).abs() < 0.1,
+        "the middle ball is {distance} m away"
+    );
+    // 3 m left of centre at 10 m, with a 55 degree view, is about 0.2 of the screen across.
+    assert_eq!(pick(0.21, 0.5).instance, Some(0));
+    assert_eq!(pick(0.79, 0.5).instance, Some(2));
+    assert_eq!(pick(0.5, 0.05).instance, None, "the sky above them");
+}
