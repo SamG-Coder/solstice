@@ -113,6 +113,8 @@ pub struct PagedScene {
     pub still_water: Option<crate::scene::StillWater>,
     /// The scene's gameplay files, if it has any.
     pub gameplay: Vec<GameFile>,
+    /// Which entity made which instances, for a scene baked from a project.
+    pub sources: Vec<crate::scene::Source>,
     /// Where its collision shapes are, if it has any: only those playing fetch them.
     pub collision: Option<crate::collision::CollisionIndex>,
     /// Longest root-to-leaf path over all meshes, which sets the traversal dispatch count.

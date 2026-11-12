@@ -273,6 +273,16 @@ pub struct StillWater {
     pub water: String,
 }
 
+/// Which entity of an editor project made which instances (`docs/editor.md`), so the editor can
+/// turn a click on an instance into the thing to select.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Source {
+    /// The entity's id in its project, or `terrain` or `circuit` for all that the scene's land
+    /// made.
+    pub id: String,
+    pub instances: std::ops::Range<u32>,
+}
+
 /// One text file of a scene's gameplay: an actor file, a script, the input actions, or the list
 /// of placed actors. Carried as it was written, by the name it was written under, so the scene
 /// file needs no knowledge of what is in it.
@@ -300,6 +310,8 @@ pub struct SceneAsset {
     pub still_water: Option<StillWater>,
     /// The scene's gameplay, if it has any. Empty for a scene that is only looked at.
     pub gameplay: Vec<GameFile>,
+    /// Which entity made which instances, for a scene baked from a project. Empty otherwise.
+    pub sources: Vec<Source>,
     /// How each instance collides, where the scene says. Instances past its end are
     /// [`Collide::Auto`](crate::collision::Collide::Auto).
     pub collide: Vec<crate::collision::Collide>,

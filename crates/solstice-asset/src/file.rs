@@ -21,7 +21,7 @@ use crate::paged::{
     PAGE_BYTES,
 };
 use crate::scene::{
-    Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, Sea,
+    Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, Sea, Source,
     TextureEncoding, TextureLayer, Viewpoint,
 };
 use crate::skeleton::{Bone, BoneTrack, Clip, Skeleton, MAX_BONES, NO_POSE};
@@ -37,6 +37,10 @@ const DEFLATE_LEVEL: u8 = 9;
 const SEA_TAG: [u8; 4] = *b"SEA ";
 /// Still water: a count of ponds, five numbers for each, then the water's description as text.
 const POND_TAG: [u8; 4] = *b"POND";
+/// The optional section saying which entity of an editor project made which instances: how many
+/// [`Source`]s, then each one's first instance, its end, and its id's length and text. Written
+/// only for scenes baked from a project.
+const SOURCE_TAG: [u8; 4] = *b"SRCE";
 /// The optional section holding the scene's gameplay: how many [`GameFile`]s, then each one's
 /// name and text. Written only for scenes that have gameplay.
 const GAME_TAG: [u8; 4] = *b"GAME";
@@ -71,6 +75,7 @@ pub enum DecodeError {
     BadSkin,
     BadGlow,
     BadCards,
+    BadSources,
     /// The file made for browsers, read where the whole scene's file is wanted.
     SplitForBrowsers,
 }
@@ -98,6 +103,7 @@ impl fmt::Display for DecodeError {
             Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
             Self::BadGlow => write!(f, "the scene's emissive maps are malformed"),
             Self::BadCards => write!(f, "the scene's cards are malformed"),
+            Self::BadSources => write!(f, "the map of the scene's entities is malformed"),
             Self::SplitForBrowsers => {
                 write!(
                     f,
@@ -306,6 +312,9 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
     }
     if !scene.gameplay.is_empty() {
         w.section(GAME_TAG, &encode_gameplay(&scene.gameplay));
+    }
+    if !scene.sources.is_empty() {
+        w.section(SOURCE_TAG, &encode_sources(&scene.sources));
     }
     if let Some(index) = &scene.collision {
         w.section(COLLISION_TAG, &encode_collision_index(index));
@@ -714,6 +723,56 @@ fn encode_gameplay(files: &[GameFile]) -> Vec<u8> {
     bytes
 }
 
+fn encode_sources(sources: &[Source]) -> Vec<u8> {
+    let mut bytes = (sources.len() as u32).to_le_bytes().to_vec();
+    for source in sources {
+        for number in [
+            source.instances.start,
+            source.instances.end,
+            source.id.len() as u32,
+        ] {
+            bytes.extend_from_slice(&number.to_le_bytes());
+        }
+        bytes.extend_from_slice(source.id.as_bytes());
+    }
+    bytes
+}
+
+fn decode_sources(mut bytes: &[u8], instances: u32) -> Result<Vec<Source>, DecodeError> {
+    fn number(bytes: &mut &[u8]) -> Result<u32, DecodeError> {
+        let (word, rest) = bytes
+            .split_first_chunk::<4>()
+            .ok_or(DecodeError::BadSources)?;
+        *bytes = rest;
+        Ok(u32::from_le_bytes(*word))
+    }
+    let count = number(&mut bytes)? as usize;
+    // Each takes at least twelve bytes, so a count beyond that is a lie, not a large map.
+    if count > bytes.len() / 12 {
+        return Err(DecodeError::BadSources);
+    }
+    let mut sources = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (start, end, len) = (
+            number(&mut bytes)?,
+            number(&mut bytes)?,
+            number(&mut bytes)?,
+        );
+        let (id, rest) = bytes
+            .split_at_checked(len as usize)
+            .ok_or(DecodeError::BadSources)?;
+        bytes = rest;
+        if start > end || end > instances {
+            return Err(DecodeError::BadSources);
+        }
+        sources.push(Source {
+            id: String::from_utf8(id.to_vec()).map_err(|_| DecodeError::BadSources)?,
+            instances: start..end,
+        });
+    }
+    Ok(sources)
+}
+
 fn decode_gameplay(mut bytes: &[u8]) -> Result<Vec<GameFile>, DecodeError> {
     fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Result<&'a [u8], DecodeError> {
         let (head, rest) = bytes
@@ -824,6 +883,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
     let mut sea = None;
     let mut still_water = None;
     let mut gameplay = Vec::new();
+    let mut sources = Vec::new();
     let mut collision = None;
     let mut skin = None;
     let mut clips = Vec::new();
@@ -868,6 +928,8 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
             });
         } else if tag == GAME_TAG {
             gameplay = decode_gameplay(&contents)?;
+        } else if tag == SOURCE_TAG {
+            sources = decode_sources(&contents, instances.len() as u32)?;
         } else if tag == COLLISION_TAG {
             collision = Some(decode_collision_index(&contents)?);
         } else if tag == SKIN_TAG {
@@ -940,6 +1002,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         sea,
         still_water,
         gameplay,
+        sources,
         collision,
         hierarchy_depth,
         source_triangles,
@@ -1536,6 +1599,36 @@ mod tests {
         bad(|s| s.external.as_mut().unwrap().clusters = 0);
         bad(|s| s.external.as_mut().unwrap().pinned_bytes += 1);
         bad(|s| s.pinned_data.push(0));
+    }
+
+    #[test]
+    fn the_map_of_entities_travels_with_its_scene() {
+        let mut loaded = sample_scene();
+        let count = loaded.scene.instances.len() as u32;
+        let sources = vec![
+            Source {
+                id: "a91fXq2b".into(),
+                instances: 0..1,
+            },
+            Source {
+                id: "terrain".into(),
+                instances: 1..count,
+            },
+        ];
+        loaded.scene.sources = sources.clone();
+        assert_eq!(decode(&encode(&loaded)).unwrap().scene.sources, sources);
+        // A scene not baked from a project has none, and writes no section for it.
+        assert!(decode(&encode(&sample_scene()))
+            .unwrap()
+            .scene
+            .sources
+            .is_empty());
+        // One that names instances the scene doesn't have is refused.
+        loaded.scene.sources[1].instances = 1..count + 1;
+        assert_eq!(
+            decode(&encode(&loaded)).err(),
+            Some(DecodeError::BadSources)
+        );
     }
 
     #[test]
