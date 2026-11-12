@@ -35,7 +35,7 @@ export const SETTINGS = {
   },
   sea: {
     description: "An open sea: its calm level, and a built-in ocean's name.",
-    fields: { level: { min: -100, max: 100, step: 0.1 }, ocean: { text: true } },
+    fields: { level: { min: -100, max: 100, step: 0.1 }, ocean: { names: ["coastal", "clear", "ocean", "murky"] } },
   },
 };
 
@@ -52,8 +52,8 @@ export function checkSetting(name, value) {
   for (const [key, field] of Object.entries(setting.fields)) {
     const v = value[key];
     if (v === undefined) return `\`${name}\` needs \`${key}\``;
-    if (field.text) {
-      if (typeof v !== "string" || !/^[\w.-]+$/.test(v)) return `\`${name}.${key}\` is a name with no spaces`;
+    if (field.names) {
+      if (!field.names.includes(v)) return `\`${name}.${key}\` is one of ${field.names.join(", ")}`;
       continue;
     }
     if (typeof v !== "number" || !Number.isFinite(v) || v < field.min || v > field.max) {

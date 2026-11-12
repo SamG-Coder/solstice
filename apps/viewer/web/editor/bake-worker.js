@@ -28,7 +28,11 @@ async function provideSurfaces(content, size) {
 
 onmessage = async ({ data: { id, scene, name, content } }) => {
   try {
-    ready ??= init();
+    // A start that failed, such as a fetch that didn't arrive, is tried again next time.
+    ready ??= init().catch((error) => {
+      ready = null;
+      throw error;
+    });
     await ready;
     const size = JSON.parse(scene).texture_size ?? 1024;
     await provideSurfaces(content, size);

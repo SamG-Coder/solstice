@@ -179,10 +179,9 @@ export class Details {
         for (const [key, field] of Object.entries(setting.fields)) {
           const set = (v) => this.editor.call("scene.set", { [name]: { ...value, [key]: v } });
           let input;
-          if (field.text) {
-            input = make("input", { type: "text", value: value[key] });
+          if (field.names) {
+            input = make("select", {}, field.names.map((n) => make("option", { value: n, textContent: n, selected: n === value[key] })));
             input.addEventListener("change", () => set(input.value));
-            input.addEventListener("keydown", (e) => e.stopPropagation());
           } else {
             input = numberField("·", value[key], field.step, (v) => {
               const clamped = Math.min(field.max, Math.max(field.min, field.integer ? Math.round(v) : v));

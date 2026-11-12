@@ -147,6 +147,8 @@ export class Commands {
           `no command \`${name}\`; solstice.help() lists them`);
       }
       const checked = check(name, command.args ?? {}, args ?? {});
+      // While a newly baked scene is put in place there is no viewer to act on: wait for it.
+      await this.context.whenReady?.();
       const outcome = await command.run(checked, this.context, by);
       const { step, result } = outcome && "step" in outcome ? outcome : { step: null, result: outcome };
       if (step) this.history.push({ ...step, by });
