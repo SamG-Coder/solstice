@@ -400,6 +400,7 @@ impl WaterSurface {
     /// Chooses this frame's patches for a camera at `camera`, over a sea at `sea_level`. The
     /// seabed map must have been placed for this frame first.
     /// `slopes` is the sea's table of unresolved slopes, from `spectrum::unresolved_slopes`.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         gpu: &Gpu,
