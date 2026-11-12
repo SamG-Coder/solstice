@@ -6001,9 +6001,11 @@ fn the_wind_ruffles_a_pond() {
         rain: 0.0,
         ..Weather::by_name("clear").unwrap()
     };
+    // At cloud height: half that blows near the water, still air, a gentle breeze of 3 m/s and
+    // a fresh one of 7, below the speed at which ripples stop growing.
     let still = render_ponds_in(&gpu, &camera, &[pond], None, wind(0.5));
-    let breezy = render_ponds_in(&gpu, &camera, &[pond], None, wind(10.0));
-    let gale = render_ponds_in(&gpu, &camera, &[pond], None, wind(40.0));
+    let breezy = render_ponds_in(&gpu, &camera, &[pond], None, wind(6.0));
+    let gale = render_ponds_in(&gpu, &camera, &[pond], None, wind(14.0));
     if let Ok(dir) = std::env::var("SOLSTICE_TEST_IMAGES") {
         for (name, p) in [("still", &still), ("gale", &gale)] {
             let mut ppm = format!(

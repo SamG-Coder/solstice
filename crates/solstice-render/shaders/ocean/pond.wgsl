@@ -71,7 +71,7 @@ const RIPPLE_HEIGHT: array<f32, 5> = array<f32, 5>(0.0022, 0.0013, 0.0007, 0.000
 // How hard the wind ruffles still water, against a breeze of this speed, 10 m up, in m/s; the
 // least ruffling still air leaves; and the most a gale raises on a pond.
 const RUFFLE_BREEZE: f32 = 5.0;
-const RUFFLE_STILL: f32 = 0.08;
+const RUFFLE_STILL: f32 = 0.15;
 const RUFFLE_MOST: f32 = 2.5;
 
 // The ripples' slope at `at`, for a pixel `footprint` metres across, and the mean square of the
