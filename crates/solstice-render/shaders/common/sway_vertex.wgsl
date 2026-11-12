@@ -175,10 +175,15 @@ fn tree_offset(w: WindParams, i: Instance, local: vec3f, world: vec3f, wind: vec
         let way = local.xz / max(length(local.xz), 1.0e-5);
         let phase = 2.5 * (3.0 * way.y - 4.0 * way.y * way.y * way.y) * cos(seed * 20.0)
             + 2.5 * way.x * sin(seed * 20.0) + 1.3 * sin(height * 0.8 + way.x * 2.0);
-        let branch_rate = 1.4 + 0.5 * seed;
+        // Branches bob slowly, about once in one to two seconds: they are long and springy, and
+        // only twigs move faster.
+        let branch_rate = 0.55 + 0.35 * seed;
         // Only beyond the trunk: its own bark, a short way from its axis, moves with it whole.
         let off_trunk = smoothstep(TRUNK_RADIUS, TRUNK_RADIUS * 3.0, reach);
-        let out = reach * sqrt(reach) * TREE_BRANCH * speed * off_trunk
+        // A breeze barely stirs them; the bob grows with the drag, the speed squared, until a
+        // fresh wind, then with the speed.
+        let stir = speed * min(speed / 10.0, 1.0);
+        let out = reach * sqrt(reach) * TREE_BRANCH * stir * off_trunk
             * (1.0 - smoothstep(far * TREE_BRANCH_REACH * 0.7, far * TREE_BRANCH_REACH, seen_from));
         offset += vec3f(along.x, 0.0, along.y) * out * (0.6 + 0.4 * sin(TAU * branch_rate * time + phase));
         offset.y += out * 0.5 * sin(TAU * branch_rate * 1.3 * time + phase * 1.3);
@@ -187,9 +192,10 @@ fn tree_offset(w: WindParams, i: Instance, local: vec3f, world: vec3f, wind: vec
     // Leaves flutter, each its own way: the phase turns over a few centimetres.
     if instance_flutters(i) && seen_from < far * TREE_FLUTTER_REACH {
         let q = world * 7.0;
-        let strength = TREE_FLUTTER * (0.15 + 0.85 * min(speed / 10.0, 1.5))
+        // Leaves only flutter hard in a stiff wind: by the drag, from almost nothing in a breeze.
+        let strength = TREE_FLUTTER * min(sq(speed / 10.0), 1.5)
             * (1.0 - smoothstep(far * TREE_FLUTTER_REACH * 0.6, far * TREE_FLUTTER_REACH, seen_from));
-        let f = TAU * 7.0 * time;
+        let f = TAU * (3.0 + 1.5 * seed) * time;
         offset += strength * vec3f(
             sin(f + q.x * 1.3 + q.y * 0.7),
             sin(f * 1.13 + q.z * 1.1 + q.x * 0.5),
