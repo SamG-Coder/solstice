@@ -112,6 +112,15 @@ impl Strike {
         self.brightness_at(self.age)
     }
 
+    /// The illuminance it gives the scene at its brightest.
+    pub fn peak_illuminance(&self) -> f32 {
+        let at_two_km = match self.kind {
+            Kind::ToGround => GROUND_FLASH,
+            Kind::InCloud => CLOUD_FLASH,
+        };
+        (at_two_km * (2000.0 / self.distance.max(NEAREST)).powi(2)).min(BRIGHTEST)
+    }
+
     /// The illuminance it gives the scene now, in the scene's units of light.
     pub fn illuminance(&self) -> f32 {
         let at_two_km = match self.kind {
@@ -223,6 +232,10 @@ impl Lightning {
             let asked = self.requested;
             self.requested = false;
             let strike = self.make_strike(weather, camera, facing, asked);
+            // A host that never sounds thunder keeps only the latest.
+            if self.thunder.len() >= 32 {
+                self.thunder.remove(0);
+            }
             self.thunder.push(Thunder {
                 delay: strike.distance / SPEED_OF_SOUND,
                 distance: strike.distance,
@@ -258,9 +271,13 @@ impl Lightning {
         self.strike.as_ref()
     }
 
-    /// Whether exposure should hold still: while a flash lasts, as an eye stays dazzled.
+    /// Whether exposure should hold still: while a flash bright enough to see lights the scene,
+    /// as an eye stays dazzled, through its strokes and a moment after.
     pub fn holds_exposure(&self) -> bool {
-        self.strike.is_some()
+        self.strike.as_ref().is_some_and(|s| {
+            let last = s.strokes.last().map_or(0.0, |l| l.0);
+            s.age < last + 0.3 && s.peak_illuminance() > 1.0
+        })
     }
 
     fn make_strike(
@@ -312,10 +329,10 @@ impl Lightning {
                     .collect()
             }
         };
+        // Into the ground: the land there is unknown, so the bolt runs below the camera's feet,
+        // and whatever stands in front hides where it ends.
         let bolt = match kind {
-            Kind::ToGround => {
-                self.grow_bolt(Vec3::new(ground.x, base, ground.y), camera.y.min(0.0))
-            }
+            Kind::ToGround => self.grow_bolt(Vec3::new(ground.x, base, ground.y), camera.y - 30.0),
             Kind::InCloud => Vec::new(),
         };
         Strike {

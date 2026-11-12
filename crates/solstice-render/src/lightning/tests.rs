@@ -149,3 +149,37 @@ fn weather_reads_and_writes_its_thunder() {
     assert!(Weather::by_name("storm").unwrap().thunder > 0.0);
     assert_eq!(Weather::by_name("fair").unwrap().thunder, 0.0);
 }
+
+#[test]
+fn a_strike_asked_for_falls_ahead() {
+    for (seed, facing) in [
+        (1, Vec3::X),
+        (2, Vec3::NEG_Z),
+        (3, Vec3::new(-0.6, -0.2, 0.77)),
+    ] {
+        let mut lightning = Lightning::new(seed);
+        lightning.strike_soon();
+        lightning.advance_facing(&storm(0.0), Vec3::ZERO, facing.normalize(), 1.0 / 60.0);
+        let strike = lightning.strike().expect("a strike");
+        assert_eq!(strike.kind, Kind::ToGround);
+        let way = Vec2::new(strike.at.x, strike.at.z).normalize();
+        let ahead = Vec2::new(facing.x, facing.z).normalize();
+        assert!(
+            way.angle_to(ahead).abs() <= 0.5 + 1.0e-4,
+            "{way} vs {ahead}"
+        );
+    }
+}
+
+#[test]
+fn a_far_faint_flash_holds_exposure_only_briefly() {
+    let mut lightning = Lightning::new(5);
+    lightning.strike_soon();
+    lightning.advance(&storm(0.0), Vec3::ZERO, 1.0 / 60.0);
+    assert!(lightning.holds_exposure());
+    // Long after its last stroke, while it is still dying away, it no longer does.
+    for _ in 0..80 {
+        lightning.advance(&storm(0.0), Vec3::ZERO, 1.0 / 60.0);
+    }
+    assert!(lightning.strike().is_some() && !lightning.holds_exposure());
+}

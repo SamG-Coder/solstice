@@ -35,10 +35,10 @@
 // Fraction of light a leaf or blade passes on to its far side, relative to what it reflects.
 // Measured leaf spectra transmit about as much as they reflect across visible light (Jacquemoud
 // and Ustin 2019), slightly less towards blue.
+const FOLIAGE_TRANSMITTANCE: vec3f = vec3f(0.8, 0.8, 0.6);
 // The share of a flash's illuminance that the whole lit cloud deck sends down onto a surface,
 // besides what comes straight from the flash, as a Lambertian albedo-weighted term.
 const FLASH_DECK: f32 = 0.12;
-const FOLIAGE_TRANSMITTANCE: vec3f = vec3f(0.8, 0.8, 0.6);
 
 // A short ray through the depth buffer towards the sun. Catches the small-scale shadowing
 // of dense geometry, which is finer than any shadow map texel.
@@ -215,10 +215,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let toward = clouds.flash.xyz;
         let flash = FLASH_COLOR * clouds.flash.w;
         if dot(normal, toward) > 0.0 {
+            // A ray that runs out of steps among surfaces got away only partly.
             let blocked = trace_volume(world + normal * 0.25, toward, 0.1, 80.0, 24u);
-            if !blocked.hit {
-                color += shade_light(surface, view, toward) * flash;
-            }
+            let open = select(blocked.escaped, 0.0, blocked.hit);
+            color += shade_light(surface, view, toward) * flash * open;
         }
         let gi_open = textureLoad(gi_tex, pixel, 0).a;
         color += surface.diffuse * flash * FLASH_DECK * (normal.y * 0.5 + 0.5) * gi_open;

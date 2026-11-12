@@ -6042,3 +6042,53 @@ fn the_wind_ruffles_a_pond() {
         "a breeze changed it by {breeze}, a gale by {blow}"
     );
 }
+
+/// The shelter by night in a storm, a frame after lightning strikes ahead if `strike`.
+fn render_flash(gpu: &Gpu, strike: bool) -> Vec<u8> {
+    let settings = RendererSettings {
+        temporal_accumulation: false,
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(gpu, &paginate(&shelter()), FORMAT, settings);
+    let mut storm = Weather::by_name("storm").unwrap();
+    // No strikes but the one asked for.
+    storm.thunder = 0.0;
+    renderer.set_weather(storm, 0.0);
+    let environment = Environment {
+        sun_direction: Vec3::new(0.3, 0.6, 0.4).normalize(),
+        sun_illuminance: 0.3,
+        ..Default::default()
+    };
+    let camera = beside_the_shelter();
+    let target = test_target(gpu, 128);
+    let view = target.create_view(&Default::default());
+    for frame in 0..40 {
+        if strike && frame == 38 {
+            renderer.strike_lightning();
+        }
+        renderer.render(gpu, &camera, &environment, &view, (128, 128), 1.0 / 60.0);
+        gpu.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+    }
+    read_pixels(gpu, &target, 128)
+}
+
+#[test]
+fn a_flash_of_lightning_lights_the_night() {
+    let Some(gpu) = request_gpu() else { return };
+    let dark = render_flash(&gpu, false);
+    let lit = render_flash(&gpu, true);
+    let bright = |p: &[u8], x: u32, y: u32| brightness(patch(p, 128, x, y, 3));
+    // The open floor in front, and the sky above, light up.
+    let (floor_dark, floor_lit) = (bright(&dark, 64, 112), bright(&lit, 64, 112));
+    assert!(
+        floor_lit > floor_dark * 1.5 + 5.0,
+        "the floor goes from {floor_dark} to {floor_lit}"
+    );
+    let (sky_dark, sky_lit) = (bright(&dark, 64, 4), bright(&lit, 64, 4));
+    assert!(
+        sky_lit > sky_dark + 5.0,
+        "the sky goes from {sky_dark} to {sky_lit}"
+    );
+}
