@@ -1661,9 +1661,7 @@ mod native {
                             .state
                             .as_ref()
                             .and_then(|s| s.play.as_ref())
-                            .is_some_and(|(play, _)| {
-                                play.play.has_player() && !play.play.flying()
-                            });
+                            .is_some_and(|(play, _)| play.play.has_player() && !play.play.flying());
                         match event.state {
                             ElementState::Pressed => {
                                 self.keys.insert(code);
