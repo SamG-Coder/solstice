@@ -692,3 +692,36 @@ fn a_far_tree_stands_still_and_a_calm_one_too() {
     );
     assert_eq!(offset(&none[0]), Vec3::ZERO);
 }
+
+#[test]
+fn a_trunk_sways_whole_and_does_not_wobble_about_its_axis() {
+    let Some(gpu) = request_gpu() else { return };
+    let wind = blown(&weather(30.0, 270.0, 0.0, 0.0), 60, 1.0 / 60.0);
+    let (field, _) = fill(&gpu, &wind, Vec2::ZERO, true, [40.0, 60.0]);
+    // Around a thick trunk, 0.45 m from its axis, at several heights.
+    let points: Vec<Vec3> = (1..=4)
+        .flat_map(|h| {
+            (0..8).map(move |k| {
+                let a = k as f32 * std::f32::consts::TAU / 8.0;
+                Vec3::new(a.cos() * 0.45, h as f32 * 3.0, a.sin() * 0.45)
+            })
+        })
+        .collect();
+    let moved = probe(
+        &gpu,
+        &field,
+        tree_words(false),
+        &points,
+        Vec3::new(0.0, 2.0, -20.0),
+    );
+    for ring in moved.chunks(8) {
+        let first = offset(&ring[0]);
+        for r in ring {
+            assert!(
+                (offset(r) - first).length() < 0.01,
+                "{} apart",
+                (offset(r) - first).length()
+            );
+        }
+    }
+}

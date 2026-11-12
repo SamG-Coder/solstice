@@ -131,6 +131,9 @@ const TREE_FLUTTER: f32 = 0.012;
 const TREE_FADE_REACH: f32 = 1.5;
 const TREE_BRANCH_REACH: f32 = 0.7;
 const TREE_FLUTTER_REACH: f32 = 0.35;
+// How far from a tree's axis its trunk reaches, flare included, in metres: branches bob only
+// beyond it.
+const TRUNK_RADIUS: f32 = 0.5;
 
 // A small hash of an instance's place in the world, so each tree keeps its own rhythm.
 fn instance_seed(i: Instance) -> f32 {
@@ -168,12 +171,14 @@ fn tree_offset(w: WindParams, i: Instance, local: vec3f, world: vec3f, wind: vec
     // Branches, each around the crown in its own phase: which way a branch points from the
     // trunk, and how high it is, set its phase, smoothly, so all of one branch moves together.
     let far = w.fade.y * TREE_FADE_REACH;
-    if seen_from < far * TREE_BRANCH_REACH && reach > 0.05 {
+    if seen_from < far * TREE_BRANCH_REACH && reach > TRUNK_RADIUS {
         let way = local.xz / max(length(local.xz), 1.0e-5);
         let phase = 2.5 * (3.0 * way.y - 4.0 * way.y * way.y * way.y) * cos(seed * 20.0)
             + 2.5 * way.x * sin(seed * 20.0) + 1.3 * sin(height * 0.8 + way.x * 2.0);
         let branch_rate = 1.4 + 0.5 * seed;
-        let out = reach * sqrt(reach) * TREE_BRANCH * speed
+        // Only beyond the trunk: its own bark, a short way from its axis, moves with it whole.
+        let off_trunk = smoothstep(TRUNK_RADIUS, TRUNK_RADIUS * 3.0, reach);
+        let out = reach * sqrt(reach) * TREE_BRANCH * speed * off_trunk
             * (1.0 - smoothstep(far * TREE_BRANCH_REACH * 0.7, far * TREE_BRANCH_REACH, seen_from));
         offset += vec3f(along.x, 0.0, along.y) * out * (0.6 + 0.4 * sin(TAU * branch_rate * time + phase));
         offset.y += out * 0.5 * sin(TAU * branch_rate * 1.3 * time + phase * 1.3);
