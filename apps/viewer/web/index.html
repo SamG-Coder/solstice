@@ -201,6 +201,7 @@
   <details id="extras">
     <summary>Extras</summary>
     <label><input id="live-weather" type="checkbox"> Real weather now</label>
+    <label><input id="sound" type="checkbox"> Sound (thunder)</label>
     <label>Place
       <select id="live-place">
         <option value="default">London</option>
@@ -956,8 +957,76 @@ async function main() {
   const keys = new Set();
   let lookYaw = 0;
   let lookPitch = 0;
-  addEventListener("keydown", (e) => keys.add(e.code));
+  addEventListener("keydown", (e) => {
+    keys.add(e.code);
+    // L calls down lightning ahead, whatever the weather.
+    if (e.code === "KeyL" && !e.repeat && !/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) {
+      viewer.strike_lightning();
+    }
+  });
   addEventListener("keyup", (e) => keys.delete(e.code));
+
+  // Thunder, made here from noise: no sound files. Browsers allow sound only after the visitor
+  // asks for it, so it stays silent until "Sound" is ticked. Each strike's thunder arrives
+  // after the flash by its distance at the speed of sound (the renderer works that out): a
+  // near bolt cracks, then rumbles; a far one only rolls, low and long, as its long channel's
+  // sound arrives from a spread of distances.
+  const thunder = {
+    context: null,
+    noise: null,
+    on: false,
+    enable(on) {
+      this.on = on;
+      if (on && !this.context) {
+        const AudioContext = window.AudioContext ?? window.webkitAudioContext;
+        if (!AudioContext) return;
+        this.context = new AudioContext();
+        // Two seconds of brown noise: a rumble's raw stuff.
+        const length = this.context.sampleRate * 2;
+        this.noise = this.context.createBuffer(1, length, this.context.sampleRate);
+        const data = this.noise.getChannelData(0);
+        let last = 0;
+        for (let i = 0; i < length; i++) {
+          last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02;
+          data[i] = last * 3.5;
+        }
+      }
+      if (this.context) on ? this.context.resume() : this.context.suspend();
+    },
+    hear(strikes) {
+      if (!this.on || !this.context) return;
+      for (const s of strikes) this.play(s);
+    },
+    play(s) {
+      const ctx = this.context;
+      const start = ctx.currentTime + Math.max(0, s.delay);
+      const out = ctx.createGain();
+      out.gain.value = 0.9 * s.loudness;
+      out.connect(ctx.destination);
+      const near = 1500 / (s.distance + 1500);
+      const parts = 4 + Math.round(s.rumble);
+      for (let k = 0; k < parts; k++) {
+        const crack = k === 0 && s.ground && s.distance < 2500;
+        const source = ctx.createBufferSource();
+        source.buffer = this.noise;
+        source.loop = true;
+        const filter = ctx.createBiquadFilter();
+        filter.type = "lowpass";
+        filter.frequency.value = crack ? 2200 : 90 + 450 * near * Math.random();
+        const gain = ctx.createGain();
+        const at = start + (k === 0 ? 0 : Math.random() * s.rumble * 0.7);
+        const lasts = crack ? 0.5 : 0.8 + Math.random() * s.rumble * 0.6;
+        const peak = crack ? 1 : 0.35 + 0.5 * Math.random();
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(peak, at + (crack ? 0.008 : 0.12 + 0.3 * Math.random()));
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + lasts);
+        source.connect(filter).connect(gain).connect(out);
+        source.start(at, Math.random() * 1.5);
+        source.stop(at + lasts + 0.05);
+      }
+    },
+  };
+  el("sound").addEventListener("change", (e) => thunder.enable(e.target.checked));
   addEventListener("blur", () => keys.clear());
   // A mouse's click captures the pointer; a touch has nothing to capture.
   canvas.addEventListener("click", (e) => {
@@ -1072,6 +1141,8 @@ async function main() {
     lookPitch = 0;
 
     // The moments the first image was submitted, and what it took, for measuring load times.
+    const heard = viewer.take_thunder();
+    if (heard !== "[]") thunder.hear(JSON.parse(heard));
     if (frames === 0) {
       performance.mark("first-frame");
       window.solstice.firstFrameBytes = file.bytesFetched;

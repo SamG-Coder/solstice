@@ -21,4 +21,7 @@ struct CloudParams {
     shadow_origin: vec2f,
     // Unit direction the wind blows towards, in X and Z.
     wind_direction: vec2f,
+    // A flash of lightning this frame (lightning.rs): towards it from the camera, and the
+    // illuminance it gives the scene, in the sun's units; 0 for none.
+    flash: vec4f,
 }

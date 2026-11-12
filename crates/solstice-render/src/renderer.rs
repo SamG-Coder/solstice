@@ -9,6 +9,7 @@ use crate::gpu::{Gpu, Target};
 use crate::lighting::{
     environment_group, environment_layout, DeferredLighting, LightShadows, LightTiles,
 };
+use crate::lightning::{BoltDraw, Lightning, Thunder};
 use crate::ocean::grid::PATCH_CELLS;
 use crate::ocean::pond::{Pond, PondWater};
 use crate::ocean::surface::{SceneViews, WaterSurface, WaterTargets};
@@ -52,6 +53,11 @@ const AUX_VISIBLE_CAPACITY: u64 = 1 << 21;
 const MASKED_VISIBLE_CAPACITY: u64 = 1 << 19;
 
 /// Assignment of view slots.
+/// The most a flash of lightning lights the scene, against the light already about it, and the
+/// least light counted as about by night, as a share of daylight.
+const FLASH_OVER_SCENE: f32 = 20.0;
+const NIGHT_LIGHT_SHARE: f32 = 0.0003;
+
 const SLOT_MAIN_FIRST: u32 = 0;
 const SLOT_MAIN_SECOND: u32 = 1;
 const SLOT_SHADOW: u32 = 2;
@@ -345,6 +351,9 @@ pub struct Renderer {
     wind_field: Option<WindField>,
     /// Rain in the air, where it lands and what it leaves on surfaces.
     rain: Rain,
+    /// Lightning, its bolts, and the thunder queued for the page.
+    lightning: Lightning,
+    bolt: BoltDraw,
     /// Counts the size-dependent resources made, so what binds them knows when they change.
     sized_generation: usize,
     /// The layout of the lighting bind group, for passes made after the renderer.
@@ -691,6 +700,8 @@ impl Renderer {
             wind: Wind::new(),
             wind_field,
             rain,
+            lightning: Lightning::default(),
+            bolt: BoltDraw::new(gpu, crate::particles::COLOR_FORMAT),
             sized_generation: 0,
             resolve,
             waterline,
@@ -841,6 +852,17 @@ impl Renderer {
     }
 
     /// The weather now, part way to its target while it changes.
+    /// Thunder from strikes since the last call, each with how long until it is heard: the page
+    /// sounds it (`lightning.rs`).
+    pub fn take_thunder(&mut self) -> Vec<Thunder> {
+        self.lightning.take_thunder()
+    }
+
+    /// Makes lightning strike on the next frame, whatever the weather.
+    pub fn strike_lightning(&mut self) {
+        self.lightning.strike_soon();
+    }
+
     /// The wind near the ground, as it is this frame.
     pub fn wind(&self) -> &Wind {
         &self.wind
@@ -1031,6 +1053,25 @@ impl Renderer {
 
         // Clouds come before anything lit: their shadows and their light in the sky feed it all.
         mark(&self.profiler, &mut encoder, section::CLOUDS);
+        // A flash of lightning lights the clouds, the sky and everything under them.
+        self.lightning.advance_facing(
+            &self.clouds.weather(),
+            camera.position,
+            camera.forward(),
+            delta_seconds.clamp(0.0, 0.25),
+        );
+        // Against the light already about: a flash by night lights the scene brilliantly, but
+        // not to a white sheet, as the eye sees it, and by day it is a sharp flicker.
+        let weather = self.clouds.weather();
+        let open = 1.0 - 0.8 * weather.coverage;
+        let about = (environment.sun_illuminance * environment.sun_direction.y.max(0.05) * open)
+            .max(environment.daylight() * NIGHT_LIGHT_SHARE);
+        let flash = self.lightning.flash(camera.position).map(|mut flash| {
+            flash.illuminance = flash.illuminance.min(FLASH_OVER_SCENE * about);
+            flash
+        });
+        self.clouds.set_flash(flash);
+        self.post.hold_exposure = self.lightning.holds_exposure();
         self.clouds.update(gpu, delta_seconds, camera.position);
         self.clouds
             .record_lighting(&mut encoder, &self.cloud_environment);
@@ -1329,6 +1370,18 @@ impl Renderer {
                 self.sized_generation,
             );
             self.particles.mark_reactive_dirty();
+        }
+        // A bolt, over everything.
+        if let Some(strike) = self.lightning.strike().filter(|_| debug == DebugView::Lit) {
+            self.bolt.record(
+                gpu,
+                &mut encoder,
+                &self.frame_uniform,
+                strike,
+                scene_color,
+                &sized.scene_depth,
+                self.sized_generation,
+            );
         }
 
         // From the lit scene to the display.
