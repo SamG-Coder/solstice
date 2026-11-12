@@ -834,6 +834,8 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     let mut land_plan = crate::land::Plan::default();
     let mut water = None;
     let mut circuit = None;
+    // Whether there has been a circuit, and a line of land, to refuse the two together.
+    let (mut has_land, mut has_circuit) = (false, false);
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
     let mut order: Vec<PathBuf> = Vec::new();
     let mut models: HashMap<PathBuf, ModelPlacements> = HashMap::new();
@@ -847,6 +849,31 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     for (number, line) in text.lines().enumerate() {
         let at = |e: String| format!("{}:{}: {e}", path.display(), number + 1);
         let command = parse_line(line).map_err(at)?;
+        // A circuit builds its own land, ground and planting: the lines that would build
+        // another, one inside it, are refused wherever in the file they come.
+        let lands = matches!(
+            command,
+            Some(
+                Command::Terrain { .. }
+                    | Command::Land { .. }
+                    | Command::Path { .. }
+                    | Command::Yard { .. }
+                    | Command::Clear { .. }
+                    | Command::Meadow(_)
+                    | Command::Wood { .. }
+                    | Command::Water { .. }
+            )
+        );
+        let circuits = matches!(command, Some(Command::Circuit(_)));
+        has_land |= lands;
+        has_circuit |= circuits;
+        if (lands || circuits) && has_land && has_circuit {
+            let word = line.split_whitespace().next().unwrap_or_default();
+            return Err(at(format!(
+                "`{word}` with `circuit`: a circuit builds its own land, so leave out `terrain`, \
+                 `water` and the land's lines"
+            )));
+        }
         match command {
             None => {}
             Some(Command::TextureSize(size)) => scene.texture_size = size,
@@ -1089,11 +1116,6 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     // A circuit's land, road and planting are built from its track, which also gives the
     // ground to drive on and the barriers to stop at.
     if let Some(size) = circuit {
-        // Both would be built, one inside the other, and the terrain's heights would be the
-        // ground cars drive on, not the circuit's.
-        if terrain.is_some() {
-            return Err("`circuit` builds its own land: leave out the `terrain` line".to_owned());
-        }
         let name = gameplay
             .game
             .track
@@ -1600,26 +1622,40 @@ mod tests {
         assert_eq!(scene.gameplay.len(), 1);
     }
 
+    /// A circuit's track: three points.
+    const TRACK: &[u8] = b"p 0 0 0 1 0 0 6 6
+p 0 0 50 1 0 0 6 6
+p 50 0 50 1 0 0 6 6
+";
+
     #[test]
     fn a_circuit_and_a_terrain_are_not_both_built() {
         let folder = Folder::with(&[
             (
                 "scene.txt",
-                b"terrain 400 64 0.3 52
-track c.track
-circuit 900
-",
+                b"terrain 400 64 0.3 52\ntrack c.track\ncircuit 900\n",
             ),
             (
                 "c.track",
-                b"p 0 0 0 1 0 0 6 6
-p 0 0 50 1 0 0 6 6
-p 50 0 50 1 0 0 6 6
-",
+                b"p 0 0 0 1 0 0 6 6\np 0 0 50 1 0 0 6 6\np 50 0 50 1 0 0 6 6\n",
             ),
         ]);
         let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
-        assert!(error.contains("leave out the `terrain` line"), "{error}");
+        assert!(error.contains("a circuit builds its own land"), "{error}");
+        assert!(error.contains(":3:"), "on the circuit's line: {error}");
+        // And the other way round, with a line of the land's after the circuit.
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"track c.track
+circuit 900
+wood 0 0 40 9
+",
+            ),
+            ("c.track", TRACK),
+        ]);
+        let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
+        assert!(error.contains(":3: `wood` with `circuit`"), "{error}");
     }
 
     #[test]

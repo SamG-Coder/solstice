@@ -104,3 +104,37 @@ pub fn grow(scene: &mut SceneAsset, plants: &[(&str, u32)]) -> Vec<Grown> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_is_placed_as_its_wood_then_its_leaves() {
+        let grown = Grown {
+            first_mesh: 10,
+            variants: 2,
+            bark: 4,
+            leaves: 5,
+        };
+        let mut scene = SceneAsset::default();
+        // Copy 3 of two is copy 1: meshes 12 and 13.
+        grown.place(&mut scene, 3, Mat4::IDENTITY);
+        let placed: Vec<(u32, u32)> = scene
+            .instances
+            .iter()
+            .map(|i| (i.mesh, i.material))
+            .collect();
+        assert_eq!(placed, [(12, 4), (13, 5)]);
+    }
+
+    #[test]
+    fn every_plant_material_sways_and_only_trees_sway_as_trees() {
+        for material in [bark(0), leaves(0), blades(0)] {
+            assert_ne!(material.flags & Material::SWAYS, 0);
+        }
+        assert_ne!(bark(0).flags & Material::TREE, 0);
+        assert_ne!(leaves(0).flags & Material::TREE, 0);
+        assert_eq!(blades(0).flags & Material::TREE, 0);
+    }
+}
