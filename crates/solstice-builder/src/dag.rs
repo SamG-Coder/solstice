@@ -5,7 +5,9 @@ use crate::group::{group_clusters, GroupInput, MAX_GROUP_SIZE, MAX_SKINNED_GROUP
 use crate::hierarchy::{build_hierarchy, Leaf};
 use crate::mesh::Mesh;
 use crate::partition::{partition_triangles, ClusterLimits};
-use crate::simplify::{simplify_skinned, Attribute, Corner, SkinCost, Triangle};
+use crate::simplify::{
+    simplify_skinned, simplify_skinned_each, Attribute, Corner, SkinCost, Triangle,
+};
 use crate::thin::{find_pieces, set_aside_wide_pieces, thin, NEW_POSITION};
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
@@ -274,25 +276,35 @@ fn build_level(
                         |v| shared[v as usize],
                     )
                 };
-                let mut simplified = simplify_to(target(rest.len()));
                 // A group's error is the largest of its parts'. Where thinning carries the
                 // reduction, the rest, such as a branch among twigs, goes only as far as it can
-                // without being the coarser part, so it never holds the twigs' detail back.
-                if !found.pieces.is_empty() {
+                // without being the coarser part, so it never holds the twigs' detail back: the
+                // first of these targets, deepest first, that stays within the twigs' error.
+                // One run gives all three, as simplifying to each alone would.
+                let simplified = if found.pieces.is_empty() {
+                    simplify_to(target(rest.len()))
+                } else {
                     let budget = thinning_error.max(welded_view.step);
-                    for ratio in [0.75, 0.9] {
-                        if simplified.error <= budget {
-                            break;
-                        }
-                        simplified = simplify_to(((rest.len() as f32 * ratio) as usize).max(1));
-                    }
-                    if simplified.error > budget {
-                        simplified = crate::simplify::Simplified {
+                    let at = |ratio: f32| ((rest.len() as f32 * ratio) as usize).max(1);
+                    let mut tries = simplify_skinned_each(
+                        &rest,
+                        &welded_view.positions,
+                        &welded_view.attributes,
+                        skin,
+                        &[at(0.9), at(0.75), target(rest.len())],
+                        |v| shared[v as usize],
+                    );
+                    let deepest = tries.pop().expect("three targets");
+                    let middle = tries.pop().expect("three targets");
+                    let shallow = tries.pop().expect("three targets");
+                    [deepest, middle, shallow]
+                        .into_iter()
+                        .find(|s| s.error <= budget)
+                        .unwrap_or_else(|| crate::simplify::Simplified {
                             triangles: rest.clone(),
                             error: 0.0,
-                        };
-                    }
-                }
+                        })
+                };
                 reduced.extend(simplified.triangles);
                 simplified_error = simplified.error;
             }

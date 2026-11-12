@@ -17,6 +17,7 @@
 use glam::{DVec2, DVec3, Vec2, Vec3};
 use rustc_hash::FxHashMap;
 use solstice_asset::PackedSkin;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -100,6 +101,19 @@ pub fn simplify_skinned(
     is_locked: impl Fn(u32) -> bool,
 ) -> Simplified {
     Simplifier::new(triangles, positions, attributes, skin, &is_locked).run(target_triangles)
+}
+
+/// [`simplify_skinned`] towards each of several targets, largest first, in one run: the result
+/// at each is what simplifying to it alone gives.
+pub fn simplify_skinned_each(
+    triangles: &[Triangle],
+    positions: &[Vec3],
+    attributes: &[Attribute],
+    skin: Option<SkinCost<'_>>,
+    targets: &[usize],
+    is_locked: impl Fn(u32) -> bool,
+) -> Vec<Simplified> {
+    Simplifier::new(triangles, positions, attributes, skin, &is_locked).run_to_each(targets)
 }
 
 /// A symmetric 4x4 error quadric plus the accumulated area weight.
@@ -201,6 +215,25 @@ impl Ord for Candidate {
     }
 }
 
+/// What is known about the triangles around a vertex, worked out once and kept until they change.
+/// A collapse's cost asks for these of the same few vertices tens of times, and working them out
+/// afresh each time was nearly all of a build's time.
+#[derive(Clone, Default)]
+struct Around {
+    /// Whether this holds anything yet.
+    ready: bool,
+    /// The vertex's version this was worked out at.
+    version: u32,
+    /// Neighbouring vertices, sorted.
+    neighbors: Vec<u32>,
+    /// The attributes the vertex's corners use, sorted.
+    wedges: Vec<u32>,
+    /// The neighbours across a UV seam, sorted.
+    seams: Vec<u32>,
+    /// The shading normal of the vertex's first corner.
+    normal: Vec3,
+}
+
 struct Simplifier<'a> {
     attributes: &'a [Attribute],
     skin: Option<SkinCost<'a>>,
@@ -222,6 +255,10 @@ struct Simplifier<'a> {
     alive_count: usize,
     heap: BinaryHeap<Candidate>,
     max_error: f64,
+    /// Raised whenever the triangles around a vertex change, or the corners of one of them.
+    versions: Vec<u32>,
+    /// What is known around each vertex, kept while its version holds.
+    around: RefCell<Vec<Around>>,
 }
 
 impl<'a> Simplifier<'a> {
@@ -310,13 +347,52 @@ impl<'a> Simplifier<'a> {
             alive_count,
             heap: BinaryHeap::new(),
             max_error: 0.0,
+            versions: vec![0; vertex_count],
+            around: RefCell::new(vec![Around::default(); vertex_count]),
         }
     }
 
-    fn run(mut self, target: usize) -> Simplified {
-        for v in 0..self.positions.len() as u32 {
-            self.push_edges_around(v);
+    /// Makes sure what is known around `v` is up to date.
+    fn fresh(&self, v: u32) {
+        let version = self.versions[v as usize];
+        {
+            let around = self.around.borrow();
+            let entry = &around[v as usize];
+            if entry.ready && entry.version == version {
+                return;
+            }
         }
+        let neighbors = self.find_neighbors(v);
+        let seams = self.find_seam_neighbors(v, &neighbors);
+        let entry = Around {
+            ready: true,
+            version,
+            wedges: self.find_wedges(v),
+            normal: self.find_normal(v),
+            neighbors,
+            seams,
+        };
+        self.around.borrow_mut()[v as usize] = entry;
+    }
+
+    /// Simplifies towards each of `targets`, largest first, and gives the result at each. The
+    /// collapses come in the same order whatever the target, so each result is what a run to it
+    /// alone would give.
+    fn run_to_each(mut self, targets: &[usize]) -> Vec<Simplified> {
+        debug_assert!(targets.windows(2).all(|w| w[0] >= w[1]));
+        for v in 0..self.positions.len() as u32 {
+            self.push_edges_around(v, &|n| n < v);
+        }
+        let mut results = Vec::with_capacity(targets.len());
+        for &target in targets {
+            self.collapse_to(target);
+            results.push(self.snapshot());
+        }
+        results
+    }
+
+    /// Collapses until no more than `target` triangles are left, or nothing more can be.
+    fn collapse_to(&mut self, target: usize) {
         while self.alive_count > target {
             let Some(candidate) = self.heap.pop() else {
                 break;
@@ -330,10 +406,18 @@ impl<'a> Simplifier<'a> {
                 self.collapse(candidate.from, candidate.to);
             }
         }
-        self.finish()
+    }
+
+    fn run(self, target: usize) -> Simplified {
+        self.run_to_each(&[target]).pop().expect("one target")
     }
 
     fn neighbors(&self, v: u32) -> Vec<u32> {
+        self.fresh(v);
+        self.around.borrow()[v as usize].neighbors.clone()
+    }
+
+    fn find_neighbors(&self, v: u32) -> Vec<u32> {
         let mut result: Vec<u32> = self.vertex_triangles[v as usize]
             .iter()
             .flat_map(|&t| self.triangles[t as usize])
@@ -345,8 +429,14 @@ impl<'a> Simplifier<'a> {
         result
     }
 
-    fn push_edges_around(&mut self, v: u32) {
+    /// Queues both collapses of each edge from `v`, but those to neighbours `skip` passes over,
+    /// which are queued from the other end: an edge queued twice would be popped twice, to the
+    /// same effect, so once is the same simplification for half the work.
+    fn push_edges_around(&mut self, v: u32, skip: &dyn Fn(u32) -> bool) {
         for neighbor in self.neighbors(v) {
+            if skip(neighbor) {
+                continue;
+            }
             for (from, to) in [(v, neighbor), (neighbor, v)] {
                 if !self.locked[from as usize] {
                     let candidate = Candidate {
@@ -390,23 +480,26 @@ impl<'a> Simplifier<'a> {
     /// How far the texture would slide across the surface if `from` collapsed into `to`, in world
     /// units, including what earlier collapses already moved at `from`.
     fn texture_error(&self, from: u32, to: u32) -> f64 {
-        let wedges = self.wedges_at(to);
+        self.fresh(from);
+        self.fresh(to);
+        let around = self.around.borrow();
+        let wedges = &around[to as usize].wedges;
         let worst = self.vertex_triangles[from as usize]
             .iter()
             .map(|&t| self.triangles[t as usize])
             .filter(|t| !t.iter().any(|corner| corner.position == to))
-            .map(|t| self.moved_corner(&t, from, to, &wedges).1)
+            .map(|t| self.moved_corner(&t, from, to, wedges).1)
             .fold(0.0, f64::max);
-        worst.max(self.seam_movement(from, to)) + self.texture_errors[from as usize]
+        let seams = &around[from as usize].seams;
+        worst.max(self.seam_movement(seams, from, to)) + self.texture_errors[from as usize]
     }
 
     /// How far the collapse moves a UV seam. Each side's mapping can stay perfectly continuous
     /// while one side grows over the other, replacing what the surface showed there.
-    fn seam_movement(&self, from: u32, to: u32) -> f64 {
-        let seams = self.seam_neighbors(from);
+    fn seam_movement(&self, seams: &[u32], from: u32, to: u32) -> f64 {
         let start = self.positions[from as usize];
         let end = self.positions[to as usize];
-        match seams[..] {
+        match *seams {
             [] => 0.0,
             // Sliding along a seam only moves it as far as the seam bends here.
             [a, b] if a == to || b == to => {
@@ -419,14 +512,14 @@ impl<'a> Simplifier<'a> {
     }
 
     /// The neighbours of `v` connected by an edge whose two sides use different textures.
-    fn seam_neighbors(&self, v: u32) -> Vec<u32> {
+    fn find_seam_neighbors(&self, v: u32, neighbors: &[u32]) -> Vec<u32> {
         let uv_of = |triangle: &Triangle, vertex: u32| {
             triangle
                 .iter()
                 .find(|corner| corner.position == vertex)
                 .map(|corner| self.attributes[corner.attribute as usize].uv)
         };
-        let mut seams = self.neighbors(v);
+        let mut seams = neighbors.to_vec();
         seams.retain(|&n| {
             let mut sides = self.vertex_triangles[v as usize]
                 .iter()
@@ -486,27 +579,38 @@ impl<'a> Simplifier<'a> {
 
     /// How much the shading normals disagree between the two ends, in `0..=1`.
     fn normal_difference(&self, from: u32, to: u32) -> f64 {
-        let normal_at = |v: u32| {
-            self.vertex_triangles[v as usize]
-                .iter()
-                .flat_map(|&t| self.triangles[t as usize])
-                .find(|corner| corner.position == v)
-                .map_or(Vec3::Y, |corner| {
-                    self.attributes[corner.attribute as usize].normal
-                })
-        };
-        f64::from((1.0 - normal_at(from).dot(normal_at(to))) * 0.5)
+        self.fresh(from);
+        self.fresh(to);
+        let around = self.around.borrow();
+        let (a, b) = (around[from as usize].normal, around[to as usize].normal);
+        f64::from((1.0 - a.dot(b)) * 0.5)
+    }
+
+    /// The shading normal of the first of `v`'s corners.
+    fn find_normal(&self, v: u32) -> Vec3 {
+        self.vertex_triangles[v as usize]
+            .iter()
+            .flat_map(|&t| self.triangles[t as usize])
+            .find(|corner| corner.position == v)
+            .map_or(Vec3::Y, |corner| {
+                self.attributes[corner.attribute as usize].normal
+            })
     }
 
     fn can_collapse(&self, from: u32, to: u32) -> bool {
         // Link condition: the only vertices adjacent to both ends must be the two
         // opposite the shared edge, otherwise the collapse pinches the surface.
-        let from_neighbors = self.neighbors(from);
-        let to_neighbors = self.neighbors(to);
-        let shared = from_neighbors
-            .iter()
-            .filter(|n| to_neighbors.binary_search(n).is_ok())
-            .count();
+        self.fresh(from);
+        self.fresh(to);
+        let shared = {
+            let around = self.around.borrow();
+            let to_neighbors = &around[to as usize].neighbors;
+            around[from as usize]
+                .neighbors
+                .iter()
+                .filter(|n| to_neighbors.binary_search(n).is_ok())
+                .count()
+        };
         if shared != 2 {
             return false;
         }
@@ -558,12 +662,14 @@ impl<'a> Simplifier<'a> {
 
         let target_wedges = self.wedges_at(to);
         let from_triangles = std::mem::take(&mut self.vertex_triangles[from as usize]);
+        let mut changed = vec![from, to];
         for triangle in from_triangles {
             let index = triangle as usize;
             if !self.alive[index] {
                 continue;
             }
             let corners = self.triangles[index];
+            changed.extend(corners.iter().map(|c| c.position));
             if corners.iter().any(|c| c.position == to) {
                 self.alive[index] = false;
                 self.alive_count -= 1;
@@ -584,6 +690,10 @@ impl<'a> Simplifier<'a> {
             }
         }
 
+        for v in changed {
+            self.versions[v as usize] += 1;
+        }
+
         // Invalidate every queued collapse touching the changed neighbourhood.
         self.stamps[from as usize] += 1;
         self.stamps[to as usize] += 1;
@@ -591,13 +701,21 @@ impl<'a> Simplifier<'a> {
         for &n in &neighbors {
             self.stamps[n as usize] += 1;
         }
-        self.push_edges_around(to);
-        for n in neighbors {
-            self.push_edges_around(n);
+        // Every edge from `to`, then each neighbour's other edges: those round the ring of
+        // neighbours from its lower end, and all the rest.
+        self.push_edges_around(to, &|_| false);
+        for &n in &neighbors {
+            let ring = &neighbors;
+            self.push_edges_around(n, &|m| m == to || (m < n && ring.binary_search(&m).is_ok()));
         }
     }
 
     fn wedges_at(&self, v: u32) -> Vec<u32> {
+        self.fresh(v);
+        self.around.borrow()[v as usize].wedges.clone()
+    }
+
+    fn find_wedges(&self, v: u32) -> Vec<u32> {
         let mut wedges: Vec<u32> = self.vertex_triangles[v as usize]
             .iter()
             .flat_map(|&t| self.triangles[t as usize])
@@ -609,7 +727,7 @@ impl<'a> Simplifier<'a> {
         wedges
     }
 
-    fn finish(self) -> Simplified {
+    fn snapshot(&self) -> Simplified {
         let global = &self.global;
         let triangles = self
             .triangles
@@ -865,6 +983,29 @@ mod tests {
         let result = simplify(&triangles, &positions, &attributes, 4, |_| false);
         assert_eq!(result.triangles.len(), 4);
         assert!(result.error > 0.1, "error {}", result.error);
+    }
+
+    #[test]
+    fn one_run_to_several_targets_gives_what_a_run_to_each_does() {
+        for (triangles, positions, attributes) in
+            [closed_sphere(24, 16), flat_with_seam(12, 5, 0.3)]
+        {
+            let count = triangles.len();
+            let targets = [count * 9 / 10, count * 3 / 4, count / 2, count / 5];
+            let together =
+                simplify_skinned_each(&triangles, &positions, &attributes, None, &targets, |_| {
+                    false
+                });
+            for (target, result) in targets.iter().zip(&together) {
+                let alone = simplify(&triangles, &positions, &attributes, *target, |_| false);
+                assert_eq!(result.triangles, alone.triangles, "target {target}");
+                assert_eq!(
+                    result.error.to_bits(),
+                    alone.error.to_bits(),
+                    "target {target}"
+                );
+            }
+        }
     }
 
     #[test]
