@@ -103,8 +103,8 @@ pub fn simplify_skinned(
     Simplifier::new(triangles, positions, attributes, skin, &is_locked).run(target_triangles)
 }
 
-/// [`simplify_skinned`] towards each of several targets, largest first, in one run: the result
-/// at each is what simplifying to it alone gives.
+/// [`simplify_skinned`] towards each of several targets, in one run: the result at each, in the
+/// order given, is what simplifying to it alone gives.
 pub fn simplify_skinned_each(
     triangles: &[Triangle],
     positions: &[Vec3],
@@ -113,7 +113,20 @@ pub fn simplify_skinned_each(
     targets: &[usize],
     is_locked: impl Fn(u32) -> bool,
 ) -> Vec<Simplified> {
-    Simplifier::new(triangles, positions, attributes, skin, &is_locked).run_to_each(targets)
+    // One run reaches the largest target first, so they are taken largest first and handed back
+    // in the order asked for.
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(targets[i]));
+    let descending: Vec<usize> = order.iter().map(|&i| targets[i]).collect();
+    let results = Simplifier::new(triangles, positions, attributes, skin, &is_locked)
+        .run_to_each(&descending);
+    let mut out: Vec<Option<Simplified>> = (0..targets.len()).map(|_| None).collect();
+    for (result, i) in results.into_iter().zip(order) {
+        out[i] = Some(result);
+    }
+    out.into_iter()
+        .map(|r| r.expect("one result for each target"))
+        .collect()
 }
 
 /// A symmetric 4x4 error quadric plus the accumulated area weight.
@@ -352,6 +365,28 @@ impl<'a> Simplifier<'a> {
         }
     }
 
+    /// In tests, after each collapse: everything kept as up to date is what working it out
+    /// afresh gives, so a change that should have raised a version and didn't is caught.
+    #[cfg(test)]
+    fn check_kept(&self) {
+        let around = self.around.borrow();
+        for (v, kept) in around.iter().enumerate() {
+            if !kept.ready || kept.version != self.versions[v] {
+                continue;
+            }
+            let v = v as u32;
+            let neighbors = self.find_neighbors(v);
+            assert_eq!(kept.neighbors, neighbors, "neighbours of {v}");
+            assert_eq!(kept.wedges, self.find_wedges(v), "wedges of {v}");
+            assert_eq!(
+                kept.seams,
+                self.find_seam_neighbors(v, &neighbors),
+                "seams of {v}"
+            );
+            assert_eq!(kept.normal, self.find_normal(v), "normal of {v}");
+        }
+    }
+
     /// Makes sure what is known around `v` is up to date.
     fn fresh(&self, v: u32) {
         let version = self.versions[v as usize];
@@ -379,7 +414,7 @@ impl<'a> Simplifier<'a> {
     /// collapses come in the same order whatever the target, so each result is what a run to it
     /// alone would give.
     fn run_to_each(mut self, targets: &[usize]) -> Vec<Simplified> {
-        debug_assert!(targets.windows(2).all(|w| w[0] >= w[1]));
+        assert!(targets.windows(2).all(|w| w[0] >= w[1]), "targets descend");
         for v in 0..self.positions.len() as u32 {
             self.push_edges_around(v, &|n| n < v);
         }
@@ -693,6 +728,8 @@ impl<'a> Simplifier<'a> {
         for v in changed {
             self.versions[v as usize] += 1;
         }
+        #[cfg(test)]
+        self.check_kept();
 
         // Invalidate every queued collapse touching the changed neighbourhood.
         self.stamps[from as usize] += 1;
@@ -991,7 +1028,8 @@ mod tests {
             [closed_sphere(24, 16), flat_with_seam(12, 5, 0.3)]
         {
             let count = triangles.len();
-            let targets = [count * 9 / 10, count * 3 / 4, count / 2, count / 5];
+            // In any order: each result is the one for the target in its place.
+            let targets = [count / 2, count * 9 / 10, count / 5, count * 3 / 4];
             let together =
                 simplify_skinned_each(&triangles, &positions, &attributes, None, &targets, |_| {
                     false
