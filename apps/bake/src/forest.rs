@@ -5,7 +5,7 @@ use glam::{Mat4, Vec3};
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{Instance, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions};
-use solstice_procgen::foliage::bark::{Bark, BARK_TILE_METRES};
+use solstice_procgen::foliage::bark::Bark;
 use solstice_procgen::foliage::grass::Meadow;
 use solstice_procgen::foliage::leaf::LeafKind;
 use solstice_procgen::foliage::tree::Species;
@@ -133,14 +133,7 @@ pub fn build(texture_size: u32) -> SceneAsset {
             macro_variation: 1.0,
             ..Default::default()
         },
-        Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            normal_strength: 1.0,
-            texture_layer: 1,
-            flags: Material::TWO_SIDED | Material::FOLIAGE | Material::SWAYS,
-            ..Default::default()
-        },
+        crate::foliage::blades(1),
     ];
 
     // Each plant is two meshes, wood then leaves, placed together.
@@ -163,23 +156,8 @@ pub fn build(texture_size: u32) -> SceneAsset {
         let leaf: LeafKind = species.leaves.kind;
         let bark_layer = layers.layer(bark.name(), || bark.surface(0));
         let leaf_layer = layers.layer(leaf.name(), || leaf.atlas(0));
-        materials.push(Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            uv_scale: 1.0 / BARK_TILE_METRES,
-            normal_strength: 1.0,
-            texture_layer: bark_layer,
-            flags: Material::SWAYS | Material::TREE,
-            ..Default::default()
-        });
-        materials.push(Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            normal_strength: 1.0,
-            texture_layer: leaf_layer,
-            flags: Material::TWO_SIDED | Material::FOLIAGE | Material::SWAYS | Material::TREE,
-            ..Default::default()
-        });
+        materials.push(crate::foliage::bark(bark_layer));
+        materials.push(crate::foliage::leaves(leaf_layer));
         grown.push(Grown {
             first_mesh,
             variants,

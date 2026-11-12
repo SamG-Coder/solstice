@@ -1089,6 +1089,11 @@ pub fn build(path: &Path, texture_size: Option<u32>) -> Result<(SceneAsset, Vec<
     // A circuit's land, road and planting are built from its track, which also gives the
     // ground to drive on and the barriers to stop at.
     if let Some(size) = circuit {
+        // Both would be built, one inside the other, and the terrain's heights would be the
+        // ground cars drive on, not the circuit's.
+        if terrain.is_some() {
+            return Err("`circuit` builds its own land: leave out the `terrain` line".to_owned());
+        }
         let name = gameplay
             .game
             .track
@@ -1593,6 +1598,28 @@ mod tests {
         ]);
         let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
         assert_eq!(scene.gameplay.len(), 1);
+    }
+
+    #[test]
+    fn a_circuit_and_a_terrain_are_not_both_built() {
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"terrain 400 64 0.3 52
+track c.track
+circuit 900
+",
+            ),
+            (
+                "c.track",
+                b"p 0 0 0 1 0 0 6 6
+p 0 0 50 1 0 0 6 6
+p 50 0 50 1 0 0 6 6
+",
+            ),
+        ]);
+        let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
+        assert!(error.contains("leave out the `terrain` line"), "{error}");
     }
 
     #[test]

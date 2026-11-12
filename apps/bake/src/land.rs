@@ -23,9 +23,7 @@
 use glam::{Mat4, Vec2, Vec3};
 use solstice_asset::{Instance, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
-use solstice_procgen::foliage::bark::BARK_TILE_METRES;
 use solstice_procgen::foliage::grass::Meadow;
-use solstice_procgen::foliage::tree::Species;
 use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
@@ -438,14 +436,7 @@ fn add_meadow(
         first_mesh + PATCH_VARIANTS + which * SHAPE_VARIANTS + seed
     };
     let blades = layer(scene, meadow.atlas(0));
-    scene.materials.push(Material {
-        base_color: [1.0; 4],
-        roughness: 1.0,
-        normal_strength: 1.0,
-        texture_layer: blades,
-        flags: Material::TWO_SIDED | Material::FOLIAGE | Material::SWAYS,
-        ..Default::default()
-    });
+    scene.materials.push(crate::foliage::blades(blades));
     let material = scene.materials.len() as u32 - 1;
     let cells = (radius * 2.0 / size) as i32;
     let quarter = std::f32::consts::FRAC_PI_2;
@@ -556,58 +547,16 @@ fn add_woods(
     kind_at: &dyn Fn(Vec2) -> usize,
 ) {
     println!("  growing the woods...");
-    // Each plant: its meshes, wood then leaves for each grown copy, and its two materials.
-    let mut grown = Vec::new();
-    for (name, variants) in [("oak", 2u32), ("birch", 2), ("bush", 2)] {
-        let species = Species::by_name(name).expect("a built-in species");
-        let first_mesh = scene.meshes.len() as u32;
-        for seed in 0..variants {
-            let plant = species.grow(seed);
-            scene
-                .meshes
-                .push(build_virtual_mesh(&plant.wood, &BuildOptions::default()));
-            scene
-                .meshes
-                .push(build_virtual_mesh(&plant.leaves, &BuildOptions::default()));
-        }
-        let bark = layer(scene, species.bark.surface(0));
-        let leaf = layer(scene, species.leaves.kind.atlas(0));
-        scene.materials.push(Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            uv_scale: 1.0 / BARK_TILE_METRES,
-            normal_strength: 1.0,
-            texture_layer: bark,
-            flags: Material::SWAYS | Material::TREE,
-            ..Default::default()
-        });
-        scene.materials.push(Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            normal_strength: 1.0,
-            texture_layer: leaf,
-            flags: Material::TWO_SIDED | Material::FOLIAGE | Material::SWAYS | Material::TREE,
-            ..Default::default()
-        });
-        let leaves = scene.materials.len() as u32 - 1;
-        grown.push((first_mesh, variants, leaves - 1, leaves));
-    }
+    let grown = crate::foliage::grow(scene, &[("oak", 2), ("birch", 2), ("bush", 2)]);
     let mut rng = Rng::new(11, 5);
     let mut trees: Vec<Vec2> = Vec::new();
     let mut bushes: Vec<Vec2> = Vec::new();
     let place = |scene: &mut SceneAsset, which: usize, at: Vec2, rng: &mut Rng| {
-        let (first_mesh, variants, bark, leaves) = grown[which];
-        let mesh = first_mesh + rng.index(variants as usize) as u32 * 2;
+        let copy = rng.index(grown[which].variants as usize) as u32;
         let transform = Mat4::from_translation(Vec3::new(at.x, height(at.x, at.y) - 0.05, at.y))
             * Mat4::from_rotation_y(rng.range(0.0, std::f32::consts::TAU))
             * Mat4::from_scale(Vec3::splat(rng.range(0.8, 1.25)));
-        for (mesh, material) in [(mesh, bark), (mesh + 1, leaves)] {
-            scene.instances.push(Instance {
-                mesh,
-                material,
-                transform,
-            });
-        }
+        grown[which].place(scene, copy, transform);
     };
     for &(centre, radius, spacing) in &plan.woods {
         for _ in 0..(radius * radius * 2.0) as u32 {

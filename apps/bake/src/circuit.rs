@@ -30,9 +30,7 @@ use rustc_hash::FxHashMap;
 use solstice_asset::{Heightfield, Instance, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 use solstice_game::{Blocker, Track};
-use solstice_procgen::foliage::bark::BARK_TILE_METRES;
 use solstice_procgen::foliage::grass::Meadow;
-use solstice_procgen::foliage::tree::Species;
 use solstice_procgen::foliage::Rng;
 use solstice_procgen::noise::fbm;
 use solstice_procgen::surface::TILE_METRES;
@@ -686,14 +684,7 @@ fn blades(scene: &mut SceneAsset, meadow: &Meadow) -> u32 {
     scene
         .textures
         .push(meadow.atlas(0).bake(scene.texture_size));
-    scene.materials.push(Material {
-        base_color: [1.0; 4],
-        roughness: 1.0,
-        normal_strength: 1.0,
-        texture_layer: layer,
-        flags: Material::TWO_SIDED | Material::FOLIAGE,
-        ..Default::default()
-    });
+    scene.materials.push(crate::foliage::blades(layer));
     scene.materials.len() as u32 - 1
 }
 
@@ -729,60 +720,15 @@ pub fn build(scene: &mut SceneAsset, track: &Track, size: f32) -> Built {
 
     // ---- Woods beyond the barriers: thick inland, thinning to open ground towards the cliffs.
     println!("  trees...");
-    let mut grown = Vec::new();
-    for (name, variants) in [("oak", 2u32), ("birch", 2), ("fir", 2), ("bush", 2)] {
-        let species = Species::by_name(name).expect("a built-in species");
-        let first_mesh = scene.meshes.len() as u32;
-        for seed in 0..variants {
-            let plant = species.grow(seed);
-            scene
-                .meshes
-                .push(build_virtual_mesh(&plant.wood, &BuildOptions::default()));
-            scene
-                .meshes
-                .push(build_virtual_mesh(&plant.leaves, &BuildOptions::default()));
-        }
-        let (bark, leaf) = (species.bark, species.leaves.kind);
-        let bark_layer = scene.textures.len() as i32;
-        scene
-            .textures
-            .push(bark.surface(0).bake(scene.texture_size));
-        let leaf_layer = scene.textures.len() as i32;
-        scene.textures.push(leaf.atlas(0).bake(scene.texture_size));
-        scene.materials.push(Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            uv_scale: 1.0 / BARK_TILE_METRES,
-            normal_strength: 1.0,
-            texture_layer: bark_layer,
-            ..Default::default()
-        });
-        scene.materials.push(Material {
-            base_color: [1.0; 4],
-            roughness: 1.0,
-            normal_strength: 1.0,
-            texture_layer: leaf_layer,
-            flags: Material::TWO_SIDED | Material::FOLIAGE,
-            ..Default::default()
-        });
-        let leaves = scene.materials.len() as u32 - 1;
-        grown.push((first_mesh, variants, leaves - 1, leaves));
-    }
+    let grown = crate::foliage::grow(scene, &[("oak", 2), ("birch", 2), ("fir", 2), ("bush", 2)]);
     let plant = |scene: &mut SceneAsset, kind: usize, x: f32, z: f32, k: u32| {
-        let (first_mesh, variants, bark, leaves) = grown[kind];
-        let mesh = first_mesh + (hash(x as i32, z as i32, k + 2) % variants) * 2;
+        let copy = hash(x as i32, z as i32, k + 2);
         let turn = (hash(x as i32, z as i32, k) % 1000) as f32 / 1000.0 * std::f32::consts::TAU;
         let scale = 0.8 + (hash(x as i32, z as i32, k + 1) % 1000) as f32 / 1000.0 * 0.5;
         let transform = Mat4::from_translation(Vec3::new(x, land.at(x, z) - 0.05, z))
             * Mat4::from_rotation_y(turn)
             * Mat4::from_scale(Vec3::splat(scale));
-        for (mesh, material) in [(mesh, bark), (mesh + 1, leaves)] {
-            scene.instances.push(Instance {
-                mesh,
-                material,
-                transform,
-            });
-        }
+        grown[kind].place(scene, copy, transform);
     };
     // Whether a tree may stand here: on dry, gentle ground, clear of the barrier.
     let open = |x: f32, z: f32, clear: f32| {
@@ -992,6 +938,19 @@ mod tests {
             })
             .collect();
         Track::new("Ring", samples, vec![140, 280]).unwrap()
+    }
+
+    #[test]
+    fn the_verge_grass_sways_as_grass() {
+        let mut scene = SceneAsset {
+            texture_size: 16,
+            ..Default::default()
+        };
+        let verge = Meadow::by_name("verge").expect("a built-in grass");
+        let blade = blades(&mut scene, &verge) as usize;
+        let flags = scene.materials[blade].flags;
+        assert_eq!(flags & Material::SWAYS, Material::SWAYS);
+        assert_eq!(flags & Material::TREE, 0, "grass sways as grass");
     }
 
     #[test]

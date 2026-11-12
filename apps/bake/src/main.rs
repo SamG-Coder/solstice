@@ -24,6 +24,7 @@
 
 mod circuit;
 mod collision_view;
+mod foliage;
 mod forest;
 mod gallery;
 mod land;
