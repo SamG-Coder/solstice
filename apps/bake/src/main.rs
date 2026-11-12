@@ -210,6 +210,12 @@ fn parse_args() -> Result<Options, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    if options.only && !options.plants {
+        return Err(
+            "--only keeps just the species and grass files given: it needs --plants, --species or --grass"
+                .to_owned(),
+        );
+    }
     Ok(options)
 }
 
