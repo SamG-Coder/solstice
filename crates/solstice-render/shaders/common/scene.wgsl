@@ -23,12 +23,11 @@ struct Node {
     is_leaf: u32, // 0 for an interior node. See the NODE_ constants in vg/cull.wgsl.
 }
 
-// x y | z nx | ny u | v _
+// x y | z n | u v, sixteen bits each: three words of the page pool. See common/pool.wgsl.
 struct PackedVertex {
     a: u32,
     b: u32,
     c: u32,
-    d: u32,
 }
 
 struct Instance {
@@ -162,15 +161,16 @@ fn decode_position(i: Instance, v: PackedVertex) -> vec3f {
     return i.quant_origin + grid * i.quant_step;
 }
 
-fn sign_extend_16(x: u32) -> f32 {
-    return f32(i32(x << 16u) >> 16u);
+fn sign_extend_8(x: u32) -> f32 {
+    return f32(i32(x << 24u) >> 24u);
 }
 
+// The normal is octahedral, a signed byte for each coordinate.
 fn decode_normal(v: PackedVertex) -> vec3f {
-    let e = vec2f(sign_extend_16(v.b >> 16u), sign_extend_16(v.c & 0xffffu)) / 32767.0;
+    let e = vec2f(sign_extend_8(v.b >> 16u), sign_extend_8(v.b >> 24u)) / 127.0;
     return oct_decode(e);
 }
 
 fn decode_uv(i: Instance, v: PackedVertex) -> vec2f {
-    return i.uv_origin + vec2f(f32(v.c >> 16u), f32(v.d & 0xffffu)) * i.uv_step;
+    return i.uv_origin + vec2f(f32(v.c & 0xffffu), f32(v.c >> 16u)) * i.uv_step;
 }

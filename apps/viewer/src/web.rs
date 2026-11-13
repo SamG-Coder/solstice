@@ -242,7 +242,7 @@ impl WebViewer {
 
     /// Takes a page of such a scene, inflated, with its cluster records.
     pub fn deliver_page(&mut self, id: u32, bytes: Vec<u8>, clusters: Vec<u8>) -> bool {
-        self.renderer.deliver_page(id, bytes, clusters)
+        self.renderer.deliver_fetched_page(id, bytes, clusters)
     }
 
     /// Call when all of such a scene's tables have been handed over.
@@ -273,7 +273,7 @@ impl WebViewer {
 
     /// Takes the bytes of a request, inflated if it needed that.
     pub fn deliver(&mut self, id: u32, bytes: Vec<u8>) -> bool {
-        self.renderer.deliver(id, bytes)
+        self.renderer.deliver_fetched(id, bytes)
     }
 
     /// Reports that a request could not be fetched.

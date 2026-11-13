@@ -46,7 +46,7 @@ fn main(
 
         let vertex_count = cluster_vertex_count(cluster);
         for (var v = lane; v < vertex_count; v += GROUP_SIZE) {
-            let packed = load_vertex(cluster.vertex_offset + v);
+            let packed = load_vertex(cluster, v);
             let posed = posed_position(instance, cluster, v, decode_position(instance, packed));
             let world = place_vertex(instance, posed);
             let clip = view.raster_view_proj * vec4f(world, 1.0);
@@ -61,7 +61,7 @@ fn main(
         workgroupBarrier();
 
         if lane < cluster_triangle_count(cluster) {
-            let packed = pool[cluster.triangle_offset + lane];
+            let packed = load_triangle(cluster, lane);
             let corners = vec3u(local_vertex(packed, 0u), local_vertex(packed, 1u), local_vertex(packed, 2u));
             rasterize_triangle(
                 screen[corners.x],

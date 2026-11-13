@@ -37,7 +37,7 @@ code and its module comments are the reference, and the notes below say so.
 - **Foliage is real geometry in the virtual-geometry pipeline**: grass patches of folded blades
   (`solstice-procgen/src/foliage/grass.rs`, 2 m patches in the Forest) and trees grown as tubes of stems with
   leaf cards (`foliage/tree.rs`), with the `FOLIAGE` material flag (two-sided, transmission).
-  Vertices are 16 bytes: position, normal, UV. There is no per-vertex room for wind data.
+  Vertices are 12 bytes: position, normal, UV. There is no per-vertex room for wind data.
 - **Skinning** (PR #50/#54) already deforms virtual geometry "where it is used": cull bounds
   (`posed_sphere`), both rasterizers (`posed_position`), and resolve (positions, normals, and
   last frame's pose for motion vectors). Bones live in a texture, uploaded from the CPU.

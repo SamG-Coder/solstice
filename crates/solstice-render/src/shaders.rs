@@ -33,6 +33,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "lightning/bolt.wgsl",
     "common/scene.wgsl",
     "common/skin.wgsl",
+    "common/pool.wgsl",
     "common/skin_vertex.wgsl",
     "common/frame.wgsl",
     "common/wetness.wgsl",

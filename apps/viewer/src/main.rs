@@ -92,7 +92,7 @@ mod native {
                 self.running -= 1;
                 match data {
                     Some(data) => {
-                        renderer.deliver(id, data);
+                        renderer.deliver_fetched(id, data);
                     }
                     None => renderer.request_failed(id),
                 }

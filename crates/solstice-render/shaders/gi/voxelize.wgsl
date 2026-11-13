@@ -12,6 +12,7 @@
 
 #include "common/math.wgsl"
 #include "common/scene.wgsl"
+#include "common/pool.wgsl"
 #include "vg/pass_view.wgsl"
 
 struct Params {
@@ -26,8 +27,18 @@ struct Params {
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> instances: array<Instance>;
 @group(0) @binding(2) var<storage, read> clusters: array<Cluster>;
-@group(0) @binding(3) var<storage, read> vertices: array<PackedVertex>;
+@group(0) @binding(3) var<storage, read> vertices: array<u32>;
 @group(0) @binding(4) var<storage, read> triangles: array<u32>;
+
+// The page pool, bound twice. See common/pool.wgsl.
+fn vertex_word(word: u32) -> u32 {
+    return vertices[word];
+}
+
+fn triangle_word(word: u32) -> u32 {
+    return triangles[word];
+}
+
 @group(0) @binding(5) var<storage, read> visible: array<VisibleCluster>;
 @group(0) @binding(6) var<storage, read> state: CullStateRead;
 @group(0) @binding(7) var<storage, read> materials: array<Material>;
@@ -249,10 +260,10 @@ fn voxelize_speck(entry: VisibleCluster) {
     let cluster = clusters[entry.cluster];
     let instance = instances[entry.instance];
     let material = materials[instance_material(instance)];
-    let packed = triangles[cluster.triangle_offset];
-    let vertex0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
-    let vertex1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
-    let vertex2 = vertices[cluster.vertex_offset + ((packed >> 16u) & 0xffu)];
+    let packed = load_triangle(cluster, 0u);
+    let vertex0 = load_vertex(cluster, packed & 0xffu);
+    let vertex1 = load_vertex(cluster, (packed >> 8u) & 0xffu);
+    let vertex2 = load_vertex(cluster, (packed >> 16u) & 0xffu);
     let world0 = transform_point(instance, decode_position(instance, vertex0));
     let world1 = transform_point(instance, decode_position(instance, vertex1));
     let world2 = transform_point(instance, decode_position(instance, vertex2));
@@ -296,10 +307,10 @@ fn voxelize_cluster_triangle(item: u32, t: u32) {
     let inv_voxel = 1.0 / params.voxel_size;
 
     {
-        let packed = triangles[cluster.triangle_offset + t];
-        let vertex0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
-        let vertex1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
-        let vertex2 = vertices[cluster.vertex_offset + ((packed >> 16u) & 0xffu)];
+        let packed = load_triangle(cluster, t);
+        let vertex0 = load_vertex(cluster, packed & 0xffu);
+        let vertex1 = load_vertex(cluster, (packed >> 8u) & 0xffu);
+        let vertex2 = load_vertex(cluster, (packed >> 16u) & 0xffu);
         let world0 = transform_point(instance, decode_position(instance, vertex0));
         let world1 = transform_point(instance, decode_position(instance, vertex1));
         let world2 = transform_point(instance, decode_position(instance, vertex2));

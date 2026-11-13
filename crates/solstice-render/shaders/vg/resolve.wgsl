@@ -20,15 +20,20 @@
 @group(0) @binding(3) var<storage, read> visible: array<VisibleCluster>;
 @group(0) @binding(4) var<storage, read> instances: array<Instance>;
 @group(0) @binding(5) var<storage, read> clusters: array<Cluster>;
-@group(0) @binding(6) var<storage, read> vertices: array<PackedVertex>;
+@group(0) @binding(6) var<storage, read> vertices: array<u32>;
 @group(0) @binding(7) var<storage, read> triangles: array<u32>;
 @group(0) @binding(8) var<storage, read> materials: array<Material>;
 @group(0) @binding(9) var bone_texture: texture_2d<f32>;
 // The wind, for what sways in it: see common/sway_vertex.wgsl.
 @group(0) @binding(10) var wind_field: texture_2d<f32>;
 
-fn load_vertex(index: u32) -> PackedVertex {
-    return vertices[index];
+// The page pool, bound twice. See common/pool.wgsl.
+fn vertex_word(word: u32) -> u32 {
+    return vertices[word];
+}
+
+fn triangle_word(word: u32) -> u32 {
+    return triangles[word];
 }
 
 @group(1) @binding(0) var out_albedo: texture_storage_2d<rgba8unorm, write>;
@@ -231,10 +236,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let cluster = clusters[entry.cluster];
     let material = materials[instance_material(instance)];
 
-    let packed = triangles[cluster.triangle_offset + triangle_index];
-    let v0 = vertices[cluster.vertex_offset + (packed & 0xffu)];
-    let v1 = vertices[cluster.vertex_offset + ((packed >> 8u) & 0xffu)];
-    let v2 = vertices[cluster.vertex_offset + ((packed >> 16u) & 0xffu)];
+    let packed = load_triangle(cluster, triangle_index);
+    let v0 = load_vertex(cluster, packed & 0xffu);
+    let v1 = load_vertex(cluster, (packed >> 8u) & 0xffu);
+    let v2 = load_vertex(cluster, (packed >> 16u) & 0xffu);
 
     var local0 = decode_position(instance, v0);
     var local1 = decode_position(instance, v1);

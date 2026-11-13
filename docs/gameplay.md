@@ -58,8 +58,9 @@ Not in the first version, with room left for each:
   Each of these has to be told when something moves, or ignore things that move.
 - **Two-phase occlusion culling** (`vg/culling.rs`) already copes with motion: anything the old
   depth hid wrongly is retried against the new depth in the same frame.
-- **Vertices** are 16 bytes on one 16-bit grid per mesh: position, a packed normal, UV, and one
-  spare 16-bit value (`x y z nx ny u v _`, `solstice-asset/src/gpu.rs`). The grid has one step
+- **Vertices** are 12 bytes on one 16-bit grid per mesh: position, a packed normal and UV
+  (`x y z n u v`, `solstice-asset/src/gpu.rs`; 16 bytes with a spare value until file version 5,
+  see `docs/streaming.md`). The grid has one step
   for all three axes, a 65,535th of the mesh's longest side (`Mesh::grid_step`), so a mesh
   that is very long keeps its points coarsely however thin it is: a kilometre of road as one
   mesh, to 15 mm. There are no bone
@@ -877,7 +878,7 @@ checked on the keeper (38,462 triangles, 628 clusters in 12 meshes):
 - **A vertex names its bones directly,** by the skeleton's own numbers, rather than through its
   cluster's list. Skeletons have at most 256 bones, so 8 bits is enough, and resolve and the
   rasterizers skip a lookup per influence. A skin is 8 bytes behind its cluster's vertices in the
-  page, two to a 16-byte record, so a page needs no new part.
+  page, end to end (two to a 16-byte record until file version 5), so a page needs no new part.
 - **The cluster's list is only for culling,** and a cluster's bounds stay its bind-pose sphere: the
   skinned position lies inside the sphere moved by each of its bones, so a union of those moved
   spheres contains it. No per-bone radii are stored.

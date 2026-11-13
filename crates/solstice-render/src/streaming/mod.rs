@@ -17,7 +17,7 @@ use feedback::RequestFeedback;
 use residency::{Residency, Step};
 use solstice_asset::gpu::{CLUSTER_CHILDREN_MISSING, NODE_INSTALLED, NODE_LEAF};
 use solstice_asset::paged::{
-    upper_mip_count, ClusterSet, PageInfo, PagedScene, BASE_TEXTURE_EDGE, PAGE_VERTICES, PAGE_WORDS,
+    upper_mip_count, ClusterSet, PageInfo, PagedScene, BASE_TEXTURE_EDGE, PAGE_WORDS,
 };
 use solstice_asset::{Material, PackedCluster, PackedNode, TextureEncoding};
 use std::collections::HashMap;
@@ -509,6 +509,22 @@ impl Streamer {
         self.deliver_page(page, data, Vec::new())
     }
 
+    /// Takes the bytes of a request as a scene file stores them, inflated if they were deflated:
+    /// a page is still filtered as `solstice_asset::file::filter_page` left it, and is put back
+    /// as the GPU reads it here. A texture level is stored as it is used.
+    pub fn deliver_fetched(&mut self, id: u32, data: Vec<u8>, clusters: Vec<u8>) -> bool {
+        if id & TEXTURE_REQUEST_BIT != 0 {
+            return self.deliver_request(id, data);
+        }
+        match self.pages.get(id as usize) {
+            Some(info) if info.raw_bytes() == data.len() => {
+                let data = solstice_asset::file::unfilter_page(&data, info);
+                self.deliver_page(id, data, clusters)
+            }
+            _ => false,
+        }
+    }
+
     /// As [`Self::deliver`], with the page's cluster records, for a scene that keeps them outside
     /// its manifest: the bytes [`StreamRequest::clusters`] names.
     pub fn deliver_page(&mut self, page: u32, data: Vec<u8>, clusters: Vec<u8>) -> bool {
@@ -574,7 +590,7 @@ impl Streamer {
             data,
         );
         let info = self.pages[page as usize];
-        let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_count);
+        let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_words());
         let chunk = self.regions.map_or(u32::MAX, |r| r.cluster_chunk);
         let installed = NODE_LEAF | NODE_INSTALLED | page;
         match &mut self.clusters {
@@ -641,7 +657,7 @@ impl Streamer {
         self.slots[page as usize] = u32::MAX;
         let info = self.pages[page as usize];
         let (band, local) = locate_slot(self.regions.as_ref(), slot);
-        let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_count);
+        let (vertex_base, triangle_base) = slot_bases(band, local, info.vertex_words());
         if let ClusterCopy::Resident(resident) = &mut self.clusters {
             resident.records[slot as usize] = Vec::new();
         }
@@ -942,15 +958,14 @@ fn locate_slot(regions: Option<&RegionPlan>, slot: u32) -> (usize, u32) {
     panic!("slot {slot} is outside the pool");
 }
 
-/// Where a slot's vertices and triangles begin, in units of vertices and of triangle words.
-/// Triangles start right after the page's own vertices. The band goes in the top three bits, which
-/// is zero in a scene with one pool.
-fn slot_bases(band: usize, local: u32, vertex_count: u32) -> (u32, u32) {
+/// Where a slot's vertices and triangles begin, both in words of the pool. Triangles start
+/// right after the page's own vertices, which take `vertex_words`. The band goes in the top
+/// three bits, which is zero in a scene with one pool.
+fn slot_bases(band: usize, local: u32, vertex_words: u32) -> (u32, u32) {
     let band = (band as u32) << crate::regions::BAND_SHIFT;
     (
-        band | (local * PAGE_VERTICES),
-        band | (local * PAGE_WORDS
-            + vertex_count * (std::mem::size_of::<solstice_asset::PackedVertex>() as u32 / 4)),
+        band | (local * PAGE_WORDS),
+        band | (local * PAGE_WORDS + vertex_words),
     )
 }
 
@@ -980,33 +995,29 @@ mod tests {
 
     #[test]
     fn triangles_follow_a_pages_vertices_within_its_slot() {
-        assert_eq!(slot_bases(0, 0, 10), (0, 40));
-        assert_eq!(
-            slot_bases(0, 2, 10),
-            (2 * PAGE_VERTICES, 2 * PAGE_WORDS + 40)
-        );
+        assert_eq!(slot_bases(0, 0, 30), (0, 30));
+        assert_eq!(slot_bases(0, 2, 30), (2 * PAGE_WORDS, 2 * PAGE_WORDS + 30));
     }
 
     #[test]
     fn a_band_is_carried_above_the_place_in_its_buffer() {
-        let (vertices, triangles) = slot_bases(2, 3, 10);
+        let (vertices, triangles) = slot_bases(2, 3, 30);
         use crate::regions::{BANDS, BAND_SHIFT};
         let low = (1 << BAND_SHIFT) - 1;
         assert_eq!(vertices >> BAND_SHIFT, 2);
-        assert_eq!(vertices & low, 3 * PAGE_VERTICES);
+        assert_eq!(vertices & low, 3 * PAGE_WORDS);
         assert_eq!(triangles >> BAND_SHIFT, 2);
-        assert_eq!(triangles & low, 3 * PAGE_WORDS + 40);
+        assert_eq!(triangles & low, 3 * PAGE_WORDS + 30);
 
-        // The last slot of the last band a binding can hold still fits beside its band, with
-        // vertex numbers counted in words as the shaders do.
+        // The last slot of the last band a binding can hold still fits beside its band.
         let last = (crate::regions::binding_slots(&wgpu::Limits {
             max_storage_buffer_binding_size: 2_147_483_644,
             max_buffer_size: 1 << 31,
             ..Default::default()
         })) - 1;
-        let (vertices, triangles) = slot_bases(BANDS - 1, last, PAGE_VERTICES);
+        let (vertices, triangles) = slot_bases(BANDS - 1, last, PAGE_WORDS);
         assert_eq!(vertices >> BAND_SHIFT, BANDS as u32 - 1);
-        assert!(u64::from(vertices & low) * 4 + u64::from(PAGE_WORDS) <= 1 << BAND_SHIFT);
+        assert!(u64::from(vertices & low) + u64::from(PAGE_WORDS) <= 1 << BAND_SHIFT);
         assert_eq!(triangles >> BAND_SHIFT, BANDS as u32 - 1);
 
         // A device that allows a larger binding still gets pools an address can reach into.

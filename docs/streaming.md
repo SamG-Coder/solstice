@@ -143,13 +143,13 @@ maps to a tier and slot:
 and serves ranges from memory, so nothing breaks. `scripts/serve.py` replaces the plain server in
 `launch.json`, adding Range support and a `--throttle-mbps` option for measuring.
 
-File v4:
+File v4 (version 5 packs its pages tighter, see [Tighter pages](#tighter-pages-file-version-5)):
 
 ```
 header    magic, version, sizes and offsets
 manifest  deflate: meshes, nodes, clusters, page table, set links, materials, instances,
           lights, viewpoint, root pages, texture mips of 128 and below
-pages     each deflated on its own
+pages     each deflated on its own (filtered first, from version 5)
 textures  raw, by layer and mip
 ```
 
@@ -207,6 +207,96 @@ the file once, in that test 226 MB, and streams from memory.
 **Not measured:** flyover frame times, real networks, and GitHub Pages serving a `.solstice` file.
 Range was tested on Pages with a `.gz` file only. The on-screen frame rate looked the same as before
 in the browser, at 102 to 110 fps, but with no controlled comparison.
+
+## Tighter pages (file version 5)
+
+A pool of fixed slots holds as many clusters as fit in a slot, so this made what a cluster takes
+smaller, and the slots fuller. Measured on a castle in its gardens, a scene that is not in this
+repository (31.2 million unique triangles in 960 meshes, most of it leaf-by-leaf planting,
+541,000 clusters, 4.1 billion triangles placed), with
+`cargo run --release -p solstice-asset --example page_stats -- FILE`, which measures any bake.
+
+**What the pages held.** Vertices were 82% of them, at 129 to a cluster of 118 triangles: leaves
+and petals share few corners. Of a vertex's 16 bytes two were padding, and its normal had 32 bits.
+Of a triangle's 4 bytes one was unused. Slots were 91.6% full, as a page closed at the first
+sibling set that would not fit.
+
+**What changed.**
+
+- **A vertex is 12 bytes**, `x y z n u v` at sixteen bits each. The normal is octahedral with a
+  signed byte for each coordinate, as Nanite's default is, and the four codes around the exact
+  point are tried for the nearest (`gpu::encode_normal`): 0.31 degrees out on average, under one
+  at worst. Positions and UVs keep all their bits, so nothing moves and no seam can open.
+- **A triangle is 3 bytes**, end to end within its cluster (`gpu::pack_triangle_words`). A mesh
+  being built still has a word for each; pages are packed when they are made.
+- **Offsets are words.** A cluster's `vertex_offset` counts words of the pool, as its
+  `triangle_offset` always did, so a slot need not be a whole number of vertices and a banded
+  pool needs no special arithmetic for them. Shaders read both through `common/pool.wgsl`.
+- **Skins lie end to end** behind their cluster's vertices, two words each: a skinned vertex is
+  20 bytes where it was 24.
+- **A page is filtered before it is deflated** (`file::filter_page`): each field of a vertex as
+  its difference from the vertex before, one byte of it to a run. The host undoes it on arrival
+  (`Renderer::deliver_fetched`). Triangles are left alone, as they packed no better for it.
+- **Room left in a page is filled** from the next twelve sets of the same mesh and round, where
+  any fit.
+
+| | Version 4 | Version 5 |
+|---|---|---|
+| Vertex, triangle | 16 and 4 bytes | **12 and 3** |
+| Pages, unpacked | 1,294.6 MiB | **970.8 MiB** |
+| Pages, as stored | 787.3 MiB | **499.9 MiB** |
+| The scene file | 1,062.7 MB | **761.2 MB** |
+| Pages | 11,309 | **8,033** |
+| Slots full to | 91.6% | **96.7%** |
+| Clusters to a slot | 47.9 | **67.4** |
+| Pool bytes a cluster | 2,736 | **1,945** |
+
+So a pool of the same size holds 41% more clusters, and a page is 36% less to download for
+what it holds.
+
+**What views want**, at 1600x900, after 400 frames with the default 128 MiB pool and 600 with a
+pool that holds everything:
+
+| View | Short of room in 128 MiB, v4 | v5 | Installed with room for all, v4 | v5 |
+|---|---|---|---|---|
+| South gate, up the avenue | 1,153 | **643** | 2,759 (345 MiB) | **2,080 (260 MiB)** |
+| From the air | 204 | **0** | 1,329 | **1,057** |
+| In the maze | 658 | **272** | 2,368 | **1,788** |
+| The great hall | 0 | 0 | 2,401 | **1,874** |
+| By the lake | | | 2,643 | **1,982** |
+| The rose garden | | | 2,584 | **1,967** |
+
+A scene this dense still wants more than the default pool: at 128 MiB its opening view is
+short, and its own page asks for 320 with `?geometry-mb=320`.
+
+**It costs nothing to draw.** The same three views, whole scene loaded, 400 frames: 5.56 ms a
+frame before and 5.53 after from the gate (raster 2.03 and 2.00, resolve 0.30 and 0.30), 3.52 and
+3.46 in the maze, 2.94 and 2.92 in the hall. A triangle that straddles two words is a second
+read, and it does not show.
+
+**The picture changes a little.** A version 5 render differs from the version 4 one by 35 to
+37 dB, where two renders of one file differ by 44 to 47 dB. The difference is soft and wide,
+bounced light a few levels brighter or darker in places, not edges: normals a fraction of a
+degree apart now weld into one vertex, so meshes simplify slightly differently and the voxels
+light is traced through differ with them. Side by side they look the same. All of
+`cargo test` passes, the GPU tests among them.
+
+**Two things tried and left out**, both for the same reason: what matters is how many pages a
+view wants, and that is set by how well a page keeps to one place.
+
+- *Filling pages from the next 256 sets of any mesh* made slots 99.0% full and views want a
+  quarter more pages: from the gate, 1,058 short of room where 643 had been.
+- *Ordering meshes by where their instances stand*, so that small meshes sharing a page would be
+  neighbours, made every view want 3 to 4% more pages. The order meshes are made in already puts
+  like beside like.
+
+**A version 4 file does not open**: the reader says so, and the scene must be baked again. The
+surfaces in `assets/content` are scene files too, and `scripts/build-web.sh` makes them again
+when they are missing.
+
+**Not measured:** a browser on a real network, scenes with skinned meshes or regions (their
+tests pass, but no such scene was baked for sizes), and whether deflate at a lower level would
+now do as well.
 
 ## Known limits
 

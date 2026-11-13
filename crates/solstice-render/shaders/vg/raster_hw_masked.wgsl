@@ -29,8 +29,8 @@ fn vs_masked(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> 
     if triangle < cluster_triangle_count(cluster) {
         let instance = instances[entry.instance];
         out.material = instance_material(instance);
-        let packed = pool[cluster.triangle_offset + triangle];
-        let vertex = load_vertex(cluster.vertex_offset + local_vertex(packed, v % 3u));
+        let packed = load_triangle(cluster, triangle);
+        let vertex = load_vertex(cluster, local_vertex(packed, v % 3u));
         out.uv = decode_uv(instance, vertex) * materials[out.material].uv_scale;
     }
     return out;

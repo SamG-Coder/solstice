@@ -72,7 +72,8 @@ fn main() {
         for page in 0..loaded.scene.pages.len() as u32 {
             let bytes = loaded.page(page);
             raw += bytes.len();
-            deflated += solstice_asset::file::deflate_page(bytes).len();
+            let info = &loaded.scene.pages[page as usize];
+            deflated += solstice_asset::file::deflate_page(bytes, info).len();
         }
         // Every cluster must still decode to exactly the original packed values, including
         // triangle ordering. This checks the thing the GPU consumes, not just byte counts.
@@ -84,20 +85,22 @@ fn main() {
                 let after = &loaded.scene.clusters[c as usize];
                 let vs = before.vertex_count() as usize;
                 let ts = before.triangle_count() as usize;
-                let vertex_at = after.vertex_offset as usize * 16;
-                let triangle_at =
-                    info.vertex_count as usize * 16 + after.triangle_offset as usize * 4;
+                // Offsets are in words: a vertex is three, a triangle three bytes.
+                let vertex_at = after.vertex_offset as usize * 4;
+                let triangle_at = info.vertex_bytes() + after.triangle_offset as usize * 4;
                 let source_vertices =
                     &scene.meshes[0].vertices[before.vertex_offset as usize..][..vs];
                 let source_triangles =
                     &scene.meshes[0].triangles[before.triangle_offset as usize..][..ts];
                 assert_eq!(
-                    &bytes[vertex_at..][..vs * 16],
+                    &bytes[vertex_at..][..vs * 12],
                     bytemuck::cast_slice(source_vertices)
                 );
+                let mut packed = Vec::new();
+                solstice_asset::gpu::pack_triangle_words(source_triangles, &mut packed);
                 assert_eq!(
-                    &bytes[triangle_at..][..ts * 4],
-                    bytemuck::cast_slice(source_triangles)
+                    &bytes[triangle_at..][..packed.len() * 4],
+                    bytemuck::cast_slice(&packed)
                 );
             }
         }
