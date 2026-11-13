@@ -7,7 +7,8 @@
 //!
 //! See `docs/streaming.md` for the rules that keep a partly loaded scene watertight.
 
-use crate::gpu::{PackedCluster, PackedNode, PackedVertex};
+use crate::gpu::{PackedCluster, PackedNode, PackedVertex, VERTEX_WORDS};
+
 use crate::scene::{
     GameFile, Instance, Light, Material, Sea, TextureEncoding, TextureLayer, Viewpoint,
 };
@@ -17,9 +18,7 @@ use glam::Vec3;
 /// Capacity of one page, and so the size of one slot in the GPU's page pool. It must hold the
 /// largest possible sibling set.
 pub const PAGE_BYTES: usize = 128 * 1024;
-/// Vertices a page could hold if it held nothing else.
-pub const PAGE_VERTICES: u32 = (PAGE_BYTES / std::mem::size_of::<PackedVertex>()) as u32;
-/// Words of triangle data a page could hold if it held nothing else.
+/// Words a page can hold: a cluster's vertices and triangles are found by the word.
 pub const PAGE_WORDS: u32 = (PAGE_BYTES / 4) as u32;
 
 /// Texture mips no larger than this travel with the manifest, so every material can draw from
@@ -57,8 +56,10 @@ pub struct PageInfo {
     pub offset: u64,
     /// Size of the compressed page. Zero for a pinned page, which is held in the manifest.
     pub stored_bytes: u32,
+    /// Vertex records, the skins of skinned clusters among them.
     pub vertex_count: u32,
-    pub triangle_count: u32,
+    /// Words of triangles, which are packed at three bytes each within a cluster.
+    pub triangle_words: u32,
     pub first_set: u32,
     pub set_count: u32,
     pub _pad: u32,
@@ -67,8 +68,17 @@ pub struct PageInfo {
 impl PageInfo {
     /// Size of the page once unpacked: all its vertices, then all its triangles.
     pub fn raw_bytes(&self) -> usize {
+        self.vertex_bytes() + self.triangle_words as usize * 4
+    }
+
+    /// Size of the page's vertices, which its triangles follow.
+    pub fn vertex_bytes(&self) -> usize {
         self.vertex_count as usize * std::mem::size_of::<PackedVertex>()
-            + self.triangle_count as usize * 4
+    }
+
+    /// Words of the page's vertices: where its triangles begin, counted in words.
+    pub fn vertex_words(&self) -> u32 {
+        self.vertex_count * VERTEX_WORDS
     }
 }
 
@@ -89,7 +99,8 @@ pub struct MeshInfo {
 /// The resident part of a scene: all of it is uploaded when the scene opens.
 #[derive(Clone, Debug, Default)]
 pub struct PagedScene {
-    /// Offsets are relative to the start of the cluster's page and rewritten on install.
+    /// Offsets are in words: a cluster's vertices from the start of its page, its triangles
+    /// from the end of the page's vertices. They are rewritten on install.
     pub clusters: Vec<PackedCluster>,
     pub nodes: Vec<PackedNode>,
     /// Sorted by page.

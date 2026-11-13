@@ -24,11 +24,11 @@ fn cluster_vertex(vertex_index: u32, visible_index: u32) -> VertexOutput {
     }
 
     let instance = instances[entry.instance];
-    let packed_triangle = pool[cluster.triangle_offset + triangle];
+    let packed_triangle = load_triangle(cluster, triangle);
     var clip: array<vec4f, 3>;
     for (var corner = 0u; corner < 3u; corner++) {
         let local = local_vertex(packed_triangle, corner);
-        let vertex = load_vertex(cluster.vertex_offset + local);
+        let vertex = load_vertex(cluster, local);
         let posed = posed_position(instance, cluster, local, decode_position(instance, vertex));
         let world = place_vertex(instance, posed);
         clip[corner] = view.raster_view_proj * vec4f(world, 1.0);

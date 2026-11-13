@@ -324,12 +324,6 @@ fn pool_word(address: u32) -> u32 {{
     )
 }
 
-/// Vertex numbers to word addresses, keeping the band.
-fn vertex_word() -> String {
-    let low = (1u32 << BAND_SHIFT) - 1;
-    format!("(index & {}u) | ((index & {low}u) * 4u)", !low)
-}
-
 /// Rewrites an expanded shader for a scene that needs regions, with this many pools.
 pub fn rewrite_shader(source: &str, cluster_chunk: u32, pools: usize) -> String {
     let mut binding = next_binding(source);
@@ -358,17 +352,10 @@ fn cluster_at(index: u32) -> Cluster {{
     };
 
     const POOL: &str = "var<storage, read> pool: array<u32>;";
-    const VERTICES: &str = "var<storage, read> vertices: array<PackedVertex>;";
+    const VERTICES: &str = "var<storage, read> vertices: array<u32>;";
     const TRIANGLES: &str = "var<storage, read> triangles: array<u32>;";
-    let vertex_word = vertex_word();
     if out.contains(POOL) {
         // One binding of words: the rasterizers.
-        const WORD: &str = "let word = index * 4u;";
-        assert!(
-            out.contains(WORD),
-            "the rasterizer's load_vertex has changed"
-        );
-        out = out.replace(WORD, &format!("let word = {vertex_word};"));
         out = replace_indexing(&out, "pool", "pool_word");
         out = out.replace(POOL, "var<storage, read> pool_near: array<u32>;");
         for band in 1..pools {
@@ -377,7 +364,7 @@ fn cluster_at(index: u32) -> Cluster {{
         extra += &pool_word(pools);
     } else if out.contains(VERTICES) {
         // A binding each for vertices and triangles, which carry the first two bands here.
-        out = replace_indexing(&out, "vertices", "region_vertex");
+        out = replace_indexing(&out, "vertices", "pool_word");
         out = replace_indexing(&out, "triangles", "pool_word");
         out = out.replace(VERTICES, "var<storage, read> pool_near: array<u32>;");
         assert!(out.contains(TRIANGLES), "the triangles binding has changed");
@@ -386,15 +373,6 @@ fn cluster_at(index: u32) -> Cluster {{
             declare(band, &mut extra);
         }
         extra += &pool_word(pools);
-        extra += &format!(
-            "
-fn region_vertex(index: u32) -> PackedVertex {{
-    let word = {vertex_word};
-    return PackedVertex(
-        pool_word(word), pool_word(word + 1u), pool_word(word + 2u), pool_word(word + 3u));
-}}
-"
-        );
     }
     out + &extra
 }

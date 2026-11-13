@@ -811,6 +811,19 @@ impl Renderer {
         self.streamer.deliver_request(id, data)
     }
 
+    /// As [`Self::deliver`], for bytes just as a scene file stores them, inflated if they were
+    /// deflated. A host reading a file hands them over with this: a stored page has its vertices
+    /// filtered to deflate smaller, which this undoes. [`Self::deliver`] takes a page as the GPU
+    /// reads it, as a scene held in memory has them.
+    pub fn deliver_fetched(&mut self, id: u32, data: Vec<u8>) -> bool {
+        self.streamer.deliver_fetched(id, data, Vec::new())
+    }
+
+    /// As [`Self::deliver_page`], for a page just as a scene file stores it, inflated.
+    pub fn deliver_fetched_page(&mut self, id: u32, data: Vec<u8>, clusters: Vec<u8>) -> bool {
+        self.streamer.deliver_fetched(id, data, clusters)
+    }
+
     /// Reports that a request could not be fetched, so what it holds may be requested again.
     pub fn request_failed(&mut self, id: u32) {
         self.streamer.request_failed(id);

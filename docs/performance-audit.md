@@ -158,6 +158,8 @@ validation:
   data further, but they change decode/upload work and need a format/version plan.
   Current vertices already occupy 16 bytes, triangle indices fit in three bytes
   of a four-byte word, and clusters allow 128 triangles and 255 vertices.
+  (Since done in part, as file version 5: 12-byte vertices and the three-byte
+  triangle stream. See "Tighter pages" in `docs/streaming.md`.)
 * The planner still scans page-sized arrays each plan. A sparse changed-request
   set could reduce that cost further, provided retention, cached-view requests,
   and deterministic priority semantics are preserved.

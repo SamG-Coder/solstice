@@ -30,7 +30,7 @@ use glam::{Mat4, Quat, Vec3};
 use std::fmt;
 
 const MAGIC: [u8; 8] = *b"SOLSTICE";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 /// How hard to compress when baking. Unpacking takes the same time at any level.
 const DEFLATE_LEVEL: u8 = 9;
 /// The optional section holding the scene's [`Sea`]: its level, then its ocean's text.
@@ -174,7 +174,7 @@ pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
     let mut scene = loaded.scene.clone();
     let mut data = Vec::new();
     for (info, raw) in scene.pages[pinned..].iter_mut().zip(&loaded.pages) {
-        let packed = miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL);
+        let packed = deflate_page(raw, info);
         info.offset = data.len() as u64;
         info.stored_bytes = packed.len() as u32;
         data.extend_from_slice(&packed);
@@ -213,9 +213,71 @@ pub fn cluster_bytes(clusters: &[PackedCluster]) -> &[u8] {
     bytemuck::cast_slice(clusters)
 }
 
-/// Deflates a page as [`encode`] does, for writers that lay out the data area themselves.
-pub fn deflate_page(raw: &[u8]) -> Vec<u8> {
-    miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL)
+/// Packs a page as [`encode`] does, for writers that lay out the data area themselves:
+/// filtered, see [`filter_page`], and deflated.
+pub fn deflate_page(raw: &[u8], info: &PageInfo) -> Vec<u8> {
+    miniz_oxide::deflate::compress_to_vec(&filter_page(raw, info), DEFLATE_LEVEL)
+}
+
+/// The `u16` fields of a vertex record.
+const VERTEX_FIELDS: usize = std::mem::size_of::<crate::gpu::PackedVertex>() / 2;
+
+/// Rewrites a page's vertices so that they deflate smaller, to the same size and with nothing
+/// lost: [`unfilter_page`] undoes it. The pages of a large garden scene stored a fifth smaller
+/// for it, see `docs/streaming.md`.
+///
+/// Each field of a vertex becomes its difference from the same field of the vertex before,
+/// folded so that a small step either way is a small number, and each byte of each field goes
+/// in a run of its own. Neighbouring vertices are close together, so the high bytes are mostly
+/// nought and the low ones small. Triangles are left alone: they pack no better for it.
+pub fn filter_page(raw: &[u8], info: &PageInfo) -> Vec<u8> {
+    let count = info.vertex_count as usize;
+    let vertex_bytes = info.vertex_bytes().min(raw.len());
+    let mut out = raw.to_vec();
+    if vertex_bytes != count * 2 * VERTEX_FIELDS {
+        return out;
+    }
+    let mut before = [0u16; VERTEX_FIELDS];
+    for (index, vertex) in raw[..vertex_bytes]
+        .chunks_exact(2 * VERTEX_FIELDS)
+        .enumerate()
+    {
+        for field in 0..VERTEX_FIELDS {
+            let value = u16::from_le_bytes([vertex[field * 2], vertex[field * 2 + 1]]);
+            let step = value.wrapping_sub(before[field]);
+            let folded = (step << 1) ^ (((step as i16) >> 15) as u16);
+            out[field * 2 * count + index] = folded as u8;
+            out[(field * 2 + 1) * count + index] = (folded >> 8) as u8;
+            before[field] = value;
+        }
+    }
+    out
+}
+
+/// Undoes [`filter_page`]: the page as the GPU reads it, from the page as a file stores it once
+/// inflated.
+pub fn unfilter_page(stored: &[u8], info: &PageInfo) -> Vec<u8> {
+    let count = info.vertex_count as usize;
+    let vertex_bytes = info.vertex_bytes().min(stored.len());
+    let mut out = stored.to_vec();
+    if vertex_bytes != count * 2 * VERTEX_FIELDS {
+        return out;
+    }
+    let mut before = [0u16; VERTEX_FIELDS];
+    for (index, vertex) in out[..vertex_bytes]
+        .chunks_exact_mut(2 * VERTEX_FIELDS)
+        .enumerate()
+    {
+        for field in 0..VERTEX_FIELDS {
+            let folded = u16::from(stored[field * 2 * count + index])
+                | u16::from(stored[(field * 2 + 1) * count + index]) << 8;
+            let step = (folded >> 1) ^ (folded & 1).wrapping_neg();
+            let value = before[field].wrapping_add(step);
+            vertex[field * 2..field * 2 + 2].copy_from_slice(&value.to_le_bytes());
+            before[field] = value;
+        }
+    }
+    out
 }
 
 /// The start of a file: its header and manifest, for a writer that has placed every page and
@@ -1145,11 +1207,12 @@ pub fn inflate_limited(packed: &[u8], limit: u64) -> Result<Vec<u8>, DecodeError
 
 /// Unpacks a page and checks that it is the size the tables say.
 pub fn unpack_page(scene: &PagedScene, page: u32, packed: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    let raw = inflate(packed)?;
-    if raw.len() != scene.pages[page as usize].raw_bytes() {
+    let info = &scene.pages[page as usize];
+    let stored = inflate(packed)?;
+    if stored.len() != info.raw_bytes() {
         return Err(DecodeError::BadPages);
     }
-    Ok(raw)
+    Ok(unfilter_page(&stored, info))
 }
 
 /// Checks everything the renderer would otherwise index blindly while installing pages. A bad
@@ -1282,7 +1345,7 @@ mod tests {
     fn sample_scene() -> LoadedScene {
         let page_bytes = |vertex: u8| {
             let vertices = [PackedVertex {
-                data: [u16::from(vertex); 8],
+                data: [u16::from(vertex); 6],
             }; 3];
             let mut bytes: Vec<u8> = bytemuck::cast_slice(&vertices).to_vec();
             bytes.extend_from_slice(bytemuck::bytes_of(&pack_triangle(0, 1, 2)));
@@ -1290,7 +1353,7 @@ mod tests {
         };
         let info = PageInfo {
             vertex_count: 3,
-            triangle_count: 1,
+            triangle_words: 1,
             set_count: 1,
             ..Default::default()
         };
@@ -1479,10 +1542,12 @@ mod tests {
     }
 
     #[test]
-    fn a_version_4_file_with_neither_section_still_loads() {
+    fn a_file_with_neither_section_still_loads() {
         let loaded = sample_scene();
         let bytes = encode(&loaded);
-        assert_eq!(bytes[8..12], 4u32.to_le_bytes(), "the version hasn't moved");
+        // Version 5 is version 4 with pages laid out more tightly: optional sections came and
+        // went without moving it.
+        assert_eq!(bytes[8..12], 5u32.to_le_bytes(), "the version hasn't moved");
         let manifest = encode_manifest(&loaded.scene);
         assert!(!manifest
             .windows(4)
@@ -2059,6 +2124,42 @@ mod tests {
         // A section cut short is an error, not a silent loss.
         manifest.truncate(manifest.len() - 2);
         assert!(decode_manifest(&manifest, 0).is_err());
+    }
+
+    #[test]
+    fn filtering_a_page_loses_nothing_and_packs_smaller() {
+        // A strip of vertices a step apart, as neighbours in a mesh are, then some triangles.
+        let vertices: Vec<PackedVertex> = (0..600u16)
+            .map(|i| PackedVertex {
+                data: [
+                    1000 + i * 3,
+                    40_000 - i * 5,
+                    i.wrapping_mul(977) % 64,
+                    i.wrapping_mul(31_337),
+                    i * 100,
+                    65_535 - i * 7,
+                ],
+            })
+            .collect();
+        let mut raw: Vec<u8> = bytemuck::cast_slice(&vertices).to_vec();
+        raw.extend((0..300u32).flat_map(|i| i.wrapping_mul(0x0101_0101).to_le_bytes()));
+        let info = PageInfo {
+            vertex_count: vertices.len() as u32,
+            triangle_words: 300,
+            ..Default::default()
+        };
+        assert_eq!(raw.len(), info.raw_bytes());
+        let stored = filter_page(&raw, &info);
+        assert_eq!(stored.len(), raw.len());
+        assert_ne!(stored, raw);
+        assert_eq!(unfilter_page(&stored, &info), raw);
+        assert!(
+            deflate_page(&raw, &info).len() * 2
+                < miniz_oxide::deflate::compress_to_vec(&raw, DEFLATE_LEVEL).len()
+        );
+        // A page the tables are wrong about comes back as it went in, to be refused for its size.
+        let short = &raw[..100];
+        assert_eq!(unfilter_page(&filter_page(short, &info), &info), short);
     }
 
     #[test]

@@ -302,10 +302,10 @@ fn importing_a_skin_keeps_its_bones_and_weights() {
     assert!(mesh.skinned());
     let cluster = mesh.clusters[0];
     assert_eq!(cluster.vertex_count(), 4);
-    let skins: Vec<solstice_asset::PackedSkin> = mesh.vertices
-        [cluster.vertex_offset as usize + 4..cluster.vertex_offset as usize + 6]
-        .iter()
-        .flat_map(|record| bytemuck::cast::<_, [solstice_asset::PackedSkin; 2]>(*record))
+    // The four vertices' skins follow them, end to end.
+    let records = &mesh.vertices[cluster.vertex_offset as usize + 4..];
+    let skins: Vec<solstice_asset::PackedSkin> = (0..4)
+        .map(|vertex| solstice_asset::gpu::skin_at(records, vertex))
         .collect();
     // Vertices may be listed in any order, but each of the file's four skins must be there.
     for (joints, weights) in Character::default().weights {
@@ -336,10 +336,10 @@ fn weights_follow_their_bones_when_bones_are_renumbered() {
     assert_eq!(bones[1].parent, Some(0));
     let mesh = &scene.meshes[0];
     let cluster = mesh.clusters[0];
-    let skins: Vec<solstice_asset::PackedSkin> = mesh.vertices
-        [cluster.vertex_offset as usize + 4..cluster.vertex_offset as usize + 6]
-        .iter()
-        .flat_map(|record| bytemuck::cast::<_, [solstice_asset::PackedSkin; 2]>(*record))
+    // The four vertices' skins follow them, end to end.
+    let records = &mesh.vertices[cluster.vertex_offset as usize + 4..];
+    let skins: Vec<solstice_asset::PackedSkin> = (0..4)
+        .map(|vertex| solstice_asset::gpu::skin_at(records, vertex))
         .collect();
     // In this file joint 0 is the spine (bone 2), 1 the pelvis (bone 1) and 2 the root (bone 0).
     for (joints, weights) in Character::default().weights {

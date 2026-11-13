@@ -13,8 +13,8 @@ use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use solstice_asset::gpu::{
-    cluster_bones, encode_uv_density, pack_triangle, ClusterBones, CLUSTER_UV_DENSITY_SHIFT,
-    MAX_CLUSTER_TRIANGLES, MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
+    cluster_bones, encode_normal, encode_uv_density, pack_skins, pack_triangle, ClusterBones,
+    CLUSTER_UV_DENSITY_SHIFT, MAX_CLUSTER_TRIANGLES, MAX_CLUSTER_VERTICES, ROOT_PARENT_ERROR,
 };
 use solstice_asset::paged::{ClusterSet, ROOT_ROUND};
 use solstice_asset::{PackedCluster, PackedSkin, PackedVertex, VirtualMesh};
@@ -517,7 +517,7 @@ fn weld(mesh: &Mesh, input_skins: Option<&[PackedSkin]>, margin: f32) -> WeldedM
     // A skin belongs to a position, so vertices that differ in skin are different positions,
     // free to part in a pose.
     let mut position_ids: FxHashMap<([u16; 3], PackedSkin), u32> = FxHashMap::default();
-    let mut attribute_ids: FxHashMap<[u32; 4], u32> = FxHashMap::default();
+    let mut attribute_ids: FxHashMap<[u32; 3], u32> = FxHashMap::default();
     let mut positions = Vec::new();
     let mut skins = input_skins.map(|_| Vec::new());
     let mut attributes = Vec::new();
@@ -538,14 +538,8 @@ fn weld(mesh: &Mesh, input_skins: Option<&[PackedSkin]>, margin: f32) -> WeldedM
                 positions.len() as u32 - 1
             });
 
-            let octahedral = encode_octahedral(vertex.normal);
             let uv = ((vertex.uv - uv_min) / uv_step).round().as_uvec2();
-            let attribute_key = [
-                u32::from(octahedral[0] as u16),
-                u32::from(octahedral[1] as u16),
-                uv.x,
-                uv.y,
-            ];
+            let attribute_key = [u32::from(encode_octahedral(vertex.normal)), uv.x, uv.y];
             let attribute = *attribute_ids.entry(attribute_key).or_insert_with(|| {
                 attributes.push(Attribute {
                     normal: vertex.normal.normalize_or(Vec3::Y),
@@ -589,22 +583,9 @@ fn weld(mesh: &Mesh, input_skins: Option<&[PackedSkin]>, margin: f32) -> WeldedM
     }
 }
 
-/// Encodes a unit vector to 16-bit signed octahedral coordinates.
-fn encode_octahedral(normal: Vec3) -> [i16; 2] {
-    let n = normal.normalize_or(Vec3::Y);
-    let p = Vec2::new(n.x, n.y) / (n.x.abs() + n.y.abs() + n.z.abs());
-    let folded = if n.z < 0.0 {
-        Vec2::new(
-            (1.0 - p.y.abs()) * p.x.signum(),
-            (1.0 - p.x.abs()) * p.y.signum(),
-        )
-    } else {
-        p
-    };
-    [
-        (folded.x.clamp(-1.0, 1.0) * 32767.0).round() as i16,
-        (folded.y.clamp(-1.0, 1.0) * 32767.0).round() as i16,
-    ]
+/// Encodes a unit vector as a vertex holds it: octahedral coordinates, a signed byte each.
+fn encode_octahedral(normal: Vec3) -> u16 {
+    encode_normal(normal.normalize_or(Vec3::Y).to_array())
 }
 
 /// Orders clusters by sibling set and emits the GPU representation.
@@ -735,11 +716,8 @@ fn pack_cluster(
         triangles.push(pack_triangle(indices[0], indices[1], indices[2]));
     }
     if welded.skins.is_some() {
-        // Two to a record, right behind the cluster's vertices.
-        for pair in skins.chunks(2) {
-            let second = pair.get(1).copied().unwrap_or_default();
-            vertices.push(bytemuck::cast([pair[0], second]));
-        }
+        // End to end, right behind the cluster's vertices.
+        vertices.extend(pack_skins(&skins));
         bones.push(cluster_bones(
             skins.iter().flat_map(|s| s.bones()).collect(),
         ));
@@ -781,17 +759,14 @@ fn pack_vertex(welded: &WeldedMesh, corner: Corner) -> PackedVertex {
     let uv = ((attribute.uv - welded.uv_origin) / welded.uv_step)
         .round()
         .as_uvec2();
-    let normal = encode_octahedral(attribute.normal);
     PackedVertex {
         data: [
             grid.x as u16,
             grid.y as u16,
             grid.z as u16,
-            normal[0] as u16,
-            normal[1] as u16,
+            encode_octahedral(attribute.normal),
             uv.x as u16,
             uv.y as u16,
-            0,
         ],
     }
 }
@@ -1282,10 +1257,11 @@ pub(crate) mod tests {
     fn skinned_vertex(mesh: &VirtualMesh, cluster: u32, local: u32) -> ([u16; 3], PackedSkin) {
         let cluster = mesh.clusters[cluster as usize];
         let data = mesh.vertices[(cluster.vertex_offset + local) as usize].data;
-        let record =
-            mesh.vertices[(cluster.vertex_offset + cluster.vertex_count() + local / 2) as usize];
-        let pair: [PackedSkin; 2] = bytemuck::cast(record);
-        ([data[0], data[1], data[2]], pair[(local % 2) as usize])
+        let skins = &mesh.vertices[(cluster.vertex_offset + cluster.vertex_count()) as usize..];
+        (
+            [data[0], data[1], data[2]],
+            solstice_asset::gpu::skin_at(skins, local as usize),
+        )
     }
 
     #[test]
@@ -1428,7 +1404,10 @@ pub(crate) mod tests {
             let bytes: usize = mesh.clusters[set.first_cluster as usize..]
                 [..set.cluster_count as usize]
                 .iter()
-                .map(|c| c.vertex_records(true) as usize * 16 + c.triangle_count() as usize * 4)
+                .map(|c| {
+                    c.vertex_records(true) as usize * std::mem::size_of::<PackedVertex>()
+                        + solstice_asset::gpu::triangle_words(c.triangle_count()) as usize * 4
+                })
                 .sum();
             assert!(bytes <= page, "a set takes {bytes} bytes, more than a page");
         }

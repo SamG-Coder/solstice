@@ -30,9 +30,13 @@ fn place_vertex(instance: Instance, posed: vec3f) -> vec3f {
     return swayed_position(instance, posed, world, view.camera_position);
 }
 
-fn load_vertex(index: u32) -> PackedVertex {
-    let word = index * 4u;
-    return PackedVertex(pool[word], pool[word + 1u], pool[word + 2u], pool[word + 3u]);
+// One binding holds vertices and triangles alike. See common/pool.wgsl.
+fn vertex_word(word: u32) -> u32 {
+    return pool[word];
+}
+
+fn triangle_word(word: u32) -> u32 {
+    return pool[word];
 }
 
 // Visibility ID: visible-cluster index in the high bits, triangle in the low 7.

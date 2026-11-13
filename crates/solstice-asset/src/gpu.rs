@@ -47,17 +47,71 @@ pub const NODE_INSTALLED: u32 = 1 << 30;
 /// The bits of [`PackedNode::is_leaf`] holding a page.
 pub const NODE_PAGE_MASK: u32 = NODE_INSTALLED - 1;
 
-/// A vertex compressed to 16 bytes.
+/// A vertex compressed to 12 bytes: three words of a page.
 ///
 /// Positions sit on a single mesh-wide 16-bit grid. Using one grid rather than
 /// one per cluster is what keeps neighbouring clusters crack-free: a shared
 /// vertex always decodes to the identical position.
 ///
-/// Layout, as little-endian `u16`s: `x y z nx ny u v _`.
+/// Layout, as little-endian `u16`s: `x y z n u v`. The normal is octahedral, a signed byte for
+/// each coordinate, see [`encode_normal`]: a page pool holds a third more vertices than it did
+/// with sixteen bits for each and a word of padding.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct PackedVertex {
-    pub data: [u16; 8],
+    pub data: [u16; 6],
+}
+
+/// Words of a page one vertex takes.
+pub const VERTEX_WORDS: u32 = (std::mem::size_of::<PackedVertex>() / 4) as u32;
+
+fn octahedral(n: [f32; 3]) -> [f32; 2] {
+    let sum = n[0].abs() + n[1].abs() + n[2].abs();
+    let p = [n[0] / sum, n[1] / sum];
+    if n[2] < 0.0 {
+        [
+            (1.0 - p[1].abs()) * if p[0] < 0.0 { -1.0 } else { 1.0 },
+            (1.0 - p[0].abs()) * if p[1] < 0.0 { -1.0 } else { 1.0 },
+        ]
+    } else {
+        p
+    }
+}
+
+/// The unit vector a packed normal stands for. `shaders/common/scene.wgsl` has a twin.
+pub fn decode_normal(packed: u16) -> [f32; 3] {
+    let x = f32::from(packed as u8 as i8) / 127.0;
+    let y = f32::from((packed >> 8) as u8 as i8) / 127.0;
+    let z = 1.0 - x.abs() - y.abs();
+    let fold = (-z).max(0.0);
+    let v = [
+        x + if x >= 0.0 { -fold } else { fold },
+        y + if y >= 0.0 { -fold } else { fold },
+        z,
+    ];
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    [v[0] / length, v[1] / length, v[2] / length]
+}
+
+/// Packs a unit vector into sixteen bits, as octahedral coordinates of a signed byte each.
+///
+/// Rounding each coordinate to the nearest step is not always the nearest direction, so the four
+/// steps around the exact point are all tried and the one that decodes closest is kept.
+pub fn encode_normal(normal: [f32; 3]) -> u16 {
+    let exact = octahedral(normal);
+    let floor = [(exact[0] * 127.0).floor(), (exact[1] * 127.0).floor()];
+    let mut best = (f32::NEG_INFINITY, 0u16);
+    for corner in 0..4 {
+        let x = (floor[0] + (corner & 1) as f32).clamp(-127.0, 127.0) as i8;
+        let y = (floor[1] + (corner >> 1) as f32).clamp(-127.0, 127.0) as i8;
+        let packed = u16::from(x as u8) | u16::from(y as u8) << 8;
+        let decoded = decode_normal(packed);
+        let alike = decoded[0] * normal[0] + decoded[1] * normal[1] + decoded[2] * normal[2];
+        if alike > best.0 {
+            best = (alike, packed);
+        }
+    }
+    best.1
 }
 
 /// How many bones a cluster's list can name. A cluster using more is drawn with the bounds of its
@@ -178,11 +232,34 @@ impl PackedSkin {
     }
 }
 
+/// Words of a page one skin takes.
+pub const SKIN_WORDS: u32 = (std::mem::size_of::<PackedSkin>() / 4) as u32;
+
 /// How many [`PackedVertex`]-sized records hold the skins of a skinned cluster's vertices. They
-/// follow the cluster's vertices, two skins a record, so only skinned meshes pay for them, and a
-/// page needs no separate part for them.
+/// follow the cluster's vertices, two words a skin with no gaps between them, so only skinned
+/// meshes pay for them, and a page needs no separate part for them.
 pub const fn skin_records(vertex_count: u32) -> u32 {
-    vertex_count.div_ceil(2)
+    (vertex_count * SKIN_WORDS).div_ceil(VERTEX_WORDS)
+}
+
+/// The records that hold some vertices' skins, to follow those vertices. See [`skin_records`].
+pub fn pack_skins(skins: &[PackedSkin]) -> Vec<PackedVertex> {
+    let mut bytes: Vec<u8> = bytemuck::cast_slice(skins).to_vec();
+    bytes.resize(
+        skin_records(skins.len() as u32) as usize * std::mem::size_of::<PackedVertex>(),
+        0,
+    );
+    bytes
+        .chunks_exact(std::mem::size_of::<PackedVertex>())
+        .map(bytemuck::pod_read_unaligned)
+        .collect()
+}
+
+/// One of the skins [`pack_skins`] packed into `records`.
+pub fn skin_at(records: &[PackedVertex], index: usize) -> PackedSkin {
+    let bytes: &[u8] = bytemuck::cast_slice(records);
+    let size = std::mem::size_of::<PackedSkin>();
+    bytemuck::pod_read_unaligned(&bytes[index * size..(index + 1) * size])
 }
 
 /// One leaf of the LOD DAG: up to [`MAX_CLUSTER_TRIANGLES`] triangles.
@@ -261,8 +338,43 @@ pub fn unpack_triangle(packed: u32) -> [u8; 3] {
     [packed as u8, (packed >> 8) as u8, (packed >> 16) as u8]
 }
 
+/// Words of a page that a cluster's triangles take: three bytes each, end to end, see
+/// [`pack_triangle_words`].
+pub const fn triangle_words(triangle_count: u32) -> u32 {
+    (triangle_count * 3).div_ceil(4)
+}
+
+/// Lays a cluster's triangles, each as [`pack_triangle`] made it, end to end at three bytes
+/// each, and appends them to `out` as whole words. A mesh being built keeps a word for each
+/// triangle; a page holds them like this, a quarter smaller.
+pub fn pack_triangle_words(triangles: &[u32], out: &mut Vec<u32>) {
+    let mut bytes = Vec::with_capacity(triangles.len() * 3 + 3);
+    for triangle in triangles {
+        bytes.extend_from_slice(&triangle.to_le_bytes()[..3]);
+    }
+    bytes.resize(triangle_words(triangles.len() as u32) as usize * 4, 0);
+    out.extend(
+        bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])),
+    );
+}
+
+/// One triangle of those [`pack_triangle_words`] packed, as [`pack_triangle`] made it. The
+/// shaders' `load_triangle` is its twin.
+pub fn triangle_at(words: &[u32], index: u32) -> u32 {
+    let bit = index * 24;
+    let word = (bit / 32) as usize;
+    let shift = bit % 32;
+    let mut packed = words[word] >> shift;
+    if shift > 8 {
+        packed |= words[word + 1] << (32 - shift);
+    }
+    packed & 0x00ff_ffff
+}
+
 const _: () = {
-    assert!(std::mem::size_of::<PackedVertex>() == 16);
+    assert!(std::mem::size_of::<PackedVertex>() == 12);
     assert!(std::mem::size_of::<PackedCluster>() == 48);
     assert!(std::mem::size_of::<PackedNode>() == 48);
     assert!(std::mem::size_of::<PackedSkin>() == 8);
@@ -331,7 +443,71 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cluster.vertex_records(false), 7);
-        assert_eq!(cluster.vertex_records(true), 11);
-        assert_eq!(skin_records(8), 4);
+        assert_eq!(cluster.vertex_records(true), 12);
+        assert_eq!(skin_records(8), 6);
+        assert_eq!(skin_records(3), 2);
+    }
+
+    #[test]
+    fn skins_pack_end_to_end_and_read_back() {
+        let skins: Vec<PackedSkin> = (0..5u8)
+            .map(|i| PackedSkin::new([i, i + 1, 0, 0], [0.25, 0.75, 0.0, 0.0]))
+            .collect();
+        let records = pack_skins(&skins);
+        assert_eq!(records.len(), skin_records(5) as usize);
+        for (index, skin) in skins.iter().enumerate() {
+            assert_eq!(skin_at(&records, index), *skin);
+        }
+    }
+
+    #[test]
+    fn triangles_pack_at_three_bytes_and_read_back() {
+        for count in [0u32, 1, 2, 3, 4, 5, 127, 128] {
+            let triangles: Vec<u32> = (0..count)
+                .map(|i| pack_triangle(i as u8, (i * 7 + 1) as u8, (255 - i) as u8))
+                .collect();
+            let mut words = vec![0xdead_beef];
+            pack_triangle_words(&triangles, &mut words);
+            assert_eq!(words.len() as u32, 1 + triangle_words(count));
+            for (index, &triangle) in triangles.iter().enumerate() {
+                assert_eq!(triangle_at(&words[1..], index as u32), triangle);
+            }
+        }
+        assert_eq!(triangle_words(128), 96);
+    }
+
+    #[test]
+    fn a_packed_normal_is_within_a_degree_and_usually_far_closer() {
+        let mut worst = 0.0f32;
+        let mut sum = 0.0f64;
+        let mut count = 0u32;
+        // A spiral over the whole sphere, and the axes, where folding is most awkward.
+        let mut normals: Vec<[f32; 3]> = (0..20_000)
+            .map(|i| {
+                let z = 1.0 - (i as f32 + 0.5) / 10_000.0;
+                let r = (1.0 - z * z).sqrt();
+                let a = i as f32 * 2.399_963;
+                [r * a.cos(), r * a.sin(), z]
+            })
+            .collect();
+        normals.extend([
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ]);
+        for normal in normals {
+            let back = decode_normal(encode_normal(normal));
+            let alike = (back[0] * normal[0] + back[1] * normal[1] + back[2] * normal[2]).min(1.0);
+            let degrees = alike.acos().to_degrees();
+            worst = worst.max(degrees);
+            sum += f64::from(degrees);
+            count += 1;
+        }
+        let mean = sum / f64::from(count);
+        assert!(worst < 1.0, "the worst normal is {worst} degrees out");
+        assert!(mean < 0.35, "the mean is {mean} degrees out");
     }
 }

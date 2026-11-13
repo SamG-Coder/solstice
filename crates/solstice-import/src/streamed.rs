@@ -20,7 +20,7 @@ use glam::{Mat3, Mat4, Quat, Vec3};
 use gltf::{buffer, Document, Gltf, Node, Primitive};
 use rayon::prelude::*;
 use solstice_asset::file::{deflate_page, encode_header_and_manifest};
-use solstice_asset::paged::{upper_mip_count, PagedScene};
+use solstice_asset::paged::{upper_mip_count, PageInfo, PagedScene};
 use solstice_asset::scene::TextureEncoding;
 use solstice_asset::{
     Card, CardImage, CardVertex, Cards, GlowMaps, Instance, Material, PackedVertex, SceneAsset,
@@ -823,10 +823,13 @@ fn bake_inner(
         BufWriter::with_capacity(1 << 22, File::create(data_path).map_err(|e| e.to_string())?);
     let mut placed: Vec<(u64, u32)> = Vec::new();
     let mut data_at = 0u64;
-    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let mut pending: Vec<(Vec<u8>, PageInfo)> = Vec::new();
     let mut since_check = 0u64;
-    let mut flush = |pending: &mut Vec<Vec<u8>>, placed: &mut Vec<(u64, u32)>| {
-        let packed: Vec<Vec<u8>> = pending.par_iter().map(|raw| deflate_page(raw)).collect();
+    let mut flush = |pending: &mut Vec<(Vec<u8>, PageInfo)>, placed: &mut Vec<(u64, u32)>| {
+        let packed: Vec<Vec<u8>> = pending
+            .par_iter()
+            .map(|(raw, info)| deflate_page(raw, info))
+            .collect();
         pending.clear();
         for page in packed {
             placed.push((data_at, page.len() as u32));
@@ -840,8 +843,8 @@ fn bake_inner(
         }
         Ok::<(), String>(())
     };
-    let mut paged = paginate_from(&scene, &mut store, &mut |page| {
-        pending.push(page);
+    let mut paged = paginate_from(&scene, &mut store, &mut |page, info| {
+        pending.push((page, *info));
         if pending.len() >= 1024 {
             flush(&mut pending, &mut placed)?;
         }
