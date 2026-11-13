@@ -100,8 +100,9 @@ The GPU regression exercises the actual control and traversal shaders at 0, 1,
 31, 32, 33, 2,097,120, 2,097,121, and 4,194,304 entries, including a nonzero queue
 start. It checks dispatch legality and complete processing. This removes a limit
 below the allocated capacity; it does not make queues or visible-cluster buffers
-unbounded. Capacity overflow still needs explicit diagnostics and a considered
-fallback before claiming arbitrary scene sizes are supported.
+unbounded. `FrameStats` already reports dropped entries for the main view and
+shadows; a considered fallback is still needed before claiming arbitrary scene
+sizes are supported.
 
 ## Smaller geometry pages without requantization
 
@@ -183,6 +184,19 @@ this environment because its PowerShell subprocess did not return a usable free
 space value. The Windows path now uses `GetDiskFreeSpaceExW` on the nearest existing
 output directory, avoiding subprocess startup and handling mount points and UNC
 paths through the native API. Its existing regression passes.
+
+## Validation completed
+
+The local native suites passed 1,009 tests: 630 outside the renderer, 286 renderer
+unit tests, and 93 full GPU integration tests. Three existing tests were ignored.
+The final integration run used the completed fixes on the RTX 5080 and finished
+in 354.39 seconds. The focused fault-injection and full-capacity traversal tests
+also passed after the last shader changes.
+
+Workspace/all-target native Clippy with warnings denied, formatting, and diff
+whitespace checks passed. The WASM viewer built and passed Clippy for minimal,
+default, and editor configurations; the browser baker also built and passed
+Clippy. The JavaScript page tests and Python crate-selection tests passed.
 
 ## Reproduction
 
