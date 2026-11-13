@@ -237,9 +237,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 // Where this surface would lie at that texel's centre, a fraction of a pixel away.
                 let there = expected + dot(gradient, vec2f(texel) + vec2f(0.5) - previous_uv * frame.viewport);
                 if abs(remembered - there) <= tolerance {
+                    let sample = textureLoad(history_tex, texel, 0);
+                    // A single NaN otherwise grows into a larger patch every frame through
+                    // this four-tap gather, even after its original source disappears.
+                    if !finite4(sample) {
+                        continue;
+                    }
                     let side = select(vec2f(1.0) - part, part, vec2i(dx, dy) == vec2i(1));
                     let weight = max(side.x * side.y, 1.0e-3);
-                    history += textureLoad(history_tex, texel, 0) * weight;
+                    history += sample * weight;
                     found += weight;
                 }
             }

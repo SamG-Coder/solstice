@@ -29,9 +29,10 @@ pub struct InstanceTable {
     gpu_index: Vec<Option<u32>>,
     /// Each instance's object-space bounding sphere, by position in `data`.
     spheres: Vec<(Vec3, f32)>,
-    /// New transforms for the next frame, by position in `data`, in the order they were set,
-    /// and whether each is a jump rather than a motion.
+    /// One pending transform per changed instance, and whether it is a jump rather than a motion.
     moves: Vec<(u32, Mat4, bool)>,
+    /// Each instance's entry in `moves`, or `u32::MAX` when it has no pending move.
+    pending_move: Vec<u32>,
     /// What moved last frame, whose previous transform must catch up this frame.
     moved_last_frame: Vec<u32>,
     /// What has changed in other ways since the last upload.
@@ -68,6 +69,7 @@ impl InstanceTable {
             .filter(|&i| data[i as usize].has_flag(INSTANCE_MOVABLE))
             .collect();
         Self {
+            pending_move: vec![u32::MAX; data.len()],
             data,
             gpu_index,
             spheres,
@@ -105,7 +107,13 @@ impl InstanceTable {
             return false;
         };
         self.make_movable(i, true);
-        self.moves.push((i as u32, world, jump));
+        let slot = self.pending_move[i];
+        if slot == u32::MAX {
+            self.pending_move[i] = self.moves.len() as u32;
+            self.moves.push((i as u32, world, jump));
+        } else {
+            self.moves[slot as usize] = (i as u32, world, jump);
+        }
         true
     }
 
@@ -199,7 +207,7 @@ impl InstanceTable {
     /// Where an instance will be drawn next frame: its latest move, or where it is.
     pub fn transform(&self, instance: u32) -> Option<Mat4> {
         let i = self.index(instance)?;
-        let pending = self.moves.iter().rev().find(|m| m.0 as usize == i);
+        let pending = self.moves.get(self.pending_move[i] as usize);
         Some(pending.map_or_else(|| self.data[i].worlds().0, |m| m.1))
     }
 
@@ -232,20 +240,15 @@ impl InstanceTable {
     /// reports what to upload.
     pub fn advance(&mut self) -> FrameChanges {
         let mut touched = std::mem::take(&mut self.changed);
-        for i in std::mem::take(&mut self.moved_last_frame) {
+        for i in self.moved_last_frame.drain(..) {
             self.data[i as usize].settle();
             touched.push(i);
         }
 
-        // A stable sort keeps each instance's moves in the order they were made, so the last of
-        // each run is the one that counts.
-        let mut moves = std::mem::take(&mut self.moves);
-        moves.sort_by_key(|m| m.0);
-        let mut moved = Vec::new();
-        for (k, &(i, world, jump)) in moves.iter().enumerate() {
-            if moves.get(k + 1).is_some_and(|next| next.0 == i) {
-                continue;
-            }
+        // Repeated writes already replaced the pending entry. Instances are independent, so
+        // applying them needs no sort, and a simulation tick cannot grow duplicate work.
+        for &(i, world, jump) in &self.moves {
+            self.pending_move[i as usize] = u32::MAX;
             let instance = &mut self.data[i as usize];
             instance.settle();
             instance.set_world(world);
@@ -254,16 +257,16 @@ impl InstanceTable {
                 // Already caught up: it shows no motion.
                 instance.settle();
             } else {
-                moved.push(i);
+                self.moved_last_frame.push(i);
             }
         }
-        self.moved_last_frame = moved;
-        // Reuse the allocation for the next frame's moves.
-        moves.clear();
-        self.moves = moves;
+        self.moves.clear();
+        let ranges = runs(&mut touched);
+        touched.clear();
+        self.changed = touched;
 
         FrameChanges {
-            ranges: runs(touched),
+            ranges,
             shadows_changed: std::mem::take(&mut self.shadows_changed),
             gi_changed: std::mem::take(&mut self.gi_changed),
         }
@@ -276,11 +279,10 @@ impl InstanceTable {
 }
 
 /// Sorts indices into runs to upload, merging runs separated by small gaps.
-fn runs(mut indices: Vec<u32>) -> Vec<Range<usize>> {
+fn runs(indices: &mut [u32]) -> Vec<Range<usize>> {
     indices.sort_unstable();
-    indices.dedup();
     let mut ranges: Vec<Range<usize>> = Vec::new();
-    for i in indices.into_iter().map(|i| i as usize) {
+    for i in indices.iter().map(|&i| i as usize) {
         match ranges.last_mut() {
             Some(last) if i <= last.end + MERGE_GAP => last.end = i + 1,
             _ => ranges.push(i..i + 1),
@@ -356,6 +358,68 @@ mod tests {
         assert_eq!(worlds(&table, 0).0, Vec3::X * 4.0);
         // Scene instance 3 is the third on the GPU.
         assert_eq!(worlds(&table, 2).0, Vec3::X * 7.0);
+    }
+
+    #[test]
+    fn many_interleaved_moves_match_a_frame_by_frame_reference() {
+        const COUNT: usize = 513;
+        let mut table = InstanceTable::new(
+            (0..COUNT).map(|i| instance_at(i as f32)).collect(),
+            (0..COUNT as u32).map(Some).collect(),
+            vec![(Vec3::ZERO, 1.0); COUNT],
+        );
+        let mut current: Vec<Mat4> = (0..COUNT).map(|i| at(i as f32)).collect();
+        let mut previous = current.clone();
+        let mut pending = vec![None; COUNT];
+        let mut random = 0x1234_5678u32;
+        for frame in 0..160 {
+            // Empty frames, sparse updates and several updates per instance, interleaved.
+            let changes = match frame % 4 {
+                0 => 0,
+                1 => 11,
+                _ => COUNT * 8,
+            };
+            for n in 0..changes {
+                random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                let i = random as usize % COUNT;
+                let world = Mat4::from_scale_rotation_translation(
+                    Vec3::new(1.0, 2.0, 0.5),
+                    glam::Quat::from_rotation_y(n as f32 * 0.01),
+                    Vec3::new(i as f32, frame as f32, n as f32),
+                );
+                let jump = n % 3 == 0;
+                table.set_transform(i as u32, world, jump);
+                pending[i] = Some((world, jump));
+                assert_eq!(table.transform(i as u32), Some(world));
+            }
+            let old_previous = previous.clone();
+            let old_current = current.clone();
+            for i in 0..COUNT {
+                previous[i] = current[i];
+                if let Some((world, jump)) = pending[i].take() {
+                    current[i] = world;
+                    if jump {
+                        previous[i] = world;
+                    }
+                }
+            }
+            let changes = table.advance();
+            for i in 0..COUNT {
+                let (now, before) = table.data[i].worlds();
+                assert_eq!(
+                    (now, before),
+                    (current[i], previous[i]),
+                    "frame {frame}, instance {i}"
+                );
+                assert_eq!(table.transform(i as u32), Some(current[i]));
+                if old_current[i] != current[i] || old_previous[i] != previous[i] {
+                    assert!(
+                        changes.ranges.iter().any(|range| range.contains(&i)),
+                        "changed instance {i} was not uploaded at frame {frame}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -491,10 +555,10 @@ mod tests {
 
     #[test]
     fn nearby_changes_upload_together_and_distant_ones_apart() {
-        assert_eq!(runs(vec![4, 1, 2, 2]), vec![1..5]);
-        assert_eq!(runs(vec![0, 20]), vec![0..1, 20..21]);
-        assert_eq!(runs(vec![0, 9]), vec![0..10]);
-        assert_eq!(runs(vec![0, 10]), vec![0..1, 10..11]);
+        assert_eq!(runs(&mut [4, 1, 2, 2]), vec![1..5]);
+        assert_eq!(runs(&mut [0, 20]), vec![0..1, 20..21]);
+        assert_eq!(runs(&mut [0, 9]), vec![0..10]);
+        assert_eq!(runs(&mut [0, 10]), vec![0..1, 10..11]);
     }
 
     #[test]

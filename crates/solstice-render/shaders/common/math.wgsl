@@ -3,6 +3,16 @@
 const PI: f32 = 3.14159265359;
 const TAU: f32 = 6.28318530718;
 
+// Inspect the exponent bits: floating-point comparisons with NaN may be folded by
+// shader optimizers. Invalid lighting must never enter a spatial or temporal filter.
+fn finite3(v: vec3f) -> bool {
+    return all((bitcast<vec3u>(v) & vec3u(0x7f800000u)) != vec3u(0x7f800000u));
+}
+
+fn finite4(v: vec4f) -> bool {
+    return all((bitcast<vec4u>(v) & vec4u(0x7f800000u)) != vec4u(0x7f800000u));
+}
+
 // Decodes a signed octahedral vector in [-1, 1]^2 to a unit vector.
 fn oct_decode(e: vec2f) -> vec3f {
     var v = vec3f(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));

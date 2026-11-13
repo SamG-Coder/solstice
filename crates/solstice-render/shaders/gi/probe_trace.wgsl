@@ -41,8 +41,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let direction = probe_ray_direction(tile, ray, normal, frame.frame_index);
 
     let screen = trace_screen(world + normal * 0.03, direction, SCREEN_DISTANCE, SCREEN_STEPS, SCREEN_THICKNESS);
-    if screen.hit && screen.weight >= 1.0 {
-        textureStore(output, id.xy, vec4f(screen_hit_radiance(screen.uv), screen.t));
+    var seen = vec4f(0.0);
+    if screen.hit {
+        seen = screen_hit_radiance(screen.uv);
+    }
+    let screen_weight = screen.weight * seen.a;
+    if screen_weight >= 1.0 {
+        textureStore(output, id.xy, vec4f(seen.rgb, screen.t));
         return;
     }
 
@@ -55,8 +60,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var t = select(1000.0, hit.t, hit.hit);
     if screen.hit {
         // Near the screen edge, blend towards the volume so probes do not pop.
-        radiance = mix(radiance, screen_hit_radiance(screen.uv), screen.weight);
-        t = mix(t, screen.t, screen.weight);
+        radiance = mix(radiance, seen.rgb, screen_weight);
+        t = mix(t, screen.t, screen_weight);
     }
     textureStore(output, id.xy, vec4f(radiance, t));
 }

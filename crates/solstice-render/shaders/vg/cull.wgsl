@@ -392,15 +392,18 @@ fn view_draws(instance: Instance) -> bool {
 
 // Queues the hierarchy root of every instance the view draws.
 @compute @workgroup_size(64)
-fn seed(@builtin(global_invocation_id) id: vec3u) {
-    if id.x < arrayLength(&instances) && view_draws(instances[id.x]) {
-        push_queue(QueueEntry(id.x, instances[id.x].root_node));
+fn seed(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) groups: vec3u) {
+    let index = id.x + id.y * groups.x * 64u;
+    if index < arrayLength(&instances) && view_draws(instances[index]) {
+        push_queue(QueueEntry(index, instances[index].root_node));
     }
 }
 
 @compute @workgroup_size(32)
-fn process(@builtin(global_invocation_id) id: vec3u) {
-    let slot = state.read_begin + id.x;
+fn process(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) groups: vec3u) {
+    // A level can contain more than 65535 workgroups. Continue in Y without dropping
+    // entries or increasing the local workgroup size (which hurts smaller levels).
+    let slot = state.read_begin + id.x + id.y * groups.x * 32u;
     if slot >= state.read_end || slot >= arrayLength(&queue) {
         return;
     }
