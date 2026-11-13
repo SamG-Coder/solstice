@@ -57,7 +57,11 @@ pub fn layer(key: &str, size: u32, make: impl FnOnce() -> TextureLayer) -> Textu
     };
     found.unwrap_or_else(|| {
         let made = make();
-        provide(key, size, made.clone());
+        let mut provided = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
+        // Kept for the size baked now: layers made at another size, as before the scene's
+        // texture size changed, would only fill memory.
+        provided.retain(|(_, s, _)| *s == size);
+        provided.push((key.to_owned(), size, made.clone()));
         made
     })
 }

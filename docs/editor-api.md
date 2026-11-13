@@ -248,14 +248,14 @@ No arguments.
 
 ### `env.set`
 
-The scene's weather and time of day, saved with it, and shown at once: the viewer starts the scene that way too. One undo step; nothing bakes.
+The scene's weather and time of day, saved with it, and shown at once: the viewer starts the scene that way too. One undo step; nothing bakes. (Ponds, which it once took, are entities now: `object.add` with `kind: "pond"`.)
 
 | Argument | Type | Needed | Meaning |
 |---|---|---|---|
-| `weather` | string |  | `changing`, or one of `env.weathers`. |
-| `time` | number |  | The hour it starts at, 0 to 24. |
-| `day_length` | number |  | Seconds a day takes: 0 (held still), 120, 1200 or 86400. |
-| `north` | number |  | Degrees from -Z to north, round +Y. |
+| `weather` | string or null |  | `changing`, or one of `env.weathers`; null leaves it to the viewer. |
+| `time` | number or null |  | The hour it starts at, 0 to 24; null leaves it to the viewer. |
+| `day_length` | number or null |  | Seconds a day takes: 0 (held still), 120, 1200 or 86400; null leaves it to the viewer. |
+| `north` | number or null |  | Degrees from -Z to north, round +Y; null leaves it to the viewer. |
 | `clear` | boolean |  | Leave them all to the viewer again. |
 
 ```js
@@ -353,7 +353,7 @@ Changes a wood's, clearing's, pond's, path's or yard's own fields, given whole. 
 | Argument | Type | Needed | Meaning |
 |---|---|---|---|
 | `id` | string | yes | The entity's id. |
-| `fields` | object | yes | wood `{ radius, spacing }` (spacing above 0.5 m), clear `{ radius }`, pond `{ min, max, level }` (corners as [x, z]), path `{ from, to, width }`, yard `{ from, to }`. |
+| `fields` | object | yes | wood `{ radius, spacing }` (radius up to 300 m, spacing above 0.5 m, at most 6000 trees), clear `{ radius }`, pond `{ min, max, level, water? }` (corners as [x, z]; water coastal, clear, ocean or murky), path `{ from, to, width }`, yard `{ from, to }`. |
 
 ```js
 await solstice.call("object.shape", {"id":"wood-id","fields":{"radius":30,"spacing":6}})

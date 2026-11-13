@@ -8,9 +8,10 @@ use std::path::Path;
 
 /// Methods whose results differ between platforms. Square roots, rounding and the like are exact
 /// everywhere, and fine.
-const UNPORTABLE: [&str; 17] = [
-    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sin_cos", "exp", "exp2", "ln", "log2",
-    "log10", "powf", "powi", "hypot", "tanh",
+const UNPORTABLE: [&str; 25] = [
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "sin_cos", "exp", "exp2", "exp_m1", "ln",
+    "ln_1p", "log", "log2", "log10", "powf", "powi", "hypot", "cbrt", "sinh", "cosh", "tanh",
+    "asinh", "acosh",
 ];
 
 fn check(folder: &Path, found: &mut Vec<String>) {
@@ -32,17 +33,20 @@ fn check(folder: &Path, found: &mut Vec<String>) {
             }
             let code = line.split("//").next().unwrap_or("");
             for name in UNPORTABLE {
-                let call = format!(".{name}(");
-                if let Some(at) = code.find(&call) {
-                    // `math::sin(` is the portable one; a receiver's `.sin(` is not.
-                    if !code[..at].ends_with("math:") {
-                        found.push(format!(
-                            "{}:{}: {}",
-                            path.display(),
-                            number + 1,
-                            line.trim()
-                        ));
-                    }
+                // A float's own method, `x.sin()`, or called by its type, `f32::sin(x)`.
+                // `math::sin(x)`, the portable one, is neither.
+                let calls = [
+                    format!(".{name}("),
+                    format!("f32::{name}("),
+                    format!("f64::{name}("),
+                ];
+                if calls.iter().any(|call| code.contains(call.as_str())) {
+                    found.push(format!(
+                        "{}:{}: {}",
+                        path.display(),
+                        number + 1,
+                        line.trim()
+                    ));
                 }
             }
         }
@@ -57,6 +61,8 @@ fn the_bake_uses_only_portable_maths() {
         "crates/solstice-procgen/src",
         "crates/solstice-bake/src",
         "crates/solstice-builder/src",
+        "crates/solstice-asset/src",
+        "crates/solstice-project/src",
     ] {
         check(&root.join(crate_folder), &mut found);
     }

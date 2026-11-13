@@ -32,12 +32,14 @@ pub fn encode_uv_density(density: f32) -> u32 {
     if !density.is_finite() || density <= 0.0 {
         return 0;
     }
-    ((density.log2() + 16.0) * 8.0).round().clamp(1.0, 255.0) as u32
+    ((crate::math::log2(density) + 16.0) * 8.0)
+        .round()
+        .clamp(1.0, 255.0) as u32
 }
 
 /// Inverse of [`encode_uv_density`], for non-zero values. `shaders/vg/cull.wgsl` has a twin.
 pub fn decode_uv_density(code: u32) -> f32 {
-    (code as f32 / 8.0 - 16.0).exp2()
+    crate::math::exp2(code as f32 / 8.0 - 16.0)
 }
 
 /// Set in [`PackedNode::is_leaf`] on a leaf. The low bits hold the page of its sibling set.

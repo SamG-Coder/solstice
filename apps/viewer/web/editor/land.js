@@ -13,7 +13,7 @@ export const LAND_KINDS = {
     description: "Trees (oak, birch and bush) over the grass, in a circle round its position.",
     placed: true,
     starts: { radius: 20, spacing: 7 },
-    fields: { radius: { min: 0.5, max: 2000, step: 0.5 }, spacing: { min: 0.6, max: 100, step: 0.1 } },
+    fields: { radius: { min: 0.5, max: 300, step: 0.5 }, spacing: { min: 0.6, max: 100, step: 0.1 } },
   },
   clear: {
     label: "Clearing",
@@ -46,12 +46,16 @@ export const LAND_KINDS = {
 };
 
 /// Checks a land component's fields. Gives back an error's message, or null if it is good.
+/// The most trees a wood may plant: the bake throws darts for each and checks each against all
+/// planted, so a wood far past this would hold the bake for minutes.
+const MOST_TREES = 6000;
+
 export function checkLand(kind, value) {
-  const spec = LAND_KINDS[kind];
+  const spec = Object.hasOwn(LAND_KINDS, kind) ? LAND_KINDS[kind] : null;
   if (!spec) return `\`${kind}\` is not one of ${Object.keys(LAND_KINDS).join(", ")}`;
   if (!value || typeof value !== "object" || Array.isArray(value)) return `a ${kind} is an object of its fields`;
   for (const key of Object.keys(value)) {
-    if (!(key in spec.fields) && !(kind === "pond" && key === "water")) {
+    if (!Object.hasOwn(spec.fields, key) && !(kind === "pond" && key === "water")) {
       return `a ${kind} has no field \`${key}\`; it has ${Object.keys(spec.fields).join(", ")}`;
     }
   }
@@ -68,6 +72,13 @@ export function checkLand(kind, value) {
   if (kind === "pond" && (value.min[0] === value.max[0] || value.min[1] === value.max[1])) {
     return "a pond's corners must differ along both x and z";
   }
+  if (kind === "pond" && value.water !== undefined
+    && !["coastal", "clear", "ocean", "murky"].includes(value.water)) {
+    return "a pond's water is one of coastal, clear, ocean, murky";
+  }
+  if (kind === "wood" && (Math.PI * value.radius * value.radius) / (value.spacing * value.spacing) > MOST_TREES) {
+    return `a wood that wide and that close would plant over ${MOST_TREES} trees: make it smaller or its trees further apart`;
+  }
   return null;
 }
 
@@ -77,7 +88,9 @@ export function landSignature(scene, entities) {
   const land = [];
   for (const entity of entities.values()) {
     const kind = kindOf(entity);
-    if (kind in LAND_KINDS && kind !== "pond") {
+    // A pond's water is baked; its outline and level are shown as they change.
+    if (kind === "pond") land.push([entity.id, entity.pond.water ?? null]);
+    else if (Object.hasOwn(LAND_KINDS, kind)) {
       land.push([entity.id, kind, entity[kind], entity.transform?.position ?? null]);
     }
   }

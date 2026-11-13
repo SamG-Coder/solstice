@@ -33,9 +33,14 @@ function check(name, schema, args) {
       continue;
     }
     const fail = () => {
-      throw new CommandError("bad_arguments", `${name}: \`${key}\` should be ${spec.type}`);
+      throw new CommandError("bad_arguments", `${name}: \`${key}\` should be ${spec.type.replace("?", " or null")}`);
     };
-    switch (spec.type) {
+    // `number?` and `string?` also take null.
+    if (value === null && spec.type.endsWith("?")) {
+      out[key] = null;
+      continue;
+    }
+    switch (spec.type.replace("?", "")) {
       case "number": if (typeof value !== "number" || !Number.isFinite(value)) fail(); break;
       case "string": if (typeof value !== "string") fail(); break;
       case "boolean": if (typeof value !== "boolean") fail(); break;
@@ -65,6 +70,8 @@ function jsonSchema(schema) {
     vec3: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
     "string[]": { type: "array", items: { type: "string" } },
     object: { type: ["object", "null"] },
+    "number?": { type: ["number", "null"] },
+    "string?": { type: ["string", "null"] },
   };
   return {
     type: "object",

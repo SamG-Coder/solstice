@@ -870,29 +870,35 @@ function defineCommands(commands, editor) {
     description: "The scene's weather and time of day, saved with it: the weather (changing, or a built-in weather), the hour it starts at (0 to 24), how long a day takes (0 holds the time still, 120, 1200 or 86400 seconds), and north (degrees). Each null leaves it to the viewer. One undo step; nothing bakes.",
     changes: true,
     args: {
-      weather: { type: "string", description: "changing, or one of env.weathers." },
-      time: { type: "number", description: "The hour, 0 to 24." },
-      day_length: { type: "number", description: "Seconds a day takes: 0 (held still), 120, 1200 or 86400." },
-      north: { type: "number", description: "Degrees from -Z to north, round +Y." },
+      weather: { type: "string?", description: "changing, or one of env.weathers; null leaves it to the viewer." },
+      time: { type: "number?", description: "The hour, 0 to 24; null leaves it to the viewer." },
+      day_length: { type: "number?", description: "Seconds a day takes: 0 (held still), 120, 1200 or 86400; null leaves it to the viewer." },
+      north: { type: "number?", description: "Degrees from -Z to north, round +Y; null leaves it to the viewer." },
       clear: { type: "boolean", description: "Leave every one of them to the viewer again." },
     },
     example: { time: 18.5, weather: "fair" },
     run: (args) => {
       if (!editor.project.saveable) throw new CommandError("not_a_project", "this scene has no project to save them in");
-      if (args.weather !== undefined && !WEATHERS.includes(args.weather)) {
+      if (args.weather != null && !WEATHERS.includes(args.weather)) {
         throw new CommandError("bad_arguments", `weather is one of ${WEATHERS.join(", ")}`);
       }
-      if (args.day_length !== undefined && !DAY_LENGTHS.includes(args.day_length)) {
+      if (args.day_length != null && !DAY_LENGTHS.includes(args.day_length)) {
         throw new CommandError("bad_arguments", `day_length is one of ${DAY_LENGTHS.join(", ")}`);
       }
       const scene = editor.project.scene;
       const before = structuredClone(scene.environment ?? null);
-      const after = args.clear ? null : { ...(scene.environment ?? {}) };
+      let after = args.clear ? null : { ...(scene.environment ?? {}) };
       if (after) {
-        if (args.weather !== undefined) after.weather = args.weather;
-        if (args.time !== undefined) after.time = Math.round((((args.time % 24) + 24) % 24) * 1000) / 1000;
-        if (args.day_length !== undefined) after.day_length = args.day_length;
-        if (args.north !== undefined) after.north = Math.round((((args.north % 360) + 360) % 360) * 10) / 10;
+        // A null takes the setting away, to the viewer's own.
+        const set = (key, value, tidy) => {
+          if (value === null) delete after[key];
+          else if (value !== undefined) after[key] = tidy ? tidy(value) : value;
+        };
+        set("weather", args.weather);
+        set("time", args.time, (t) => Math.round((((t % 24) + 24) % 24) * 1000) / 1000);
+        set("day_length", args.day_length);
+        set("north", args.north, (n) => Math.round((((n % 360) + 360) % 360) * 10) / 10);
+        if (!Object.keys(after).length) after = null;
       }
       const apply = (value) => {
         if (value) scene.environment = structuredClone(value);
@@ -1026,8 +1032,9 @@ function defineCommands(commands, editor) {
     },
     example: { kind: "wood", at: [-40, 0, -20], fields: { radius: 25, spacing: 7 } },
     run: async ({ kind, at, name, fields }) => {
-      const spec = LAND_KINDS[kind];
+      const spec = Object.hasOwn(LAND_KINDS, kind) ? LAND_KINDS[kind] : null;
       if (!spec) throw new CommandError("bad_arguments", `kind is one of ${Object.keys(LAND_KINDS).join(", ")}`);
+      if (at && !at.every((v) => Math.abs(v) < 1e6)) throw new CommandError("bad_arguments", "at is within 1000 km of the origin");
       if (!editor.project.saveable) throw new CommandError("not_a_project", "this scene has no project to add to");
       const where = at ?? await groundAhead(editor);
       const component = structuredClone(fields ?? spec.starts);
@@ -1067,12 +1074,13 @@ function defineCommands(commands, editor) {
     changes: true,
     args: { ids: { type: "string[]", description: "The entities to remove; the selection if left out." } },
     run: ({ ids }) => {
-      const which = ids ?? [...editor.selection];
+      // Each once, however often named.
+      const which = [...new Set(ids ?? [...editor.selection])];
       if (!which.length) throw new CommandError("nothing_selected", "object.delete needs ids, or something selected");
       const removals = which.map((id) => {
         const entity = needEntity(editor, id);
         const kind = kindOf(entity);
-        if (!(kind in LAND_KINDS) && !(kind === "folder" && !(entity.children ?? []).length)) {
+        if (!Object.hasOwn(LAND_KINDS, kind) && !(kind === "folder" && !(entity.children ?? []).length)) {
           throw new CommandError("not_removable", `${entity.name} is a ${kind}: only the land's shapes and empty folders can be removed yet`);
         }
         const parent = editor.project.parents.get(id);
@@ -1081,7 +1089,9 @@ function defineCommands(commands, editor) {
       });
       const remove = () => {
         for (const r of [...removals].sort((a, b) => b.index - a.index)) {
-          r.list.splice(r.list.indexOf(r.entity), 1);
+          const at = r.list.indexOf(r.entity);
+          if (at < 0) continue;
+          r.list.splice(at, 1);
           editor.project.forget(r.entity);
           editor.selection.delete(r.entity.id);
         }
@@ -1109,7 +1119,7 @@ function defineCommands(commands, editor) {
     run: ({ id: which, fields }) => {
       const entity = needEntity(editor, which);
       const kind = kindOf(entity);
-      if (!(kind in LAND_KINDS)) throw new CommandError("bad_arguments", `${entity.name} is a ${kind}, not a shape of the land`);
+      if (!Object.hasOwn(LAND_KINDS, kind)) throw new CommandError("bad_arguments", `${entity.name} is a ${kind}, not a shape of the land`);
       const problem = checkLand(kind, fields);
       if (problem) throw new CommandError("bad_arguments", problem);
       const before = structuredClone(entity[kind]);
@@ -1400,7 +1410,7 @@ function bindInput(editor) {
       editor.call("gizmo.set", { mode: modes[(modes.indexOf(editor.gizmo.mode) + 1) % 3] });
     } else if (e.code === "KeyF" && !ctrl) editor.call("camera.frame", {});
     else if (e.code === "Escape") editor.call("selection.set", { ids: [] });
-    else if ((e.code === "Delete" || e.code === "Backspace") && editor.selection.size) {
+    else if ((e.code === "Delete" || e.code === "Backspace") && editor.selection.size && !drag) {
       editor.call("object.delete", {}).then((outcome) => {
         if (!outcome.ok) log.add("error", outcome.error.message);
       });

@@ -16,6 +16,8 @@ pub trait Float: Copy {
     fn atan2_(self, x: Self) -> Self;
     fn exp_(self) -> Self;
     fn ln_(self) -> Self;
+    fn log2_(self) -> Self;
+    fn exp2_(self) -> Self;
     fn powf_(self, e: Self) -> Self;
     fn hypot_(self, o: Self) -> Self;
     fn one() -> Self;
@@ -25,7 +27,7 @@ pub trait Float: Copy {
 
 macro_rules! float {
     ($t:ty, $sin:ident, $cos:ident, $tan:ident, $asin:ident, $acos:ident, $atan:ident,
-     $atan2:ident, $exp:ident, $ln:ident, $pow:ident, $hypot:ident) => {
+     $atan2:ident, $exp:ident, $ln:ident, $log2:ident, $exp2:ident, $pow:ident, $hypot:ident) => {
         impl Float for $t {
             fn sin_(self) -> Self {
                 libm::$sin(self)
@@ -54,6 +56,12 @@ macro_rules! float {
             fn ln_(self) -> Self {
                 libm::$ln(self)
             }
+            fn log2_(self) -> Self {
+                libm::$log2(self)
+            }
+            fn exp2_(self) -> Self {
+                libm::$exp2(self)
+            }
             fn powf_(self, e: Self) -> Self {
                 libm::$pow(self, e)
             }
@@ -72,8 +80,8 @@ macro_rules! float {
         }
     };
 }
-float!(f32, sinf, cosf, tanf, asinf, acosf, atanf, atan2f, expf, logf, powf, hypotf);
-float!(f64, sin, cos, tan, asin, acos, atan, atan2, exp, log, pow, hypot);
+float!(f32, sinf, cosf, tanf, asinf, acosf, atanf, atan2f, expf, logf, log2f, exp2f, powf, hypotf);
+float!(f64, sin, cos, tan, asin, acos, atan, atan2, exp, log, log2, exp2, pow, hypot);
 
 pub fn sin<T: Float>(x: T) -> T {
     x.sin_()
@@ -102,6 +110,12 @@ pub fn exp<T: Float>(x: T) -> T {
 }
 pub fn ln<T: Float>(x: T) -> T {
     x.ln_()
+}
+pub fn log2<T: Float>(x: T) -> T {
+    x.log2_()
+}
+pub fn exp2<T: Float>(x: T) -> T {
+    x.exp2_()
 }
 pub fn powf<T: Float>(x: T, e: T) -> T {
     x.powf_(e)
