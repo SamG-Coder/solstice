@@ -44,7 +44,7 @@ fn from_ycocg(c: vec3f) -> vec3f {
 
 // Five-tap Catmull-Rom: nearly bicubic history sampling, which is the main thing keeping
 // reprojection from blurring the image over time.
-fn sample_history(uv: vec2f) -> vec3f {
+fn sample_history(uv: vec2f, fallback: vec3f) -> vec3f {
     let size = vec2f(textureDimensions(history));
     let position = uv * size;
     let center = floor(position - vec2f(0.5)) + vec2f(0.5);
@@ -70,8 +70,14 @@ fn sample_history(uv: vec2f) -> vec3f {
     var total = 0.0;
     for (var i = 0; i < 5; i++) {
         let tap = taps[i];
-        sum += textureSampleLevel(history, linear_sampler, tap.xy, 0.0).rgb * tap.z;
-        total += tap.z;
+        let color = textureSampleLevel(history, linear_sampler, tap.xy, 0.0).rgb;
+        if finite3(color) {
+            sum += color * tap.z;
+            total += tap.z;
+        }
+    }
+    if total <= 1.0e-4 || !finite3(sum) {
+        return fallback;
     }
     return sum / max(total, 1.0e-4);
 }
@@ -93,6 +99,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // foreground's motion, and the variance, which bounds what history is believable.
     var mean = vec3f(0.0);
     var second_moment = vec3f(0.0);
+    var sample_count = 0.0;
     var filtered = vec3f(0.0);
     var filter_total = 0.0;
     var closest_depth = 0.0;
@@ -104,10 +111,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
             let p = clamp(nearest + vec2i(dx, dy), vec2i(0), scene_size - vec2i(1));
-            let color = compress(textureLoad(scene, p, 0).rgb);
+            let depth = textureLoad(depth_tex, p, 0).r;
+            if depth > closest_depth {
+                closest_depth = depth;
+                closest_pixel = p;
+            }
+            let sample = textureLoad(scene, p, 0).rgb;
+            if !finite3(sample) {
+                continue;
+            }
+            let color = compress(max(sample, vec3f(0.0)));
             let ycocg = to_ycocg(color);
             mean += ycocg;
             second_moment += ycocg * ycocg;
+            sample_count += 1.0;
 
             // A Gaussian centred on this output pixel, using where the sample really landed.
             let sample_position = vec2f(p) + vec2f(0.5) + jitter_pixels;
@@ -116,15 +133,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             filtered += color * weight;
             filter_total += weight;
 
-            let depth = textureLoad(depth_tex, p, 0).r;
-            if depth > closest_depth {
-                closest_depth = depth;
-                closest_pixel = p;
-            }
         }
     }
-    mean /= 9.0;
-    second_moment /= 9.0;
+    mean /= max(sample_count, 1.0);
+    second_moment /= max(sample_count, 1.0);
     let deviation = sqrt(max(second_moment - mean * mean, vec3f(0.0)));
     let current = filtered / max(filter_total, 1.0e-4);
 
@@ -143,7 +155,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     var result = current;
     let on_screen = all(previous_uv > vec2f(0.0)) && all(previous_uv < vec2f(1.0));
     if on_screen && frame.frame_index > 0u && frame.temporal_accumulation != 0u {
-        let previous = compress(max(sample_history(previous_uv), vec3f(0.0)));
+        let history_color = max(sample_history(previous_uv, decompress(current)), vec3f(0.0));
+        // If the whole neighbourhood is invalid, keep valid history until lighting recovers.
+        if sample_count == 0.0 {
+            textureStore(output, id.xy, vec4f(min(history_color, vec3f(65504.0)), 1.0));
+            return;
+        }
+        let previous = compress(history_color);
 
         // Clip history against the current neighbourhood's colour distribution: anything far
         // outside it is a disocclusion or lighting change, not a useful earlier sample.
@@ -164,5 +182,5 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let blend = max(clamp(0.06 * render_ratio + moved * 0.012, 0.04, 0.3), reactive * REACTIVE_BLEND);
         result = mix(from_ycocg(clipped), current, blend);
     }
-    textureStore(output, id.xy, vec4f(decompress(max(result, vec3f(0.0))), 1.0));
+    textureStore(output, id.xy, vec4f(min(decompress(max(result, vec3f(0.0))), vec3f(65504.0)), 1.0));
 }

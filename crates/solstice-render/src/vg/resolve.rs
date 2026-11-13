@@ -1,6 +1,9 @@
 //! Converts the visibility buffer into a G-buffer.
 
 use super::culling::CullWork;
+#[cfg(test)]
+#[path = "resolve_stress.rs"]
+mod stress;
 use super::raster::VisibilityBuffer;
 use crate::gpu::{groups_for, Gpu, LayoutBuilder, Target};
 use crate::regions::RegionPlan;

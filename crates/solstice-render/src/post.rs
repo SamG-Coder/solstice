@@ -6,6 +6,10 @@ use bytemuck::{Pod, Zeroable};
 use glam::Vec2;
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+#[cfg(test)]
+#[path = "post_stress.rs"]
+mod stress;
 /// Matches `BLOOM_LEVELS` in `post/tonemap.wgsl`.
 const BLOOM_LEVELS: u32 = 6;
 

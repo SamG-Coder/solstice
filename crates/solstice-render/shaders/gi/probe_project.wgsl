@@ -50,21 +50,27 @@ fn project(@builtin(global_invocation_id) id: vec3u) {
     // hemisphere carrying the average radiance. A pixel whose bumped normal leans away from
     // the probe's normal then reads something sensible.
     var mean = vec3f(0.0);
+    var valid_rays = 0.0;
     for (var y = 0u; y < PROBE_RAYS; y++) {
         for (var x = 0u; x < PROBE_RAYS; x++) {
             let texel = tile * PROBE_RAYS + vec2u(x, y);
-            mean += textureLoad(traced, vec2i(texel), 0).rgb;
+            let radiance = textureLoad(traced, vec2i(texel), 0).rgb;
+            if finite3(radiance) {
+                mean += radiance;
+                valid_rays += 1.0;
+            }
         }
     }
     let ray_count = f32(PROBE_RAYS * PROBE_RAYS);
-    mean /= ray_count;
+    mean /= max(valid_rays, 1.0);
 
     // Each ray stands for an equal part of the 2 pi steradian hemisphere.
     let weight = TAU / ray_count;
     for (var y = 0u; y < PROBE_RAYS; y++) {
         for (var x = 0u; x < PROBE_RAYS; x++) {
             let texel = tile * PROBE_RAYS + vec2u(x, y);
-            let radiance = textureLoad(traced, vec2i(texel), 0).rgb;
+            let sample = textureLoad(traced, vec2i(texel), 0).rgb;
+            let radiance = select(mean, sample, finite3(sample));
             let direction = probe_ray_direction(tile, vec2u(x, y), normal, frame.frame_index);
             let mirrored = direction - 2.0 * dot(direction, normal) * normal;
             var basis_up = sh_basis(direction);

@@ -116,7 +116,7 @@ fn trace_refined(origin: vec3f, direction: vec3f, start: f32) -> VolumeHit {
         }
         let edge = min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y));
         let seen = screen_hit_radiance(p.xy);
-        return VolumeHit(true, hit.t, mix(hit.radiance, seen, smoothstep(0.0, SCREEN_EDGE_FADE, edge)), 0.0);
+        return VolumeHit(true, hit.t, mix(hit.radiance, seen.rgb, seen.a * smoothstep(0.0, SCREEN_EDGE_FADE, edge)), 0.0);
     }
     // Every hit was somewhere the camera sees past, so the ray is still skimming the voxels of
     // something. That thing's light is a far better guess than the sky's, which it would be
@@ -165,10 +165,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let screen = trace_screen(world + normal * 0.02, direction, SCREEN_DISTANCE, SCREEN_STEPS, SCREEN_THICKNESS);
     var radiance = vec3f(0.0);
+    var screen_weight = 0.0;
     if screen.hit {
-        radiance = screen_hit_radiance(screen.uv);
+        let seen = screen_hit_radiance(screen.uv);
+        radiance = seen.rgb;
+        screen_weight = screen.weight * seen.a;
     }
-    if screen.weight < 1.0 {
+    if screen_weight < 1.0 {
         let level = min(volume_level_at(world, 0u), VOLUME_LEVELS - 1u);
         let voxel = volume_params.levels[level].w;
         // Voxels are coarse, so a sharp reflection of them shows their blocks. A smooth surface
@@ -188,7 +191,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let hit_point = world + direction * hit.t;
         let found = select(miss_radiance(hit, direction, sky), hit.radiance, hit.hit);
         let far = mix(sky, found, volume_edge_fade(hit_point) * volume_edge_fade(world));
-        radiance = mix(far, radiance, screen.weight);
+        radiance = mix(far, radiance, screen_weight);
     }
 
     // Fireflies would otherwise persist through the temporal filter. At night the limit stays
@@ -204,9 +207,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let motion = textureLoad(motion_tex, vec2i(pixel), 0).xy;
     let previous_uv = center * frame.inv_viewport + motion;
     var history = vec4f(0.0);
-    let remembered = all(previous_uv > vec2f(0.0)) && all(previous_uv < vec2f(1.0)) && frame.frame_index > 0u;
+    var remembered = all(previous_uv > vec2f(0.0)) && all(previous_uv < vec2f(1.0)) && frame.frame_index > 0u;
     if remembered {
         history = textureSampleLevel(reflection_history, clamp_sampler, previous_uv, 0.0);
+        if !finite4(history) {
+            history = vec4f(0.0);
+            remembered = false;
+        }
     }
     {
         // A rough surface's rays scatter, and one in many finds something far brighter than the
@@ -219,7 +226,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         // What the screen shows is exact. The volume is coarse, with gaps where walls are
         // thin, so what comes from it or from the sky beyond is trusted as a rough
         // surface's rays are, however smooth this one is.
-        let smooth_reach = mix(ROUGH_REACH, SMOOTH_REACH, screen.weight);
+        let smooth_reach = mix(ROUGH_REACH, SMOOTH_REACH, screen_weight);
         let reach = mix(smooth_reach, ROUGH_REACH, smoothstep(0.08, 0.4, roughness));
         let brightest = max(result.x, max(result.y, result.z));
         let ambient = luminance(textureLoad(irradiance_tex, vec2i(pixel), 0).rgb) * frame.gi_intensity / PI;

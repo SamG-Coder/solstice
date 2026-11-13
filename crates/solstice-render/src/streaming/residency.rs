@@ -4,7 +4,57 @@
 //! it depends on, and only leaves after every page depending on it. A page's dependencies hold
 //! the parents of its clusters, so a parent is always there to draw until its children are.
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap};
+use std::ops::Index;
+
+/// A page graph stored in two contiguous arrays instead of a heap allocation per page.
+/// Its topology is fixed when the baked scene opens; frames only read slices of it.
+struct PageLinks {
+    offsets: Vec<usize>,
+    entries: Vec<u32>,
+}
+
+impl PageLinks {
+    fn new(lists: Vec<Vec<u32>>) -> Self {
+        let mut offsets = Vec::with_capacity(lists.len() + 1);
+        let mut entries = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+        offsets.push(0);
+        for list in lists {
+            entries.extend(list);
+            offsets.push(entries.len());
+        }
+        Self { offsets, entries }
+    }
+
+    fn reversed(&self) -> Self {
+        let mut offsets = vec![0; self.offsets.len()];
+        for &page in &self.entries {
+            offsets[page as usize + 1] += 1;
+        }
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+        let mut next = offsets.clone();
+        let mut entries = vec![0; self.entries.len()];
+        for page in 0..self.offsets.len() - 1 {
+            for &dependency in &self[page] {
+                let at = &mut next[dependency as usize];
+                entries[*at] = page as u32;
+                *at += 1;
+            }
+        }
+        Self { offsets, entries }
+    }
+}
+
+impl Index<usize> for PageLinks {
+    type Output = [u32];
+
+    fn index(&self, page: usize) -> &Self::Output {
+        &self.entries[self.offsets[page]..self.offsets[page + 1]]
+    }
+}
 
 /// In the request array, a page that was seen but occluded: worth keeping, not worth loading.
 pub const REQUEST_KEEP: u32 = 1;
@@ -95,8 +145,8 @@ pub struct Install {
 
 /// Tracks every page's state, and owns the allocation of pool slots.
 pub struct Residency {
-    dependencies: Vec<Vec<u32>>,
-    dependants: Vec<Vec<u32>>,
+    dependencies: PageLinks,
+    dependants: PageLinks,
     pinned: u32,
     states: Vec<State>,
     /// The installed pages, so that a look over them costs what's installed, not the whole scene.
@@ -119,8 +169,9 @@ pub struct Residency {
     fetching: u32,
     /// Pages that wanted loading but found no room in the pool at the last plan.
     starved: u32,
-    /// What the last plan wanted and could not start yet, most wanted last.
-    queue: Vec<u32>,
+    /// What the last plan wanted and could not start yet: highest priority, then lowest id.
+    /// Heap construction is linear; a frame needn't sort a million pages to fetch thirty-two.
+    queue: BinaryHeap<(u32, Reverse<u32>)>,
     /// Slots the last plan found reclaimable in each band, which is slow to work out. Each
     /// eviction spends one.
     reclaimable_at_plan: Vec<u32>,
@@ -189,13 +240,13 @@ impl Residency {
             pinned_by_band.iter().zip(band_slots).all(|(p, s)| p <= s),
             "the pool must hold the pinned pages"
         );
-        let mut dependants = vec![Vec::new(); count];
         for (page, list) in dependencies.iter().enumerate() {
             for &dependency in list {
                 assert!((dependency as usize) < page, "dependencies point coarser");
-                dependants[dependency as usize].push(page as u32);
             }
         }
+        let dependencies = PageLinks::new(dependencies);
+        let dependants = dependencies.reversed();
         let mut first = 0;
         let free_slots = band_slots
             .iter()
@@ -226,7 +277,7 @@ impl Residency {
             arrived: BTreeSet::new(),
             fetching: 0,
             starved: 0,
-            queue: Vec::new(),
+            queue: BinaryHeap::new(),
             reclaimable_at_plan: vec![0; band_slots.len()],
             victims: vec![Vec::new(); band_slots.len()],
             victims_frame: None,
@@ -407,8 +458,6 @@ impl Residency {
                 _ => {}
             }
         }
-        wanted.sort_by_key(|&page| (std::cmp::Reverse(priority[page as usize]), page));
-
         self.plans = self.plans.wrapping_add(1).max(1);
         self.reclaimable_at_plan = self.reclaimable(frame);
         coming.extend(wanted.iter().map(|&page| priority[page as usize]));
@@ -417,8 +466,12 @@ impl Residency {
         self.victims_frame = None;
         let room: u32 = self.room().1.iter().sum();
         self.starved = (wanted.len() as u32).saturating_sub(room);
-        wanted.reverse();
-        self.queue = wanted;
+        self.queue = BinaryHeap::from(
+            wanted
+                .into_iter()
+                .map(|page| (priority[page as usize], Reverse(page)))
+                .collect::<Vec<_>>(),
+        );
         self.refill(max_fetching)
     }
 
@@ -439,7 +492,7 @@ impl Residency {
         };
         let mut started = Vec::new();
         while (started.len() as u32) < can_fetch {
-            let Some(page) = self.queue.pop() else {
+            let Some((_, Reverse(page))) = self.queue.pop() else {
                 break;
             };
             if self.states[page as usize] != State::Absent {

@@ -257,6 +257,10 @@ const STATE_SIZE: u64 = 72;
 /// Where in `CullState` the opaque lists' end is. A frame's clear stops short of it.
 const STATE_OPAQUE_END_OFFSET: u64 = 68;
 
+#[cfg(test)]
+#[path = "culling_stress.rs"]
+mod stress;
+
 /// Which occlusion phase a cull runs. See the module docs of [`crate::vg`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CullPhase {
@@ -639,7 +643,9 @@ impl CullPipelines {
                 pass.set_pipeline(&self.seed);
                 pass.set_bind_group(0, scene_group, &offset);
                 pass.set_bind_group(1, work_group, &[]);
-                pass.dispatch_workgroups(groups_for(scene.gpu_instance_count, 64), 1, 1);
+                let groups = groups_for(scene.gpu_instance_count, 64);
+                let rows = groups.div_ceil(65_535).max(1);
+                pass.dispatch_workgroups(groups.div_ceil(rows), rows, 1);
             }
             CullPhase::Second => {
                 pass.set_pipeline(&self.begin_second_phase);

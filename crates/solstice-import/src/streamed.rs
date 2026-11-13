@@ -155,17 +155,32 @@ fn free_bytes(path: &Path) -> Option<u64> {
     let absolute = std::path::absolute(path).ok()?;
     #[cfg(windows)]
     {
-        let root = absolute.components().next()?;
-        let drive = root.as_os_str().to_str()?.trim_end_matches(':').to_owned();
-        let output = std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!("(Get-PSDrive -Name '{drive}').Free"),
-            ])
-            .output()
-            .ok()?;
-        String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetDiskFreeSpaceExW(
+                directory: *const u16,
+                available: *mut u64,
+                total: *mut u64,
+                free: *mut u64,
+            ) -> i32;
+        }
+        // The output may not exist yet. Query its nearest existing directory, which also
+        // handles UNC paths and volume mount points without parsing a drive letter.
+        let directory = absolute.ancestors().find(|p| p.is_dir())?;
+        let directory: Vec<u16> = directory.as_os_str().encode_wide().chain([0]).collect();
+        let mut available = 0;
+        // SAFETY: directory is a terminated UTF-16 string and available is a writable u64.
+        // The optional total/free outputs are null, as allowed by the Windows API.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                directory.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(available)
     }
     #[cfg(not(windows))]
     {

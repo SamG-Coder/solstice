@@ -64,8 +64,10 @@ fn groups_for(count: u32, size: u32) -> u32 {
 fn advance() {
     state.read_begin = state.read_end;
     state.read_end = atomicLoad(&state.write_head);
-    args.queue_x = groups_for(state.read_end - state.read_begin, PROCESS_GROUP_SIZE);
-    args.queue_y = 1u;
+    let groups = groups_for(state.read_end - state.read_begin, PROCESS_GROUP_SIZE);
+    args.queue_y = max(groups_for(groups, MAX_GROUPS), 1u);
+    // Balance rows so crossing the X limit does not launch a nearly empty second row.
+    args.queue_x = groups_for(groups, args.queue_y);
     args.queue_z = 1u;
 }
 

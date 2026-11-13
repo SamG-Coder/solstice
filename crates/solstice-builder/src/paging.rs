@@ -4,6 +4,7 @@
 //! set's parents always come from a later round, so page dependencies can't form a cycle, and
 //! they always point at a lower id.
 
+use rustc_hash::FxHashMap;
 use solstice_asset::{
     gpu::{CLUSTER_CHILDREN_MISSING, NODE_LEAF},
     paged::{
@@ -12,6 +13,77 @@ use solstice_asset::{
     },
     PackedNode, PackedVertex, SceneAsset, TextureLayer, VirtualMesh,
 };
+use std::ops::Range;
+
+/// Identical payloads may share an offset within a page. Keys compare every byte, so this
+/// preserves quantized positions, attributes, skin weights and triangle order exactly.
+#[derive(Default)]
+struct PageRecords {
+    data: ClusterRecords,
+    vertices: FxHashMap<Vec<u8>, u32>,
+    triangles: FxHashMap<Vec<u32>, u32>,
+    clusters: usize,
+}
+
+// External cluster tables reserve the largest page's record count for every pool slot.
+// Sharing a tiny payload must not pack unbounded metadata into one otherwise empty page.
+const MAX_PAGE_CLUSTERS: usize = PAGE_BYTES / std::mem::size_of::<solstice_asset::PackedCluster>();
+
+struct PageCluster {
+    id: u32,
+    vertices: Range<usize>,
+    triangles: Range<usize>,
+}
+
+impl PageRecords {
+    fn append(&mut self, source: &ClusterRecords, ranges: &[PageCluster], out: &mut PagedScene) {
+        self.clusters += ranges.len();
+        for range in ranges {
+            let vertices = &source.vertices[range.vertices.clone()];
+            let vertex_key: &[u8] = bytemuck::cast_slice(vertices);
+            let vertex_offset = match self.vertices.get(vertex_key) {
+                Some(&offset) => offset,
+                None => {
+                    let offset = self.data.vertices.len() as u32;
+                    self.data.vertices.extend_from_slice(vertices);
+                    self.vertices.insert(vertex_key.to_vec(), offset);
+                    offset
+                }
+            };
+            let triangles = &source.triangles[range.triangles.clone()];
+            let triangle_offset = match self.triangles.get(triangles) {
+                Some(&offset) => offset,
+                None => {
+                    let offset = self.data.triangles.len() as u32;
+                    self.data.triangles.extend_from_slice(triangles);
+                    self.triangles.insert(triangles.to_vec(), offset);
+                    offset
+                }
+            };
+            let cluster = &mut out.clusters[range.id as usize];
+            cluster.vertex_offset = vertex_offset;
+            cluster.triangle_offset = triangle_offset;
+        }
+    }
+
+    fn rollback(&mut self, vertices: usize, triangles: usize, clusters: usize) {
+        self.clusters = clusters;
+        self.data.vertices.truncate(vertices);
+        self.data.triangles.truncate(triangles);
+        self.vertices
+            .retain(|_, offset| (*offset as usize) < vertices);
+        self.triangles
+            .retain(|_, offset| (*offset as usize) < triangles);
+    }
+
+    fn clear(&mut self) {
+        self.clusters = 0;
+        self.data.vertices.clear();
+        self.data.triangles.clear();
+        self.vertices.clear();
+        self.triangles.clear();
+    }
+}
 
 /// One set on its way into a page.
 struct Item {
@@ -164,7 +236,9 @@ pub fn paginate_from<E>(
     // Coarsest first. The roots lead, as `ROOT_ROUND` is the largest round.
     items.sort_by_key(|item| (std::cmp::Reverse(item.round), item.mesh, item.curve));
 
-    let mut records = ClusterRecords::default();
+    let mut records = PageRecords::default();
+    let mut incoming = ClusterRecords::default();
+    let mut ranges = Vec::new();
     let mut current = PageInfo::default();
     let mut current_round = None;
     for item in &items {
@@ -184,21 +258,20 @@ pub fn paginate_from<E>(
             "a sibling set must fit in a page"
         );
 
-        let raw = PageInfo {
-            vertex_count: current.vertex_count + extra_vertices,
-            triangle_count: current.triangle_count + extra_triangles,
-            ..Default::default()
-        };
-        if current_round.is_some_and(|round| round != item.round) || raw.raw_bytes() > PAGE_BYTES {
+        if current_round.is_some_and(|round| round != item.round)
+            || records.clusters + range.len() > MAX_PAGE_CLUSTERS
+        {
             finish_page(&mut out, &mut records, &mut current, current_round, sink)?;
         }
         current_round = Some(item.round);
 
+        incoming.vertices.clear();
+        incoming.triangles.clear();
+        ranges.clear();
         for c in range {
             let cluster = *local(c);
-            let packed = &mut out.clusters[c as usize];
-            packed.vertex_offset = records.vertices.len() as u32;
-            packed.triangle_offset = records.triangles.len() as u32;
+            let vertex_start = incoming.vertices.len();
+            let triangle_start = incoming.triangles.len();
             store.read(
                 item.mesh,
                 ClusterRange {
@@ -207,11 +280,29 @@ pub fn paginate_from<E>(
                     first_triangle: cluster.triangle_offset as usize,
                     triangles: cluster.triangle_count() as usize,
                 },
-                &mut records,
+                &mut incoming,
             );
+            ranges.push(PageCluster {
+                id: c,
+                vertices: vertex_start..incoming.vertices.len(),
+                triangles: triangle_start..incoming.triangles.len(),
+            });
         }
-        current.vertex_count = records.vertices.len() as u32;
-        current.triangle_count = records.triangles.len() as u32;
+        // Try the whole sibling set before closing a page: shared payloads can make it fit
+        // where its unshared size would not. An overflowing set moves intact to the next page.
+        let previous_clusters = records.clusters;
+        records.append(&incoming, &ranges, &mut out);
+        if records.data.vertices.len() * 16 + records.data.triangles.len() * 4 > PAGE_BYTES {
+            records.rollback(
+                current.vertex_count as usize,
+                current.triangle_count as usize,
+                previous_clusters,
+            );
+            finish_page(&mut out, &mut records, &mut current, current_round, sink)?;
+            records.append(&incoming, &ranges, &mut out);
+        }
+        current.vertex_count = records.data.vertices.len() as u32;
+        current.triangle_count = records.data.triangles.len() as u32;
         current.set_count += 1;
         out.sets.push(ClusterSet {
             page: out.pages.len() as u32,
@@ -238,14 +329,14 @@ pub fn paginate_from<E>(
 
 fn finish_page<E>(
     out: &mut PagedScene,
-    records: &mut ClusterRecords,
+    records: &mut PageRecords,
     current: &mut PageInfo,
     round: Option<u32>,
     sink: &mut dyn FnMut(Vec<u8>) -> Result<(), E>,
 ) -> Result<(), E> {
     let mut bytes = Vec::with_capacity(current.raw_bytes());
-    bytes.extend_from_slice(bytemuck::cast_slice(&records.vertices));
-    bytes.extend_from_slice(bytemuck::cast_slice(&records.triangles));
+    bytes.extend_from_slice(bytemuck::cast_slice(&records.data.vertices));
+    bytes.extend_from_slice(bytemuck::cast_slice(&records.data.triangles));
     // The roots lead, so pinned pages are the first of them.
     if round == Some(ROOT_ROUND) {
         out.pinned_data.extend_from_slice(&bytes);
@@ -255,8 +346,7 @@ fn finish_page<E>(
     current.first_set = out.sets.len() as u32 - current.set_count;
     out.pages.push(*current);
     *current = PageInfo::default();
-    records.vertices.clear();
-    records.triangles.clear();
+    records.clear();
     Ok(())
 }
 
@@ -361,6 +451,43 @@ mod tests {
             materials: vec![Material::default()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn identical_payloads_share_storage_but_different_attributes_do_not() {
+        let mut source = scene(&[0, 0]);
+        let loaded = paginate(&source);
+        assert_eq!(loaded.scene.pages.len(), 1);
+        let [first, second] = loaded.scene.clusters.as_slice() else {
+            panic!("each simple mesh should make one cluster");
+        };
+        assert_eq!(first.vertex_offset, second.vertex_offset);
+        assert_eq!(first.triangle_offset, second.triangle_offset);
+        assert_eq!(loaded.scene.pages[0].vertex_count, first.vertex_count());
+        assert_eq!(loaded.scene.pages[0].triangle_count, first.triangle_count());
+        // One bit of a packed normal must prevent vertex sharing. Topology can still share.
+        source.meshes[1].vertices[0].data[3] ^= 1;
+        let loaded = paginate(&source);
+        let first = &loaded.scene.clusters[0];
+        let second = &loaded.scene.clusters[1];
+        assert_ne!(first.vertex_offset, second.vertex_offset);
+        assert_eq!(first.triangle_offset, second.triangle_offset);
+        assert_eq!(loaded.scene.pages[0].vertex_count, first.vertex_count() * 2);
+        let encoded = solstice_asset::file::encode(&loaded);
+        let decoded = solstice_asset::file::decode(&encoded).unwrap();
+        assert_eq!(decoded.scene.clusters, loaded.scene.clusters);
+        assert_eq!(decoded.scene.pinned_data, loaded.scene.pinned_data);
+    }
+
+    #[test]
+    fn sharing_payloads_does_not_make_a_pages_cluster_table_unbounded() {
+        let mut source = scene(&[0]);
+        source
+            .meshes
+            .resize(MAX_PAGE_CLUSTERS + 1, source.meshes[0].clone());
+        let loaded = paginate(&source);
+        assert_eq!(loaded.scene.pages.len(), 2);
+        assert!(loaded.scene.max_page_clusters() as usize <= MAX_PAGE_CLUSTERS);
     }
 
     #[test]

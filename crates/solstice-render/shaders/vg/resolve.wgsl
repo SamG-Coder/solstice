@@ -102,19 +102,20 @@ fn sample_material(tier: u32, uv: vec2f, layer: i32, dx: vec2f, dy: vec2f) -> ve
 
 // Perspective-correct barycentrics of a pixel inside a triangle.
 fn barycentrics(clip: array<vec4f, 3>, ndc: vec2f) -> vec3f {
-    let inv_w = vec3f(1.0 / clip[0].w, 1.0 / clip[1].w, 1.0 / clip[2].w);
-    let p0 = clip[0].xy * inv_w.x;
-    let p1 = clip[1].xy * inv_w.y;
-    let p2 = clip[2].xy * inv_w.z;
-    let e0 = p1 - p0;
-    let e1 = p2 - p0;
-    let d = ndc - p0;
-    let inv_det = 1.0 / (e0.x * e1.y - e0.y * e1.x);
-    let screen_b = (d.x * e1.y - d.y * e1.x) * inv_det;
-    let screen_c = (e0.x * d.y - e0.y * d.x) * inv_det;
-    let screen = vec3f(1.0 - screen_b - screen_c, screen_b, screen_c);
-    let weighted = screen * inv_w;
-    return weighted / (weighted.x + weighted.y + weighted.z);
+    // Solve in homogeneous coordinates. Dividing each vertex by w first produces
+    // NaNs when a triangle crosses the eye plane with a vertex exactly on it.
+    let x = vec3f(clip[0].x, clip[1].x, clip[2].x) - ndc.x * vec3f(clip[0].w, clip[1].w, clip[2].w);
+    let y = vec3f(clip[0].y, clip[1].y, clip[2].y) - ndc.y * vec3f(clip[0].w, clip[1].w, clip[2].w);
+    let weighted = cross(x, y);
+    let total = weighted.x + weighted.y + weighted.z;
+    if abs(total) > 1.0e-30 {
+        let b = weighted / total;
+        if finite3(b) {
+            return b;
+        }
+    }
+    // Degenerate projection (including an extrapolated derivative at infinity).
+    return vec3f(1.0, 0.0, 0.0);
 }
 
 fn interp2(b: vec3f, a0: vec2f, a1: vec2f, a2: vec2f) -> vec2f {
