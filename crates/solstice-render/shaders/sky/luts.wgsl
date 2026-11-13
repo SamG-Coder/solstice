@@ -1,6 +1,6 @@
 // Generates the three atmosphere lookup tables. Transmittance and multiple scattering
 // depend only on the atmosphere, so they are built once. The sky view depends on the
-// sun and is cheap enough to rebuild every frame. Radiance is per unit of sun illuminance.
+// sun and viewer radius, and is rebuilt when either changes. Radiance is per unit of sun illuminance.
 
 #include "common/math.wgsl"
 #include "common/atmosphere.wgsl"
