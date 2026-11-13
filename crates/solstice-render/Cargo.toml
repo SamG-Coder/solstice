@@ -17,3 +17,5 @@ wgpu.workspace = true
 naga.workspace = true
 pollster.workspace = true
 solstice-builder.workspace = true
+solstice-procgen.workspace = true
+png = "0.17"

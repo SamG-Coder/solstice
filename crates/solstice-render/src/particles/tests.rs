@@ -147,12 +147,16 @@ impl Rig {
     /// Each live emitter's slot, slice, state, free list and alive particles, as the next frame
     /// will read them.
     fn emitters(&self) -> Vec<Snapshot> {
-        let states: Vec<EmitterState> = self.read(&self.particles.pool.state);
-        let records: Vec<EmitterRecord> = self.read(&self.particles.pool.emitters);
-        let free: Vec<u32> = self.read(&self.particles.pool.free);
-        let alive: Vec<u32> = self.read(&self.particles.pool.alive);
-        let pool: Vec<Particle> = self.read(&self.particles.pool.particles);
-        let capacity = self.particles.pool.capacity;
+        if self.particles.pool.is_none() {
+            assert!(!self.particles.slots.iter().any(|&live| live));
+            return Vec::new();
+        }
+        let states: Vec<EmitterState> = self.read(&self.particles.pool().state);
+        let records: Vec<EmitterRecord> = self.read(&self.particles.pool().emitters);
+        let free: Vec<u32> = self.read(&self.particles.pool().free);
+        let alive: Vec<u32> = self.read(&self.particles.pool().alive);
+        let pool: Vec<Particle> = self.read(&self.particles.pool().particles);
+        let capacity = self.particles.pool().capacity;
         let parity = self.particles.parity;
         (0..MAX_EMITTERS)
             .filter(|&slot| self.particles.slots[slot])
@@ -190,6 +194,40 @@ struct Snapshot {
     free: Vec<u32>,
     alive: Vec<u32>,
     particles: Vec<Particle>,
+}
+
+#[test]
+fn unused_pool_is_lazy_and_late_effects_keep_their_full_budget() {
+    let Some(mut rig) = Rig::new(262_144) else {
+        return;
+    };
+    assert_eq!(rig.particles.capacity(), 262_144);
+    assert_eq!(rig.particles.buffer_bytes(), 0);
+    for _ in 0..8 {
+        rig.frame(1.0 / 60.0);
+    }
+    rig.particles.resize(&rig.gpu, 8192);
+    assert_eq!(rig.particles.stats().capacity, 8192);
+    assert_eq!(rig.particles.buffer_bytes(), 0);
+    let effect =
+        Effect::parse("emitter late\n budget 8192\n spawn burst=8192\n lifetime 10").unwrap();
+    // An effect cancelled before prepare never needs GPU storage.
+    let cancelled = rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    rig.particles.kill(cancelled);
+    rig.frame(1.0 / 60.0);
+    assert_eq!(rig.particles.buffer_bytes(), 0);
+    let live = rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    rig.frame(1.0 / 60.0);
+    let allocated = rig.particles.buffer_bytes();
+    assert!(allocated > 8192 * std::mem::size_of::<Particle>() as u64);
+    assert_eq!(rig.emitters()[0].alive.len(), 8192);
+    rig.particles.kill(live);
+    rig.frame(1.0 / 60.0);
+    // Keep used storage to avoid a hitch when another effect starts.
+    assert_eq!(rig.particles.buffer_bytes(), allocated);
+    rig.particles.spawn(&effect, Mat4::IDENTITY).unwrap();
+    rig.frame(1.0 / 60.0);
+    assert_eq!(rig.emitters()[0].alive.len(), 8192);
 }
 
 const BALLISTIC: &str = "
@@ -1470,13 +1508,13 @@ impl Ground {
     fn emitters(&mut self) -> Vec<(EmitterState, Vec<Particle>)> {
         let particles = self.renderer.particles();
         let (state, alive, pool, emitters) = (
-            particles.pool.state.clone(),
-            particles.pool.alive.clone(),
-            particles.pool.particles.clone(),
-            particles.pool.emitters.clone(),
+            particles.pool().state.clone(),
+            particles.pool().alive.clone(),
+            particles.pool().particles.clone(),
+            particles.pool().emitters.clone(),
         );
         let (capacity, parity, slots) =
-            (particles.pool.capacity, particles.parity, particles.slots);
+            (particles.pool().capacity, particles.parity, particles.slots);
         let records: Vec<EmitterRecord> = self.read(&emitters);
         let states: Vec<EmitterState> = self.read(&state);
         let lists: Vec<u32> = self.read(&alive);

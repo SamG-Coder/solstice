@@ -115,7 +115,7 @@ fn traversal_visits_every_entry_beyond_one_dispatch_dimension() {
     let queue = gpu.storage_buffer(
         "stress queue",
         ((1 << 22) * 2 + 64) * 8,
-        wgpu::BufferUsages::empty(),
+        wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
     );
     let scratch = gpu.storage_buffer("stress scratch", 16, wgpu::BufferUsages::empty());
     // Separate buffers avoid writable binding aliasing.
@@ -169,4 +169,71 @@ fn traversal_visits_every_entry_beyond_one_dispatch_dimension() {
             assert_eq!(result[9], 0, "no entry should be dropped");
         }
     }
+
+    // Distant child subtrees must be rejected before they consume queue capacity.
+    // Values exactly at the threshold match process's existing <= comparison.
+    let errors = [
+        0.0,
+        0.5,
+        1.0,
+        1.0001,
+        2.0,
+        solstice_asset::gpu::ROOT_PARENT_ERROR,
+    ];
+    let mut children = vec![PackedNode {
+        radius: 1.0,
+        max_parent_error: solstice_asset::gpu::ROOT_PARENT_ERROR,
+        first: 1,
+        count: 120,
+        ..Default::default()
+    }];
+    children.extend((0..120).map(|index| PackedNode {
+        radius: 1.0,
+        max_parent_error: errors[index % errors.len()],
+        ..Default::default()
+    }));
+    let child_nodes = gpu.storage_buffer_init("child LOD nodes", &children);
+    let child_scene = gpu.bind_group(
+        "child LOD scene",
+        &pipelines.scene_layout,
+        &[
+            slots.binding(),
+            instances.as_entire_binding(),
+            child_nodes.as_entire_binding(),
+            clusters.as_entire_binding(),
+            wgpu::BindingResource::TextureView(&float_view),
+            wgpu::BindingResource::TextureView(&float_view),
+            wgpu::BindingResource::TextureView(&uint_view),
+        ],
+    );
+    let mut words = [0u32; STATE_SIZE as usize / 4];
+    words[2] = 1;
+    gpu.queue
+        .write_buffer(&state, 0, bytemuck::cast_slice(&words));
+    gpu.queue.write_buffer(&queue, 0, &[0u8; 8]);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipelines.advance);
+        pass.set_bind_group(0, &control, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&pipelines.process);
+        pass.set_bind_group(0, &child_scene, &[0]);
+        pass.set_bind_group(1, &work, &[]);
+        pass.dispatch_workgroups_indirect(&args, 0);
+    }
+    gpu.queue.submit([encoder.finish()]);
+    let result = read_words(&gpu, &state, STATE_SIZE);
+    let expected: Vec<u32> = (0..120)
+        .filter(|&i| errors[i % errors.len()] > 1.0)
+        .map(|i| i as u32 + 1)
+        .collect();
+    assert_eq!(result[2], expected.len() as u32 + 1);
+    assert_eq!(result[9], 0);
+    let entries = read_words(&gpu, &queue, u64::from(result[2]) * 8);
+    let actual: Vec<u32> = entries[2..].chunks_exact(2).map(|entry| entry[1]).collect();
+    assert_eq!(
+        actual, expected,
+        "only children that process would visit may be queued"
+    );
 }

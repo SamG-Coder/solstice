@@ -141,8 +141,15 @@ fn rasterize_triangle(
     let z2 = b_in.z;
     let inv_area = 1.0 / f32(-area);
 
-    let first = max(vec2i(bounds_min), vec2i(0));
-    let last = min(vec2i(bounds_max), vec2i(view.viewport) - 1);
+    // Only visit pixel centres inside the rounded triangle's bounds. Using whole pixel
+    // edges visits an extra row/column on both sides of tiny grass and leaf triangles,
+    // often even when no sample can be covered. Work from the same fixed-point vertices
+    // as the edge tests so rounding cannot discard a sample on a top/left edge.
+    // The numerators stay nonnegative, including for triangles outside the viewport.
+    let low = min(min(a, b), c);
+    let high = max(max(a, b), c);
+    let first = max(vec2i(origin) + (low + vec2i(127)) / SUBPIXEL_I, vec2i(0));
+    let last = min(vec2i(origin) + (high + vec2i(128)) / SUBPIXEL_I - vec2i(1), vec2i(view.viewport) - 1);
     if first.x > last.x || first.y > last.y {
         return;
     }

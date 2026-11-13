@@ -167,6 +167,7 @@ impl ParticleTargets {
 /// The buffers of a pool of one size, and their bind groups.
 struct Pool {
     capacity: u32,
+    buffer_bytes: u64,
     // Held by the bind groups too; tests read them back.
     #[cfg_attr(not(test), allow(dead_code))]
     particles: wgpu::Buffer,
@@ -202,7 +203,10 @@ struct PoolLayouts {
 /// Every effect running, the pool their particles live in, and the passes that move and draw
 /// them.
 pub struct Particles {
-    pool: Pool,
+    // Logical capacity is reserved immediately; GPU buffers are needed only once an
+    // effect reaches prepare. Keep a used pool for later effects to avoid allocation churn.
+    pool: Option<Pool>,
+    capacity: u32,
     layouts: PoolLayouts,
     inputs: LightInputs,
     light: wgpu::ComputePipeline,
@@ -253,8 +257,9 @@ pub struct Particles {
 }
 
 impl Particles {
-    /// Creates the passes and a pool of `capacity` particles, or as many as the device can
-    /// bind. `frame` is the renderer's frame uniform, which the draw reads; the light pass reads
+    /// Creates the passes and reserves a pool of `capacity` particles, or as many as the
+    /// device can bind. The GPU buffers are allocated when an effect is first prepared.
+    /// `frame` is the renderer's frame uniform, which the draw reads; the light pass reads
     /// the environment group, made with `environment`, and `inputs`.
     pub fn new(
         gpu: &Gpu,
@@ -535,9 +540,9 @@ impl Particles {
             light: light_layout,
             draw: pool_draw_layout,
         };
-        let pool = Pool::new(gpu, capacity, &layouts, &inputs);
         Self {
-            pool,
+            pool: None,
+            capacity,
             layouts,
             inputs,
             light,
@@ -598,17 +603,30 @@ impl Particles {
 
     /// Particles the pool holds.
     pub fn capacity(&self) -> u32 {
-        self.pool.capacity
+        self.capacity
+    }
+
+    /// Bytes in the allocated simulation buffers, excluding pipelines and render targets.
+    /// Zero until an effect is first prepared; the configured capacity is unchanged.
+    pub fn buffer_bytes(&self) -> u64 {
+        self.pool.as_ref().map_or(0, |pool| pool.buffer_bytes)
+    }
+
+    fn pool(&self) -> &Pool {
+        self.pool.as_ref().expect("active particles have a pool")
     }
 
     /// Makes the pool hold `capacity` particles. Running effects start again in the new pool,
     /// with budgets that fit it.
     pub fn resize(&mut self, gpu: &Gpu, capacity: u32) {
         let capacity = fitted_capacity(gpu, capacity);
-        if capacity == self.pool.capacity {
+        if capacity == self.capacity {
             return;
         }
-        self.pool = Pool::new(gpu, capacity, &self.layouts, &self.inputs);
+        self.capacity = capacity;
+        if self.pool.is_some() {
+            self.pool = Some(Pool::new(gpu, capacity, &self.layouts, &self.inputs));
+        }
         self.ranges = vec![(0, capacity)];
         self.slots = [false; MAX_EMITTERS];
         self.pending.clear();
@@ -788,7 +806,7 @@ impl Particles {
     /// The pool's use, from a recent frame.
     pub fn stats(&self) -> ParticleStats {
         let mut stats = self.stats.latest();
-        stats.capacity = self.pool.capacity;
+        stats.capacity = self.capacity;
         stats.reserved = self
             .effects
             .iter()
@@ -841,7 +859,10 @@ impl Particles {
             return;
         }
 
-        let capacity = self.pool.capacity;
+        let pool = self
+            .pool
+            .get_or_insert_with(|| Pool::new(gpu, self.capacity, &self.layouts, &self.inputs));
+        let capacity = pool.capacity;
         let mut records = [EmitterRecord::default(); MAX_EMITTERS];
         let mut draws = vec![0u8; MAX_EMITTERS * DRAW_STRIDE as usize];
         let written = 1 - self.parity;
@@ -935,31 +956,31 @@ impl Particles {
                 ..Default::default()
             };
             queue.write_buffer(
-                &self.pool.state,
+                &pool.state,
                 (slot * std::mem::size_of::<EmitterState>()) as u64,
                 bytemuck::bytes_of(&state),
             );
             let free: Vec<u32> = (emitter.base..emitter.base + emitter.budget).collect();
             queue.write_buffer(
-                &self.pool.free,
+                &pool.free,
                 u64::from(emitter.base) * 4,
                 bytemuck::cast_slice(&free),
             );
             queue.write_buffer(
-                &self.pool.curves,
+                &pool.curves,
                 (slot * CURVE_STRIDE * 16) as u64,
                 bytemuck::cast_slice(&baked_curves(desc)),
             );
             // Light left by the slice's last owner must not pass for a new particle's: the
             // new emitter counts its particles from zero again, into the same slots.
             queue.write_buffer(
-                &self.pool.light,
+                &pool.light,
                 u64::from(emitter.base) * LIGHT_BYTES,
                 &vec![0u8; (u64::from(emitter.budget) * LIGHT_BYTES) as usize],
             );
         }
-        queue.write_buffer(&self.pool.emitters, 0, bytemuck::cast_slice(&records));
-        queue.write_buffer(&self.pool.draws, 0, &draws);
+        queue.write_buffer(&pool.emitters, 0, bytemuck::cast_slice(&records));
+        queue.write_buffer(&pool.draws, 0, &draws);
         let sim = SimUniform {
             seconds,
             parity: self.parity,
@@ -971,7 +992,7 @@ impl Particles {
             camera_position: eye.extend(self.wind_floor).into(),
             camera_forward: camera.forward().extend(0.0).into(),
         };
-        queue.write_buffer(&self.pool.sim, 0, bytemuck::bytes_of(&sim));
+        queue.write_buffer(&pool.sim, 0, bytemuck::bytes_of(&sim));
         self.stats.live = self.slots;
         self.stats.parity = written;
         self.parity = written;
@@ -982,7 +1003,7 @@ impl Particles {
         if !self.active {
             return;
         }
-        let pool = &self.pool;
+        let pool = self.pool();
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("particles"),
             timestamp_writes: None,
@@ -1018,11 +1039,11 @@ impl Particles {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.collide);
-        pass.set_bind_group(0, &self.pool.collide_group, &[]);
+        pass.set_bind_group(0, &self.pool().collide_group, &[]);
         pass.set_bind_group(1, environment, &[]);
         pass.set_bind_group(2, &targets.opaque_group, &[]);
         pass.set_bind_group(3, waterline, &[]);
-        pass.dispatch_workgroups_indirect(&self.pool.indirect, LIGHT_ARGS);
+        pass.dispatch_workgroups_indirect(&self.pool().indirect, LIGHT_ARGS);
     }
 
     /// Records the light each live particle receives this frame, after the simulation, with
@@ -1037,9 +1058,9 @@ impl Particles {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.light);
-        pass.set_bind_group(0, &self.pool.light_group, &[]);
+        pass.set_bind_group(0, &self.pool().light_group, &[]);
         pass.set_bind_group(1, environment, &[]);
-        pass.dispatch_workgroups_indirect(&self.pool.indirect, LIGHT_ARGS);
+        pass.dispatch_workgroups_indirect(&self.pool().indirect, LIGHT_ARGS);
     }
 
     /// The targets for drawing at one size, over a scene whose depth and motion are
@@ -1125,7 +1146,7 @@ impl Particles {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.sort);
-        pass.set_bind_group(0, &self.pool.simulate_group, &[]);
+        pass.set_bind_group(0, &self.pool().simulate_group, &[]);
         pass.dispatch_workgroups(MAX_EMITTERS as u32, 1, 1);
     }
 
@@ -1196,10 +1217,10 @@ impl Particles {
         let draw_slot = |pass: &mut wgpu::RenderPass<'_>, slot: usize| {
             pass.set_bind_group(
                 1,
-                &self.pool.draw_group,
+                &self.pool().draw_group,
                 &[(slot as u64 * DRAW_STRIDE) as u32],
             );
-            pass.draw_indirect(&self.pool.indirect, DRAWS_OFFSET + slot as u64 * 16);
+            pass.draw_indirect(&self.pool().indirect, DRAWS_OFFSET + slot as u64 * 16);
         };
 
         // The scene's depth, for the hardware to test against.
@@ -1280,7 +1301,8 @@ impl Particles {
     /// Copies this frame's counters for the statistics, when the last copy has been read.
     pub fn capture_stats(&mut self, encoder: &mut wgpu::CommandEncoder) {
         if self.active {
-            self.stats.capture(encoder, &self.pool.state);
+            self.stats
+                .capture(encoder, &self.pool.as_ref().unwrap().state);
         } else {
             self.stats.idle();
         }
@@ -1428,8 +1450,16 @@ impl Pool {
                 whole(&light),
             ],
         );
+        let buffer_bytes = [
+            &particles, &free, &alive, &state, &emitters, &curves, &indirect, &light, &events,
+            &sim, &draws,
+        ]
+        .iter()
+        .map(|buffer| buffer.size())
+        .sum();
         Self {
             capacity,
+            buffer_bytes,
             particles,
             free,
             alive,

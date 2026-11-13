@@ -3294,9 +3294,11 @@ dependencies = [
  "glam 0.33.12",
  "log",
  "naga",
+ "png 0.17.16",
  "pollster",
  "solstice-asset",
  "solstice-builder",
+ "solstice-procgen",
  "wgpu",
 ]
 

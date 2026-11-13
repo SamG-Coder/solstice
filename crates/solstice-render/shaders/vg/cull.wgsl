@@ -178,6 +178,20 @@ fn projected_error(center: vec3f, radius: f32, error: f32) -> f32 {
     return error * view.lod_scale / distance;
 }
 
+// A child below the LOD cut would return immediately on the next dispatch. Reject it
+// before reserving queue space: distant instances can have many such children even
+// though only a few of their coarsest clusters contribute to the image.
+fn push_child(instance_index: u32, node_index: u32, instance: Instance) {
+    let node = nodes[node_index];
+    let center = transform_point(instance, node.lod_center);
+    let radius = (node.lod_radius + instance.lod_margin) * instance.max_scale;
+    let error = node.max_parent_error * instance.max_scale;
+    if projected_error(center, radius, error) <= view.lod_threshold {
+        return;
+    }
+    push_queue(QueueEntry(instance_index, node_index));
+}
+
 fn in_frustum(center: vec3f, radius: f32) -> bool {
     for (var i = 0u; i < 6u; i++) {
         let p = view.planes[i];
@@ -440,7 +454,7 @@ fn process(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) gr
             && distance(center, view.camera_position) - radius < view.prefetch_radius {
             if node.is_leaf == 0u {
                 for (var i = 0u; i < node.count; i++) {
-                    push_queue(QueueEntry(entry.instance, node.first + i));
+                    push_child(entry.instance, node.first + i, instance);
                 }
             } else {
                 atomicMax(&page_requests[page], REQUEST_LOWEST_LOAD);
@@ -460,7 +474,7 @@ fn process(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgroups) gr
 
     if node.is_leaf == 0u {
         for (var i = 0u; i < node.count; i++) {
-            push_queue(QueueEntry(entry.instance, node.first + i));
+            push_child(entry.instance, node.first + i, instance);
         }
         return;
     }

@@ -14,6 +14,8 @@
 mod culling;
 mod hzb;
 mod raster;
+#[cfg(test)]
+mod raster_stress;
 mod resolve;
 
 pub use culling::{
