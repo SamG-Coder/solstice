@@ -262,6 +262,7 @@ const wasm = await import(build).catch((error) => {
 const { default: init } = wasm;
 const { adapterReport, readWithRetries, inflateAtMost, requestAdapter, openScene } =
   await import("./loader.js");
+const { AutoQuality } = await import("./auto-quality.js");
 
 const sceneName = params.get("scene") ?? "cove";
 if (!/^[\w-]+$/.test(sceneName)) throw new Error("invalid scene name");
@@ -308,8 +309,10 @@ async function failWithReport(text) {
 }
 
 
+// Canvas pixels per CSS pixel are capped at 2, and at 1 once automatic quality's last step asks.
+let pixelRatioCap = 2;
 const canvasSize = () => {
-  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const ratio = Math.min(window.devicePixelRatio || 1, pixelRatioCap);
   return [
     Math.max(1, Math.round(canvas.clientWidth * ratio)),
     Math.max(1, Math.round(canvas.clientHeight * ratio)),
@@ -505,42 +508,42 @@ async function main() {
     viewer.set_debug_view(params.get("debug"));
   }
 
-  // Automatic quality starts high and steps down while the frame rate stays below target.
-  // It never steps back up: oscillating between presets is worse than either one.
+  // Automatic quality starts high and steps down while the frame rate stays below target:
+  // see auto-quality.js. Its last step, on a high-density display, draws fewer pixels.
   const LEVELS = ["high", "medium", "low"];
-  const TARGET_FPS = 28;
   const LOADING_PAGES_PER_REPORT = 200;
-  let autoLevel = 0;
-  let slowReports = 0;
-  let ignoreReports = 4;
+  const auto = new AutoQuality(window.devicePixelRatio || 1);
   const autoOption = el("quality").querySelector('[value="auto"]');
   let pagesAtReport = 0;
+  const resizeCanvas = () => {
+    const [width, height] = canvasSize();
+    if (width !== canvas.width || height !== canvas.height) {
+      canvas.width = width;
+      canvas.height = height;
+      viewer.resize(width, height);
+    }
+  };
+  const usePixelRatio = (cap) => {
+    if (cap === pixelRatioCap) return;
+    pixelRatioCap = cap;
+    resizeCanvas();
+  };
   const adaptQuality = (fps) => {
-    if (el("quality").value !== "auto" || autoLevel === LEVELS.length - 1) return;
-    // While geometry pours in, the frame rate says how fast the scene loads, not how fast it
-    // draws: a lower quality would outlast the loading it was chosen for.
     const pages = viewer.pages_installed() + viewer.pages_evicted();
     const loading = pages - pagesAtReport > LOADING_PAGES_PER_REPORT;
     pagesAtReport = pages;
-    if (loading) {
-      slowReports = 0;
-      return;
-    }
-    if (ignoreReports > 0) {
-      ignoreReports -= 1;
-      return;
-    }
-    slowReports = fps < TARGET_FPS ? slowReports + 1 : 0;
-    if (slowReports >= 3) {
-      autoLevel += 1;
-      slowReports = 0;
-      ignoreReports = 4;
-      viewer.set_quality(LEVELS[autoLevel]);
-      autoOption.textContent = `Automatic (${LEVELS[autoLevel]})`;
-    }
+    if (el("quality").value !== "auto") return;
+    const step = auto.report(fps, loading);
+    if (!step) return;
+    viewer.set_quality(step.quality);
+    usePixelRatio(step.pixelRatio);
+    autoOption.textContent = `Automatic (${auto.label})`;
   };
+  // A preset chosen by hand is drawn at the display's full density.
   el("quality").addEventListener("change", (e) => {
-    viewer.set_quality(e.target.value === "auto" ? LEVELS[autoLevel] : e.target.value);
+    const automatic = e.target.value === "auto";
+    viewer.set_quality(automatic ? auto.step.quality : e.target.value);
+    usePixelRatio(automatic ? auto.step.pixelRatio : 2);
   });
   const requestedQuality = params.get("quality");
   if (LEVELS.includes(requestedQuality)) {
@@ -680,14 +683,7 @@ async function main() {
     canvas.addEventListener("touchcancel", endTouch);
   }
 
-  new ResizeObserver(() => {
-    const [width, height] = canvasSize();
-    if (width !== canvas.width || height !== canvas.height) {
-      canvas.width = width;
-      canvas.height = height;
-      viewer.resize(width, height);
-    }
-  }).observe(canvas);
+  new ResizeObserver(resizeCanvas).observe(canvas);
 
   el("overlay").hidden = true;
   for (const id of ["hud", "controls", "help", "more"]) el(id).hidden = false;
