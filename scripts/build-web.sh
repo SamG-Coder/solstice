@@ -41,7 +41,7 @@ if [ ! -e assets/content/surface-grass-0-1024.solstice ]; then
 fi
 mkdir -p dist/content
 cp assets/content/*.solstice dist/content/
-cp apps/viewer/web/index.html apps/viewer/web/editor.html apps/viewer/web/loader.js dist/
+cp apps/viewer/web/index.html apps/viewer/web/editor.html apps/viewer/web/loader.js apps/viewer/web/auto-quality.js dist/
 cp -r apps/viewer/web/editor dist/
 # Scene files are already compressed where it helps, part by part, so that the page can fetch
 # any part alone. Hard links keep big scenes from taking disk space twice.

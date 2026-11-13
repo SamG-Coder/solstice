@@ -1,11 +1,12 @@
-// Tests of the editor's own code that need no browser: the project file writer, the rotation
-// maths and the gizmo's drags. Run with `node apps/viewer/web/editor/test.mjs`; CI runs it.
+// Tests of the web pages' own code that need no browser: the editor's project file writer,
+// rotation maths and gizmo drags, and the viewer's automatic quality. Run with `node apps/viewer/web/editor/test.mjs`; CI runs it.
 
 import { readFileSync } from "node:fs";
 import { Commands } from "./commands.js";
 import { Gizmo } from "./gizmo.js";
 import * as m from "./math.js";
 import { writeScene } from "./project.js";
+import { AutoQuality } from "../auto-quality.js";
 
 let failures = 0;
 function check(what, ok, detail) {
@@ -126,6 +127,32 @@ function check(what, ok, detail) {
   check("undo puts it back", state.value === 0);
   const help = commands.help("value.set");
   check("help gives JSON Schema", help.arguments.required[0] === "to" && help.arguments.properties.to.type === "number");
+}
+
+// ---- Automatic quality steps down while slow, faster when far too slow, never while loading.
+{
+  // Reports until the next step, at a steady frame rate.
+  const reportsToStep = (auto, fps) => {
+    for (let n = 1; n <= 100; n++) if (auto.report(fps, false)) return n;
+    return Infinity;
+  };
+  const retina = new AutoQuality(2);
+  check("a high-density display ends on Low at one pixel per CSS pixel",
+    JSON.stringify(retina.steps.at(-1)) === '{"quality":"low","pixelRatio":1}', retina.steps);
+  check("a display of ratio 1 has no step for fewer pixels", new AutoQuality(1).steps.length === 3);
+  check("a fast frame rate never steps", reportsToStep(new AutoQuality(2), 60) === Infinity);
+  check("a little slow: three reports after the four at start", reportsToStep(new AutoQuality(2), 25) === 7);
+  check("far too slow: two after the four at start", reportsToStep(retina, 10) === 6);
+  check("and then two after the one for new targets", reportsToStep(retina, 10) === 3);
+  reportsToStep(retina, 10);
+  check("the last step is fewer pixels", retina.step.pixelRatio === 1 && retina.label === "low, fewer pixels");
+  check("nothing after the last step", reportsToStep(retina, 1) === Infinity);
+  const loading = new AutoQuality(2);
+  for (let n = 0; n < 20; n++) loading.report(5, true);
+  check("loading never steps down", loading.level === 0);
+  const hitch = new AutoQuality(1);
+  for (const fps of [60, 60, 60, 60, 10, 60, 10, 60, 25, 25, 60]) hitch.report(fps, false);
+  check("a slow report between fast ones is a hitch", hitch.level === 0);
 }
 
 console.log(failures ? `${failures} failed` : "all passed");
