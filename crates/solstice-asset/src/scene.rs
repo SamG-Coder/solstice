@@ -288,6 +288,21 @@ pub struct Source {
     pub placement: glam::Mat4,
 }
 
+/// The weather and time of day a scene was made with, for a viewer to start it as. Each is left
+/// to the viewer where the scene doesn't say.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneEnvironment {
+    /// A built-in weather's name, or `changing` for weather that drifts by itself. Empty to
+    /// leave it to the viewer.
+    pub weather: String,
+    /// The hour it starts at, 0 to 24.
+    pub time: Option<f32>,
+    /// Seconds a whole day takes to pass; 0 holds the time still.
+    pub day_length: Option<f32>,
+    /// Degrees from -Z to north, round +Y.
+    pub north: Option<f32>,
+}
+
 /// One text file of a scene's gameplay: an actor file, a script, the input actions, or the list
 /// of placed actors. Carried as it was written, by the name it was written under, so the scene
 /// file needs no knowledge of what is in it.
@@ -313,6 +328,8 @@ pub struct SceneAsset {
     pub sea: Option<Sea>,
     /// The scene's ponds, if it has any. A scene with a sea draws the sea and not its ponds.
     pub still_water: Option<StillWater>,
+    /// The weather and time it was made with, if it says.
+    pub environment: Option<SceneEnvironment>,
     /// The scene's gameplay, if it has any. Empty for a scene that is only looked at.
     pub gameplay: Vec<GameFile>,
     /// Which entity made which instances, for a scene baked from a project. Empty otherwise.

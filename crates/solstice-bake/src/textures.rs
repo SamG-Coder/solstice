@@ -45,7 +45,8 @@ pub fn provided(key: &str, size: u32) -> bool {
     provided.iter().any(|(k, s, _)| k == key && *s == size)
 }
 
-/// The layer for `key` at `size`: the one provided, or else `make`'s.
+/// The layer for `key` at `size`: the one provided, or else `make`'s, which is then kept as
+/// provided, so a process baking again makes it only once.
 pub fn layer(key: &str, size: u32, make: impl FnOnce() -> TextureLayer) -> TextureLayer {
     let found = {
         let provided = PROVIDED.lock().unwrap_or_else(|e| e.into_inner());
@@ -54,7 +55,57 @@ pub fn layer(key: &str, size: u32, make: impl FnOnce() -> TextureLayer) -> Textu
             .find(|(k, s, _)| k == key && *s == size)
             .map(|(_, _, layer)| layer.clone())
     };
-    found.unwrap_or_else(make)
+    found.unwrap_or_else(|| {
+        let made = make();
+        provide(key, size, made.clone());
+        made
+    })
+}
+
+/// A species' bark surface's key.
+pub fn bark_key(species: &str) -> String {
+    format!("bark-{species}-0")
+}
+
+/// A species' leaves' key.
+pub fn leaves_key(species: &str) -> String {
+    format!("leaves-{species}-0")
+}
+
+/// The key of the default meadow's blades.
+pub const GRASS_ATLAS_KEY: &str = "grass-atlas-default-0";
+
+/// The surfaces a scene's land is laid with: its bands, and the plain terrain's sand.
+pub const LAND_SURFACES: [&str; 3] = ["grass", "sand", "dirt"];
+
+/// Every layer made ready ahead for the editor's bake: the land's surfaces, the woods' bark and
+/// leaves, and the meadow's blades.
+pub fn content_keys() -> Vec<String> {
+    let mut keys: Vec<String> = LAND_SURFACES.iter().map(|n| surface_key(n, 0)).collect();
+    for (species, _) in crate::foliage::WOOD_SPECIES {
+        keys.push(bark_key(species));
+        keys.push(leaves_key(species));
+    }
+    keys.push(GRASS_ATLAS_KEY.to_owned());
+    keys
+}
+
+/// Makes the layer one of [`content_keys`] names, at `size`; `None` for any other key.
+pub fn make_content(key: &str, size: u32) -> Option<TextureLayer> {
+    use solstice_procgen::foliage::{grass::Meadow, tree::Species};
+    if let Some(name) = LAND_SURFACES.iter().find(|n| surface_key(n, 0) == key) {
+        return Some(surface(name, size));
+    }
+    for (name, _) in crate::foliage::WOOD_SPECIES {
+        let species = Species::by_name(name)?;
+        if key == bark_key(name) {
+            return Some(species.bark.surface(0).bake(size));
+        }
+        if key == leaves_key(name) {
+            return Some(species.leaves.kind.atlas(0).bake(size));
+        }
+    }
+    (key == GRASS_ATLAS_KEY).then(|| Meadow::default().atlas(0).bake(size))
 }
 
 /// A scene file holding one layer, compressed, as `bake --surfaces` writes them.

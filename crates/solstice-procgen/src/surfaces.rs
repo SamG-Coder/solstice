@@ -11,6 +11,7 @@ use crate::foliage::bark::Bark;
 use crate::noise::lattice_random;
 use crate::surface::{Shade, Surface, TILE_METRES};
 use glam::Vec3;
+use solstice_asset::math;
 
 /// Every surface in the library, by name.
 pub const NAMES: [&str; 20] = [
@@ -89,7 +90,7 @@ pub fn sand(seed: u32) -> Surface {
             // Leaning the sine forward gives a long windward slope and a shorter lee, with no
             // sharp edge anywhere for the light to draw as a line.
             let angle = phase * std::f32::consts::TAU;
-            let wave = (angle + (angle.sin() * 0.55)).sin() * 0.5 + 0.5;
+            let wave = math::sin(angle + (math::sin(angle) * 0.55)) * 0.5 + 0.5;
             let height = mounds.at(u, v) * 0.1
                 + wave * 0.0042 * strength.at(u, v)
                 + unevenness.at(u, v) * 0.004
@@ -145,7 +146,7 @@ pub fn wet_sand(seed: u32) -> Surface {
         move |u, v| {
             let phase = v * RIPPLES_PER_TILE + wander.at(u, v) * 9.0 + breakup.at(u, v) * 1.0;
             let angle = phase * std::f32::consts::TAU;
-            let wave = 1.0 - (angle.sin() * 0.5 + 0.5).powf(0.7);
+            let wave = 1.0 - math::powf(math::sin(angle) * 0.5 + 0.5, 0.7);
             let rill = smoothstep(0.86, 0.985, rills.at(u, v));
             let ground = lay.at(u, v) * 0.02 + wave * 0.0085 * ripple_strength.at(u, v)
                 - rill * 0.006
@@ -835,10 +836,10 @@ pub fn rock(seed: u32) -> Surface {
         },
         move |u, v, id, relief| {
             // Beds of slightly different stone run through the whole rock.
-            let bed = ((v * 7.0 + beds.at(u, v) * 2.5).rem_euclid(1.0) * std::f32::consts::TAU)
-                .sin()
-                * 0.5
-                + 0.5;
+            let bed =
+                math::sin((v * 7.0 + beds.at(u, v) * 2.5).rem_euclid(1.0) * std::f32::consts::TAU)
+                    * 0.5
+                    + 0.5;
             let stone = mix(
                 tone(0.115, 0.105, 0.095),
                 tone(0.2, 0.175, 0.15),
@@ -1007,7 +1008,7 @@ pub fn snow(seed: u32) -> Surface {
     let aged = fbm(3, 4, seed + 308).unit();
     Surface::shaped(
         move |u, v| {
-            let ridge = sastrugi.at(u, v).powi(3);
+            let ridge = math::powi(sastrugi.at(u, v), 3);
             let height = drifts.at(u, v) * 0.1
                 + ridge * 0.022 * scoured.at(u, v)
                 + crust.at(u, v) * 0.0022
@@ -1087,7 +1088,7 @@ pub fn sandstone(seed: u32) -> Surface {
             // Beds vary in thickness and wander, their edges are broken up, and each fault block
             // has slipped, so that no bed crosses the whole rock.
             let place = (v + bed_wander.at(u, v) * 0.045 + bed_edges.at(u, v) * 0.009) * BEDS
-                + (v * std::f32::consts::TAU * 2.0).sin() * 0.4
+                + math::sin(v * std::f32::consts::TAU * 2.0) * 0.4
                 + fault.id * 3.0;
             let bed = place.floor() as i32;
             let within = place - place.floor();
@@ -1165,10 +1166,10 @@ pub fn marble(seed: u32) -> Surface {
         move |u, v| {
             // Bent any harder, the lines close into loops like the contours of a map.
             let bent = fold.at(u, v) * 3.2 + fine_fold.at(u, v) * 0.45;
-            let main = (TAU * (u * 2.0 + v * 3.0) + bent).sin().abs();
-            let side = (TAU * (u * 5.0 + v * 2.0) + bent * 1.3).sin().abs();
-            let fine = (TAU * (u * 7.0 + v * 12.0) + bent * 1.6).sin().abs();
-            let width = 0.012 + width_change.at(u, v).powi(2) * 0.05;
+            let main = math::sin(TAU * (u * 2.0 + v * 3.0) + bent).abs();
+            let side = math::sin(TAU * (u * 5.0 + v * 2.0) + bent * 1.3).abs();
+            let fine = math::sin(TAU * (u * 7.0 + v * 12.0) + bent * 1.6).abs();
+            let width = 0.012 + math::powi(width_change.at(u, v), 2) * 0.05;
             let main_strength = strength_main.at(u, v);
             let side_strength = strength_side.at(u, v);
             let core = smoothstep(width, width * 0.2, main) * main_strength
@@ -1191,7 +1192,7 @@ pub fn marble(seed: u32) -> Surface {
             let toned = mix(
                 base,
                 tone(0.5, 0.51, 0.52),
-                cloud.powf(1.5) * (0.3 + wisps.at(u, v) * 0.7),
+                math::powf(cloud, 1.5) * (0.3 + wisps.at(u, v) * 0.7),
             );
             let flecked = toned * (0.985 + flecks.at(u, v) * 0.03);
             Shade {
@@ -1367,7 +1368,7 @@ mod tests {
         for (name, surface) in all(0) {
             let layer = surface.bake(64);
             let colors = &layer.color_mips[0];
-            let linear = |byte: u8| (f32::from(byte) / 255.0).powf(2.2);
+            let linear = |byte: u8| math::powf(f32::from(byte) / 255.0, 2.2);
             let count = colors.len() / 4;
             let mean: f32 = colors
                 .chunks_exact(4)

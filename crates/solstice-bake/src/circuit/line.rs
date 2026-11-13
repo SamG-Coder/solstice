@@ -8,6 +8,7 @@
 //! with more for its detail.
 
 use glam::Vec2;
+use solstice_asset::math;
 use solstice_game::Track;
 
 /// How far from the road's edge the middle of a car keeps.
@@ -81,7 +82,7 @@ pub fn turning(points: &[Vec2]) -> Vec<f32> {
             let (before, after) = (b - a, c - b);
             let step = (before.length() + after.length()) * 0.5;
             // With y up and z towards the viewer, a turn to the left is clockwise in (x, z).
-            -before.perp_dot(after).atan2(before.dot(after)) / step.max(1.0e-4)
+            -math::atan2(before.perp_dot(after), before.dot(after)) / step.max(1.0e-4)
         })
         .collect()
 }
@@ -135,7 +136,7 @@ mod tests {
             let middle = start + along * (side - radius) + right * radius;
             for k in 0..arc {
                 let a = k as f32 / arc as f32 * std::f32::consts::FRAC_PI_2;
-                let p = middle - right * radius * a.cos() + along * radius * a.sin();
+                let p = middle - right * radius * math::cos(a) + along * radius * math::sin(a);
                 points.push((p.x, p.y));
             }
         }
@@ -147,7 +148,7 @@ mod tests {
         let ring: Vec<(f32, f32)> = (0..300)
             .map(|k| {
                 let a = k as f32 / 300.0 * std::f32::consts::TAU;
-                (a.cos() * 150.0, a.sin() * 150.0)
+                (math::cos(a) * 150.0, math::sin(a) * 150.0)
             })
             .collect();
         let line = racing_line(&track(&ring));

@@ -4,6 +4,7 @@
 
 use glam::{Vec2, Vec3};
 use rustc_hash::FxHashMap;
+use solstice_asset::math;
 use solstice_builder::{Mesh, Vertex};
 use solstice_procgen::noise::{fbm, random, ridged};
 use std::f32::consts::TAU;
@@ -242,7 +243,7 @@ pub fn column(height: f32, radial: u32, rows: u32, seed: u32) -> Mesh {
             t * t * (3.0 - 2.0 * t)
         };
         // Tapered shaft with entasis: a slight swelling that corrects a perceived waist.
-        let shaft = 0.62 - 0.14 * t + 0.022 * (t * std::f32::consts::PI).sin();
+        let shaft = 0.62 - 0.14 * t + 0.022 * math::sin(t * std::f32::consts::PI);
         let echinus = smooth(0.885, 0.955, t) * 0.26;
         let abacus = smooth(0.955, 0.958, t) * 0.05;
         let fluting = 1.0 - smooth(0.87, 0.885, t);
@@ -252,7 +253,7 @@ pub fn column(height: f32, radial: u32, rows: u32, seed: u32) -> Mesh {
 
     let side = |u: f32, v: f32| {
         let theta = u * TAU;
-        let (sin, cos) = theta.sin_cos();
+        let (sin, cos) = math::sin_cos(theta);
         let (radius, fluting, square) = profile(v);
 
         // Twenty concave flutes separated by sharp arrises.

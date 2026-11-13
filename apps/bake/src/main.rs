@@ -21,9 +21,10 @@
 //! a scene's text as a project's `SCENE.scene` beside it, and lists it in the `solstice.project`
 //! there.
 //!
-//! `--surfaces` writes the surfaces a land is laid with, each as a scene file holding one
-//! compressed texture layer, for the editor's bake in the browser to take ready-made rather than
-//! spend minutes making (`solstice_bake::textures`): `surface-NAME-0-SIZE.solstice`.
+//! `--surfaces` writes the textures the editor's bake in the browser takes ready-made rather than
+//! spend minutes making (`solstice_bake::textures`): the land's surfaces, the woods' bark and
+//! leaves and the meadow's blades, each as a scene file holding one compressed layer,
+//! `KEY-SIZE.solstice`.
 //!
 //! `--check-character` bakes nothing: it checks a rigged character as the export tool wrote it
 //! (`tools/blender/solstice_export.py`), prints what it holds and what is wrong with it, and
@@ -340,20 +341,16 @@ fn check_character(path: &std::path::Path, roles: Option<&PathBuf>) -> Result<()
     }
 }
 
-/// The surfaces a scene's land is laid with: its bands, and the plain terrain's sand.
-const LAND_SURFACES: [&str; 3] = ["grass", "sand", "dirt"];
-
-/// Writes each of the land's surfaces, compressed, as a scene file of one layer.
+/// Writes each layer the editor's bake takes ready-made (`solstice_bake::textures`), compressed,
+/// as a scene file of one layer.
 fn write_surfaces(folder: &Path, size: u32) -> Result<(), String> {
     use solstice_bake::textures;
     std::fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
-    for name in LAND_SURFACES {
+    for key in textures::content_keys() {
         let start = Instant::now();
-        let bytes = textures::encode_layer(textures::surface(name, size), size);
-        let path = folder.join(format!(
-            "{}-{size}.solstice",
-            textures::surface_key(name, 0)
-        ));
+        let layer = textures::make_content(&key, size).expect("a key from the list");
+        let bytes = textures::encode_layer(layer, size);
+        let path = folder.join(format!("{key}-{size}.solstice"));
         std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         println!(
             "wrote {} ({:.1} MB) in {:.1}s",

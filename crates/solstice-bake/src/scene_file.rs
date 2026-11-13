@@ -35,6 +35,7 @@
 
 use crate::meshes;
 use glam::{Mat4, Quat, Vec3};
+use solstice_asset::math;
 use solstice_asset::scene::Viewpoint;
 use solstice_asset::{
     Collide, GameFile, Heightfield, Instance, Light, Material, SceneAsset, Sea, Source, StillWater,
@@ -450,7 +451,7 @@ fn offshore(x: f32, z: f32, shore_x: f32) -> (f32, f32) {
     let cove = x - shore_x - wander;
     // The coast round the rest of the island, sampled around a circle so that it wanders
     // seamlessly: broad headlands and bays, with smaller points along them.
-    let radius = x.hypot(z);
+    let radius = math::hypot(x, z);
     let around = Vec3::new(x, 0.0, z) / radius.max(1.0);
     let headlands = fbm(around * 1.6 + Vec3::new(0.0, 3.0, 0.0), 3, 307) * 45.0;
     let points = fbm(around * 7.0 + Vec3::new(0.0, 11.0, 0.0), 3, 309) * 14.0;

@@ -6,6 +6,7 @@
 
 use glam::Vec3;
 use solstice_asset::gpu::unpack_triangle;
+use solstice_asset::math;
 use solstice_asset::{
     Collide, Collision, CollisionShape, SceneAsset, VirtualMesh, MAX_HULL_POINTS, NO_SHAPE,
 };
@@ -135,7 +136,7 @@ fn thin_hull(points: Vec<[f32; 3]>) -> Vec<[f32; 3]> {
     for i in 0..DIRECTIONS {
         let y = 1.0 - 2.0 * (i as f32 + 0.5) / DIRECTIONS as f32;
         let radius = (1.0 - y * y).max(0.0).sqrt();
-        let (sin, cos) = (golden * i as f32).sin_cos();
+        let (sin, cos) = math::sin_cos(golden * i as f32);
         let direction = Vec3::new(cos * radius, y, sin * radius);
         let furthest = points
             .iter()
@@ -206,7 +207,7 @@ mod tests {
         for z in 0..row {
             for x in 0..row {
                 let (u, v) = (x as f32 / cells as f32, z as f32 / cells as f32);
-                let height = (u * 40.0).sin() * (v * 37.0).cos() * ripple;
+                let height = math::sin(u * 40.0) * math::cos(v * 37.0) * ripple;
                 mesh.vertices.push(Vertex {
                     position: Vec3::new((u - 0.5) * size, height, (v - 0.5) * size),
                     normal: Vec3::Y,

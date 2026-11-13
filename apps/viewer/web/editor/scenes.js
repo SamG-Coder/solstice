@@ -2,6 +2,11 @@
 // starts from, the settings a scene has one of, and the worker that bakes a scene to the file the
 // viewer plays.
 
+/// The weathers a scene can start with, as the viewer's menu offers them.
+export const WEATHERS = ["changing", "clear", "fair", "broken", "overcast", "storm", "cirrus"];
+/// The day lengths the viewer's menu offers, in seconds: 0 holds the time still.
+export const DAY_LENGTHS = [0, 120, 1200, 86400];
+
 /// A new scene: an island of sand, dirt and grass in a coastal sea, seen from offshore.
 export function blankScene() {
   return {
@@ -79,7 +84,9 @@ export class Baker {
   }
 
   /// Bakes a scene's file text. Resolves to `{ bytes, ms }`; rejects with the bake's error.
-  bake(text, name) {
+  /// `quick` (the default) writes the file quickly, for the editor to show at once; without it,
+  /// it is the file `bake --project` writes for the scene, byte for byte.
+  bake(text, name, quick = true) {
     if (!this.#worker) {
       this.#worker = new Worker(new URL("./bake-worker.js", import.meta.url), { type: "module" });
       this.#worker.onmessage = ({ data }) => {
@@ -97,7 +104,7 @@ export class Baker {
     const id = this.#next++;
     return new Promise((resolve, reject) => {
       this.#waiting.set(id, { resolve, reject });
-      this.#worker.postMessage({ id, scene: text, name, content: this.content });
+      this.#worker.postMessage({ id, scene: text, name, content: this.content, quick });
     });
   }
 }

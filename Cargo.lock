@@ -279,6 +279,7 @@ name = "bake-web"
 version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
+ "solstice-asset",
  "solstice-bake",
  "solstice-project",
  "wasm-bindgen",
@@ -3195,6 +3196,7 @@ version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam 0.33.12",
+ "libm",
  "miniz_oxide 0.8.9",
 ]
 

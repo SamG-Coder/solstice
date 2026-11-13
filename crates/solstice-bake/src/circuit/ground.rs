@@ -12,6 +12,7 @@ use super::{Island, Land, Road, GRASS, LAND_SPACING, ROCK, SAND, SINK};
 use crate::meshes;
 use glam::Vec3;
 use rayon::prelude::*;
+use solstice_asset::math;
 use solstice_builder::Mesh;
 
 /// How many smaller squares a side a square on steep ground is cut into.
@@ -169,9 +170,10 @@ pub(super) fn draw(island: &Island, road: &Road, land: &Land, size: f32) -> Vec<
                             Vec3::new(x0 + small, h10, z0),
                         ];
                         let middle = (h00 + h01 + h11 + h10) * 0.25;
-                        let slope = ((h10 + h11 - h00 - h01) * 0.5)
-                            .hypot((h01 + h11 - h00 - h10) * 0.5)
-                            / small;
+                        let slope = math::hypot(
+                            (h10 + h11 - h00 - h01) * 0.5,
+                            (h01 + h11 - h00 - h10) * 0.5,
+                        ) / small;
                         let (cx, cz) = (x0 + small * 0.5, z0 + small * 0.5);
                         let what = kind(middle, slope, island.rocky(cx, cz), beside_road(cx, cz));
                         pieces.push((what, corners));

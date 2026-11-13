@@ -36,7 +36,7 @@ cargo build --release --target wasm32-unknown-unknown -p viewer --lib --no-defau
 # for every visitor (`bake --surfaces`). A local build reuses any already in assets/content.
 cargo build --release --target wasm32-unknown-unknown -p bake-web
 "$bindgen" --target web --no-typescript --out-dir dist/bake-wasm target/wasm32-unknown-unknown/release/solstice_bake_web.wasm
-if [ ! -e assets/content/surface-grass-0-1024.solstice ]; then
+if [ ! -e assets/content/grass-atlas-default-0-1024.solstice ]; then
   cargo run --release -p bake -- --surfaces assets/content
 fi
 mkdir -p dist/content

@@ -23,6 +23,7 @@
 use super::bark::Bark;
 use super::leaf::{LeafKind, LEAF_VARIANTS};
 use super::text::{number, pairs, range, range_text, single};
+use solstice_asset::math;
 use std::f32::consts::PI;
 use std::fmt::Write as _;
 
@@ -55,7 +56,7 @@ impl Crown {
     pub fn envelope(&self, x: f32) -> f32 {
         let x = x.clamp(0.0, 1.0);
         match self {
-            Self::Round => (PI * (x * 0.85 + 0.12)).sin().powf(0.7),
+            Self::Round => math::powf(math::sin(PI * (x * 0.85 + 0.12)), 0.7),
             Self::Cone => 1.0 - x * 0.85,
             Self::Even => 1.0 - x * 0.3,
             Self::Profile(points) => match points.len() {

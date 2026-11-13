@@ -23,7 +23,7 @@ solstice.version                 // 1, raised when a command changes
 Every call returns `{ ok: true, result }` or `{ ok: false, error: { code, message } }`, and never
 throws. Error codes are `unknown_command`, `bad_arguments` (a missing, misspelt or mistyped
 argument, named in the message), `unknown_id`, `no_transform`, `nothing_selected`,
-`nothing_to_frame`, `not_a_project`, `bake_failed`, `not_drawing` (a `pick` or `wait` while the tab is hidden, which draws no
+`nothing_to_frame`, `not_a_project`, `not_removable`, `bake_failed`, `not_drawing` (a `pick` or `wait` while the tab is hidden, which draws no
 frames: bring it to the front) and `failed`.
 
 Changes an agent makes are steps in the same history as a person's, marked `agent` in
@@ -66,6 +66,9 @@ Building a scene from blank terrain:
 await solstice.call("project.new", { name: "island" });   // baked in the browser in a few seconds
 await solstice.call("scene.set", { terrain: { size: 256, cells: 128, height: 12, shore_x: 30 } });
 await solstice.call("scene.set", { land: { sand: 18, dirt: 8 } });
+await solstice.call("object.add", { kind: "wood", at: [-40, 0, -20] });
+await solstice.call("scene.set", { meadow: 60 });
+await solstice.call("env.set", { weather: "fair", time: 18.5 });  // saved with the scene
 await solstice.call("bake.run");                          // waits for the bake, and shows it
 await solstice.call("project.get");                       // the scene's file, to save or read
 ```
@@ -245,13 +248,15 @@ No arguments.
 
 ### `env.set`
 
-The time of day (hours, 0 to 24), the weather (by name, or `changing`), and the ponds (x0,z0,x1,z1,level; with ; between). Not saved yet.
+The scene's weather and time of day, saved with it, and shown at once: the viewer starts the scene that way too. One undo step; nothing bakes.
 
 | Argument | Type | Needed | Meaning |
 |---|---|---|---|
-| `time` | number |  | Hours, 0 to 24. |
-| `weather` | string |  | changing, or a weather's name: env.weathers lists them. |
-| `ponds` | string |  | Ponds as x0,z0,x1,z1,level, with ; between them. |
+| `weather` | string |  | `changing`, or one of `env.weathers`. |
+| `time` | number |  | The hour it starts at, 0 to 24. |
+| `day_length` | number |  | Seconds a day takes: 0 (held still), 120, 1200 or 86400. |
+| `north` | number |  | Degrees from -Z to north, round +Y. |
+| `clear` | boolean |  | Leave them all to the viewer again. |
 
 ```js
 await solstice.call("env.set", {"time":18.5,"weather":"fair"})
@@ -259,7 +264,7 @@ await solstice.call("env.set", {"time":18.5,"weather":"fair"})
 
 ### `env.weathers`
 
-The names env.set takes for the weather.
+The names `env.set` takes for the weather: changing, clear, fair, broken, overcast, storm, cirrus.
 
 No arguments.
 
@@ -319,11 +324,50 @@ Changes the scene's settings, each given whole, or null to take it away. One und
 |---|---|---|---|
 | `terrain` | object or null |  | `{ size, cells, height, shore_x }`: metres across (16 to 4096), cells along a side (8 to 1024; more takes longer), hill height in metres, and the x where the shore begins (the sea lies towards +X). Null for no ground. |
 | `land` | object or null |  | `{ sand, dirt }`: metres of sand from the water, then of dirt; grass beyond. Null for plain ground. |
-| `sea` | object or null |  | `{ level, ocean }`: the calm sea's height, and a built-in ocean (`coastal`). Null for no sea. |
+| `sea` | object or null |  | `{ level, ocean }`: the calm sea's height, and a built-in ocean (`coastal`, `clear`, `ocean`, `murky`). Null for no sea. |
+| `meadow` | number |  | Real grass on the grass, out to this many metres from the origin (1 to 4000); 0 for none. |
 
 ```js
 await solstice.call("scene.set", {"terrain":{"size":256,"cells":128,"height":6,"shore_x":40}})
 ```
+
+### `object.add`
+
+Adds something the land is shaped by: a wood, clearing, pond, path or yard, where asked (at the middle of the view if not given), at its starting size. The scene bakes again; a pond shows at once. One undo step.
+
+| Argument | Type | Needed | Meaning |
+|---|---|---|---|
+| `kind` | string | yes | `wood`, `clear`, `pond`, `path` or `yard`. |
+| `at` | [x, y, z] |  | Where, in metres; a pond, path or yard is laid round its x and z. |
+| `name` | string |  | Its name in the outliner. |
+| `fields` | object |  | Its own fields instead of the starting ones, as `object.shape` takes them. |
+
+```js
+await solstice.call("object.add", {"kind":"wood","at":[-40,0,-20],"fields":{"radius":25,"spacing":7}})
+```
+
+### `object.shape`
+
+Changes a wood's, clearing's, pond's, path's or yard's own fields, given whole. The scene bakes again, but for a pond, which changes at once. One undo step.
+
+| Argument | Type | Needed | Meaning |
+|---|---|---|---|
+| `id` | string | yes | The entity's id. |
+| `fields` | object | yes | wood `{ radius, spacing }` (spacing above 0.5 m), clear `{ radius }`, pond `{ min, max, level }` (corners as [x, z]), path `{ from, to, width }`, yard `{ from, to }`. |
+
+```js
+await solstice.call("object.shape", {"id":"wood-id","fields":{"radius":30,"spacing":6}})
+```
+
+A wood or clearing is moved like anything else, with `object.move`; the scene bakes again.
+
+### `object.delete`
+
+Removes woods, clearings, ponds, paths, yards or empty folders (the selection if no ids). The scene bakes again. One undo step. Models and actors can't be removed yet.
+
+| Argument | Type | Needed | Meaning |
+|---|---|---|---|
+| `ids` | string[] |  | The entities to remove; the selection if left out. |
 
 ### `bake.run`
 

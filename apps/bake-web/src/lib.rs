@@ -9,12 +9,18 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-/// Bakes a project's scene, given as its file's text. `name` names it in errors.
-pub fn bake(scene: &str, name: &str) -> Result<Vec<u8>, String> {
+/// Bakes a project's scene, given as its file's text. `name` names it in errors. `quick` writes
+/// the file quickly, for the editor to show at once; otherwise it is the file `bake --project`
+/// writes, byte for byte.
+pub fn bake(scene: &str, name: &str, quick: bool) -> Result<Vec<u8>, String> {
     let scene = solstice_project::Scene::parse(scene).map_err(|e| format!("{name}: {e}"))?;
     let (built, _warnings) =
         solstice_bake::project::build_scene(&scene, name, std::path::Path::new("."), None)?;
-    Ok(solstice_bake::project::encode(built))
+    Ok(if quick {
+        solstice_bake::project::encode_quickly(built)
+    } else {
+        solstice_bake::project::encode(built)
+    })
 }
 
 /// Hands over a ready-made texture layer, from a file `bake --surfaces` wrote, under `key`.
@@ -34,8 +40,8 @@ pub fn start() {
 /// See [`bake`].
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub fn bake_scene(scene: &str, name: &str) -> Result<Vec<u8>, JsValue> {
-    bake(scene, name).map_err(|e| JsValue::from_str(&e))
+pub fn bake_scene(scene: &str, name: &str, quick: bool) -> Result<Vec<u8>, JsValue> {
+    bake(scene, name, quick).map_err(|e| JsValue::from_str(&e))
 }
 
 /// See [`provide`].
@@ -43,6 +49,13 @@ pub fn bake_scene(scene: &str, name: &str) -> Result<Vec<u8>, JsValue> {
 #[wasm_bindgen]
 pub fn provide_layer(key: &str, file: &[u8]) -> Result<u32, JsValue> {
     provide(key, file).map_err(|e| JsValue::from_str(&e))
+}
+
+/// The keys of every layer made ready ahead (`bake --surfaces`), one to a line.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn content_keys() -> String {
+    solstice_bake::textures::content_keys().join("\n")
 }
 
 /// The key a built-in surface's layer is provided under.
@@ -75,8 +88,15 @@ mod tests {
         .unwrap();
         let mut small = text.to_owned();
         small = small.replace("\"format\": 1,", "\"format\": 1,\n  \"texture_size\": 32,");
-        let baked = bake(&small, "t.scene").unwrap();
+        let baked = bake(&small, "t.scene", false).unwrap();
         assert_eq!(baked, solstice_bake::project::encode(native));
-        assert!(bake("{", "t.scene").unwrap_err().contains("t.scene"));
+        assert!(bake("{", "t.scene", false).unwrap_err().contains("t.scene"));
+        // Written quickly, it is the same scene.
+        let quick = bake(&small, "t.scene", true).unwrap();
+        let read = |bytes: &[u8]| solstice_asset::file::decode(bytes).unwrap();
+        let (a, b) = (read(&baked), read(&quick));
+        assert_eq!(a.pages, b.pages);
+        assert_eq!(a.scene.instances.len(), b.scene.instances.len());
+        assert_eq!(a.upper_textures.len(), b.upper_textures.len());
     }
 }

@@ -63,6 +63,9 @@ pub struct Scene {
     /// An open sea.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sea: Option<Sea>,
+    /// The weather and time of day the scene starts with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
     /// The game the scene plays, if any beyond its actors.
     #[serde(default, skip_serializing_if = "Game::is_empty")]
     pub game: Game,
@@ -114,6 +117,25 @@ pub struct Sea {
     pub level: f32,
     /// A built-in ocean's name, or a `.ocean` file in the project.
     pub ocean: String,
+}
+
+/// The weather and time of day a scene starts with. Each left out is the viewer's own choice.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    /// A built-in weather (clear, calm, fair, broken, overcast, storm, cirrus), or `changing` for
+    /// weather that drifts by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weather: Option<String>,
+    /// The hour the scene starts at, 0 to 24.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<f32>,
+    /// Seconds a whole day takes to pass; 0 holds the time still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_length: Option<f32>,
+    /// Degrees from -Z to north, round +Y.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub north: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

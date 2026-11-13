@@ -21,8 +21,8 @@ use crate::paged::{
     PAGE_BYTES,
 };
 use crate::scene::{
-    Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, Sea, Source,
-    TextureEncoding, TextureLayer, Viewpoint,
+    Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material,
+    SceneEnvironment, Sea, Source, TextureEncoding, TextureLayer, Viewpoint,
 };
 use crate::skeleton::{Bone, BoneTrack, Clip, Skeleton, MAX_BONES, NO_POSE};
 use bytemuck::{Pod, Zeroable};
@@ -37,6 +37,9 @@ const DEFLATE_LEVEL: u8 = 9;
 const SEA_TAG: [u8; 4] = *b"SEA ";
 /// Still water: a count of ponds, five numbers for each, then the water's description as text.
 const POND_TAG: [u8; 4] = *b"POND";
+/// The optional section holding the weather and time a scene was made with: which of the three
+/// numbers it gives (bits 0 to 2), the time, day length and north, then the weather's name.
+const ENVIRONMENT_TAG: [u8; 4] = *b"ENVR";
 /// The optional section saying which entity of an editor project made which instances: how many
 /// [`Source`]s, then each one's first instance, its end, its placement (16 floats, by column),
 /// and its id's length and text. Written only for scenes baked from a project.
@@ -70,6 +73,7 @@ pub enum DecodeError {
     BadPages,
     BadSea,
     BadStillWater,
+    BadEnvironment,
     BadGameplay,
     BadCollision,
     BadSkin,
@@ -98,6 +102,7 @@ impl fmt::Display for DecodeError {
             Self::BadPages => write!(f, "the page tables are inconsistent"),
             Self::BadSea => write!(f, "the sea's description is not text"),
             Self::BadStillWater => write!(f, "the scene's ponds are malformed"),
+            Self::BadEnvironment => write!(f, "the scene's weather and time are malformed"),
             Self::BadGameplay => write!(f, "the scene's gameplay files are malformed"),
             Self::BadCollision => write!(f, "the scene's collision shapes are malformed"),
             Self::BadSkin => write!(f, "the scene's skeletons or skins are malformed"),
@@ -168,13 +173,29 @@ struct RawMesh {
 
 /// Serialises a scene.
 pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
+    encode_at(loaded, DEFLATE_LEVEL)
+}
+
+/// How hard [`encode_quickly`] compresses: about the size of the hardest for a small part of
+/// the time.
+const QUICK_DEFLATE_LEVEL: u8 = 1;
+
+/// Serialises a scene as [`encode`] does, but compressing its parts quickly rather than as small
+/// as can be: the same scene, read the same way, in a somewhat larger file. For a scene that is
+/// only read where it is made, as the editor's bake in the browser makes one each time a scene
+/// changes, where compressing hard is most of the time it takes.
+pub fn encode_quickly(loaded: &LoadedScene) -> Vec<u8> {
+    encode_at(loaded, QUICK_DEFLATE_LEVEL)
+}
+
+fn encode_at(loaded: &LoadedScene, level: u8) -> Vec<u8> {
     let pinned = loaded.scene.pinned_pages as usize;
     let upper_count = upper_mip_count(loaded.scene.texture_size);
 
     let mut scene = loaded.scene.clone();
     let mut data = Vec::new();
     for (info, raw) in scene.pages[pinned..].iter_mut().zip(&loaded.pages) {
-        let packed = miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL);
+        let packed = miniz_oxide::deflate::compress_to_vec(raw, level);
         info.offset = data.len() as u64;
         info.stored_bytes = packed.len() as u32;
         data.extend_from_slice(&packed);
@@ -190,10 +211,10 @@ pub fn encode(loaded: &LoadedScene) -> Vec<u8> {
     }
 
     if let Some(collision) = &loaded.collision {
-        scene.collision = Some(append_collision(collision, &mut data));
+        scene.collision = Some(append_collision(collision, &mut data, level));
     }
 
-    let manifest = miniz_oxide::deflate::compress_to_vec(&encode_manifest(&scene), DEFLATE_LEVEL);
+    let manifest = miniz_oxide::deflate::compress_to_vec(&encode_manifest(&scene), level);
     let header = Header {
         magic: MAGIC,
         version: VERSION,
@@ -309,6 +330,9 @@ fn encode_manifest(scene: &PagedScene) -> Vec<u8> {
         }
         contents.extend_from_slice(still.water.as_bytes());
         w.section(POND_TAG, &contents);
+    }
+    if let Some(environment) = &scene.environment {
+        w.section(ENVIRONMENT_TAG, &encode_environment(environment));
     }
     if !scene.gameplay.is_empty() {
         w.section(GAME_TAG, &encode_gameplay(&scene.gameplay));
@@ -645,9 +669,9 @@ fn skin_is_consistent(scene: &PagedScene) -> bool {
 
 /// Writes a scene's collision shapes into the data area, each deflated on its own so that it
 /// can be fetched alone, and lists where they went.
-fn append_collision(collision: &Collision, data: &mut Vec<u8>) -> CollisionIndex {
+fn append_collision(collision: &Collision, data: &mut Vec<u8>, level: u8) -> CollisionIndex {
     let mut store = |raw: &[u8]| {
-        let packed = miniz_oxide::deflate::compress_to_vec(raw, DEFLATE_LEVEL);
+        let packed = miniz_oxide::deflate::compress_to_vec(raw, level);
         let offset = data.len() as u64;
         data.extend_from_slice(&packed);
         (offset, packed.len() as u32)
@@ -721,6 +745,47 @@ fn encode_gameplay(files: &[GameFile]) -> Vec<u8> {
         }
     }
     bytes
+}
+
+fn encode_environment(environment: &SceneEnvironment) -> Vec<u8> {
+    let numbers = [environment.time, environment.day_length, environment.north];
+    let given = numbers
+        .iter()
+        .enumerate()
+        .fold(0u32, |bits, (k, n)| bits | (u32::from(n.is_some()) << k));
+    let mut bytes = given.to_le_bytes().to_vec();
+    for n in numbers {
+        bytes.extend_from_slice(&n.unwrap_or(0.0).to_le_bytes());
+    }
+    bytes.extend_from_slice(environment.weather.as_bytes());
+    bytes
+}
+
+fn decode_environment(bytes: &[u8]) -> Result<SceneEnvironment, DecodeError> {
+    let word = |k: usize| -> Result<[u8; 4], DecodeError> {
+        bytes
+            .get(k * 4..k * 4 + 4)
+            .and_then(|w| w.try_into().ok())
+            .ok_or(DecodeError::BadEnvironment)
+    };
+    let given = u32::from_le_bytes(word(0)?);
+    let number = |k: usize| -> Result<Option<f32>, DecodeError> {
+        let value = f32::from_le_bytes(word(k + 1)?);
+        if given & (1 << k) == 0 {
+            Ok(None)
+        } else if value.is_finite() {
+            Ok(Some(value))
+        } else {
+            Err(DecodeError::BadEnvironment)
+        }
+    };
+    Ok(SceneEnvironment {
+        time: number(0)?,
+        day_length: number(1)?,
+        north: number(2)?,
+        weather: String::from_utf8(bytes[16..].to_vec())
+            .map_err(|_| DecodeError::BadEnvironment)?,
+    })
 }
 
 fn encode_sources(sources: &[Source]) -> Vec<u8> {
@@ -888,6 +953,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
 
     let mut sea = None;
     let mut still_water = None;
+    let mut environment = None;
     let mut gameplay = Vec::new();
     let mut sources = Vec::new();
     let mut collision = None;
@@ -907,6 +973,8 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
                 level: f32::from_le_bytes(*level),
                 ocean: String::from_utf8(text.to_vec()).map_err(|_| DecodeError::BadSea)?,
             });
+        } else if tag == ENVIRONMENT_TAG {
+            environment = Some(decode_environment(&contents)?);
         } else if tag == POND_TAG {
             let (count, rest) = contents
                 .split_first_chunk::<4>()
@@ -1007,6 +1075,7 @@ pub fn decode_manifest(bytes: &[u8], data_offset: u64) -> Result<PagedScene, Dec
         viewpoint: (has_viewpoint != 0).then_some(viewpoint),
         sea,
         still_water,
+        environment,
         gameplay,
         sources,
         collision,
@@ -1680,6 +1749,32 @@ mod tests {
     }
 
     #[test]
+    fn the_weather_and_time_travel_with_their_scene() {
+        let mut loaded = sample_scene();
+        let environment = SceneEnvironment {
+            weather: "fair".into(),
+            time: Some(18.5),
+            day_length: None,
+            north: Some(-30.0),
+        };
+        loaded.scene.environment = Some(environment.clone());
+        assert_eq!(
+            decode(&encode(&loaded)).unwrap().scene.environment,
+            Some(environment)
+        );
+        assert_eq!(
+            decode(&encode(&sample_scene())).unwrap().scene.environment,
+            None
+        );
+        for bad in [
+            &[1u8, 0, 0][..],
+            &[1, 0, 0, 0, 0, 0, 0xc0, 0x7f, 0, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            assert_eq!(decode_environment(bad), Err(DecodeError::BadEnvironment));
+        }
+    }
+
+    #[test]
     fn a_sea_travels_with_its_scene() {
         let mut loaded = sample_scene();
         let sea = Sea {
@@ -1798,7 +1893,7 @@ mod tests {
     fn broken_collision_is_an_error_not_a_guess() {
         let collision = sample_collision();
         let mut data = Vec::new();
-        let index = append_collision(&collision, &mut data);
+        let index = append_collision(&collision, &mut data, DEFLATE_LEVEL);
         let mut pieces: Vec<Vec<u8>> = index
             .ranges()
             .iter()
@@ -1855,7 +1950,7 @@ mod tests {
     #[test]
     fn a_collision_index_is_checked_before_anything_is_fetched() {
         let mut data = Vec::new();
-        let index = append_collision(&sample_collision(), &mut data);
+        let index = append_collision(&sample_collision(), &mut data, DEFLATE_LEVEL);
         assert_eq!(index.validate(1, 100), Ok(()));
         assert_eq!(index.raw_sizes(), [48, 48, 24]);
         let bad = |index: &CollisionIndex| {
@@ -1994,6 +2089,7 @@ mod tests {
         index.collision = Some(append_collision(
             with_collision.collision.as_ref().unwrap(),
             &mut Vec::new(),
+            DEFLATE_LEVEL,
         ));
         let longer = encode_manifest(&index);
         assert_eq!(&longer[..manifest.len()], &manifest[..]);

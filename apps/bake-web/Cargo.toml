@@ -10,6 +10,7 @@ name = "solstice_bake_web"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+solstice-asset.workspace = true
 solstice-bake.workspace = true
 solstice-project.workspace = true
 

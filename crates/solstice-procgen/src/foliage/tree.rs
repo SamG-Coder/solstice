@@ -18,6 +18,7 @@ pub use super::species::{Crown, Leaves, Level, Species};
 use super::Rng;
 use crate::field::smoothstep;
 use glam::{Quat, Vec2, Vec3};
+use solstice_asset::math;
 use solstice_builder::{Mesh, Vertex};
 use std::f32::consts::TAU;
 
@@ -107,7 +108,7 @@ fn grow(
         }
         grown += step;
         points.push(point);
-        radii.push(radius + (tip_radius - radius) * t.powf(0.8));
+        radii.push(radius + (tip_radius - radius) * math::powf(t, 0.8));
     }
     if let Some(last) = radii.last_mut() {
         *last = last.min(tip_radius.max(0.0015));
@@ -167,7 +168,7 @@ impl Species {
                             + rng.signed() * 10.0
                     };
                     let angle = angle.to_radians();
-                    let direction = along * angle.cos() + side * angle.sin();
+                    let direction = along * math::cos(angle) + side * math::sin(angle);
                     let mut length = parent_length * level.length * rng.range(0.75, 1.2);
                     if depth == 0 {
                         length *= self.crown.envelope(along_span);
@@ -317,14 +318,14 @@ fn add_tube(mesh: &mut Mesh, stem: &Stem, root_flare: f32, rng: &mut Rng) {
         let tip = i + 1 == rings;
         // The trunk spreads into buttresses where it meets the ground.
         let height = stem.points[i].y;
-        let flare = root_flare * (1.0 - smoothstep(0.0, 1.2, height)).powi(2);
+        let flare = root_flare * math::powi(1.0 - smoothstep(0.0, 1.2, height), 2);
         for j in 0..=sides {
             let theta = j as f32 / sides as f32 * TAU;
-            let buttress = 1.0 + flare * (0.6 + 0.4 * (theta * 5.0 + lobes).cos());
-            let outward = normal * theta.cos() + binormal * theta.sin();
+            let buttress = 1.0 + flare * (0.6 + 0.4 * math::cos(theta * 5.0 + lobes));
+            let outward = normal * math::cos(theta) + binormal * math::sin(theta);
             let lump = if thick > 0.0 {
                 // Read round a circle, so the swelling has no seam.
-                let (c, s) = (theta.cos(), theta.sin());
+                let (c, s) = (math::cos(theta), math::sin(theta));
                 let broad = Vec3::new(c * 1.3, distance * 0.9 + bulges.0, s * 1.3);
                 let fine = Vec3::new(c * 3.1, distance * 2.6 + bulges.1, s * 3.1);
                 1.0 + thick
@@ -362,7 +363,7 @@ fn add_leaves(mesh: &mut Mesh, stem: &Stem, leaves: &Leaves, crown: Vec3, rng: &
     let mut spin = rng.range(0.0, TAU);
     for k in 0..count {
         // Mostly towards the tip, where the newest growth is.
-        let t = 0.25 + 0.75 * ((k as f32 + rng.unit()) / count as f32).powf(0.7);
+        let t = 0.25 + 0.75 * math::powf((k as f32 + rng.unit()) / count as f32, 0.7);
         let (point, along, radius) = stem.at(t);
         spin += GOLDEN_ANGLE;
         let side = perpendicular(along, spin);
@@ -428,7 +429,8 @@ fn add_needle_spray(
         for sign in [1.0, -1.0] {
             // Alternate sides are offset half a spacing, as needles spiral round a real shoot.
             let root = root + axis * (sign * 0.25 * NEEDLE_SPACING);
-            let direction = (axis * NEEDLE_ANGLE.cos() + side * (sign * NEEDLE_ANGLE.sin())
+            let direction = (axis * math::cos(NEEDLE_ANGLE)
+                + side * (sign * math::sin(NEEDLE_ANGLE))
                 - face * 0.12)
                 .normalize();
             let tip = root + direction * needle;

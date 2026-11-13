@@ -3,7 +3,8 @@
 // anything itself.
 
 import { kindOf } from "./project.js";
-import { SETTINGS } from "./scenes.js";
+import { DAY_LENGTHS, SETTINGS, WEATHERS } from "./scenes.js";
+import { LAND_KINDS } from "./land.js";
 
 const ICONS = {
   folder: "▤", mesh: "◆", actor: "●", light: "✦", blocker: "▭", wood: "♣", clear: "○",
@@ -193,6 +194,43 @@ export class Details {
       }
       this.#element.append(make("details", { open: Boolean(value), title: setting.description }, [summary, ...rows]));
     }
+
+    // The meadow: real grass out to a radius.
+    const meadow = scene.meadow;
+    const hasMeadow = make("input", { type: "checkbox", checked: meadow !== undefined, title: "Has a meadow" });
+    hasMeadow.addEventListener("click", (e) => e.stopPropagation());
+    hasMeadow.addEventListener("change", () => this.editor.call("scene.set", { meadow: hasMeadow.checked ? 60 : 0 }));
+    const meadowRows = meadow === undefined ? [] : [make("div", { className: "field" }, [
+      make("span", { className: "name", textContent: "Radius (m)" }),
+      numberField("·", meadow, 1, (v) => {
+        const r = Math.min(4000, Math.max(1, v));
+        if (r !== meadow) this.editor.call("scene.set", { meadow: r });
+      }, () => {}),
+    ])];
+    this.#element.append(make("details", { open: meadow !== undefined, title: "Real grass on the grass, out to this far from the origin." },
+      [make("summary", {}, [hasMeadow, " Meadow"]), ...meadowRows]));
+
+    // The weather and time it starts with: saved with the scene, and no bake.
+    const environment = scene.environment ?? {};
+    const env = (args) => this.editor.call("env.set", args);
+    const weather = make("select", {}, WEATHERS.map((w) => make("option", {
+      value: w, textContent: w, selected: w === (environment.weather ?? "changing"),
+    })));
+    weather.addEventListener("change", () => env({ weather: weather.value }));
+    const day = make("select", {}, DAY_LENGTHS.map((d) => make("option", {
+      value: String(d),
+      textContent: { 0: "Still", 120: "2 minutes", 1200: "20 minutes", 86400: "Real time" }[d],
+      selected: d === (environment.day_length ?? 1200),
+    })));
+    day.addEventListener("change", () => env({ day_length: Number(day.value) }));
+    const field = (label, input) => make("div", { className: "field" }, [make("span", { className: "name", textContent: label }), input]);
+    this.#element.append(make("details", { open: true, title: "The weather and time of day the scene starts with, saved with it. A change shows at once." }, [
+      make("summary", { textContent: "Weather and time" }),
+      field("Weather", weather),
+      field("Hour", numberField("·", environment.time ?? 9, 0.25, (v) => env({ time: v }), () => {})),
+      field("A day takes", day),
+      field("North (°)", numberField("·", environment.north ?? 0, 1, (v) => env({ north: v }), () => {})),
+    ]));
   }
 
   constructor(element, editor) {
@@ -275,7 +313,28 @@ export class Details {
     }
 
     const kind = kindOf(entity);
-    if (kind !== "folder") {
+    if (kind in LAND_KINDS) {
+      const component = entity[kind];
+      const spec = LAND_KINDS[kind];
+      const shape = (key, value) => this.editor.call("object.shape", { id, fields: { ...component, [key]: value } });
+      const rows = Object.entries(spec.fields).map(([key, field]) => {
+        if (field.pair) {
+          const pair = make("div", { className: "vector" }, [0, 1].map((k) => numberField("XZ"[k], component[key][k], 0.5, (v) => {
+            const next = [...component[key]];
+            next[k] = v;
+            shape(key, next);
+          }, () => {})));
+          return row(key, pair);
+        }
+        return row(key, numberField("·", component[key], field.step, (v) => {
+          const clamped = Math.min(field.max, Math.max(field.min, v));
+          if (clamped !== component[key]) shape(key, clamped);
+        }, () => {}));
+      });
+      rows.unshift(make("p", { className: "hint", textContent: spec.description }));
+      if (kind === "pond") rows.push(make("p", { className: "hint", textContent: "Ponds are drawn in scenes without a sea." }));
+      this.#element.append(section(spec.label, rows));
+    } else if (kind !== "folder") {
       const component = entity[kind];
       const rows = Object.entries(component).map(([key, value]) => row(key,
         make("span", {

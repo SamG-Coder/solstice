@@ -6,6 +6,7 @@ pub mod circuit;
 pub mod foliage;
 pub mod land;
 pub mod meshes;
+pub mod pieces;
 pub mod project;
 pub mod scene_file;
 pub mod textures;

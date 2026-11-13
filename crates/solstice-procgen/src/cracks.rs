@@ -8,6 +8,7 @@
 //! by generation, gives all of this without asking for any of it.
 
 use crate::noise::{lattice_random, tiling_fbm};
+use solstice_asset::math;
 use std::collections::VecDeque;
 
 /// One pass of cracking.
@@ -235,7 +236,7 @@ impl Simulation {
         let mut heading = if gx == 0.0 && gy == 0.0 {
             self.random() * std::f32::consts::TAU
         } else {
-            gy.atan2(gx) + std::f32::consts::PI
+            math::atan2(gy, gx) + std::f32::consts::PI
         };
         heading += (self.random() - 0.5) * 0.35;
 
@@ -285,7 +286,7 @@ impl Simulation {
             let (gx, gy) = field.gradient(x / scale, y / scale);
             let length = (gx * gx + gy * gy).sqrt();
             if length > 1.0e-5 {
-                let target = (-gy).atan2(-gx);
+                let target = math::atan2(-gy, -gx);
                 let near = field.at(x / scale, y / scale);
                 let pull = (1.0 - near / generation.spacing.max(1.0e-3)).clamp(0.0, 1.0) * 0.32;
                 heading += wrap_angle(target - heading) * pull;
@@ -297,7 +298,7 @@ impl Simulation {
             if self.random() < KINK_CHANCE {
                 heading += (self.random() - 0.5) * 2.0 * KINK;
             }
-            let (dx, dy) = (heading.cos(), heading.sin());
+            let (dx, dy) = (math::cos(heading), math::sin(heading));
             let (nx, ny) = (x + dx * STEP, y + dy * STEP);
             // Meeting another crack ends this one, which is what makes a T-junction.
             let ahead = self.cell(nx + dx * CAPTURE, ny + dy * CAPTURE);
@@ -391,7 +392,7 @@ struct Nearest {
 impl Nearest {
     fn distance(&self) -> f32 {
         if self.found {
-            f32::from(self.dx).hypot(f32::from(self.dy))
+            math::hypot(f32::from(self.dx), f32::from(self.dy))
         } else {
             // An empty grid has nothing near anywhere, which reads as far from any crack.
             f32::from(i16::MAX)

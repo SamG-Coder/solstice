@@ -27,6 +27,7 @@ use crate::meshes;
 use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use solstice_asset::math;
 use solstice_asset::{Heightfield, Instance, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 use solstice_game::{Blocker, Track};
@@ -112,7 +113,7 @@ impl Island {
         let nearest = track
             .samples
             .iter()
-            .map(|s| (s.position.x - centre[0]).hypot(s.position.z - centre[1]))
+            .map(|s| math::hypot(s.position.x - centre[0], s.position.z - centre[1]))
             .fold(f32::INFINITY, f32::min);
         let east = centre[0] + half_x;
         Self {
@@ -141,14 +142,15 @@ impl Island {
         let (dx, dz) = (x - self.centre[0], z - self.centre[1]);
         let reach_x = self.reach_x[if dx > 0.0 { 0 } else { 1 }];
         let reach_z = self.reach_z[if dz > 0.0 { 1 } else { 0 }];
-        let length = dx.hypot(dz);
+        let length = math::hypot(dx, dz);
         let around = if length > 1.0e-3 {
             Vec3::new(dx, 0.0, dz) / length
         } else {
             Vec3::X
         };
         // How far the waterline is from the middle, that way.
-        let waterline = 1.0 / ((around.x / reach_x).powi(2) + (around.z / reach_z).powi(2)).sqrt();
+        let waterline =
+            1.0 / (math::powi(around.x / reach_x, 2) + math::powi(around.z / reach_z, 2)).sqrt();
         let wander = fbm(around * 2.2 + Vec3::new(0.0, 3.0, 0.0), 3, 311) * 0.035
             + fbm(around * 9.0 + Vec3::new(0.0, 11.0, 0.0), 3, 313) * 0.012;
         waterline * (1.0 + wander) - length
@@ -165,12 +167,12 @@ impl Island {
         // The road's height nearby, spread wide.
         let (mut total, mut height) = (0.0, 0.0);
         for anchor in &self.anchors {
-            let d = (anchor.x - x).powi(2) + (anchor.z - z).powi(2) + 110.0 * 110.0;
+            let d = math::powi(anchor.x - x, 2) + math::powi(anchor.z - z, 2) + 110.0 * 110.0;
             let weight = 1.0 / (d * d);
             total += weight;
             height += weight * anchor.y;
         }
-        let from_middle = (x - self.centre[0]).hypot(z - self.centre[1]);
+        let from_middle = math::hypot(x - self.centre[0], z - self.centre[1]);
         let hill = smoothstep(self.hill, self.hill * 0.15, from_middle)
             * 17.0
             * (0.8 + fbm(p * 0.006, 3, 305) * 0.35);
@@ -223,7 +225,7 @@ impl Island {
         let p = Vec3::new(x, 0.0, z);
         let mut found: Option<(f32, f32)> = None;
         for &[sx, sz, wide, high] in &self.stacks {
-            let away = (x - sx).hypot(z - sz) + fbm(p * 0.09, 3, 340) * wide * 0.35;
+            let away = math::hypot(x - sx, z - sz) + fbm(p * 0.09, 3, 340) * wide * 0.35;
             if away < wide * 1.6 {
                 let within = smoothstep(wide * 1.5, wide * 0.3, away);
                 let height = (high + SEA_BED) * within - SEA_BED + fbm(p * 0.3, 2, 341) * 0.6;
@@ -394,7 +396,7 @@ impl<'a> Road<'a> {
                 };
                 for &index in list {
                     let p = samples[index as usize].position;
-                    let d = (p.x - x).powi(2) + (p.z - z).powi(2);
+                    let d = math::powi(p.x - x, 2) + math::powi(p.z - z, 2);
                     if best.is_none_or(|(nearest, _)| d < nearest) {
                         best = Some((d, index as usize));
                     }
@@ -412,7 +414,7 @@ impl<'a> Road<'a> {
             );
             let (ax, az) = (b.x - a.x, b.z - a.z);
             let share = (((x - a.x) * ax + (z - a.z) * az) / (ax * ax + az * az)).clamp(0.0, 1.0);
-            let d = (a.x + ax * share - x).powi(2) + (a.z + az * share - z).powi(2);
+            let d = math::powi(a.x + ax * share - x, 2) + math::powi(a.z + az * share - z, 2);
             if found.is_none_or(|(least, _, _)| d < least) {
                 found = Some((d, first, share));
             }
@@ -582,7 +584,7 @@ impl Land {
         let step = 1.5;
         let dx = (self.at(x + step, z) - self.at(x - step, z)) / (2.0 * step);
         let dz = (self.at(x, z + step) - self.at(x, z - step)) / (2.0 * step);
-        dx.hypot(dz)
+        math::hypot(dx, dz)
     }
 
     fn ground(self) -> Heightfield {
@@ -755,8 +757,9 @@ pub fn build(scene: &mut SceneAsset, track: &Track, size: f32) -> Built {
         let crowded = (-1..=1).any(|dz| {
             (-1..=1).any(|dx| {
                 taken.get(&(key.0 + dx, key.1 + dz)).is_some_and(|near| {
-                    near.iter()
-                        .any(|&(sx, sz)| (sx - x).powi(2) + (sz - z).powi(2) < spacing * spacing)
+                    near.iter().any(|&(sx, sz)| {
+                        math::powi(sx - x, 2) + math::powi(sz - z, 2) < spacing * spacing
+                    })
                 })
             })
         });
@@ -796,7 +799,7 @@ pub fn build(scene: &mut SceneAsset, track: &Track, size: f32) -> Built {
             (-1..=1).any(|dx| {
                 taken.get(&(key.0 + dx, key.1 + dz)).is_some_and(|near| {
                     near.iter()
-                        .any(|&(sx, sz)| (sx - x).powi(2) + (sz - z).powi(2) < 49.0)
+                        .any(|&(sx, sz)| math::powi(sx - x, 2) + math::powi(sz - z, 2) < 49.0)
                 })
             })
         });
@@ -926,8 +929,8 @@ mod tests {
             .map(|k| {
                 let a = k as f32 / 420.0 * std::f32::consts::TAU;
                 // Clockwise seen from above: the left of the road is the outside.
-                let position = Vec3::new(a.cos() * 200.0, height, a.sin() * 200.0);
-                let forward = Vec3::new(-a.sin(), 0.0, a.cos());
+                let position = Vec3::new(math::cos(a) * 200.0, height, math::sin(a) * 200.0);
+                let forward = Vec3::new(-math::sin(a), 0.0, math::cos(a));
                 Sample {
                     position,
                     left: Vec3::Y.cross(forward),
@@ -991,17 +994,17 @@ mod tests {
             .samples
             .iter()
             .map(|sample| Sample {
-                left: sample.left * tilt.cos() + Vec3::Y * tilt.sin(),
+                left: sample.left * math::cos(tilt) + Vec3::Y * math::sin(tilt),
                 ..sample.clone()
             })
             .collect();
         track = Track::new("Banked", samples, vec![140, 280]).unwrap();
         let (road, island) = (Road::new(&track), Island::new(&track));
         let land = Land::new(&island, &road, 1000.0);
-        let rise = 6.0 * tilt.sin();
+        let rise = 6.0 * math::sin(tilt);
         // Across the road the land tilts with it.
         assert!((land.at(200.0, 0.0) - 30.0).abs() < 0.02);
-        assert!((land.at(204.0, 0.0) - (30.0 + 4.0 * tilt.sin())).abs() < 0.03);
+        assert!((land.at(204.0, 0.0) - (30.0 + 4.0 * math::sin(tilt))).abs() < 0.03);
         // Over the gravel outside and out to the barrier it is level with the outside edge,
         // and inside, with the inside edge: nowhere does it go on rising.
         for radius in [208.0, 214.0, 221.0, 225.0] {
@@ -1022,7 +1025,7 @@ mod tests {
         assert!((road.at(0, 6.0, 0.0).y - (30.0 + rise)).abs() < 1.0e-3);
         assert!((road.at(0, 16.0, 0.0).y - (30.0 + rise)).abs() < 1.0e-3);
         assert!((road.at(0, -7.5, 0.0).y - (30.0 - rise)).abs() < 1.0e-3);
-        assert!((road.at(0, 16.0, 0.0).x - (200.0 + 6.0 * tilt.cos() + 10.0)).abs() < 1.0e-3);
+        assert!((road.at(0, 16.0, 0.0).x - (200.0 + 6.0 * math::cos(tilt) + 10.0)).abs() < 1.0e-3);
     }
 
     #[test]
@@ -1053,7 +1056,7 @@ mod tests {
         let mut seen = [0; 3];
         for vertex in kinds.iter().flat_map(|mesh| &mesh.vertices) {
             let p = vertex.position;
-            let radius = p.x.hypot(p.z);
+            let radius = math::hypot(p.x, p.z);
             let expected = if (195.0..215.0).contains(&radius) {
                 seen[0] += 1;
                 30.0 - SINK
@@ -1099,10 +1102,10 @@ mod tests {
         for k in 0..30 {
             let a = k as f32 / 30.0 * std::f32::consts::PI;
             add(
-                -45.0 * a.cos(),
+                -45.0 * math::cos(a),
                 20.0 + 4.0 * k as f32 / 30.0,
-                150.0 + 45.0 * a.sin(),
-                Vec3::new(a.sin(), 0.0, a.cos()),
+                150.0 + 45.0 * math::sin(a),
+                Vec3::new(math::sin(a), 0.0, math::cos(a)),
             );
         }
         for k in 0..100 {
@@ -1111,10 +1114,10 @@ mod tests {
         for k in 0..30 {
             let a = k as f32 / 30.0 * std::f32::consts::PI;
             add(
-                45.0 * a.cos(),
+                45.0 * math::cos(a),
                 24.0 - 4.0 * k as f32 / 30.0,
-                -150.0 - 45.0 * a.sin(),
-                Vec3::new(-a.sin(), 0.0, -a.cos()),
+                -150.0 - 45.0 * math::sin(a),
+                Vec3::new(-math::sin(a), 0.0, -math::cos(a)),
             );
         }
         let track = Track::new("Pair", samples, vec![80, 160]).unwrap();

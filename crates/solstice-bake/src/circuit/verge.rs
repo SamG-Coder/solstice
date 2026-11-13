@@ -10,6 +10,7 @@
 use super::{blades, hash, Land, Road, BARRIER};
 use glam::{Mat4, Vec3, Vec4};
 use rustc_hash::FxHashMap;
+use solstice_asset::math;
 use solstice_asset::{Instance, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh};
 use solstice_procgen::foliage::grass::Meadow;
@@ -104,9 +105,9 @@ fn thinned(mesh: &Mesh, keep: impl Fn(Vec3, u32) -> bool) -> Mesh {
 fn edge(along: f32, patch: u32) -> f32 {
     let turn = along / TILE * std::f32::consts::PI;
     let wave = |k: u32| hash(patch as i32, k as i32, 77) as f32 / u32::MAX as f32 * 2.0 - 1.0;
-    0.55 + 0.42 * turn.sin() * wave(1)
-        + 0.3 * (2.0 * turn).sin() * wave(2)
-        + 0.2 * (3.0 * turn).sin() * wave(3)
+    0.55 + 0.42 * math::sin(turn) * wave(1)
+        + 0.3 * math::sin(2.0 * turn) * wave(2)
+        + 0.2 * math::sin(3.0 * turn) * wave(3)
 }
 
 /// Grows the long grass along both sides of the road.
@@ -138,7 +139,7 @@ pub(super) fn grow(scene: &mut SceneAsset, road: &Road, land: &Land) {
             thinned(&whole, |root, number| {
                 let in_from_side = if outer { TILE - root.x } else { root.x };
                 let past = in_from_side - edge(root.z, seed);
-                past > 0.0 && past > 0.55 * chance(number, seed).powi(2)
+                past > 0.0 && past > 0.55 * math::powi(chance(number, seed), 2)
             })
         };
         triangles += mesh.triangle_count();

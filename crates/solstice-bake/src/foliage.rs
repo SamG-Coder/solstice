@@ -44,6 +44,9 @@ pub fn blades(texture_layer: i32) -> Material {
     }
 }
 
+/// The species a wood is planted with, and how many copies of each.
+pub const WOOD_SPECIES: [(&str, u32); 3] = [("oak", 2), ("birch", 2), ("bush", 2)];
+
 /// A species grown into a scene: copies from different seeds, each two meshes, wood then
 /// leaves, and its two materials.
 #[derive(Clone, Copy, Debug)]
@@ -77,21 +80,31 @@ pub fn grow(scene: &mut SceneAsset, plants: &[(&str, u32)]) -> Vec<Grown> {
             let species = Species::by_name(name).expect("a built-in species");
             let first_mesh = scene.meshes.len() as u32;
             for seed in 0..variants {
-                let plant = species.grow(seed);
+                // Grown once for both of its meshes, and only if either isn't built already.
+                let plant = std::cell::OnceCell::new();
+                let grown = || plant.get_or_init(|| species.grow(seed));
                 let options = BuildOptions::default();
-                scene.meshes.push(build_virtual_mesh(&plant.wood, &options));
-                scene
-                    .meshes
-                    .push(build_virtual_mesh(&plant.leaves, &options));
+                let key = |part: &str| format!("species-{name}-{seed}-{part}");
+                scene.meshes.push(crate::pieces::mesh(&key("wood"), || {
+                    build_virtual_mesh(&grown().wood, &options)
+                }));
+                scene.meshes.push(crate::pieces::mesh(&key("leaves"), || {
+                    build_virtual_mesh(&grown().leaves, &options)
+                }));
             }
+            let size = scene.texture_size;
             let bark_layer = scene.textures.len() as i32;
-            scene
-                .textures
-                .push(species.bark.surface(0).bake(scene.texture_size));
+            scene.textures.push(crate::textures::layer(
+                &crate::textures::bark_key(name),
+                size,
+                || species.bark.surface(0).bake(size),
+            ));
             let leaf_layer = scene.textures.len() as i32;
-            scene
-                .textures
-                .push(species.leaves.kind.atlas(0).bake(scene.texture_size));
+            scene.textures.push(crate::textures::layer(
+                &crate::textures::leaves_key(name),
+                size,
+                || species.leaves.kind.atlas(0).bake(size),
+            ));
             scene.materials.push(bark(bark_layer));
             scene.materials.push(leaves(leaf_layer));
             let leaves = scene.materials.len() as u32 - 1;

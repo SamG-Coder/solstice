@@ -8,6 +8,7 @@
 use crate::field::{fbm, smoothstep, Field};
 use crate::surface::{Surface, Texel};
 use glam::Vec3;
+use solstice_asset::math;
 use std::f32::consts::TAU;
 
 /// Colour variants in each leaf atlas, side by side.
@@ -70,8 +71,8 @@ impl LeafKind {
             Self::Oak => (0.75, 0.6),
         };
         let peak = a / (a + b);
-        let max = peak.powf(a) * (1.0 - peak).powf(b);
-        0.5 * s.clamp(0.0, 1.0).powf(a) * (1.0 - s.clamp(0.0, 1.0)).powf(b) / max
+        let max = math::powf(peak, a) * math::powf(1.0 - peak, b);
+        0.5 * math::powf(s.clamp(0.0, 1.0), a) * math::powf(1.0 - s.clamp(0.0, 1.0), b) / max
     }
 
     /// Fractions of a leaf's length at which it has a full cross-section, between its stalk and
@@ -174,8 +175,8 @@ fn veined(
         let (variant, across) = column(u);
         let d = across.abs();
         let phase = v * vein_count - d * 2.2;
-        let side_veins = (-((phase - phase.round()) * 9.0).powi(2)).exp() * (1.0 - d);
-        let midrib = (-(across * 18.0).powi(2)).exp();
+        let side_veins = math::exp(-math::powi((phase - phase.round()) * 9.0, 2)) * (1.0 - d);
+        let midrib = math::exp(-math::powi(across * 18.0, 2));
         let veins = side_veins.max(midrib);
 
         let mut color = colors[variant];
@@ -201,7 +202,7 @@ fn needles(seed: u32) -> Surface {
     Surface::new(0.004, move |u, v| {
         let (variant, across) = column(u);
         // Five needles across the fan, closing up towards its tip.
-        let needle = 0.5 + 0.5 * (across * 2.5 * TAU / (1.0 - v * 0.85)).cos();
+        let needle = 0.5 + 0.5 * math::cos(across * 2.5 * TAU / (1.0 - v * 0.85));
         let gap = smoothstep(0.35, 0.0, needle) * (1.0 - smoothstep(0.75, 1.0, v));
         let mut color = NEEDLES[variant] * (1.0 + 0.2 * shade.at(u, v));
         color *= 0.8 + 0.35 * needle;
@@ -253,7 +254,7 @@ mod tests {
             let layer = kind.atlas(0).bake(64);
             let top = layer.color_mips.last().unwrap();
             // Real leaves reflect about 0.05 to 0.2 in green.
-            let green = (top[1] as f32 / 255.0).powf(2.2);
+            let green = math::powf(top[1] as f32 / 255.0, 2.2);
             assert!(
                 (0.03..0.22).contains(&green),
                 "{kind:?}: green albedo {green}"

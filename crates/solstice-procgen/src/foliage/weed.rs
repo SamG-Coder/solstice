@@ -20,6 +20,7 @@ use crate::field::smoothstep;
 use crate::noise::tiling_fbm;
 use crate::surface::Texel;
 use glam::{Quat, Vec2, Vec3};
+use solstice_asset::math;
 use solstice_builder::{Mesh, Vertex};
 use std::f32::consts::TAU;
 
@@ -156,7 +157,7 @@ impl Weed {
         let turn = rng.range(0.0, TAU);
         for k in 0..count {
             let angle = turn + (k as f32 + rng.signed() * 0.3) / count as f32 * TAU;
-            let out = Vec3::new(angle.cos(), 0.0, angle.sin());
+            let out = Vec3::new(math::cos(angle), 0.0, math::sin(angle));
             let length = rng.range(self.length.0, self.length.1);
             match self.kind {
                 WeedKind::Rosette => {
@@ -182,7 +183,8 @@ impl Weed {
                     // Three round leaflets, spread flat around the top of the stalk.
                     for leaflet in 0..3 {
                         let a = angle + leaflet as f32 / 3.0 * TAU;
-                        let axis = (Vec3::new(a.cos(), 0.0, a.sin()) + Vec3::Y * 0.1).normalize();
+                        let axis = (Vec3::new(math::cos(a), 0.0, math::sin(a)) + Vec3::Y * 0.1)
+                            .normalize();
                         add_leaf(
                             mesh,
                             top,
@@ -230,8 +232,9 @@ fn add_leaf(
     let face = (Vec3::Y - axis * axis.dot(Vec3::Y)).normalize_or(Vec3::Y);
     let side = axis.cross(face).normalize();
     let peak = a / (a + b);
-    let max = peak.powf(a) * (1.0 - peak).powf(b);
-    let half = |s: f32| length * width_ratio * 0.5 * s.powf(a) * (1.0 - s).powf(b) / max;
+    let max = math::powf(peak, a) * math::powf(1.0 - peak, b);
+    let half =
+        |s: f32| length * width_ratio * 0.5 * math::powf(s, a) * math::powf(1.0 - s, b) / max;
     // Leaves curve down towards their tips.
     let curl = |s: f32| -face * (s * s * length * 0.15);
     let first = mesh.vertices.len() as u32;
@@ -313,7 +316,7 @@ fn add_flower_head(
     });
     for i in 0..=SEGMENTS {
         let a = i as f32 / SEGMENTS as f32 * TAU;
-        let out = rotation * Vec3::new(a.cos(), 0.0, a.sin());
+        let out = rotation * Vec3::new(math::cos(a), 0.0, math::sin(a));
         mesh.vertices.push(Vertex {
             position: centre + out * radius,
             normal: (facing + out * dome).normalize(),
@@ -332,8 +335,8 @@ fn add_flower_head(
 pub(crate) fn leaf_texel(across: f32, v: f32, color: Vec3, seed: u32) -> Texel {
     let d = across.abs();
     let phase = v * 6.0 - d * 2.0;
-    let side_veins = (-((phase - phase.round()) * 8.0).powi(2)).exp() * (1.0 - d);
-    let midrib = (-(across * 12.0).powi(2)).exp();
+    let side_veins = math::exp(-math::powi((phase - phase.round()) * 8.0, 2)) * (1.0 - d);
+    let midrib = math::exp(-math::powi(across * 12.0, 2));
     let veins = side_veins.max(midrib);
     let mottle = tiling_fbm(across * 0.5 + 0.5, v, 6, 3, seed);
     let mut c = color * (1.0 + 0.2 * mottle);
@@ -350,7 +353,7 @@ pub(crate) fn leaf_texel(across: f32, v: f32, color: Vec3, seed: u32) -> Texel {
 /// rim (1): petals radiating from a centre of another colour.
 pub(crate) fn flower_texel(across: f32, v: f32, petals: Vec3, centre: Vec3) -> Texel {
     // Many narrow petals, with darker gaps between them towards the rim.
-    let petal = 0.5 + 0.5 * (across * 11.0 * TAU).cos();
+    let petal = 0.5 + 0.5 * math::cos(across * 11.0 * TAU);
     let gap = smoothstep(0.55, 1.0, v) * smoothstep(0.35, 0.0, petal);
     let disc = 1.0 - smoothstep(0.25, 0.4, v);
     let color = petals.lerp(centre, disc) * (1.0 - 0.5 * gap) * (0.9 + 0.15 * petal);

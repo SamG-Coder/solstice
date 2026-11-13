@@ -41,6 +41,10 @@ pollster = "0.4"
 # `enhanced-determinism` makes a run the same on every platform, for about 3% of its cost.
 rapier3d = { version = "0.36", features = ["enhanced-determinism"] }
 rayon = "1"
+# Maths the same on every platform (docs/editor.md): a bake in the browser and one natively must
+# give the same bytes, and the standard library's sin, cos and pow differ in their last bits. Was
+# already built, through glam.
+libm = "0.2"
 rustc-hash = "2"
 # The editor's project files (docs/editor.md). Both were already built, through Starlark.
 serde = { version = "1", features = ["derive"] }

@@ -5,6 +5,7 @@
 use super::line::turning;
 use super::{Land, Road};
 use glam::{Mat4, Vec2, Vec3};
+use solstice_asset::math;
 use solstice_asset::{Instance, Material, SceneAsset};
 use solstice_builder::{build_virtual_mesh, BuildOptions, Mesh, Vertex};
 
@@ -66,8 +67,11 @@ impl Shapes {
             let slope = Vec2::new(y1 - y0, r0 - r1).normalize_or_zero();
             for side in 0..sides {
                 let turn = |k: usize| k as f32 / sides as f32 * std::f32::consts::TAU;
-                let point = |r: f32, y: f32, a: f32| base + Vec3::new(r * a.cos(), y, r * a.sin());
-                let normal = |a: f32| Vec3::new(slope.x * a.cos(), slope.y, slope.x * a.sin());
+                let point = |r: f32, y: f32, a: f32| {
+                    base + Vec3::new(r * math::cos(a), y, r * math::sin(a))
+                };
+                let normal =
+                    |a: f32| Vec3::new(slope.x * math::cos(a), slope.y, slope.x * math::sin(a));
                 let (a, b) = (turn(side), turn(side + 1));
                 let corners = [
                     point(r0, y0, a),

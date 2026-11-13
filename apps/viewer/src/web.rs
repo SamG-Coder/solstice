@@ -62,6 +62,8 @@ pub struct WebViewer {
     play: Option<crate::play::PlayMode>,
     /// See [`WebViewer::external_tables`].
     external_tables: Option<Vec<f64>>,
+    /// The weather and time the scene was made with, for the page to start it as.
+    environment: Option<solstice_asset::SceneEnvironment>,
     pinned_sizes: Vec<u32>,
     pinned_clusters: Vec<u32>,
     /// What scripts logged, and errors, for the page to take.
@@ -191,6 +193,7 @@ impl WebViewer {
             clock: DayClock::new(TimeOfDay::default(), DEFAULT_DAY_SECONDS),
             gpu_errors,
             external_tables,
+            environment: scene.environment.clone(),
             pinned_sizes,
             pinned_clusters,
             gameplay: scene.gameplay,
@@ -552,6 +555,24 @@ impl WebViewer {
                 false
             }
         }
+    }
+
+    /// The weather the scene was made with: a built-in weather's name, `changing`, or empty if it
+    /// doesn't say.
+    pub fn scene_weather(&self) -> String {
+        self.environment
+            .as_ref()
+            .map(|e| e.weather.clone())
+            .unwrap_or_default()
+    }
+
+    /// The hour, day length in seconds and north in degrees the scene was made with, each NaN
+    /// where it doesn't say.
+    pub fn scene_time(&self) -> Vec<f32> {
+        let e = self.environment.clone().unwrap_or_default();
+        [e.time, e.day_length, e.north]
+            .map(|v| v.unwrap_or(f32::NAN))
+            .to_vec()
     }
 
     pub fn set_camera(&mut self, x: f32, y: f32, z: f32, yaw: f32, pitch: f32) {
@@ -1009,6 +1030,21 @@ impl WebViewer {
         let mut out = camera.view().to_cols_array().to_vec();
         out.extend(camera.projection(aspect).to_cols_array());
         out
+    }
+
+    /// Puts these ponds, written as `set_ponds` takes them, in place of all the scene has, none
+    /// included, as the editor's ponds change. False, changing nothing, if they can't be read.
+    pub fn replace_ponds(&mut self, ponds: &str) -> bool {
+        match solstice_render::Pond::parse_list(ponds) {
+            Ok(ponds) => {
+                self.renderer.set_ponds(&ponds);
+                true
+            }
+            Err(error) => {
+                log::warn!("ponds: {error}");
+                false
+            }
+        }
     }
 
     /// How fast the camera flies, in metres a second (Shift goes five times faster).

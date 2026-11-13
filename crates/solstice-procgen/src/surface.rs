@@ -7,6 +7,7 @@
 
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
+use solstice_asset::math;
 use solstice_asset::TextureLayer;
 use solstice_builder::mip_chain;
 
@@ -239,7 +240,7 @@ impl Surface {
                     * size as f32;
                 let normal = Vec3::new(-slope.x, -slope.y, 1.0).normalize();
 
-                let srgb = texel.color.powf(1.0 / 2.2);
+                let srgb = texel.color.map(|c| math::powf(c, 1.0 / 2.2));
                 color.extend_from_slice(&[
                     to_byte(srgb.x),
                     to_byte(srgb.y),

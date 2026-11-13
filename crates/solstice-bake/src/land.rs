@@ -406,26 +406,33 @@ fn add_meadow(
     let size = meadow.size;
     let first_mesh = scene.meshes.len() as u32;
     // Whole patches, then each shape's.
+    // Each kept once built (`pieces`), so a bake again only places them.
     for seed in 0..PATCH_VARIANTS {
-        let mesh = Meadow {
-            seed,
-            ..meadow.clone()
-        }
-        .mesh();
-        scene
-            .meshes
-            .push(build_virtual_mesh(&mesh, &BuildOptions::default()));
+        scene.meshes.push(crate::pieces::mesh(
+            &format!("meadow-default-patch-{seed}"),
+            || {
+                let mesh = Meadow {
+                    seed,
+                    ..meadow.clone()
+                }
+                .mesh();
+                build_virtual_mesh(&mesh, &BuildOptions::default())
+            },
+        ));
     }
-    for shape in SHAPES.into_iter().chain(RIMS) {
+    for (which, shape) in SHAPES.into_iter().chain(RIMS).enumerate() {
         for seed in 0..SHAPE_VARIANTS {
-            let mesh = Meadow {
-                seed: 100 + seed,
-                ..meadow.clone()
-            }
-            .mesh_where(&|u, v| shape.vigour(u, v, size, seed));
-            scene
-                .meshes
-                .push(build_virtual_mesh(&mesh, &BuildOptions::default()));
+            scene.meshes.push(crate::pieces::mesh(
+                &format!("meadow-default-shape-{which}-{seed}"),
+                || {
+                    let mesh = Meadow {
+                        seed: 100 + seed,
+                        ..meadow.clone()
+                    }
+                    .mesh_where(&|u, v| shape.vigour(u, v, size, seed));
+                    build_virtual_mesh(&mesh, &BuildOptions::default())
+                },
+            ));
         }
     }
     let shaped_mesh = |shape: Shape, seed: u32| {
@@ -438,7 +445,7 @@ fn add_meadow(
     };
     let texture_size = scene.texture_size;
     scene.textures.push(crate::textures::layer(
-        "grass-atlas-default-0",
+        crate::textures::GRASS_ATLAS_KEY,
         texture_size,
         || meadow.atlas(0).bake(texture_size),
     ));
@@ -554,7 +561,7 @@ fn add_woods(
     kind_at: &dyn Fn(Vec2) -> usize,
 ) {
     println!("  growing the woods...");
-    let grown = crate::foliage::grow(scene, &[("oak", 2), ("birch", 2), ("bush", 2)]);
+    let grown = crate::foliage::grow(scene, &crate::foliage::WOOD_SPECIES);
     let mut rng = Rng::new(11, 5);
     let mut trees: Vec<Vec2> = Vec::new();
     let mut bushes: Vec<Vec2> = Vec::new();

@@ -4,6 +4,7 @@
 use super::line::{racing_line, turning};
 use super::{lay, smoothstep, Land, Road};
 use glam::{Vec2, Vec3};
+use solstice_asset::math;
 use solstice_asset::{Material, SceneAsset};
 use solstice_game::{Blocker, Track};
 use solstice_procgen::foliage::Rng;
@@ -561,8 +562,8 @@ pub(super) fn pave(scene: &mut SceneAsset, road: &Road, land: &Land, grass: u32)
                 let middle = (a + c) * 0.5 + behind * (WALL_DEPTH * 0.5 - 0.15);
                 blockers.push(Blocker {
                     centre: Vec3::new(middle.x, (a.y + c.y) * 0.5 + WALL * 0.5 - 1.5, middle.z),
-                    size: Vec3::new(WALL_DEPTH, WALL, dx.hypot(dz) + 0.3),
-                    yaw_degrees: dx.atan2(dz).to_degrees(),
+                    size: Vec3::new(WALL_DEPTH, WALL, math::hypot(dx, dz) + 0.3),
+                    yaw_degrees: math::atan2(dx, dz).to_degrees(),
                 });
             }
         }

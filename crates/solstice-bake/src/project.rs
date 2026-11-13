@@ -54,7 +54,18 @@ pub fn build_scene(
     folder: &Path,
     texture_size: Option<u32>,
 ) -> Result<(SceneAsset, Vec<String>), String> {
-    scene_file::build_commands(folder, lower(scene, name)?, texture_size)
+    let (mut built, warnings) =
+        scene_file::build_commands(folder, lower(scene, name)?, texture_size)?;
+    built.environment = scene
+        .environment
+        .as_ref()
+        .map(|e| solstice_asset::SceneEnvironment {
+            weather: e.weather.clone().unwrap_or_default(),
+            time: e.time,
+            day_length: e.day_length,
+            north: e.north,
+        });
+    Ok((built, warnings))
 }
 
 /// A built scene as its file holds it: textures compressed, paged and encoded, as `bake` writes
@@ -62,6 +73,13 @@ pub fn build_scene(
 pub fn encode(mut scene: SceneAsset) -> Vec<u8> {
     solstice_builder::compress_textures(&mut scene);
     solstice_asset::file::encode(&solstice_builder::paginate(&scene))
+}
+
+/// [`encode`], compressing quickly (`solstice_asset::file::encode_quickly`): the same scene, in a
+/// file a little larger, for the editor to show at once rather than keep.
+pub fn encode_quickly(mut scene: SceneAsset) -> Vec<u8> {
+    solstice_builder::compress_textures(&mut scene);
+    solstice_asset::file::encode_quickly(&solstice_builder::paginate(&scene))
 }
 
 /// The commands a scene says, in the order the scene text would have them: its settings, then

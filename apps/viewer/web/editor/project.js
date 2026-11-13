@@ -196,6 +196,20 @@ export class Project {
     return { centre, radius };
   }
 
+  /// Takes in an entity just added to the scene's tree, and all it holds, under `parent`.
+  adopt(entity, parent) {
+    this.entities.set(entity.id, entity);
+    this.parents.set(entity.id, parent);
+    for (const child of entity.children ?? []) this.adopt(child, entity.id);
+  }
+
+  /// Forgets an entity just taken out of the scene's tree, and all it holds.
+  forget(entity) {
+    this.entities.delete(entity.id);
+    this.parents.delete(entity.id);
+    for (const child of entity.children ?? []) this.forget(child);
+  }
+
   /// The ids of an entity's line of parents, nearest first.
   ancestors(id) {
     const out = [];
@@ -256,13 +270,14 @@ const ENTITY_ORDER = {
 ENTITY_ORDER.nested.children = { list: ENTITY_ORDER };
 const SCENE_ORDER = {
   keys: ["format", "note", "texture_size", "camera", "terrain", "land", "meadow", "water", "sea",
-    "game", "entities"],
+    "environment", "game", "entities"],
   nested: {
     camera: { keys: ["position", "yaw_radians", "pitch_radians"] },
     terrain: { keys: ["size", "cells", "height", "shore_x"] },
     land: { keys: ["sand", "dirt"] },
     water: { keys: ["level", "color"] },
     sea: { keys: ["level", "ocean"] },
+    environment: { keys: ["weather", "time", "day_length", "north"] },
     game: { keys: ["input", "track", "circuit"] },
     entities: { list: ENTITY_ORDER },
   },

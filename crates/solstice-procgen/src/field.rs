@@ -13,6 +13,7 @@
 
 use crate::noise::{lattice_random, tiling_billow, tiling_fbm, tiling_fbm_xy, tiling_ridged};
 use glam::Vec2;
+use solstice_asset::math;
 
 /// A seamlessly tiling value at every point of a square.
 pub trait Field: Send + Sync {
@@ -107,7 +108,7 @@ pub fn billow(period: i32, octaves: u32, seed: u32) -> impl Field + Copy {
 
 /// Smooth waves across `v`, with `count` crests over the square, in `0..1`.
 pub fn waves(count: u32) -> impl Field {
-    move |_: f32, v: f32| (v * count as f32 * std::f32::consts::TAU).sin() * 0.5 + 0.5
+    move |_: f32, v: f32| math::sin(v * count as f32 * std::f32::consts::TAU) * 0.5 + 0.5
 }
 
 pub fn smoothstep(low: f32, high: f32, x: f32) -> f32 {
@@ -449,10 +450,10 @@ impl Leaves {
                     // Widest below the middle, narrowing to a point at the tip.
                     let half_width = length
                         * (0.2 + random(5) * 0.12)
-                        * (std::f32::consts::PI * t.powf(0.8))
-                            .sin()
-                            .max(0.0)
-                            .powf(0.75);
+                        * math::powf(
+                            math::sin(std::f32::consts::PI * math::powf(t, 0.8)).max(0.0),
+                            0.75,
+                        );
                     if half_width <= 0.0 {
                         continue;
                     }
@@ -532,7 +533,7 @@ impl Strokes {
                     let width = self.width * (1.0 - along * along).max(0.0).sqrt();
                     if distance < width {
                         let layer = lattice_random(wx, wy, self.seed, channel + 3);
-                        let height = layer * (1.0 - (distance / width).powi(2)).sqrt();
+                        let height = layer * (1.0 - math::powi(distance / width, 2)).sqrt();
                         if height > top.height {
                             top = Stroke {
                                 height,

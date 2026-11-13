@@ -8,6 +8,7 @@
 pub mod collision;
 pub mod file;
 pub mod gpu;
+pub mod math;
 pub mod paged;
 pub mod scene;
 pub mod skeleton;
@@ -22,5 +23,6 @@ pub use gpu::{unpack_triangle, PackedCluster, PackedNode, PackedSkin, PackedVert
 pub use paged::{LoadedScene, PagedScene};
 pub use scene::{
     Card, CardImage, CardVertex, Cards, GameFile, GlowMaps, Instance, Light, Material, SceneAsset,
-    Sea, Source, StillWater, TextureEncoding, TextureLayer, Viewpoint, VirtualMesh,
+    SceneEnvironment, Sea, Source, StillWater, TextureEncoding, TextureLayer, Viewpoint,
+    VirtualMesh,
 };

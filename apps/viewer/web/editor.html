@@ -127,6 +127,13 @@ main { grid-area: view; position: relative; min-width: 0; min-height: 0; backgro
   <label>Grid <input id="snap-move" type="number" min="0.01" step="0.05" title="Metres a move snaps to"></label>
   <label>Angle <input id="snap-angle" type="number" min="1" step="1" title="Degrees a turn snaps to"></label>
   <div class="group"><button id="frame" type="button" title="Frame the selection (F)">Frame</button></div>
+  <div class="group" role="group" aria-label="Add">
+    <button type="button" data-add="wood" title="Add a wood at the middle of the view">+ Wood</button>
+    <button type="button" data-add="clear" title="Add a clearing, where nothing grows">+ Clearing</button>
+    <button type="button" data-add="pond" title="Add a pond (drawn in scenes without a sea)">+ Pond</button>
+    <button type="button" data-add="path" title="Add a dirt path">+ Path</button>
+    <button id="delete" type="button" title="Remove the selection (Delete)">Delete</button>
+  </div>
   <span class="spacer"></span>
   <a id="view-scene" href="./">View scene</a>
 </header>

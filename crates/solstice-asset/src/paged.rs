@@ -111,6 +111,8 @@ pub struct PagedScene {
     pub sea: Option<Sea>,
     /// The scene's ponds, if it has any.
     pub still_water: Option<crate::scene::StillWater>,
+    /// The weather and time the scene was made with, if it says.
+    pub environment: Option<crate::scene::SceneEnvironment>,
     /// The scene's gameplay files, if it has any.
     pub gameplay: Vec<GameFile>,
     /// Which entity made which instances, for a scene baked from a project.

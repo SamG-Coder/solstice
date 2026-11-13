@@ -10,7 +10,8 @@ import {
 } from "./math.js";
 import { Details, Outliner } from "./panels.js";
 import { Project, kindOf, writeScene } from "./project.js";
-import { Baker, SETTINGS, blankScene, checkSetting } from "./scenes.js";
+import { Baker, DAY_LENGTHS, SETTINGS, WEATHERS, blankScene, checkSetting } from "./scenes.js";
+import { LAND_KINDS, checkLand, drawLand, landSignature, pondsText } from "./land.js";
 
 const params = new URLSearchParams(location.search);
 const el = (id) => document.getElementById(id);
@@ -172,6 +173,7 @@ const editor = {
     this.commands = new Commands(this);
     defineCommands(this.commands, this);
     this.commands.history.onChange = () => {
+      this.landChanged();
       this.dirty = true;
       this.refresh();
       scheduleAutosave(this);
@@ -180,6 +182,10 @@ const editor = {
     };
     this.outliner = new Outliner(el("outliner"), this);
     this.details = new Details(el("details"), this);
+    // What the land was baked as, so a change to it bakes again; and the ponds shown.
+    this.land = landSignature(this.project.scene, this.project.entities);
+    this.ponds = pondsText(this.project.entities);
+    applyEnvironment(this);
     this.refresh();
     bindInput(this);
     bindToolbar(this);
@@ -194,6 +200,7 @@ const editor = {
   /// what is hidden.
   async swap(bytes, scene) {
     const camera = Array.from(this.viewer.camera());
+    const hour = this.viewer.time_of_day();
     const old = this.viewer;
     // One canvas holds one viewer: the old one goes first, and no frame is drawn, nor command
     // run, until the new one is there (`whenReady`).
@@ -229,12 +236,31 @@ const editor = {
     this.file = opened.file;
     this.viewer.set_camera(...camera);
     this.project = new Project(scene, this.viewer);
+    applyEnvironment(this, hour);
+    this.viewer.replace_ponds(this.ponds = pondsText(this.project.entities));
     this.selection = new Set([...this.selection].filter((id) => this.project.entities.has(id)));
     for (const id of this.hidden) {
       for (const instance of this.project.instancesOf(id)) this.viewer.set_instance_hidden(instance, true);
     }
     ready();
     this.refresh();
+  },
+
+  /// After any change: bakes again if what the bake makes of the land changed, and shows the
+  /// ponds as they are now, which needs no bake.
+  landChanged() {
+    if (!this.project.saveable || !this.viewer) return;
+    const ponds = pondsText(this.project.entities);
+    if (ponds !== this.ponds) {
+      this.viewer.replace_ponds(ponds);
+      this.ponds = ponds;
+    }
+    const land = landSignature(this.project.scene, this.project.entities);
+    if (land !== this.land) {
+      this.land = land;
+      if (bakeableHere(this.project)) this.rebakeSoon();
+      else log.add("warn", "This scene places models from files, which the browser can't bake yet: the land's change shows once it is baked with bake --project.");
+    }
   },
 
   /// Resolves once a viewer is shown: at once, but for while a new scene is put in place.
@@ -372,6 +398,7 @@ const editor = {
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, w, h);
     const camera = this.camera();
+    drawLand(context, this.project.entities, camera, this.selection, this.hidden);
     // Things with nowhere to be drawn, such as lights and blockers, show as markers.
     for (const marker of this.markers(camera)) {
       context.fillStyle = this.selection.has(marker.id) ? "#ff9f1a" : "rgba(235, 235, 235, 0.8)";
@@ -521,6 +548,42 @@ function applyChange(shown, change) {
 }
 
 // ---- Commands: what the panels, the keyboard and agents can do.
+
+/// Whether the browser can bake this scene: it places nothing read from a file.
+function bakeableHere(project) {
+  return ![...project.entities.values()].some((e) => e.mesh || e.actor);
+}
+
+/// A new entity's id: eight letters and digits, as the converter makes them, not yet used.
+function newId(editor) {
+  const digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  for (;;) {
+    const bytes = crypto.getRandomValues(new Uint8Array(8));
+    const id = [...bytes].map((b) => digits[b % 62]).join("");
+    if (!editor.project.entities.has(id) && id !== "terrain" && id !== "circuit") return id;
+  }
+}
+
+/// Where the middle of the view meets the ground, or 20 m ahead at sea level if nothing is there.
+async function groundAhead(editor) {
+  const hit = await editor.pick(0.5, 0.5).catch(() => null);
+  if (hit?.point) return hit.point;
+  const camera = editor.camera();
+  return add(camera.position, scaleVector(camera.forward, 20)).map((v, k) => (k === 1 ? 0 : v));
+}
+
+/// Shows the scene's weather and time as it says, or the viewer's own where it doesn't. `hour`
+/// keeps the time of day shown, as after a bake, unless the scene says one.
+function applyEnvironment(editor, hour) {
+  const viewer = editor.viewer;
+  const e = editor.project.scene.environment ?? {};
+  if (e.time !== undefined) viewer.set_time(e.time);
+  else if (hour !== undefined) viewer.set_time(hour);
+  viewer.set_day_length(e.day_length ?? 1200);
+  viewer.set_north(e.north ?? 0);
+  if (!e.weather || e.weather === "changing") viewer.set_weather_changing(true, "fair");
+  else viewer.set_weather(e.weather, 2);
+}
 
 function needEntity(editor, id) {
   const entity = editor.project.entities.get(id);
@@ -804,28 +867,49 @@ function defineCommands(commands, editor) {
     run: () => editor.commands.history.list(),
   });
   commands.define("env.set", {
-    description: "The time of day (hours, 0 to 24), the weather (by name, or `changing`), and the ponds (x0,z0,x1,z1,level; with ; between). Not saved yet.",
+    description: "The scene's weather and time of day, saved with it: the weather (changing, or a built-in weather), the hour it starts at (0 to 24), how long a day takes (0 holds the time still, 120, 1200 or 86400 seconds), and north (degrees). Each null leaves it to the viewer. One undo step; nothing bakes.",
+    changes: true,
     args: {
-      time: { type: "number", description: "Hours, 0 to 24." },
-      weather: { type: "string", description: "changing, or a weather's name: env.weathers lists them." },
-      ponds: { type: "string", description: "Ponds as x0,z0,x1,z1,level, with ; between them." },
+      weather: { type: "string", description: "changing, or one of env.weathers." },
+      time: { type: "number", description: "The hour, 0 to 24." },
+      day_length: { type: "number", description: "Seconds a day takes: 0 (held still), 120, 1200 or 86400." },
+      north: { type: "number", description: "Degrees from -Z to north, round +Y." },
+      clear: { type: "boolean", description: "Leave every one of them to the viewer again." },
     },
     example: { time: 18.5, weather: "fair" },
-    run: ({ time, weather, ponds }) => {
-      if (time !== undefined) editor.viewer.set_time(((time % 24) + 24) % 24);
-      if (weather === "changing") editor.viewer.set_weather_changing(true, "fair");
-      else if (weather !== undefined && !editor.viewer.set_weather(weather, 10)) {
-        throw new CommandError("bad_arguments", `no weather \`${weather}\`; env.weathers lists them`);
+    run: (args) => {
+      if (!editor.project.saveable) throw new CommandError("not_a_project", "this scene has no project to save them in");
+      if (args.weather !== undefined && !WEATHERS.includes(args.weather)) {
+        throw new CommandError("bad_arguments", `weather is one of ${WEATHERS.join(", ")}`);
       }
-      if (ponds !== undefined && !editor.viewer.set_ponds(ponds)) {
-        throw new CommandError("bad_arguments", "ponds couldn't be read: x0,z0,x1,z1,level with ; between");
+      if (args.day_length !== undefined && !DAY_LENGTHS.includes(args.day_length)) {
+        throw new CommandError("bad_arguments", `day_length is one of ${DAY_LENGTHS.join(", ")}`);
       }
-      return { time: tidy(editor.viewer.time_of_day(), 0.01), weather: editor.viewer.weather_summary() };
+      const scene = editor.project.scene;
+      const before = structuredClone(scene.environment ?? null);
+      const after = args.clear ? null : { ...(scene.environment ?? {}) };
+      if (after) {
+        if (args.weather !== undefined) after.weather = args.weather;
+        if (args.time !== undefined) after.time = Math.round((((args.time % 24) + 24) % 24) * 1000) / 1000;
+        if (args.day_length !== undefined) after.day_length = args.day_length;
+        if (args.north !== undefined) after.north = Math.round((((args.north % 360) + 360) % 360) * 10) / 10;
+      }
+      const apply = (value) => {
+        if (value) scene.environment = structuredClone(value);
+        else delete scene.environment;
+        applyEnvironment(editor);
+        editor.refresh();
+      };
+      apply(after);
+      return {
+        result: { environment: scene.environment ?? null, now: editor.viewer.weather_summary() },
+        step: { label: "Change weather and time", undo: () => apply(before), redo: () => apply(after) },
+      };
     },
   });
   commands.define("env.weathers", {
     description: "The names env.set takes for the weather.",
-    run: () => editor.viewer.constructor.weather_names().split(",").map((w) => w.trim()).filter(Boolean),
+    run: () => WEATHERS,
   });
   commands.define("stats.frame", {
     description: "How the viewport is drawing: frames a second, milliseconds a frame, triangles, clusters, instances, geometry pages, megabytes fetched, GPU errors and any fallbacks for this GPU.",
@@ -892,7 +976,8 @@ function defineCommands(commands, editor) {
     args: {
       terrain: { type: "object", description: "{ size, cells, height, shore_x }: metres across, cells along a side (8 to 1024; more takes longer), hill height in metres, and the x where the shore begins (the sea lies towards +X). Null for no ground." },
       land: { type: "object", description: "{ sand, dirt }: metres of sand from the water, then of dirt; grass beyond. Null for plain ground." },
-      sea: { type: "object", description: "{ level, ocean }: the calm sea's height, and a built-in ocean (coastal). Null for no sea." },
+      sea: { type: "object", description: "{ level, ocean }: the calm sea's height, and a built-in ocean (coastal, clear, ocean, murky). Null for no sea." },
+      meadow: { type: "number", description: "Real grass on the grass out to this many metres from the origin (1 to 4000); 0 for none." },
     },
     example: { terrain: { size: 256, cells: 128, height: 6, shore_x: 40 } },
     run: (args) => {
@@ -904,7 +989,12 @@ function defineCommands(commands, editor) {
           `this scene places ${placed.name} from a file, which the browser can't bake yet: change it in the project and bake it with bake --project`);
       }
       if (!Object.keys(args).length) throw new CommandError("bad_arguments", "scene.set takes terrain, land or sea");
+      if (args.meadow !== undefined && args.meadow !== 0 && !(args.meadow >= 1 && args.meadow <= 4000)) {
+        throw new CommandError("bad_arguments", "meadow is 0 for none, or 1 to 4000 metres");
+      }
+      if (args.meadow === 0) args.meadow = null;
       for (const [name, value] of Object.entries(args)) {
+        if (name === "meadow") continue;
         const problem = checkSetting(name, value);
         if (problem) throw new CommandError("bad_arguments", problem);
       }
@@ -923,6 +1013,113 @@ function defineCommands(commands, editor) {
         result: { baking: true },
         step: { label: `Change ${Object.keys(args).join(" and ")}`, undo: () => apply(before), redo: () => apply(args) },
       };
+    },
+  });
+  commands.define("object.add", {
+    description: "Adds something the land is shaped by: a wood, clearing, pond, path or yard, where asked (at the middle of the view if not given), with its starting size. The scene bakes again. One undo step.",
+    changes: true,
+    args: {
+      kind: { type: "string", required: true, description: "wood, clear, pond, path or yard." },
+      at: { type: "vec3", description: "Where, in metres; a pond, path or yard is laid round its x and z." },
+      name: { type: "string", description: "Its name in the outliner." },
+      fields: { type: "object", description: "Its own fields, instead of the starting ones: as object.get shows them." },
+    },
+    example: { kind: "wood", at: [-40, 0, -20], fields: { radius: 25, spacing: 7 } },
+    run: async ({ kind, at, name, fields }) => {
+      const spec = LAND_KINDS[kind];
+      if (!spec) throw new CommandError("bad_arguments", `kind is one of ${Object.keys(LAND_KINDS).join(", ")}`);
+      if (!editor.project.saveable) throw new CommandError("not_a_project", "this scene has no project to add to");
+      const where = at ?? await groundAhead(editor);
+      const component = structuredClone(fields ?? spec.starts);
+      if (!fields && !spec.placed) {
+        // Laid round where it goes.
+        for (const key of Object.keys(component)) {
+          if (Array.isArray(component[key])) component[key] = [component[key][0] + where[0], component[key][1] + where[2]].map((v) => tidy(v, 0.01));
+        }
+      }
+      const problem = checkLand(kind, component);
+      if (problem) throw new CommandError("bad_arguments", problem);
+      const entity = {
+        id: newId(editor),
+        name: name ?? spec.label,
+        ...(spec.placed ? { transform: { position: where.map((v) => tidy(v, 0.01)) } } : {}),
+        [kind]: component,
+      };
+      const list = editor.project.scene.entities;
+      const add = () => {
+        list.push(entity);
+        editor.project.adopt(entity, null);
+        editor.selection = new Set([entity.id]);
+        editor.refresh();
+      };
+      const remove = () => {
+        list.splice(list.indexOf(entity), 1);
+        editor.project.forget(entity);
+        editor.selection.delete(entity.id);
+        editor.refresh();
+      };
+      add();
+      return { result: describe(editor, entity.id), step: { label: `Add ${spec.label.toLowerCase()}`, undo: remove, redo: add } };
+    },
+  });
+  commands.define("object.delete", {
+    description: "Removes woods, clearings, ponds, paths, yards or empty folders (the selection if no ids). The scene bakes again. One undo step. Models and actors can't be removed yet.",
+    changes: true,
+    args: { ids: { type: "string[]", description: "The entities to remove; the selection if left out." } },
+    run: ({ ids }) => {
+      const which = ids ?? [...editor.selection];
+      if (!which.length) throw new CommandError("nothing_selected", "object.delete needs ids, or something selected");
+      const removals = which.map((id) => {
+        const entity = needEntity(editor, id);
+        const kind = kindOf(entity);
+        if (!(kind in LAND_KINDS) && !(kind === "folder" && !(entity.children ?? []).length)) {
+          throw new CommandError("not_removable", `${entity.name} is a ${kind}: only the land's shapes and empty folders can be removed yet`);
+        }
+        const parent = editor.project.parents.get(id);
+        const list = parent ? editor.project.entities.get(parent).children : editor.project.scene.entities;
+        return { entity, parent, list, index: list.indexOf(entity) };
+      });
+      const remove = () => {
+        for (const r of [...removals].sort((a, b) => b.index - a.index)) {
+          r.list.splice(r.list.indexOf(r.entity), 1);
+          editor.project.forget(r.entity);
+          editor.selection.delete(r.entity.id);
+        }
+        editor.refresh();
+      };
+      const restore = () => {
+        for (const r of [...removals].sort((a, b) => a.index - b.index)) {
+          r.list.splice(r.index, 0, r.entity);
+          editor.project.adopt(r.entity, r.parent);
+        }
+        editor.refresh();
+      };
+      remove();
+      return { result: which, step: { label: `Remove ${which.length === 1 ? removals[0].entity.name : `${which.length} things`}`, undo: restore, redo: remove } };
+    },
+  });
+  commands.define("object.shape", {
+    description: "Changes a wood's, clearing's, pond's, path's or yard's own fields (radius, spacing, corners, level, width...), given whole as object.get shows them. The scene bakes again, but for a pond, which changes at once. One undo step.",
+    changes: true,
+    args: {
+      id,
+      fields: { type: "object", required: true, description: "Its fields: wood { radius, spacing }, clear { radius }, pond { min, max, level }, path { from, to, width }, yard { from, to }." },
+    },
+    example: { id: "wood-id", fields: { radius: 30, spacing: 6 } },
+    run: ({ id: which, fields }) => {
+      const entity = needEntity(editor, which);
+      const kind = kindOf(entity);
+      if (!(kind in LAND_KINDS)) throw new CommandError("bad_arguments", `${entity.name} is a ${kind}, not a shape of the land`);
+      const problem = checkLand(kind, fields);
+      if (problem) throw new CommandError("bad_arguments", problem);
+      const before = structuredClone(entity[kind]);
+      const after = structuredClone(fields);
+      const apply = (value) => {
+        entity[kind] = structuredClone(value);
+        editor.refresh();
+      };
+      apply(after);
+      return { result: describe(editor, which), step: { label: `Shape ${entity.name}`, undo: () => apply(before), redo: () => apply(after) } };
     },
   });
   commands.define("bake.run", {
@@ -1203,6 +1400,11 @@ function bindInput(editor) {
       editor.call("gizmo.set", { mode: modes[(modes.indexOf(editor.gizmo.mode) + 1) % 3] });
     } else if (e.code === "KeyF" && !ctrl) editor.call("camera.frame", {});
     else if (e.code === "Escape") editor.call("selection.set", { ids: [] });
+    else if ((e.code === "Delete" || e.code === "Backspace") && editor.selection.size) {
+      editor.call("object.delete", {}).then((outcome) => {
+        if (!outcome.ok) log.add("error", outcome.error.message);
+      });
+    }
   });
   addEventListener("keyup", (e) => keys.delete(e.code));
   addEventListener("blur", () => keys.clear());
@@ -1261,6 +1463,16 @@ function bindToolbar(editor) {
   el("snap-move").addEventListener("change", (e) => editor.call("gizmo.set", { move_step: Number(e.target.value) }));
   el("snap-angle").addEventListener("change", (e) => editor.call("gizmo.set", { angle_step: Number(e.target.value) }));
   el("frame").addEventListener("click", () => editor.call("camera.frame", {}));
+  for (const button of document.querySelectorAll("[data-add]")) {
+    button.addEventListener("click", async () => {
+      const outcome = await editor.call("object.add", { kind: button.dataset.add });
+      if (!outcome.ok) log.add("error", outcome.error.message);
+    });
+  }
+  el("delete").addEventListener("click", async () => {
+    const outcome = await editor.call("object.delete", {});
+    if (!outcome.ok) log.add("error", outcome.error.message);
+  });
   el("view-scene").href = `./?scene=${encodeURIComponent(sceneName)}`;
   el("undo").disabled = true;
   el("redo").disabled = true;

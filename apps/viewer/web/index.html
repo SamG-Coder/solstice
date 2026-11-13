@@ -389,9 +389,18 @@ async function main() {
     const minutes = Math.floor(hours * 60) % (24 * 60);
     return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
   };
+  // A scene may say the time, day and north it was made with; the address still overrides it.
+  const [sceneHour, sceneDay, sceneNorth] = viewer.scene_time();
   const startTime = params.get("time")?.split(":").map(Number);
   if (startTime?.every(Number.isFinite)) viewer.set_time(startTime[0] + (startTime[1] ?? 0) / 60);
+  else if (Number.isFinite(sceneHour)) viewer.set_time(sceneHour);
+  if (Number.isFinite(sceneNorth)) {
+    viewer.set_north(sceneNorth);
+    el("north").value = ((sceneNorth % 360) + 360) % 360;
+  }
+  const dayOption = (seconds) => [...el("day-length").options].some((o) => o.value === String(seconds));
   if (params.has("day-length")) el("day-length").value = params.get("day-length");
+  else if (Number.isFinite(sceneDay) && dayOption(sceneDay)) el("day-length").value = String(sceneDay);
   // A scene read in parts is far heavier than any other, and every step of the sun redraws its
   // shadows: there, time stands still unless asked to pass.
   else if (params.has("split")) el("day-length").value = "0";
@@ -469,7 +478,9 @@ async function main() {
     weather.place = { name: `${lat.toFixed(2)}, ${lon.toFixed(2)}`, latitude: lat, longitude: lon };
     el("live-place").options[0].textContent = weather.place.name;
   }
-  el("weather").value = params.get("weather") ?? "changing";
+  const sceneWeather = viewer.scene_weather();
+  const known = (name) => [...el("weather").options].some((o) => o.value === name);
+  el("weather").value = params.get("weather") ?? (known(sceneWeather) ? sceneWeather : "changing");
   el("weather").addEventListener("change", (e) => weather.choose(e.target.value));
   weather.choose(el("weather").value);
   el("live-weather").addEventListener("change", (e) => {

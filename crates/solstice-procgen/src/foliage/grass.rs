@@ -32,6 +32,7 @@ use crate::field::smoothstep;
 use crate::noise::tiling_fbm;
 use crate::surface::{Surface, Texel};
 use glam::{Vec2, Vec3};
+use solstice_asset::math;
 use solstice_builder::{Mesh, Vertex};
 use std::f32::consts::TAU;
 
@@ -311,10 +312,10 @@ impl Meadow {
                 // the outer ones leaning furthest.
                 let angle = rng.range(0.0, TAU);
                 let reach = rng.unit().sqrt();
-                let outward = Vec3::new(angle.cos(), 0.0, angle.sin());
+                let outward = Vec3::new(math::cos(angle), 0.0, math::sin(angle));
                 let root = center + outward * reach * 0.035 - Vec3::Y * ROOT_DEPTH;
                 let swing = rng.signed() * 0.7;
-                let bend = Vec3::new((angle + swing).cos(), 0.0, (angle + swing).sin());
+                let bend = Vec3::new(math::cos(angle + swing), 0.0, math::sin(angle + swing));
                 let lean = (self.lean.0
                     + (self.lean.1 - self.lean.0) * (reach * 0.6 + rng.unit() * 0.4))
                     .min(0.9);
@@ -379,7 +380,7 @@ impl Meadow {
             self.add_blade(
                 &mut mesh,
                 root,
-                Vec3::new(angle.cos(), 0.0, angle.sin()),
+                Vec3::new(math::cos(angle), 0.0, math::sin(angle)),
                 height,
                 width,
                 lean,
@@ -422,7 +423,7 @@ impl Meadow {
             let center = point(t);
             let along = direction(t);
             let face = side.cross(along).normalize();
-            let half = width * 0.5 * (1.0 - t.powf(2.2));
+            let half = width * 0.5 * (1.0 - math::powf(t, 2.2));
             let fold = face * (self.fold * half * 2.0);
             // Each half of the V leans in towards the midrib.
             let tilt = side * (self.fold * 2.0);
@@ -477,8 +478,8 @@ fn blade_texel(
     let base = colors[variant as usize];
 
     // Parallel veins, and a paler midrib.
-    let veins = 0.5 + 0.5 * (across * 9.0 * TAU).cos();
-    let midrib = (-((across - 0.5) * 14.0).powi(2)).exp();
+    let veins = 0.5 + 0.5 * math::cos(across * 9.0 * TAU);
+    let midrib = math::exp(-math::powi((across - 0.5) * 14.0, 2));
     // Slow streaks along the blade.
     let streaks = tiling_fbm(across * 0.25 + variant as f32 * 0.25, v, 8, 3, seed);
 
@@ -502,11 +503,7 @@ fn blade_texel(
 /// The angle between two directions, for tests.
 #[cfg(test)]
 fn angle_between(a: Vec3, b: Vec3) -> f32 {
-    a.normalize()
-        .dot(b.normalize())
-        .clamp(-1.0, 1.0)
-        .acos()
-        .to_degrees()
+    math::acos(a.normalize().dot(b.normalize()).clamp(-1.0, 1.0)).to_degrees()
 }
 
 #[cfg(test)]
@@ -578,7 +575,7 @@ mod tests {
             let layer = Meadow::by_name(name).unwrap().atlas(0).bake(64);
             let top = layer.color_mips.last().unwrap();
             // The whole atlas averaged, in sRGB. Real grass is about 0.1 linear albedo in green.
-            let green = (top[1] as f32 / 255.0).powf(2.2);
+            let green = math::powf(top[1] as f32 / 255.0, 2.2);
             assert!(
                 (0.06..0.25).contains(&green),
                 "{name}: green albedo {green}"

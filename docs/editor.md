@@ -335,8 +335,11 @@ note, and **components**. Part of Cove in this format (its ids here are made up)
 }
 ```
 
-The scene's settings are `texture_size`, `camera`, `terrain`, `land`, `meadow`, `water`, `sea`
-and `game` (`input`, `track`, `circuit`). The components that say what an entity is, at most
+The scene's settings are `texture_size`, `camera`, `terrain`, `land`, `meadow`, `water`, `sea`,
+`environment` (`weather`, `time`, `day_length`, `north`: what the scene starts with, each left to
+the viewer where it isn't given; approved by the user on 13 November) and `game` (`input`,
+`track`, `circuit`). A scene baked from a project carries its environment in an optional `ENVR`
+section of the scene file, which the viewer starts it with unless its address says otherwise. The components that say what an entity is, at most
 one each, are `mesh` (a whole model or one `part`, with `collide` and `skinned`), `actor`,
 `light`, `blocker`, `wood`, `clear`, `path`, `yard` and `pond`; an entity with none is a folder.
 A child's transform is in the world, not relative to its parent: folders only group, as
@@ -385,9 +388,15 @@ the pieces the scene uses and writes their instances, which takes well under a s
 - sculpting a corner of the terrain rebakes **those tiles**; regrowing one grove, **that grove**.
 
 **The browser and the PC give the same bytes.** The bake is already deterministic: the same
-model baked on one thread and on sixteen gives byte-identical files (checked, 13 November). The
-library keeps that a rule, tested in CI, so a piece baked in the browser and one baked on the PC
-are interchangeable. A project opened from disk shares one `.cache/` between them: bake the big
+model baked on one thread and on sixteen gives byte-identical files (checked, 13 November). It
+is the same across platforms too only if its maths is: the standard library's `sin`, `cos`,
+`powf` and the like call each platform's own, which differ in their last bits between Windows
+and the browser's wasm, so trees grown in one differed from trees grown in the other. Everything
+a bake computes with them goes through `solstice_asset::math` (`libm`'s, the same everywhere;
+approved by the user on 13 November), and a test (`solstice-bake/tests/portable_math.rs`) fails
+on any call to the platform's own in the bake's code. A scene with terrain, a wood and a meadow
+bakes to the same SHA-256 in the browser's wasm and natively. So a piece baked in the browser
+and one baked on the PC are interchangeable. A project opened from disk shares one `.cache/` between them: bake the big
 scans natively once, and the editor never bakes them again.
 
 **Where each bake runs best:**
@@ -575,11 +584,29 @@ on a phone.
 
    **Milestone**: from an empty page, make an island with sand, grass and sea, change it, reload
    and find it kept; an agent does the same through the API.
-3. **Trees, water and weather.** Woods, meadows and clearings as shapes with handles, planted
-   and regrown in the worker, area by area; tree species and grass from the built-in ones and
-   from species files, edited in a panel; ponds with handles; the scene's weather and time of
-   day saved with it. Commands: `foliage.*`, `species.*`, `pond.*`.
-   **Milestone**: plant a wood with a clearing and a pond on the island.
+3. **Trees, water and weather.** Woods and clearings are circles on the ground, ponds, yards
+   and paths their outlines; each is added from the toolbar (or `object.add`), moved with the
+   gizmo, shaped in the details panel (or `object.shape`), and removed with Delete. A change to
+   the land bakes the scene again in the background; a pond shows at once, as the viewer takes
+   ponds as they change. The meadow is one of the scene's settings. The weather and time of day
+   are saved with the scene (`env.set`), and the viewer opens it that way. Species files edited
+   in a panel are left for later.
+
+   Making it fast enough, without a new format (the user's choice): the cluster builder
+   simplifies 3–4 times faster to the very same meshes (PR #82); the trees and grass, which
+   don't depend on the scene, are built once in the bake's worker and kept for every bake after
+   (`solstice_bake::pieces`); their bark, leaves and blades come ready-made like the land's
+   surfaces, as scene files of one layer; and the editor's own bakes compress quickly
+   (`encode_quickly`: the same scene, read the same way, in a file a little larger), while a
+   saved bake is the native one byte for byte. Measured in the browser, one thread, a 256 m
+   island with a wood and a meadow:
+
+   | | Before | After |
+   |---|---|---|
+   | The first bake of a session | over a minute | 10.9 s |
+   | Every bake after it, such as moving the wood | 4.8 s | 1.4 s |
+
+   **Milestone**: plant a wood with a clearing on the island, and a pond inland.
 4. **Placing things.** A content browser of the built-in models, the scans the site's scenes use,
    and glTF files dropped on the page and baked in the worker; drag into the viewport onto the
    ground; duplicate, delete, box select, End to the ground; lights with handles. The renderer
@@ -623,3 +650,12 @@ Approved by the user on 13 November 2026, as recommended:
 6. **No new dependencies for the UI**: panels, docking and the gizmo hand-written in plain
    JavaScript modules and WGSL, as the viewer is.
 7. **Shortcuts**: Unreal's (W/E/R, F, End) by default, Unity's (Q/W/E/R) as an option.
+
+Later the same day:
+
+8. **No file format of ready-made meshes.** The user chose making the bake faster instead: the
+   builder is 3–4 times faster to the same meshes, and the editor's bake keeps what it has built.
+9. **A scene's weather and time are saved with it**: an optional `environment` in the project's
+   scene, and an optional `ENVR` section in the scene file.
+10. **`libm` as a direct dependency**, for maths the same on every platform (it was already built,
+    through glam).
