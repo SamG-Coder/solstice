@@ -126,10 +126,13 @@ impl Driver {
         if wanted != 0.0 {
             self.stick = wanted.abs() < 0.999;
         }
+        // A heavy car's wheel is turned more slowly, and a heavy car's pedals pressed more
+        // gently: its driver has more to move.
+        let quick = vehicle.spec().steering_quick;
         self.steer = if self.stick {
-            ease(self.steer, wanted, STEER_STICK, STEER_STICK)
+            ease(self.steer, wanted, STEER_STICK * quick, STEER_STICK * quick)
         } else {
-            ease(self.steer, wanted, STEER_IN, STEER_BACK)
+            ease(self.steer, wanted, STEER_IN * quick, STEER_BACK * quick)
         };
         let mut steer = self.steer * Self::lock_share(vehicle, speed.abs(), gravity);
         // Following a slide: the wheel turns towards the way the car is going.
@@ -154,7 +157,7 @@ impl Driver {
                 go = 0.0;
             }
         }
-        self.throttle = ease(self.throttle, go, PEDAL_DOWN, PEDAL_UP);
+        self.throttle = ease(self.throttle, go, PEDAL_DOWN * quick.min(1.0), PEDAL_UP);
         self.brake = ease(self.brake, stop, PEDAL_DOWN * 1.6, PEDAL_UP);
 
         Controls {
@@ -213,19 +216,41 @@ impl Driver {
         let gears = &spec.gearbox.gears;
         let (rpm, limit) = (vehicle.rpm(), spec.engine.limit);
         let top = gears.len() as i32;
-        // Up, just before the limiter, unless the wheels are spinning the revs up.
-        let driven = if spec.front.driven { [0, 1] } else { [2, 3] };
-        let gripping = driven
-            .iter()
-            .all(|&index| vehicle.wheels[index].slip_ratio.abs() < 0.2);
-        if gear < top && rpm > limit - 330.0 && go > 0.05 && gripping {
+        // Up, just before the limiter, unless the wheels are spinning the revs up. On loose
+        // ground a tyre that is gripping slips more, so it is held to what the ground allows.
+        let driven: &[usize] = match (spec.front.driven, spec.rear.driven) {
+            (true, true) => &[0, 1, 2, 3],
+            (true, false) => &[0, 1],
+            _ => &[2, 3],
+        };
+        let gripping = driven.iter().all(|&index| {
+            let wheel = &vehicle.wheels[index];
+            wheel.slip_ratio.abs() < 0.2 * wheel.surface.grip().slip
+        });
+        // A gearbox that cruises changes up early on a light throttle, and later the further
+        // the pedal is down.
+        let cruise = spec.gearbox.cruise;
+        let up_at = (limit - 330.0) * (cruise + (1.0 - cruise) * go.powf(1.5));
+        // A gearbox that cruises goes by the road's speed, as a road car's does, not the
+        // engine's: with a wheel spinning in mud, or the clutch slipping against a ledge, the
+        // engine's speed says nothing of what gear the car should be in.
+        let on_road = |gear: i32| speed.abs() / speed_in_gear(vehicle, gear as usize, 1.0);
+        let rpm = if cruise < 1.0 { on_road(gear) } else { rpm };
+        if gear < top && rpm > up_at && go > 0.05 && gripping {
             return change(true);
         }
         // Down, when the engine has fallen out of its power, sooner under braking or with the
         // throttle flat, and never to where it would over-rev.
         if gear > 1 {
             let lower = rpm * gears[gear as usize - 2] / gears[gear as usize - 1];
-            let below = if stop > 0.1 {
+            let below = if cruise < 1.0 {
+                // Well under where it would change straight back up, so that it never hunts.
+                if stop > 0.1 {
+                    up_at.max(limit * 0.5) * 0.7
+                } else {
+                    up_at * 0.7
+                }
+            } else if stop > 0.1 {
                 limit * 0.76
             } else if go > 0.9 {
                 limit * 0.70
@@ -248,6 +273,6 @@ pub fn speed_in_gear(vehicle: &Vehicle, gear: usize, rpm: f32) -> f32 {
     } else {
         &spec.rear
     };
-    let ratio = spec.gearbox.gears[gear - 1] * spec.gearbox.final_drive;
+    let ratio = spec.gearbox.gears[gear - 1] * spec.gearbox.final_drive * vehicle.range();
     rpm * RPM_TO_RADIANS / ratio * axle.radius
 }

@@ -185,7 +185,7 @@ fn rasterize_triangle(
                 let w2 = f32(e2 - bias2) * inv_area;
                 let depth = w0 * z0 + w1 * z1 + w2 * z2;
                 // Tested before the bias, as the hardware clips before it biases.
-                if depth > 0.0 && covered(w0, w2, w1) {
+                if depth > 0.0 && covered(w0, w2, w1, vec2f(f32(x), f32(y))) {
                     write_visibility(u32(y) * width + u32(x), depth + bias, id);
                 }
             }

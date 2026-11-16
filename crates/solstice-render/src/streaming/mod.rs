@@ -491,6 +491,66 @@ impl Streamer {
         self.apply_install(gpu, scene, page, slot, data, clusters);
     }
 
+    /// Writes over part of a page that is installed: `data` in place of what is `offset`
+    /// bytes into it. For a thing whose points are made as the game is played, in a page
+    /// that is always loaded. Both are whole words. False, and nothing is written, if the
+    /// page is not installed or the bytes are not all within it.
+    pub fn rewrite(
+        &self,
+        gpu: &Gpu,
+        scene: &GpuScene,
+        page: u32,
+        offset: u32,
+        data: &[u8],
+    ) -> bool {
+        let (Some(&slot), Some(info)) =
+            (self.slots.get(page as usize), self.pages.get(page as usize))
+        else {
+            return false;
+        };
+        let within = offset as usize + data.len() <= info.raw_bytes();
+        if slot == u32::MAX || !offset.is_multiple_of(4) || !data.len().is_multiple_of(4) || !within
+        {
+            return false;
+        }
+        let (band, local) = locate_slot(self.regions.as_ref(), slot);
+        gpu.queue.write_buffer(
+            scene.pool(band),
+            u64::from(local) * u64::from(PAGE_WORDS) * 4 + u64::from(offset),
+            data,
+        );
+        true
+    }
+
+    /// Makes one of the scene's materials this one from now on: for a material with no
+    /// texture, whose colour is decided as the game is played.
+    pub fn set_material(
+        &mut self,
+        gpu: &Gpu,
+        scene: &GpuScene,
+        index: u32,
+        material: Material,
+    ) -> bool {
+        let size = std::mem::size_of::<Material>() as u64;
+        if (u64::from(index) + 1) * size > scene.materials.size() || material.texture_layer >= 0 {
+            return false;
+        }
+        // What moves textures between tiers writes every material when one changes.
+        if let Some(kept) = self
+            .textures
+            .as_mut()
+            .and_then(|textures| textures.materials.get_mut(index as usize))
+        {
+            *kept = material;
+        }
+        gpu.queue.write_buffer(
+            &scene.materials,
+            u64::from(index) * size,
+            bytemuck::bytes_of(&material),
+        );
+        true
+    }
+
     /// Records the requests read back, and returns the pages the host should start fetching.
     fn plan(&mut self, requests: &[u32], max_fetching: u32) -> Vec<u32> {
         let pages = self.pages.len().min(requests.len());

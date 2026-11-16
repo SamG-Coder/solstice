@@ -13,7 +13,7 @@
 //! the outline each leaf is built with.
 
 use super::bark::BARK_REPEAT;
-use super::leaf::{LeafKind, LEAF_VARIANTS};
+use super::leaf::LEAF_VARIANTS;
 pub use super::species::{Crown, Leaves, Level, Species};
 use super::Rng;
 use crate::field::smoothstep;
@@ -471,7 +471,7 @@ fn add_leaf(
 ) {
     let kind = leaves.kind;
     let crown_normals = leaves.crown_normals;
-    if kind == LeafKind::Needles {
+    if kind.is_spray() {
         add_needle_spray(mesh, base, axis, length, leaves, roll, variant, crown);
         return;
     }

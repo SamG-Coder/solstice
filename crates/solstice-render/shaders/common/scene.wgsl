@@ -97,6 +97,12 @@ const MATERIAL_MASKED: u32 = 4u;
 // Twin of Material::BLENDS: ground of three kinds, this material's and the next two's,
 // blended by the shares the mesh's texture coordinates hold (land.rs).
 const MATERIAL_BLENDS: u32 = 32u;
+// Twins of Material::PAINT and Material::INSIDE: the paint of something driven, and what is
+// in its cab or under its bonnet (vg/resolve.wgsl, `coat`).
+const MATERIAL_PAINT: u32 = 64u;
+const MATERIAL_INSIDE: u32 = 128u;
+// Twin of Material::GLASS: seen through, by being drawn in a share of its pixels (vg/mask.wgsl).
+const MATERIAL_GLASS: u32 = 256u;
 // Twins of the INSTANCE_ flags in scene.rs.
 const INSTANCE_TWO_SIDED: u32 = 0x80000000u;
 const INSTANCE_MOVABLE: u32 = 0x40000000u;

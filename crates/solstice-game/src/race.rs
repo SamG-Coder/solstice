@@ -44,6 +44,10 @@ pub struct Lap {
     pub valid: bool,
     /// Whether the last lap finished did.
     pub last_valid: bool,
+    /// How many times the car has been put back on the track on the lap being driven, and
+    /// how many it was on the last lap finished. Each costs time; none costs the lap.
+    pub resets: u32,
+    pub last_resets: u32,
     /// The sector the car is in, from 0.
     pub sector: usize,
     /// This lap's sector times so far, and the best there has been of each.
@@ -101,6 +105,8 @@ impl Lap {
             best: None,
             valid: true,
             last_valid: true,
+            resets: 0,
+            last_resets: 0,
             sector: 0,
             splits: Vec::new(),
             best_splits: vec![None; track.sectors.len() + 1],
@@ -113,11 +119,25 @@ impl Lap {
         }
     }
 
-    /// The car was put back on the track: the lap being driven no longer counts.
+    /// The car was put back on the track: it is counted, against the lap being driven. The
+    /// lap still stands. Its lines are still to be crossed in turn, so being put down past
+    /// one is not having driven to it.
     pub fn interrupt(&mut self) {
-        self.valid = false;
+        if self.current.is_some() {
+            self.resets += 1;
+        }
         self.before = None;
         self.hint = None;
+    }
+
+    /// The section of the lap that is being driven: how far round the lap it starts, and
+    /// how far round it ends. A car put back on the track is put back in it.
+    pub fn section(&self, track: &Track) -> (f32, f32) {
+        let ends = match self.next {
+            0 => track.length(),
+            next => track.sector_start(next),
+        };
+        (track.sector_start(self.sector), ends)
     }
 
     /// Follows the car through one step of `seconds`. `off_track` is whether it has all four
@@ -175,6 +195,7 @@ impl Lap {
                 self.count += 1;
                 self.last = Some(current);
                 self.last_valid = self.valid;
+                self.last_resets = self.resets;
                 if self.valid && self.best.is_none_or(|best| current < best) {
                     self.best = Some(current);
                 }
@@ -182,6 +203,7 @@ impl Lap {
                 events.push(LapEvent::Started);
             }
             self.current = Some(0.0);
+            self.resets = 0;
             self.valid = !off_track;
             self.splits.clear();
             self.sector = 0;

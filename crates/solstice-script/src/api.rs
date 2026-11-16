@@ -10,7 +10,7 @@
 
 use crate::host::{ScriptEvent, RESERVED_EVENTS};
 use crate::value::{number, EntityValue, ScriptValue, Vec3Value};
-use solstice_world::{Entity, Input, Name, Played, TimerId, World};
+use solstice_world::{Entity, Idle, Input, Name, Played, TimerId, World};
 use starlark::any::ProvidesStaticType;
 use starlark::environment::GlobalsBuilder;
 use starlark::eval::Evaluator;
@@ -93,7 +93,10 @@ fn context<'a, 'e>(eval: &Evaluator<'_, 'a, 'e>) -> anyhow::Result<&'a Context<'
 /// while they are away flying the camera, so the keys that fly it don't walk who was left.
 fn heard<'a>(context: &'a Context) -> Option<&'a Input> {
     let input = context.world.input();
-    let left = input.away() && context.world.entities.get::<&Played>(context.actor).is_ok();
+    let entities = &context.world.entities;
+    // Nor for one the player could play and is not playing: the driver while they drive.
+    let left = entities.get::<&Idle>(context.actor).is_ok()
+        || (input.away() && entities.get::<&Played>(context.actor).is_ok());
     (!left).then_some(input)
 }
 

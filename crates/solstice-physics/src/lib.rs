@@ -14,7 +14,7 @@
 
 pub mod car;
 
-pub use car::Car;
+pub use car::{Car, Knock};
 pub use solstice_vehicle as vehicle;
 
 use glam::{Mat4, Quat, Vec3};
@@ -34,8 +34,9 @@ use std::sync::mpsc::{channel, Receiver};
 pub const GRAVITY: f32 = 9.81;
 /// The steepest slope, in degrees, a character can walk up.
 pub const MAX_SLOPE_DEGREES: f32 = 45.0;
-/// The highest step, in metres, a character climbs without jumping.
-pub const MAX_STEP: f32 = 0.35;
+/// The highest step, in metres, a character climbs without jumping: a kerb, a verandah's
+/// edge, a ledge of rock on a track.
+pub const MAX_STEP: f32 = 0.6;
 /// How fast a character may fall, in metres a second.
 pub const TERMINAL_SPEED: f32 = 50.0;
 
@@ -101,6 +102,8 @@ struct CharacterState {
     collider: ColliderHandle,
     /// Falling speed, negative downward.
     vertical: f32,
+    /// Whether it stood on something at the end of the last step: only then can it jump.
+    grounded: bool,
 }
 
 /// The simulation of one world.
@@ -132,6 +135,8 @@ pub struct Physics {
     cars: BTreeMap<Entity, car::CarStep>,
     /// What the ground is made of at a place, for tyres.
     surfaces: Option<Box<dyn Fn(Vec3) -> solstice_vehicle::Surface>>,
+    /// What tyres have pressed into the ground: the ruts they stand in, which stay.
+    ruts: std::cell::RefCell<solstice_vehicle::Ruts>,
     /// Problems with the scene's shapes, for the viewer to show.
     pub warnings: Vec<String>,
 }
@@ -205,6 +210,7 @@ impl Physics {
             _tears: tears,
             cars: BTreeMap::new(),
             surfaces: None,
+            ruts: Default::default(),
             warnings: Vec::new(),
         }
     }
@@ -334,6 +340,51 @@ impl Physics {
             .map(|(_, distance)| from.y - distance)
     }
 
+    /// The height of whatever of the scene itself is under a place: its land, its floors and
+    /// its walls, and nothing that moves, a car or an actor or a thing lying about. For what
+    /// falls off a car to come to rest on. From inside something solid, as what comes off
+    /// against a wall is, it is what that stands on.
+    pub fn fixed_below(&self, from: Vec3) -> Option<f32> {
+        let queries = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            QueryFilter::only_fixed().exclude_sensors(),
+        );
+        let ray = Ray::new(to_vector(from), -Vector::Y);
+        queries
+            .cast_ray(&ray, 10_000.0, false)
+            .map(|(_, distance)| from.y - distance)
+    }
+
+    /// The height of the land itself under a place, if the scene has a grid of heights:
+    /// not of a wall, a tree or a car that stands on it. For a camera to keep above.
+    pub fn land_below(&self, from: Vec3) -> Option<f32> {
+        let land =
+            |_: ColliderHandle, collider: &Collider| collider.shape().as_heightfield().is_some();
+        let queries = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            QueryFilter::new().exclude_sensors().predicate(&land),
+        );
+        let ray = Ray::new(to_vector(from), -Vector::Y);
+        queries
+            .cast_ray(&ray, 10_000.0, true)
+            .map(|(_, distance)| from.y - distance)
+    }
+
+    /// What tyres have pressed into the ground, which every car's wheels read and press
+    /// further (`solstice_vehicle::rut`): for whoever draws it.
+    pub fn ruts(&self) -> std::cell::Ref<'_, solstice_vehicle::Ruts> {
+        self.ruts.borrow()
+    }
+
+    /// The same, to change: to forget every rut, or to lay what was thrown where it landed.
+    pub fn ruts_mut(&mut self) -> &mut solstice_vehicle::Ruts {
+        self.ruts.get_mut()
+    }
+
     /// One fixed step: takes in new actors, moves kinematic ones to where their transforms say,
     /// steps the simulation, walks the characters, and writes back what physics moved.
     pub fn step(&mut self, world: &mut World) {
@@ -341,6 +392,9 @@ impl Physics {
         self.take_in_cars(world);
         self.follow_transforms(world);
         self.drive_cars(world);
+        self.ruts
+            .get_mut()
+            .advance(solstice_world::STEP_SECONDS as f32);
         self.pipeline.step(
             to_vector(Vec3::new(0.0, -GRAVITY, 0.0)),
             &self.params,
@@ -422,7 +476,12 @@ impl Physics {
     ) {
         let kind = collider.map_or(BodyKind::Kinematic, |c| c.kind);
         let builder = match kind {
-            BodyKind::Dynamic(_) => RigidBodyBuilder::dynamic(),
+            // What is loose may be small and heavy, and is carried on trucks: it is not to
+            // pass through a floor in a step, and it comes to rest where it is put.
+            BodyKind::Dynamic(_) => RigidBodyBuilder::dynamic()
+                .ccd_enabled(true)
+                .linear_damping(0.05)
+                .angular_damping(0.6),
             _ => RigidBodyBuilder::kinematic_position_based(),
         };
         let handle = self.bodies.insert(
@@ -443,7 +502,7 @@ impl Physics {
                     );
             }
             if let BodyKind::Dynamic(mass) = kind {
-                shape = shape.mass(mass);
+                shape = shape.mass(mass).friction(0.9).restitution(0.0);
             }
             shape
         };
@@ -485,6 +544,7 @@ impl Physics {
             CharacterState {
                 collider,
                 vertical: 0.0,
+                grounded: false,
             }
         });
         self.actors.insert(
@@ -554,11 +614,22 @@ impl Physics {
             let collider = &self.colliders[state.collider];
             let shape = collider.shared_shape().clone();
             let pose = *collider.position();
-            let walk = world
+            let wanted = world
                 .entities
                 .get::<&Walk>(entity)
-                .map_or(Vec3::ZERO, |w| Vec3::new(w.0.x, 0.0, w.0.z));
+                .map_or(Vec3::ZERO, |w| w.0);
+            let walk = Vec3::new(wanted.x, 0.0, wanted.z);
+            // A jump: what a walk says of going up is the speed to leave the ground with,
+            // and is heeded only on the ground.
+            if wanted.y > 0.0 && state.grounded {
+                state.vertical = wanted.y;
+            }
             let falling = (state.vertical - GRAVITY * dt).max(-TERMINAL_SPEED);
+            // Going up, it is not held down to the ground it has just left.
+            let mut controller = self.controller;
+            if falling > 0.0 {
+                controller.snap_to_ground = None;
+            }
             let desired = walk * dt + Vec3::Y * falling * dt;
             let filter = QueryFilter::new()
                 .exclude_sensors()
@@ -569,21 +640,31 @@ impl Physics {
                 &self.colliders,
                 filter,
             );
-            let moved = self.controller.move_shape(
-                dt,
-                &queries,
-                &*shape,
-                &pose,
-                to_vector(desired),
-                |_| {},
-            );
-            state.vertical = if moved.grounded { 0.0 } else { falling };
+            let moved =
+                controller.move_shape(dt, &queries, &*shape, &pose, to_vector(desired), |_| {});
+            state.grounded = moved.grounded && falling <= 0.0;
+            state.vertical = if state.grounded { 0.0 } else { falling };
             let next = rigid.translation() + moved.translation;
             self.bodies
                 .get_mut(body.handle)
                 .expect("found above")
                 .set_next_kinematic_translation(next);
             body.at = from_vector(next);
+        }
+    }
+
+    /// Puts a walking character somewhere else: it is not walked there, it is there.
+    pub fn place(&mut self, entity: Entity, at: Vec3) {
+        let Some(body) = self.actors.get_mut(&entity) else {
+            return;
+        };
+        if let Some(rigid) = self.bodies.get_mut(body.handle) {
+            rigid.set_translation(to_vector(at), true);
+            rigid.set_next_kinematic_translation(to_vector(at));
+        }
+        body.at = at;
+        if let Some(state) = body.character.as_mut() {
+            state.vertical = 0.0;
         }
     }
 

@@ -84,6 +84,10 @@ pub struct Tyre {
     pub load_sensitivity: f32,
     /// How far the tyre rolls, in metres, before its side force catches up with its slip angle.
     pub relaxation: f32,
+    /// What its tread makes of the ground: times its grip on firm ground (a road, rock, hard
+    /// clay), and on soft ground that a tyre sinks into (mud, sand, a bog). A road tyre is
+    /// more than 1 and less; a mud tyre, less than 1 and more.
+    pub tread: (f32, f32),
 }
 
 impl Tyre {
@@ -103,7 +107,14 @@ impl Tyre {
             nominal_load: 4000.0,
             load_sensitivity: 0.14,
             relaxation: 0.28,
+            tread: (1.0, 1.0),
         }
+    }
+
+    /// What its tread makes of ground a tyre sinks this far into, in metres: times its grip.
+    pub fn tread_on(&self, sink: f32) -> f32 {
+        let soft = ((sink - 0.008) / 0.04).clamp(0.0, 1.0);
+        self.tread.0 + (self.tread.1 - self.tread.0) * soft
     }
 
     /// The friction a tyre has under this load, as a multiple of the figure at its nominal one.

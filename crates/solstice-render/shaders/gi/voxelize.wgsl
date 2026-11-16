@@ -278,7 +278,7 @@ fn voxelize_speck(entry: VisibleCluster) {
     let data = VoxelData(
         pack4x8unorm(vec4f(albedo, 1.0)),
         pack2x16snorm(oct_encode(normal)),
-        encode_emissive(material.emissive * instance.glow),
+        encode_emissive(material.emissive * abs(instance.glow)),
     );
 
     let inv_voxel = 1.0 / params.voxel_size;
@@ -324,7 +324,7 @@ fn voxelize_cluster_triangle(item: u32, t: u32) {
         let data = VoxelData(
             pack4x8unorm(vec4f(albedo, 1.0)),
             pack2x16snorm(oct_encode(face / face_length)),
-            encode_emissive(material.emissive * instance.glow),
+            encode_emissive(material.emissive * abs(instance.glow)),
         );
         let p0 = (world0 - params.origin) * inv_voxel;
         let p1 = (world1 - params.origin) * inv_voxel;

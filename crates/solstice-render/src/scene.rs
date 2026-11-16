@@ -492,7 +492,10 @@ fn gpu_instances(scene: &PagedScene) -> (Vec<GpuInstance>, Vec<Option<u32>>) {
                 } else {
                     0
                 }
-                | if source.is_some_and(|m| m.flags & Material::MASKED != 0) {
+                // Glass is drawn where a cut-out is: by the rasterizers that leave pixels out.
+                | if source
+                    .is_some_and(|m| m.flags & (Material::MASKED | Material::GLASS) != 0)
+                {
                     INSTANCE_MASKED
                 } else {
                     0

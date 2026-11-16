@@ -1103,11 +1103,6 @@ fn convert_material(
         };
     };
     let name = source.name().unwrap_or("unnamed");
-    if source.alpha_mode() == gltf::material::AlphaMode::Blend {
-        warnings.push(format!(
-            "material '{name}': alpha mode Blend is drawn as opaque"
-        ));
-    }
     let glow_layer = source
         .emissive_texture()
         .filter(|_| textures)
@@ -1170,11 +1165,18 @@ fn convert_material(
                     1.0
                 }
         }),
-        flags: if source.double_sided() {
-            Material::TWO_SIDED
-        } else {
-            0
-        } | if masked { Material::MASKED } else { 0 }
+        flags: crate::material::named_flags(source.name())
+            | if source.double_sided() {
+                Material::TWO_SIDED
+            } else {
+                0
+            }
+            | if masked { Material::MASKED } else { 0 }
+            | if source.alpha_mode() == gltf::material::AlphaMode::Blend {
+                Material::GLASS
+            } else {
+                0
+            }
             | glow_layer.map_or(0, |layer| (layer + 1) << Material::GLOW_SHIFT),
         roughness: pbr.roughness_factor() * if has_roughness_map { 0.5 } else { 1.0 },
         metallic: pbr.metallic_factor(),

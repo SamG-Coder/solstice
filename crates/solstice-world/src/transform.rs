@@ -96,7 +96,8 @@ impl GlobalTransform {
 }
 
 /// How a walking character wants to move, in metres a second across the ground. Set by its script
-/// each step, carried out by physics, and held until set again.
+/// each step, carried out by physics, and held until set again. Its `y` is a jump: the speed
+/// to leave the ground with, heeded only while the character stands on something.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Walk(pub Vec3);
 

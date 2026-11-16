@@ -314,6 +314,18 @@ struct History {
 
 /// Renders a scene with virtualized geometry and global illumination.
 pub struct Renderer {
+    /// The lamps of whatever is driven, when they are on.
+    lamp: Option<crate::Lamp>,
+    /// What whatever is driven wears, and which of the scene's instances are it: the first
+    /// of them as the GPU numbers them, and how many.
+    coat: Option<(crate::Coat, u32, u32)>,
+    /// Trucks that stand about, each in a colour of its own: the colour, the colour it was
+    /// made in, and the instances that draw it.
+    resprays: Vec<(Vec3, Vec3, Vec<u32>)>,
+    /// The ruts tyres have pressed into the ground, round the camera, and the colour of
+    /// the soil they churn up.
+    ruts: crate::ruts::RutMap,
+    rut_soil: Vec3,
     streamer: Streamer,
     settings: RendererSettings,
     scene: GpuScene,
@@ -377,6 +389,11 @@ pub struct Renderer {
     time: f32,
     /// Seconds since the previous frame.
     frame_seconds: f32,
+    /// What is to be written over in installed pages before the next frame is drawn: the
+    /// page, how far into it, and the bytes. See [`Self::rewrite_page`].
+    rewrites: Vec<(u32, u32, Vec<u8>)>,
+    /// Materials to be changed before the next frame is drawn. See [`Self::set_material`].
+    recoloured: Vec<(u32, solstice_asset::Material)>,
 }
 
 impl Renderer {
@@ -450,6 +467,24 @@ impl Renderer {
         Self::from_parts(gpu, scene, streamer, output_format, settings)
             .with_sea(&paged.sea)
             .with_still_water(&paged.still_water)
+    }
+
+    /// Writes over part of a page from the next frame on: `data` in place of what is
+    /// `offset` bytes into it, both whole words. This is how a thing is made as the game is
+    /// played: the scene holds a mesh for it, built with nothing coarser made from it
+    /// (`solstice_builder::BuildOptions::flat`) so that it is all in pages that are always
+    /// loaded, with bounds wide enough for whatever it will be, and its points are written
+    /// here when they are known. Its triangles stay as they are. An instance of it should
+    /// be movable ([`Self::set_instance_movable`]), so that it is drawn afresh each frame
+    /// rather than kept in a view drawn before.
+    pub fn rewrite_page(&mut self, page: u32, offset: u32, data: Vec<u8>) {
+        self.rewrites.push((page, offset, data));
+    }
+
+    /// Makes one of the scene's materials this one from the next frame on. For materials
+    /// with no texture alone: one with a texture is refused, and stays as it is.
+    pub fn set_material(&mut self, index: u32, material: solstice_asset::Material) {
+        self.recoloured.push((index, material));
     }
 
     /// For a scene that keeps its tables outside its manifest: takes a pinned page and its
@@ -584,6 +619,9 @@ impl Renderer {
         self.scene.instance_table.set_hidden(instance, hidden)
     }
 
+    /// Below zero, it glows red, as brightly as it would have glowed above: a tail lamp, whose
+    /// model has a white lamp behind what should be red glass.
+    ///
     /// Scales how brightly an instance's material glows, as a lamp is lit or put out: 1 as the
     /// material says, 0 dark.
     pub fn set_instance_glow(&mut self, instance: u32, glow: f32) -> bool {
@@ -766,6 +804,11 @@ impl Renderer {
             particles,
             profiler: Profiler::new(gpu),
             scene,
+            lamp: None,
+            coat: None,
+            resprays: Vec::new(),
+            ruts: crate::ruts::RutMap::new(gpu),
+            rut_soil: Vec3::new(0.33, 0.15, 0.075),
             streamer,
             frame_uniform,
             view_slots,
@@ -795,6 +838,8 @@ impl Renderer {
             frame_index: 0,
             time: 0.0,
             frame_seconds: 1.0 / 60.0,
+            rewrites: Vec::new(),
+            recoloured: Vec::new(),
         }
     }
 
@@ -940,6 +985,55 @@ impl Renderer {
         self.clouds.weather()
     }
 
+    /// Says what whatever is driven wears from now on (see [`crate::Coat`]), and which of
+    /// the scene's instances are it; or, with `None`, that nothing wears anything. The
+    /// instances are taken as one run of the scene's: a car's are, as a bake places them.
+    /// Set each frame the car moves, as its lamp is.
+    pub fn set_coat(&mut self, coat: Option<(crate::Coat, &[u32])>) {
+        self.coat = coat.and_then(|(coat, instances)| {
+            let numbered = instances
+                .iter()
+                .filter_map(|&instance| self.scene.instance_table.gpu_number(instance));
+            let (first, last) = numbered.fold((u32::MAX, 0), |(first, last), number| {
+                (first.min(number), last.max(number))
+            });
+            (first <= last).then(|| (coat, first, last - first + 1))
+        });
+    }
+
+    /// Says which trucks stand about in colours of their own: for each, its colour, the
+    /// colour its paint was made in, and the instances that draw it, which are taken as one
+    /// run of the scene's. Only the first [`crate::frame::RESPRAYS`] of them are painted.
+    /// It holds until it is set again.
+    pub fn set_resprays(&mut self, resprays: &[(Vec3, Vec3, Vec<u32>)]) {
+        self.resprays = resprays.to_vec();
+    }
+
+    /// Brings the ruts that are drawn up to date with the map of them that `source` keeps
+    /// (see [`crate::ruts`]), round `centre`: the world's x and z of what is looked at. Call
+    /// each frame something may have been driven; on ground nobody has pressed it does
+    /// nothing. Returns how many squares of the map were copied to the GPU.
+    pub fn sync_ruts(&mut self, centre: glam::Vec2, source: &dyn crate::ruts::RutSource) -> usize {
+        self.ruts.sync(centre, source)
+    }
+
+    /// Says what colour the soil is that tyres churn up: red clay, unless told.
+    pub fn set_rut_soil(&mut self, soil: Vec3) {
+        self.rut_soil = soil;
+    }
+
+    /// Turns on the lamps of whatever is driven, where they are now, or turns them off. Set
+    /// each frame as the car moves.
+    pub fn set_lamp(&mut self, lamp: Option<crate::Lamp>) {
+        self.lamp = lamp;
+    }
+
+    /// What the rain has done so far: how hard it falls now, how wet it has left what is open
+    /// to the sky, and how full the puddles are. For a game whose ground the rain changes.
+    pub fn rain_state(&self) -> crate::rain::RainState {
+        self.rain.state
+    }
+
     /// Whether this scene has cut-out materials, and so the passes that draw them.
     pub fn draws_masked(&self) -> bool {
         self.rasterizer.draws_masked()
@@ -1044,6 +1138,19 @@ impl Renderer {
 
         // Everything below draws what's installed from here on, with instances where they are
         // this frame.
+        for (page, offset, data) in std::mem::take(&mut self.rewrites) {
+            if !self.streamer.rewrite(gpu, &self.scene, page, offset, &data) {
+                log::warn!("page {page} could not be written over at {offset}: it is not installed, or is shorter");
+            }
+        }
+        for (index, material) in std::mem::take(&mut self.recoloured) {
+            if !self
+                .streamer
+                .set_material(gpu, &self.scene, index, material)
+            {
+                log::warn!("material {index} could not be changed: it has a texture, or there is none such");
+            }
+        }
         self.streamer.update(gpu, &self.scene, delta_seconds);
         let changes = self.scene.update_instances(gpu);
         let streamed = self.streamer.should_refresh_cached_views();
@@ -1536,6 +1643,7 @@ impl Renderer {
             &visibility,
             &self.main_work,
             &gbuffer,
+            &self.ruts.view,
         );
 
         let history = PostProcess::history_targets(gpu, output_size);
@@ -1642,6 +1750,30 @@ impl Renderer {
         };
         let previous = self.history.unwrap_or(current);
 
+        // The coat of what is driven: the world as its own space sees it, a row a line.
+        let coat = self.coat;
+        let coat_rows = coat.map_or([glam::Vec4::ZERO; 3], |(coat, ..)| {
+            let to_car = coat.car.inverse();
+            [to_car.row(0), to_car.row(1), to_car.row(2)]
+        });
+        // And of what stands about: each where its instances are numbered now.
+        let mut resprays = [crate::frame::Respray::default(); crate::frame::RESPRAYS];
+        for (slot, (paint, was, instances)) in resprays.iter_mut().zip(&self.resprays) {
+            let numbered = instances
+                .iter()
+                .filter_map(|&instance| self.scene.instance_table.gpu_number(instance));
+            let (first, last) = numbered.fold((u32::MAX, 0), |(first, last), number| {
+                (first.min(number), last.max(number))
+            });
+            if first <= last {
+                *slot = crate::frame::Respray {
+                    paint: *paint,
+                    first,
+                    was: *was,
+                    count: last - first + 1,
+                };
+            }
+        }
         let frame = FrameUniform {
             view_proj: jittered,
             inv_view_proj: jittered.inverse(),
@@ -1682,6 +1814,32 @@ impl Renderer {
             },
             moon_disc: environment.moon_disc.unwrap_or(Vec3::NEG_Y),
             _pad2: 0.0,
+            lamp_position: self.lamp.map_or(Vec3::ZERO, |lamp| lamp.position),
+            lamp_range: self.lamp.map_or(0.0, |lamp| lamp.range),
+            lamp_direction: self.lamp.map_or(Vec3::NEG_Z, |lamp| lamp.direction),
+            lamp_spread: self.lamp.map_or(1.0, |lamp| lamp.half_angle.cos()),
+            lamp_intensity: self.lamp.map_or(Vec3::ZERO, |lamp| lamp.intensity),
+            _pad3: 0.0,
+            coat_x: coat_rows[0],
+            coat_y: coat_rows[1],
+            coat_z: coat_rows[2],
+            coat_paint: coat.map_or(Vec3::ZERO, |(coat, ..)| coat.paint),
+            coat_rust: coat.map_or(0.0, |(coat, ..)| coat.rust.clamp(0.0, 1.0)),
+            coat_soil: coat.map_or(Vec3::ZERO, |(coat, ..)| coat.soil),
+            coat_mud: coat.map_or(0.0, |(coat, ..)| coat.mud.clamp(0.0, 1.0)),
+            coat_was: coat.map_or(Vec3::ZERO, |(coat, ..)| coat.was),
+            coat_dust: coat.map_or(0.0, |(coat, ..)| coat.dust.clamp(0.0, 1.0)),
+            coat_first: coat.map_or(0, |(_, first, _)| first),
+            coat_count: coat.map_or(0, |(_, _, count)| count),
+            coat_seed: coat.map_or(0, |(coat, ..)| coat.seed),
+            coat_wet: coat.map_or(0.0, |(coat, ..)| coat.wet.clamp(0.0, 1.0)),
+            coat_axles: coat.map_or(glam::Vec4::ZERO, |(coat, ..)| {
+                glam::Vec4::from_array(coat.axles)
+            }),
+            resprays,
+            rut_window: self.ruts.window(),
+            rut_soil: self.rut_soil,
+            rut_cell: self.ruts.cell(),
             daylight_illuminance: environment.daylight(),
         };
         gpu.queue

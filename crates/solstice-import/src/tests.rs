@@ -443,13 +443,18 @@ fn material_sample(image: &ImageData) -> u8 {
     material::sample(image, 0.3, 0.3, 4)[0]
 }
 
+/// A material whose alpha is blended is glass: seen through, by its colour's alpha.
 #[test]
-fn unsupported_features_are_reported_not_hidden() {
+fn a_blended_material_is_glass() {
     let dir = TempDir::new();
-    let materials = r#", "materials": [{"alphaMode": "BLEND", "doubleSided": true}]"#;
+    let materials = r#", "materials": [{"alphaMode": "BLEND", "doubleSided": true,
+        "pbrMetallicRoughness": {"baseColorFactor": [0.1, 0.1, 0.1, 0.25]}}]"#;
     let path = write_model(&dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, materials);
-    let warnings = import(&path).warnings.join("\n");
-    assert!(warnings.contains("Blend"), "{warnings}");
+    let imported = import(&path);
+    let glass = &imported.scene.materials[0];
+    assert_eq!(glass.flags & Material::GLASS, Material::GLASS);
+    assert_eq!(glass.base_color[3], 0.25);
+    assert!(imported.warnings.iter().all(|w| !w.contains("Blend")));
 }
 
 /// Writes a model with two images, each a flat 2x2 colour, and the given materials over them,
@@ -703,6 +708,7 @@ fn small_model(meshes: usize, materials: usize, layers: usize) -> Imported {
     Imported {
         scene,
         parts: HashMap::from([("kit_wall_01".to_string(), vec![piece])]),
+        names: Vec::new(),
         warnings: Vec::new(),
     }
 }
@@ -1158,7 +1164,7 @@ fn what_blends_and_glows_becomes_cards_and_emissive_maps_are_kept() {
     assert_eq!(leftmost, 1.0);
 }
 
-/// Without textures there is nothing to draw a card with, so it is left as it was.
+/// Without textures there is nothing to draw a card with: it is a surface still, and glass.
 #[test]
 fn without_textures_a_blended_material_stays_solid() {
     let dir = TempDir::new();
@@ -1167,7 +1173,6 @@ fn without_textures_a_blended_material_stays_solid() {
     let report = streamed::bake_large(&path, &output, &large_options()).unwrap();
     assert_eq!((report.glow_maps, report.cards), (0, 0));
     assert_eq!(report.instances, 2);
-    assert!(report.warnings.iter().any(|w| w.contains("Blend")));
     assert!(report
         .warnings
         .iter()

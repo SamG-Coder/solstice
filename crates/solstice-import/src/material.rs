@@ -179,11 +179,6 @@ impl<'a> MaterialTable<'a> {
 
     fn convert(&mut self, source: &gltf::Material<'_>, warnings: &mut Vec<String>) -> Material {
         let name = source.name().unwrap_or("unnamed");
-        if source.alpha_mode() == gltf::material::AlphaMode::Blend {
-            warnings.push(format!(
-                "material '{name}': alpha mode Blend is drawn as opaque"
-            ));
-        }
         if source.emissive_texture().is_some() {
             warnings.push(format!(
                 "material '{name}': emissive texture is ignored, only its factor is used"
@@ -252,15 +247,22 @@ impl<'a> MaterialTable<'a> {
         Material {
             base_color: pbr.base_color_factor(),
             emissive: [er, eg, eb],
-            flags: if source.double_sided() {
-                Material::TWO_SIDED
-            } else {
-                0
-            } | if masked.is_some() {
-                Material::MASKED
-            } else {
-                0
-            },
+            flags: named_flags(source.name())
+                | if source.double_sided() {
+                    Material::TWO_SIDED
+                } else {
+                    0
+                }
+                | if masked.is_some() {
+                    Material::MASKED
+                } else {
+                    0
+                }
+                | if source.alpha_mode() == gltf::material::AlphaMode::Blend {
+                    Material::GLASS
+                } else {
+                    0
+                },
             roughness: pbr.roughness_factor(),
             metallic: pbr.metallic_factor(),
             uv_scale: 1.0,
@@ -492,5 +494,19 @@ fn texel(image: &ImageData, x: i64, y: i64) -> [f32; 4] {
             f32_at(index * 4 + 2),
             f32_at(index * 4 + 3),
         ],
+    }
+}
+
+/// What a material's name says of it: one whose name begins `paint` is the paint of
+/// something driven, and one whose name begins `inside` is in its cab or under its bonnet
+/// (`Material::PAINT`, `Material::INSIDE`). A model is given such names when it is made ready.
+pub(crate) fn named_flags(name: Option<&str>) -> u32 {
+    let name = name.unwrap_or("").to_ascii_lowercase();
+    if name.starts_with("paint") {
+        Material::PAINT
+    } else if name.starts_with("inside") {
+        Material::INSIDE
+    } else {
+        0
     }
 }

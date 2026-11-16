@@ -13,6 +13,7 @@
 #include "common/frame.wgsl"
 #include "common/wetness.wgsl"
 #include "rain/surface.wgsl"
+#include "ground/ruts.wgsl"
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> vis_depth: array<u32>;
@@ -56,9 +57,11 @@ fn triangle_word(word: u32) -> u32 {
 @group(1) @binding(12) var top_color: texture_2d_array<f32>;
 @group(1) @binding(13) var top_normal: texture_2d_array<f32>;
 @group(1) @binding(14) var top_material: texture_2d_array<f32>;
+// The ruts tyres have pressed into the ground, round the camera: ground/ruts.wgsl.
+@group(1) @binding(15) var rut_map: texture_2d_array<f32>;
 // glow:begin
 // The emissive maps, for a scene that has any. Compiled out of one that hasn't.
-@group(1) @binding(15) var glow_maps: texture_2d_array<f32>;
+@group(1) @binding(16) var glow_maps: texture_2d_array<f32>;
 // `flags` above this bit: one more than the material's layer among the emissive maps, or zero.
 const MATERIAL_GLOW_SHIFT: u32 = 16u;
 // `Material.emissive` of a material with a map is the map's light taken over its surface, as this
@@ -202,6 +205,120 @@ fn layer_of(m: Material, uv: vec2f, duv_dx: vec2f, duv_dy: vec2f) -> Layer {
     );
 }
 
+// A surface of whatever is driven, in its coat (`Coat` in frame.rs).
+struct Coated {
+    albedo: vec3f,
+    roughness: f32,
+    metallic: f32,
+    normal: vec3f,
+}
+
+// A paint's new colour, where the texture is the colour the paint was made in: by its
+// colour and not its shade, so that a shadow painted into it is still there.
+fn resprayed(albedo: vec3f, was: vec3f, paint: vec3f) -> vec3f {
+    let value = max(albedo.r, max(albedo.g, albedo.b));
+    let was_value = max(was.r, max(was.g, was.b));
+    if was_value <= 0.0 {
+        return albedo;
+    }
+    let hue = albedo / max(value, 1.0e-4);
+    let was_hue = was / was_value;
+    let share = (1.0 - smoothstep(0.18, 0.5, distance(hue, was_hue))) * smoothstep(0.015, 0.06, value);
+    return mix(albedo, paint * clamp(value / was_value, 0.0, 1.5), share);
+}
+
+// Gives a surface of whatever is driven the colour its paint is to be, and lays on it its
+// rust, its dust and its mud. `world` is where the point is and `local` where it is in its
+// own mesh, which for a wheel turns with the wheel.
+fn coat(material: Material, surface: Coated, world: vec3f, local: vec3f) -> Coated {
+    var out = surface;
+    // Where the point is in the car, and how far its surface faces up, as the car lies.
+    let p = vec3f(
+        dot(frame.coat_x.xyz, world) + frame.coat_x.w,
+        dot(frame.coat_y.xyz, world) + frame.coat_y.w,
+        dot(frame.coat_z.xyz, world) + frame.coat_z.w,
+    );
+    let up = dot(frame.coat_y.xyz, surface.normal);
+    let seed = frame.coat_seed;
+    let half_track = frame.coat_axles.z;
+    let radius = frame.coat_axles.w;
+    // How far the point is from the nearer axle, seen from the side; and whether it is a
+    // wheel's, out at the track and within a wheel's radius of an axle.
+    let behind_front = p.z - frame.coat_axles.x;
+    let behind_rear = p.z - frame.coat_axles.y;
+    let from_axle = min(length(vec2f(p.y - radius, behind_front)), length(vec2f(p.y - radius, behind_rear)));
+    let outboard = smoothstep(half_track - 0.42, half_track - 0.16, abs(p.x));
+    let wheel = outboard * (1.0 - smoothstep(radius + 0.01, radius + 0.05, from_axle));
+    // What is on a wheel stays on it as it turns: its noise is read in the wheel's own space.
+    let q = select(p, local + vec3f(7.0), wheel > 0.5);
+    let broad = gradient_noise(q * 2.1, seed);
+    let fine = gradient_noise(q * 8.5, seed + 1u);
+    let speck = gradient_noise(q * 27.0, seed + 2u);
+    // A gradient in the car's space, as a direction in the world: to roughen a surface by.
+    let rough_way = frame.coat_x.xyz * (fine.y + speck.y * 0.6)
+        + frame.coat_y.xyz * (fine.z + speck.z * 0.6)
+        + frame.coat_z.xyz * (fine.w + speck.w * 0.6);
+
+    if (material.flags & MATERIAL_PAINT) != 0u {
+        out.albedo = resprayed(out.albedo, frame.coat_was, frame.coat_paint);
+        // Rust, where water sits: low on the panels and round the wheel arches, in blotches
+        // that spread as it gets worse, and run down from where they begin.
+        if frame.coat_rust > 0.0 {
+            let arch = (1.0 - smoothstep(0.05, 0.3, abs(from_axle - (radius + 0.13)))) * outboard;
+            let low = 1.0 - smoothstep(0.3, 1.1, p.y);
+            let prone = clamp(0.22 + 0.6 * low + 0.7 * arch, 0.0, 1.25);
+            let runs = gradient_noise(vec3f(q.x * 6.5, q.y * 1.1, q.z * 6.5), seed + 3u).x;
+            let blotch = broad.x * 1.1 + fine.x * 0.55 + runs * 0.5 + speck.x * 0.15;
+            let edge = 0.95 - 1.75 * frame.coat_rust * prone;
+            let rusted = smoothstep(edge, edge + 0.07, blotch);
+            // Paint lifts and dulls round the edge of it before it goes.
+            let lifting = smoothstep(edge - 0.16, edge, blotch) * (1.0 - rusted);
+            let rust_colour = mix(vec3f(0.16, 0.055, 0.02), vec3f(0.4, 0.16, 0.045), clamp(speck.x * 1.4 + 0.5 + fine.x * 0.5, 0.0, 1.0));
+            out.albedo = mix(out.albedo * (1.0 - 0.35 * lifting), rust_colour, rusted);
+            out.roughness = mix(mix(out.roughness, 0.6, lifting), 0.93, rusted);
+            out.metallic = mix(out.metallic, 0.0, rusted);
+            out.normal = normalize(out.normal + rough_way * 0.22 * rusted);
+        }
+    }
+    if (material.flags & MATERIAL_INSIDE) != 0u {
+        return out;
+    }
+
+    // Dust: a film over everything, thickest on what faces up and towards the back, and
+    // never quite even.
+    if frame.coat_dust > 0.0 {
+        let lies = 0.5 + 0.5 * max(up, 0.0) + 0.22 * smoothstep(-1.0, 2.5, p.z) + 0.3 * broad.x;
+        let film = clamp(frame.coat_dust * lies * (0.9 + 0.5 * fine.x), 0.0, 1.0);
+        let dust_colour = mix(frame.coat_soil, vec3f(0.72, 0.64, 0.53), 0.4);
+        out.albedo = mix(out.albedo, dust_colour, film * 0.85);
+        out.roughness = mix(out.roughness, 0.93, film);
+        out.metallic = out.metallic * (1.0 - 0.92 * film);
+    }
+
+    // Mud: caked from the ground up, the higher the more of it there is; thrown up along the
+    // flanks behind each wheel; spattered above that; and all over the wheels themselves.
+    if frame.coat_mud > 0.0 {
+        let mud = frame.coat_mud;
+        let rise = 0.28 + 1.2 * mud;
+        let low = 1.0 - smoothstep(0.12 * rise, rise, p.y);
+        let flank = smoothstep(half_track - 0.5, half_track - 0.12, abs(p.x)) * (1.0 - smoothstep(0.45, 1.55, p.y));
+        let thrown = max(exp(-pow((behind_front - 0.8) / 0.85, 2.0)), exp(-pow((behind_rear - 0.8) / 0.85, 2.0))) * flank;
+        let cover = mud * (low + 0.75 * thrown) + wheel * min(mud * 1.6, 1.0);
+        let edge = 0.6 - (broad.x * 0.55 + fine.x * 0.36 + speck.x * 0.12);
+        var caked = smoothstep(edge, edge + 0.07, cover * 1.25);
+        let spots = gradient_noise(q * 19.0, seed + 5u).x;
+        let spatter = mud * (1.0 - smoothstep(rise * 0.7, rise + 0.9, p.y)) * smoothstep(0.2, 0.27, spots + 0.12 * mud);
+        caked = max(caked, spatter);
+        let fresh = frame.coat_wet;
+        let mud_colour = frame.coat_soil * mix(0.92, 0.5, fresh) * (0.86 + 0.28 * (speck.x + 0.5));
+        out.albedo = mix(out.albedo, mud_colour, caked);
+        out.roughness = mix(out.roughness, mix(0.96, 0.42, fresh), caked);
+        out.metallic = out.metallic * (1.0 - caked);
+        out.normal = normalize(out.normal + rough_way * 0.3 * caked);
+    }
+    return out;
+}
+
 fn hash_color(value: u32) -> vec3f {
     let h = pcg(value);
     return vec3f(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0 * 0.8 + 0.2;
@@ -330,7 +447,23 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         normal = -normal;
     }
     // The geometry's own normal, before any normal map, for water to pool against.
-    let surface_normal = normal;
+    var surface_normal = normal;
+    // Ground that tyres have pressed is seen where the eye's ray meets it as it is now,
+    // not as the land was made (ground/ruts.wgsl): there its textures are laid, and that
+    // way it faces. `ground` is that place; `world` stays the land's own, for what moves.
+    let is_ground = (material.flags & MATERIAL_BLENDS) != 0u && material.texture_layer >= 0;
+    var ground = world;
+    var rut = Rut(false, world, 0.0, normal, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let footprint = sqrt(length(dp_dx) * length(dp_dy));
+    if is_ground && frame.rut_window.z > 0.0 {
+        rut = rut_trace(world, normal, footprint);
+        if rut.near {
+            ground = rut.at;
+            normal = rut.normal;
+        }
+    }
+    // How much of the ground here is mud, to be drawn as mud.
+    var mud_share = 0.0;
 
     var albedo = material.base_color.rgb;
     var roughness = material.roughness;
@@ -351,7 +484,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             // across, as sand blows over a path and grass creeps onto it, not one smooth line.
             var breakup = vec3f(0.0);
             if max(shares.x, max(shares.y, shares.z)) < 0.999 {
-                let p = vec3f(world.x, 0.0, world.z);
+                let p = vec3f(ground.x, 0.0, ground.z);
                 let sand = gradient_noise(p * 0.45, 811u).x + 0.5 * gradient_noise(p * 1.3, 812u).x;
                 let dirt = gradient_noise(p * 0.45 + 17.0, 813u).x + 0.5 * gradient_noise(p * 1.3 + 17.0, 814u).x;
                 // Faded out with each share, so a kind leaves off smoothly before it is skipped.
@@ -366,7 +499,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                 }
                 let m = materials[index + k];
                 let scale = m.uv_scale;
-                layers[k] = layer_of(m, world.xz * scale, dp_dx.xz * scale, dp_dy.xz * scale);
+                layers[k] = layer_of(m, ground.xz * scale, dp_dx.xz * scale, dp_dy.xz * scale);
                 // Each texture's relief, from its cavity: what stands proud shows first where
                 // two kinds meet, so grass shows on the bumps and sand settles in the hollows.
                 scores[k] = shares[k] + breakup[k] + layers[k].cavity * BLEND_RELIEF;
@@ -382,6 +515,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
                     surface.roughness += layers[k].roughness * blend[k];
                     surface.metallic += layers[k].metallic * blend[k];
                     surface.tangent += layers[k].tangent * blend[k];
+                    if (materials[index + k].flags & MATERIAL_MUD) != 0u {
+                        mud_share += blend[k];
+                    }
                 }
             }
             // The tangent frame follows the world's x and z, as all three are laid.
@@ -410,6 +546,63 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             let inv = 1.0 / sqrt(scale);
             normal = normalize(tangent * inv * tangent_xy.x + bitangent * inv * tangent_xy.y + normal * tangent_z);
         }
+    } else if (material.flags & MATERIAL_BLENDS) != 0u {
+        // A thing of three plain materials with no texture, this one and the two after it: a
+        // nugget's gold, say, the clay in its hollows and the rock in it.
+        // The mesh's texture coordinates hold how much of the second and third there is at
+        // each point. Between points each share is drawn to one side or the other, so that
+        // where two kinds meet there is an edge, which wanders across the triangles as the
+        // shares do, and not a smear a triangle wide.
+        let index = instance_material(instance);
+        let raw = uv / max(material.uv_scale, 1.0e-6);
+        let third = smoothstep(0.42, 0.58, raw.y);
+        let second = smoothstep(0.38, 0.62, raw.x) * (1.0 - third);
+        let first = 1.0 - second - third;
+        let m1 = materials[index + 1u];
+        let m2 = materials[index + 2u];
+        albedo = material.base_color.rgb * first + m1.base_color.rgb * second + m2.base_color.rgb * third;
+        roughness = material.roughness * first + m1.roughness * second + m2.roughness * third;
+        metallic = material.metallic * first + m1.metallic * second + m2.metallic * third;
+    }
+
+    // The ground as it lies and as tyres have left it: mud drawn as mud, wet at its heart
+    // and cracked at its rim, and where it was pressed, churned soil with the tread's
+    // print in it and water standing in the ruts (ground/ruts.wgsl).
+    var ground_wet = 0.0;
+    var ground_pool = 0.0;
+    var ground_shade = 1.0;
+    if is_ground && (mud_share > 0.02 || rut.near) {
+        let rain_state = rain.rain;
+        var lies = Ground(albedo, roughness, cavity, normal, surface_normal, 0.0, 0.0, 1.0);
+        lies = mud_lies(lies, mud_share, ground, footprint, rain_state.z, rain_state.w);
+        lies = rut_shade(lies, rut, mud_share, rain_state.w);
+        albedo = lies.albedo;
+        roughness = lies.roughness;
+        cavity = lies.cavity;
+        normal = lies.normal;
+        surface_normal = lies.surface_normal;
+        ground_wet = lies.wet;
+        ground_pool = lies.pool;
+        ground_shade = lies.shade;
+    }
+
+    // Trucks that stand about are each in a colour of their own.
+    if (material.flags & MATERIAL_PAINT) != 0u {
+        for (var run = 0u; run < 8u; run++) {
+            let respray = frame.resprays[run];
+            if entry.instance - respray.first < respray.count {
+                albedo = resprayed(albedo, respray.was, respray.paint);
+            }
+        }
+    }
+
+    // What is driven wears its coat: its paint's colour, and its rust, dust and mud.
+    if entry.instance - frame.coat_first < frame.coat_count {
+        let coated = coat(material, Coated(albedo, roughness, metallic, normal), world, interp3(b, local0, local1, local2));
+        albedo = coated.albedo;
+        roughness = coated.roughness;
+        metallic = coated.metallic;
+        normal = coated.normal;
     }
 
     // Water on the surface, where the sea has been (docs/wetness.md).
@@ -424,8 +617,19 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         0.0,
         1.0,
     );
-    var wet = wet_material(albedo, roughness, metallic, normal, surface_normal, max(sea.x, rain_wet), sea.y);
+    var wet = wet_material(albedo, roughness, metallic, normal, surface_normal, max(max(sea.x, rain_wet), ground_wet), sea.y);
     wet = under_puddle(wet, surface_normal, rained);
+    // The shade of lying low in a rut, on the colour as wet as it has come out.
+    wet.albedo *= ground_shade;
+    // Water standing in a rut or a hollow of mud: brown with clay, level, and smooth.
+    if ground_pool > 0.0 {
+        wet.albedo = pooled(wet.albedo, ground_pool);
+        wet.roughness = mix(wet.roughness, PUDDLE_ROUGHNESS * 2.0, ground_pool);
+        wet.normal = normalize(mix(wet.normal, vec3f(0.0, 1.0, 0.0), ground_pool));
+        // The water's own surface is open to the sky, however deep the rut it lies in.
+        cavity = mix(cavity, 1.0, ground_pool);
+        wet.wetness = max(wet.wetness, ground_pool);
+    }
     albedo = wet.albedo;
     roughness = wet.roughness;
     normal = wet.normal;
@@ -440,13 +644,17 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let current_ndc = current_clip.xy / current_clip.w;
     let motion = (prev_ndc - current_ndc) * vec2f(0.5, -0.5);
 
-    var emissive = material.emissive * instance.glow;
+    var emissive = material.emissive * abs(instance.glow);
     // glow:begin
     let glow_layer = material.flags >> MATERIAL_GLOW_SHIFT;
     if glow_layer != 0u {
         emissive *= textureSampleGrad(glow_maps, material_sampler, uv, i32(glow_layer - 1u), duv_dx * frame.mip_scale, duv_dy * frame.mip_scale).rgb / MATERIAL_GLOW_AVERAGE;
     }
     // glow:end
+    // A lamp behind red glass: an instance told to glow less than nothing.
+    if instance.glow < 0.0 {
+        emissive = dot(emissive, vec3f(0.6)) * vec3f(1.0, 0.035, 0.012);
+    }
 
     switch frame.debug_mode {
         case DEBUG_CLUSTERS: {

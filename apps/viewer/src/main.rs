@@ -118,7 +118,16 @@ mod native {
         request: &StreamRequest,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut file = std::fs::File::open(path)?;
-        file.seek(SeekFrom::Start(request.start))?;
+        // A scene joined with the file it shares with others is two files, whose bytes are
+        // numbered straight on from one to the other: past the end of the scene's is the
+        // shared one (`read_source`).
+        let length = file.metadata()?.len();
+        if request.start >= length {
+            file = std::fs::File::open(path.with_file_name(solstice_viewer::shared::FILE))?;
+            file.seek(SeekFrom::Start(request.start - length))?;
+        } else {
+            file.seek(SeekFrom::Start(request.start))?;
+        }
         let mut bytes = vec![0; (request.end - request.start) as usize];
         file.read_exact(&mut bytes)?;
         if request.deflated {
@@ -792,17 +801,48 @@ mod native {
         Ok(scene)
     }
 
+    /// Reads a scene: all of it, or what says where the rest of it is. One whose game has
+    /// actors that are in the file it shares with other scenes is read with that file, which
+    /// is beside it, and the two are one scene (`solstice_viewer::shared`).
+    fn read_source(options: &Options) -> Result<Source, Box<dyn std::error::Error>> {
+        let path = &options.scene;
+        let beside = path.with_file_name(solstice_viewer::shared::FILE);
+        let missing = |error: Box<dyn std::error::Error>| {
+            format!(
+                "{}, which this scene is read with, could not be read: {error}",
+                beside.display()
+            )
+        };
+        Ok(if options.stream {
+            let mut scene = read_manifest(path)?;
+            if solstice_viewer::shared::wanted(&scene.gameplay) {
+                let shared = read_manifest(&beside).map_err(missing)?;
+                let files = shared.gameplay.clone();
+                // The shared file's bytes are numbered on from the end of the scene's.
+                let after = std::fs::metadata(path)?.len();
+                let joined = solstice_asset::join::join(&mut scene, shared, after)?;
+                solstice_viewer::shared::adopt(&mut scene, &files, joined)?;
+            }
+            Source::Streamed(scene)
+        } else {
+            let mut scene = load_scene(path)?;
+            if solstice_viewer::shared::wanted(&scene.scene.gameplay) {
+                let shared = load_scene(&beside).map_err(missing)?;
+                let files = shared.scene.gameplay.clone();
+                let joined = scene.join(shared)?;
+                solstice_viewer::shared::adopt(&mut scene.scene, &files, joined)?;
+            }
+            Source::Loaded(scene)
+        })
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         env_logger::Builder::from_env(
             env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn"),
         )
         .init();
         let options = parse_args()?;
-        let scene = if options.stream {
-            Source::Streamed(read_manifest(&options.scene)?)
-        } else {
-            Source::Loaded(load_scene(&options.scene)?)
-        };
+        let scene = read_source(&options)?;
         if let Some(near) = options.instances_near {
             scene.list_instances(near);
             return Ok(());

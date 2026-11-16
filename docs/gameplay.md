@@ -1088,6 +1088,12 @@ Built for a racing game on the engine,
   (`kerb`, `grass`, `gravel`, `concrete`). From it each tyre knows what it is on, laps are
   timed with sectors, a lap that leaves the road does not count, and `reset` puts a car back.
   A car that falls far below its track is put back without asking.
+- **Land that is no circuit** has a map of its ground instead, named by a scene's
+  `surfaces FILE` (`solstice_game::SurfaceMap`, `crates/solstice-game/src/ground.rs`): a grid
+  of squares, each of one surface, which each tyre reads the square it is on of. Besides a
+  circuit's four there are `dirt`, `mud`, `bog`, `litter`, `rock`, `ford` and `sand`, each
+  with how far a tyre sinks into it and what rain does to it. Where a scene has both, the
+  map is what the tyres read. Soft ground keeps the ruts driven into it (docs/ruts.md).
 - **The camera** follows the player's car. `camera` steps through four views behind it, each
   further out, and two on it. `look_round` and `look_over`, the right stick, swing it round
   the car and tip it over; `look_back` is the mirror.
@@ -1135,6 +1141,42 @@ Built for a racing game on the engine,
   of what is in it. A scene without actors has no section, so it is written byte for byte as
   before. The bake checks every actor, setting and script, and stops at the first mistake, with
   its line.
+- **What several scenes share.** A game's maps have things in common that are no part of any
+  of them: its truck, what its driver carries. Baked into each, they are in every map's file.
+  - `shared` at the end of an `actor` line says the actor's model is not in this scene's file
+    but in one beside it, `shared.solstice`, baked from a scene of its own that has an actor
+    of the same `.actor` file. The actor itself, its script, physics and place, is still the
+    scene's.
+  - Whatever reads the two joins them into one scene (`solstice_asset::join::join`): the
+    shared file's tables go after the scene's, renumbered, its pages are dealt in among the
+    scene's from coarse to fine, and its bytes are numbered on from wherever the reader says
+    (`Joined`), for a scene read from its file as it is drawn. The viewer does so
+    (`apps/viewer/src/shared.rs`, `read_source` in `main.rs`): the scene's actor is given
+    the instances that draw it, moved to where the scene puts it. A scene read from its file
+    as it is drawn (`--stream`) reads the shared file the same way, its bytes numbered on
+    from the end of the scene's. The viewer does not yet do so in a browser.
+  - A joined scene is drawn as any other, and the first scene's own numbers do not change.
+    What is refused: a scene split up for a browser, textures of different sizes, and
+    collision or glowing cards in the shared file.
+  - **Lending.** Maps have more in common than their truck: the same trees, grass and
+    stone, the same textures under the ground. A map's own instances are of these, so they
+    cannot simply be the shared scene's. Instead the shared scene lends
+    (`crates/solstice-bake/src/lend.rs`):
+    - `lends` in a scene's text makes it carry a list of every mesh and texture it has, each
+      with a key, a hash of what it is (the gameplay file `shared.lends`).
+    - A scene with a `shared` actor, baked beside that file, leaves out of its own whatever
+      has a key on the list: the mesh becomes an empty place that keeps its number, the
+      texture is dropped, and the scene carries a list of what it left (`shared.borrows`).
+      Nothing says which things are shared. What both have bit for bit is left out, and what
+      differs by anything is kept, so a map is never given the wrong tree.
+    - As the two are joined the places are filled (`solstice_asset::join::fill`): each empty
+      mesh is the lender's, each such material has the lender's layer. The map's instances
+      and materials keep their numbers.
+    - So the shared file is baked first, and a map baked beside one shared file is read with
+      that one: if the stock has changed since, the join says so, and both are baked again.
+  - With `SOLSTICE_WHOLE` set, the bake takes no notice of `shared`, leaves nothing out, and
+    the scene has everything in it: to look at a map on its own, or to tell a fault in the
+    joining from one in the map.
 - **Input** (`.input` files, or built-in actions). An action's value is the sum of its
   controls, times their scales.
   - Buttons and sticks add up to between -1 and 1.

@@ -35,6 +35,26 @@ fn mask_level(tier: u32, uv_per_pixel_squared: f32) -> f32 {
     return clamp(floor(lod + 0.5), 0.0, f32(levels - 1u));
 }
 
+// Glass is seen through. Of the pixels it covers it is drawn in a share, and what is behind it
+// shows in the rest: which pixels, by a pattern that is even over any few of them, moved each
+// frame as the view is jittered, so that the frames blended show the glass and what is behind
+// it together. `share` is below zero for a material that is not glass.
+fn glass_share(material: Material) -> f32 {
+    return select(-1.0, material.base_color.a, (material.flags & MATERIAL_GLASS) != 0u);
+}
+
+// A number that differs from frame to frame, from what of the view does: its jitter.
+fn glass_turn(view_proj: mat4x4f) -> f32 {
+    let moved = abs(view_proj[2].xy) + abs(view_proj[3].xy) + abs(view_proj[0].xy);
+    return floor(fract(dot(moved, vec2f(1237.0, 3571.0))) * 64.0);
+}
+
+fn glass_kept(share: f32, pixel: vec2f, turn: f32) -> bool {
+    // Interleaved gradient noise.
+    let at = floor(pixel) + turn * vec2f(5.588238, 5.588238);
+    return fract(52.9829189 * fract(dot(at, vec2f(0.06711056, 0.00583715)))) < share;
+}
+
 // Whether a material's surface is solid at `uv`, at a level from `mask_level`.
 fn mask_solid(tier: u32, slot: u32, uv: vec2f, level: f32) -> bool {
     var alpha: f32;

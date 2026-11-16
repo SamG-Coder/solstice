@@ -36,10 +36,14 @@ fn vs_masked(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> 
     return out;
 }
 
-fn solid_here(uv: vec2f, material_index: u32) -> bool {
+fn solid_here(uv: vec2f, material_index: u32, pixel: vec2f) -> bool {
     let per_x = dpdx(uv);
     let per_y = dpdy(uv);
     let material = materials[material_index];
+    let share = glass_share(material);
+    if share >= 0.0 {
+        return glass_kept(share, pixel, glass_turn(view.raster_view_proj));
+    }
     let level = mask_level(material.texture_tier, max(dot(per_x, per_x), dot(per_y, per_y)));
     return mask_solid(material.texture_tier, material.texture_slot, uv, level);
 }
@@ -51,7 +55,7 @@ fn fs_masked(
     @location(1) uv: vec2f,
     @location(2) @interpolate(flat) material: u32,
 ) {
-    if !solid_here(uv, material) {
+    if !solid_here(uv, material, position.xy) {
         return;
     }
     let pixel = vec2u(position.xy);
@@ -61,8 +65,12 @@ fn fs_masked(
 
 // For depth maps.
 @fragment
-fn fs_masked_depth(@location(1) uv: vec2f, @location(2) @interpolate(flat) material: u32) {
-    if !solid_here(uv, material) {
+fn fs_masked_depth(
+    @builtin(position) position: vec4f,
+    @location(1) uv: vec2f,
+    @location(2) @interpolate(flat) material: u32,
+) {
+    if !solid_here(uv, material, position.xy) {
         discard;
     }
 }

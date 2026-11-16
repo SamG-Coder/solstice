@@ -55,7 +55,10 @@ pub fn by_name(name: &str, seed: u32) -> Option<Surface> {
         "marble" => marble(seed),
 
         "basalt" => basalt(seed),
-        _ => return Bark::by_name(name).map(|bark| bark.surface(seed)),
+        _ => {
+            return crate::bush::by_name(name, seed)
+                .or_else(|| Bark::by_name(name).map(|bark| bark.surface(seed)))
+        }
     })
 }
 

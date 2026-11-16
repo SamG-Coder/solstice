@@ -19,6 +19,12 @@ use std::sync::Arc;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Played;
 
+/// Marks one the player can play and is not playing now: a car whose driver has got out of
+/// it, or the driver while they are in it. Its script hears nothing, and a car is asked for
+/// nothing but its handbrake.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Idle;
+
 /// Each action's value, which were pressed since the step before, where the game is watched
 /// from, and whether the player is away. Actions not mentioned are 0.
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -39,16 +39,29 @@ pub enum Bark {
     /// Weeping willow: grey-brown and deeply furrowed like an oak's, its corky ridges paler and
     /// yellower, with tan inner bark showing in the furrows and moss where it stays damp.
     Willow,
+    /// A smooth-barked gum, such as a manna gum: bark shed each year in long plates, leaving
+    /// a patchwork of cream, grey, salmon and olive, streaked down the stem, with the dark
+    /// edges of plates not yet let go.
+    Gum,
+    /// A stringybark, such as messmate: thick, soft and fibrous, in long strings that run up
+    /// the stem between deep furrows, grey-brown outside and red-brown within.
+    Stringybark,
+    /// An ironbark: hard, deeply furrowed and nearly black, never shed, with dark red kino
+    /// in its furrows. A tree that has been through a fire looks much the same.
+    Ironbark,
 }
 
 impl Bark {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::Oak,
         Self::Birch,
         Self::Fir,
         Self::Pine,
         Self::Beech,
         Self::Willow,
+        Self::Gum,
+        Self::Stringybark,
+        Self::Ironbark,
     ];
 
     /// The name of this bark in the surface library.
@@ -60,6 +73,9 @@ impl Bark {
             Self::Pine => "pine_bark",
             Self::Beech => "beech_bark",
             Self::Willow => "willow_bark",
+            Self::Gum => "gum_bark",
+            Self::Stringybark => "stringybark",
+            Self::Ironbark => "ironbark",
         }
     }
 
@@ -76,6 +92,9 @@ impl Bark {
             Self::Pine => pine(seed),
             Self::Beech => beech(seed),
             Self::Willow => willow(seed),
+            Self::Gum => gum(seed),
+            Self::Stringybark => stringybark(seed),
+            Self::Ironbark => ironbark(seed),
         }
         .with_tile_metres(BARK_TILE_METRES)
     }
@@ -189,6 +208,113 @@ fn willow(seed: u32) -> Surface {
             fissure: Vec3::new(0.045, 0.028, 0.012),
             lichen: 0.45,
             moss: 1.0,
+        },
+    )
+}
+
+fn stringybark(seed: u32) -> Surface {
+    furrowed(
+        seed + 500,
+        Furrowed {
+            // Weathered grey-brown strings, warmer where they are newly split.
+            ridge: (Vec3::new(0.15, 0.115, 0.085), Vec3::new(0.25, 0.165, 0.1)),
+            // Red-brown inner bark deep in the furrows.
+            fissure: Vec3::new(0.1, 0.04, 0.018),
+            lichen: 0.12,
+            moss: 0.0,
+        },
+    )
+}
+
+fn ironbark(seed: u32) -> Surface {
+    furrowed(
+        seed + 600,
+        Furrowed {
+            // Charcoal, a little brown where the light catches a ridge.
+            ridge: (
+                Vec3::new(0.028, 0.025, 0.024),
+                Vec3::new(0.07, 0.056, 0.048),
+            ),
+            // Kino, the dark red gum that bleeds into the furrows and sets hard.
+            fissure: Vec3::new(0.05, 0.012, 0.008),
+            lichen: 0.06,
+            moss: 0.0,
+        },
+    )
+}
+
+/// A smooth gum's bark: blotches of different ages, as the old bark comes away in sheets of
+/// no particular shape and bares the new under it.
+///
+/// Nothing in it is regular. Where each blotch ends is where a broad, soft noise crosses a
+/// level, so the patches are the shapes of a map's contours, long along the stem, each inside
+/// or beside the next, as on a manna gum or a snow gum. A grid of plates, however jittered,
+/// lines up into stripes round a thin stem.
+fn gum(seed: u32) -> Surface {
+    // How long ago the bark here was bared: broad shapes a hand wide and a forearm long, with
+    // smaller ones on them, and the whole pushed about so that no edge runs straight.
+    let broad = noise(2, 2, 3, seed + 701);
+    let lesser = noise(4, 5, 3, seed + 702);
+    let push = noise(3, 3, 2, seed + 703);
+    let age = move |u: f32, v: f32| {
+        let (du, dv) = (push.at(u, v) * 0.012, push.at(v + 0.31, u + 0.67) * 0.05);
+        broad.at(u + du, v + dv) * 0.68 + lesser.at(u + du, v + dv) * 0.32
+    };
+    // The levels the blotches end at, youngest bark first.
+    const LEVELS: [f32; 4] = [-0.3, -0.04, 0.2, 0.42];
+    let fine = noise(60, 40, 3, seed + 704);
+    let grain = noise(160, 500, 2, seed + 705);
+    let weather = noise(1, 1, 3, seed + 706);
+    // Faint long streaks where rain runs down the stem, and darker stains below a wound.
+    let runs = noise(5, 1, 3, seed + 707);
+    let stains = noise(3, 1, 4, seed + 708);
+    let specks = noise(40, 60, 2, seed + 709);
+    Surface::shaped(
+        move |u, v| {
+            let a = age(u, v);
+            // Which blotch, and how near its edge: there the older bark still overlaps.
+            let band = LEVELS.iter().filter(|&&level| a > level).count();
+            let edge = LEVELS
+                .iter()
+                .map(|&level| (a - level).abs())
+                .fold(f32::MAX, f32::min);
+            let lip = 1.0 - smoothstep(0.0, 0.035, edge);
+            // Each older layer stands a fraction of a millimetre proud of the one it covers.
+            let height = band as f32 * 0.0005 - 0.0007 * lip
+                + 0.0004 * fine.at(u, v)
+                + 0.0001 * grain.at(u, v);
+            (height, band as f32 + lip.min(0.99))
+        },
+        move |u, v, tag, relief: Relief| {
+            let band = tag.floor() as usize;
+            let lip = tag.fract();
+            // Newly bared bark is cream, nearly white; it greys in the weather; the oldest
+            // still on the tree is salmon and tan, and what is about to fall, grey-brown.
+            let color = [
+                Vec3::new(0.63, 0.58, 0.47),
+                Vec3::new(0.52, 0.5, 0.43),
+                Vec3::new(0.42, 0.41, 0.37),
+                Vec3::new(0.47, 0.32, 0.22),
+                Vec3::new(0.3, 0.27, 0.23),
+            ][band.min(4)];
+            let mut color = color
+                * (1.0 + 0.1 * weather.at(u, v))
+                * (1.0 + 0.06 * fine.at(u, v))
+                * (1.0 + 0.05 * runs.at(u, v));
+            let stain = smoothstep(0.45, 0.85, stains.at(u, v));
+            color = color.lerp(color * Vec3::new(0.62, 0.54, 0.47), stain * 0.5);
+            // Flecks of dark where insects and lichen have been.
+            let fleck = smoothstep(0.55, 0.8, specks.at(u, v)) * 0.18;
+            color = color.lerp(Vec3::new(0.14, 0.11, 0.09), fleck);
+            // An edge is the shadowed underside of the sheet above it.
+            color = color.lerp(color * 0.55, lip * 0.5);
+            color *= 1.0 + (relief.fine * 150.0).clamp(-0.12, 0.12);
+            Shade {
+                color,
+                // Smooth, with a faint waxy sheen where it is newest.
+                roughness: 0.6 + 0.07 * band as f32,
+                cavity: 1.0 - 0.35 * lip,
+            }
         },
     )
 }
