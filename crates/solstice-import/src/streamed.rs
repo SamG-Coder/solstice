@@ -1172,7 +1172,7 @@ fn convert_material(
                 0
             }
             | if masked { Material::MASKED } else { 0 }
-            | if source.alpha_mode() == gltf::material::AlphaMode::Blend {
+            | if crate::material::is_glass(&source) {
                 Material::GLASS
             } else {
                 0

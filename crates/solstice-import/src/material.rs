@@ -502,7 +502,7 @@ fn texel(image: &ImageData, x: i64, y: i64) -> [f32; 4] {
 /// Whether a material is glass: blended, and seen through by its colour's own alpha. Glass is
 /// drawn as a share of its pixels, by that alpha alone, so a blended material whose colour is
 /// opaque stays opaque, as it was before glass, and keeps off the masked path it would not use.
-fn is_glass(material: &gltf::Material<'_>) -> bool {
+pub(crate) fn is_glass(material: &gltf::Material<'_>) -> bool {
     material.alpha_mode() == gltf::material::AlphaMode::Blend
         && material.pbr_metallic_roughness().base_color_factor()[3] < 1.0
 }

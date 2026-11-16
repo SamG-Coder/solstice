@@ -468,6 +468,13 @@ fn a_blended_material_with_an_opaque_colour_is_not_glass() {
     let imported = import(&path);
     assert_eq!(imported.scene.materials[0].flags & Material::GLASS, 0);
     assert!(imported.warnings.iter().any(|w| w.contains("Blend")));
+    // The streamed importer agrees.
+    let output = dir.0.join("out.solstice");
+    streamed::bake_large(&path, &output, &large_options()).unwrap();
+    let scene = solstice_asset::file::decode(&std::fs::read(&output).unwrap())
+        .unwrap()
+        .scene;
+    assert_eq!(scene.materials[0].flags & Material::GLASS, 0);
 }
 
 /// Writes a model with two images, each a flat 2x2 colour, and the given materials over them,
