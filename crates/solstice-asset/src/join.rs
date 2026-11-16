@@ -108,21 +108,20 @@ pub fn fill(
         let theirs = *there.get(&(what, key)).ok_or_else(stale)?;
         match what {
             Lent::Mesh => {
-                let mesh = *scene
-                    .meshes
-                    .get((joined.meshes + theirs) as usize)
-                    .ok_or_else(stale)?;
+                let at = joined.meshes.checked_add(theirs).ok_or_else(stale)?;
+                let mesh = *scene.meshes.get(at as usize).ok_or_else(stale)?;
                 *scene.meshes.get_mut(index as usize).ok_or_else(stale)? = mesh;
             }
             Lent::Texture => {
-                if (joined.layers + theirs) as usize >= scene.base_textures.len() {
+                let at = joined.layers.checked_add(theirs).ok_or_else(stale)?;
+                if at as usize >= scene.base_textures.len() {
                     return Err(stale());
                 }
                 scene
                     .materials
                     .get_mut(index as usize)
                     .ok_or_else(stale)?
-                    .texture_layer = (joined.layers + theirs) as i32;
+                    .texture_layer = i32::try_from(at).map_err(|_| stale())?;
             }
         }
     }

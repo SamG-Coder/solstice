@@ -132,6 +132,25 @@ impl Tile {
         (f32::from(raw) - f32::from(HEIGHT_ZERO)) * HEIGHT_UNIT
     }
 
+    /// Everything a cell keeps: both layers' bytes, and how wet it stays.
+    fn cell_bytes(&self, cell: usize) -> [u8; 9] {
+        let (a, b) = (
+            &self.layers[0][cell * 4..][..4],
+            &self.layers[1][cell * 4..][..4],
+        );
+        [
+            a[0],
+            a[1],
+            a[2],
+            a[3],
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            self.stays[cell],
+        ]
+    }
+
     fn set_height(&mut self, cell: usize, height: f32) {
         let raw = (height.clamp(-DEEPEST, HIGHEST) / HEIGHT_UNIT).round() + f32::from(HEIGHT_ZERO);
         let bytes = (raw as u16).to_be_bytes();
@@ -351,7 +370,7 @@ impl Ruts {
         );
         // A strip is a tyre's width and a step's length: anything far larger is a mistake,
         // a car put somewhere else between two steps.
-        if (i1 - i0) > 400 || (j1 - j0) > 400 {
+        if i1.saturating_sub(i0) > 400 || j1.saturating_sub(j0) > 400 {
             return;
         }
         let wet = byte(press.wet);
@@ -366,6 +385,10 @@ impl Ruts {
                 // The square is taken out of the map while it is pressed, and made only if
                 // the strip turns out to reach it.
                 let mut held: Option<Tile> = None;
+                // Whether the square was in the map already, and whether this changed it: a
+                // square is counted changed, and copied again, only when its bytes are.
+                let mut existed = false;
+                let mut dirty = false;
                 let rows =
                     j0.max(tile_j * side_cells)..=j1.min(tile_j * side_cells + side_cells - 1);
                 for j in rows {
@@ -399,58 +422,71 @@ impl Ruts {
                         }
                         let cell = Self::cell_at(i, j).1;
                         let tile = held.get_or_insert_with(|| {
-                            self.tiles.remove(&key).unwrap_or_else(|| Tile::new(clock))
+                            let kept = self.tiles.remove(&key);
+                            existed = kept.is_some();
+                            kept.unwrap_or_else(|| Tile::new(clock))
                         });
-                        let before = tile.height(cell);
-                        let mut after = before;
-                        if target < 0.0 {
-                            after = before.min(target);
-                        } else if target > 0.0 {
-                            after = before.max((before + target).min(target));
+                        let was = tile.cell_bytes(cell);
+                        'cell: {
+                            let before = tile.height(cell);
+                            let mut after = before;
+                            if target < 0.0 {
+                                after = before.min(target);
+                            } else if target > 0.0 {
+                                after = before.max((before + target).min(target));
+                            }
+                            if after != before {
+                                tile.set_height(cell, after);
+                            }
+                            // What the tyre reaches takes its print and its wet: the floor
+                            // where the tread stands on it, and the berm it heaped.
+                            let touched = if under {
+                                target <= before + 0.003
+                            } else {
+                                after != before
+                            };
+                            if !touched {
+                                break 'cell;
+                            }
+                            let layers = &mut tile.layers;
+                            layers[1][cell * 4 + 3] = 255;
+                            if wet > layers[0][cell * 4 + 3] {
+                                layers[0][cell * 4 + 3] = wet;
+                                tile.damp = true;
+                            }
+                            tile.stays[cell] = tile.stays[cell].max(stays);
+                            // Soil shows where the ground was broken: by how deep, a tyre's
+                            // print in dust being soil too.
+                            let broken =
+                                churn * (0.35 + 0.65 * smoothstep(0.0, 0.03, depth * weight));
+                            layers[1][cell * 4 + 2] = layers[1][cell * 4 + 2].max(byte(broken));
+                            // The stretch this step newly rolled over takes the tread's print.
+                            if under && beyond <= 0.0 {
+                                let phase =
+                                    press.phase.0 + (press.phase.1 - press.phase.0) * passed;
+                                // Crisp under the tread, gone at its shoulders.
+                                let crisp = print
+                                    * (1.0 - smoothstep(0.8, 1.0, t.abs() / press.half_width));
+                                layers[1][cell * 4] = byte(0.5 + 0.5 * crisp * phase.cos());
+                                layers[1][cell * 4 + 1] = byte(0.5 + 0.5 * crisp * phase.sin());
+                                layers[0][cell * 4 + 2] = byte(0.5 + 0.5 * t / ACROSS_REACH);
+                            }
                         }
-                        if after != before {
-                            tile.set_height(cell, after);
-                        }
-                        // What the tyre reaches takes its print and its wet: the floor
-                        // where the tread stands on it, and the berm it heaped.
-                        let touched = if under {
-                            target <= before + 0.003
-                        } else {
-                            after != before
-                        };
-                        if !touched {
-                            continue;
-                        }
-                        let layers = &mut tile.layers;
-                        layers[1][cell * 4 + 3] = 255;
-                        if wet > layers[0][cell * 4 + 3] {
-                            layers[0][cell * 4 + 3] = wet;
-                            tile.damp = true;
-                        }
-                        tile.stays[cell] = tile.stays[cell].max(stays);
-                        // Soil shows where the ground was broken: by how deep, a tyre's
-                        // print in dust being soil too.
-                        let broken = churn * (0.35 + 0.65 * smoothstep(0.0, 0.03, depth * weight));
-                        layers[1][cell * 4 + 2] = layers[1][cell * 4 + 2].max(byte(broken));
-                        // The stretch this step newly rolled over takes the tread's print.
-                        if under && beyond <= 0.0 {
-                            let phase = press.phase.0 + (press.phase.1 - press.phase.0) * passed;
-                            // Crisp under the tread, gone at its shoulders.
-                            let crisp =
-                                print * (1.0 - smoothstep(0.8, 1.0, t.abs() / press.half_width));
-                            layers[1][cell * 4] = byte(0.5 + 0.5 * crisp * phase.cos());
-                            layers[1][cell * 4 + 1] = byte(0.5 + 0.5 * crisp * phase.sin());
-                            layers[0][cell * 4 + 2] = byte(0.5 + 0.5 * t / ACROSS_REACH);
-                        }
+                        dirty |= tile.cell_bytes(cell) != was;
                     }
                 }
                 if let Some(mut tile) = held {
-                    tile.version = tile.version.wrapping_add(1).max(1);
-                    if !tile.listed {
-                        tile.listed = true;
-                        self.changed.push(key);
+                    if dirty {
+                        tile.version = tile.version.wrapping_add(1).max(1);
+                        if !tile.listed {
+                            tile.listed = true;
+                            self.changed.push(key);
+                        }
                     }
-                    self.tiles.insert(key, tile);
+                    // A square made for a strip that changed nothing is not kept.
+                    if dirty || existed {
+                        self.tiles.insert(key, tile);
+                    }
                 }
             }
         }
@@ -824,6 +860,26 @@ mod tests {
             tracked.advance(1.0);
         }
         assert_eq!(tracked.wet(1.0, 1.0), 0.0);
+    }
+
+    /// A car standing still presses the same strip each step: once it has settled (the
+    /// second press wets the tread's edge the first heaped), that changes no byte, so no
+    /// square is counted changed and none is copied to the GPU again.
+    #[test]
+    fn pressing_what_is_already_pressed_changes_nothing() {
+        let mut ruts = Ruts::new();
+        let press = rolled(0.1, 0.0, 2.0);
+        ruts.press(&press);
+        ruts.press(&press);
+        let changed = ruts.take_changed();
+        assert!(!changed.is_empty());
+        let versions: Vec<u32> = changed.iter().map(|&tile| ruts.version(tile)).collect();
+        for _ in 0..3 {
+            ruts.press(&press);
+        }
+        assert!(ruts.take_changed().is_empty());
+        let after: Vec<u32> = changed.iter().map(|&tile| ruts.version(tile)).collect();
+        assert_eq!(after, versions);
     }
 
     #[test]

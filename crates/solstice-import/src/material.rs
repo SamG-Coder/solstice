@@ -185,6 +185,12 @@ impl<'a> MaterialTable<'a> {
             ));
         }
 
+        if source.alpha_mode() == gltf::material::AlphaMode::Blend && !is_glass(source) {
+            warnings.push(format!(
+                "material '{name}': alpha mode Blend with an opaque colour is drawn as opaque"
+            ));
+        }
+
         let pbr = source.pbr_metallic_roughness();
         let mut uses_other_uv_set = false;
         let mut image_of = |set: u32, index: usize| {
@@ -258,11 +264,7 @@ impl<'a> MaterialTable<'a> {
                 } else {
                     0
                 }
-                | if source.alpha_mode() == gltf::material::AlphaMode::Blend {
-                    Material::GLASS
-                } else {
-                    0
-                },
+                | if is_glass(source) { Material::GLASS } else { 0 },
             roughness: pbr.roughness_factor(),
             metallic: pbr.metallic_factor(),
             uv_scale: 1.0,
@@ -495,6 +497,14 @@ fn texel(image: &ImageData, x: i64, y: i64) -> [f32; 4] {
             f32_at(index * 4 + 3),
         ],
     }
+}
+
+/// Whether a material is glass: blended, and seen through by its colour's own alpha. Glass is
+/// drawn as a share of its pixels, by that alpha alone, so a blended material whose colour is
+/// opaque stays opaque, as it was before glass, and keeps off the masked path it would not use.
+fn is_glass(material: &gltf::Material<'_>) -> bool {
+    material.alpha_mode() == gltf::material::AlphaMode::Blend
+        && material.pbr_metallic_roughness().base_color_factor()[3] < 1.0
 }
 
 /// What a material's name says of it: one whose name begins `paint` is the paint of

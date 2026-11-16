@@ -288,6 +288,8 @@ struct SizedResources {
     cull_scene: wgpu::BindGroup,
     raster: RasterBindings,
     resolve: ResolveBindings,
+    /// The [`crate::ruts::RutMap::generation`] whose texture `resolve` binds.
+    ruts_generation: u32,
     screen_gi: ScreenGiBindings,
     clouds: CloudBindings,
     deferred: [wgpu::BindGroup; 2],
@@ -1617,6 +1619,25 @@ impl Renderer {
                 && s.water.as_ref().map(WaterTargets::for_sea) == self.water_kind()
         });
         if unchanged {
+            // The ruts' texture is made whole at the first press: only the resolve pass,
+            // which reads it, is bound again.
+            let generation = self.ruts.generation();
+            if let Some(sized) = self
+                .sized
+                .as_mut()
+                .filter(|sized| sized.ruts_generation != generation)
+            {
+                sized.resolve = self.resolve.bindings(
+                    gpu,
+                    &self.frame_uniform,
+                    &self.scene,
+                    &sized.visibility,
+                    &self.main_work,
+                    &sized.gbuffer,
+                    &self.ruts.view,
+                );
+                sized.ruts_generation = generation;
+            }
             return;
         }
         let visibility = VisibilityBuffer::new(gpu, &self.rasterizer, render_size);
@@ -1716,6 +1737,7 @@ impl Renderer {
             cull_scene,
             raster,
             resolve,
+            ruts_generation: self.ruts.generation(),
             screen_gi,
             clouds,
             deferred,

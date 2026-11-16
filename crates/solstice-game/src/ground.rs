@@ -89,6 +89,9 @@ impl SurfaceMap {
                 continue;
             };
             // A row: runs, each a count and a letter.
+            if map.squares.len() >= (map.columns * map.rows) as usize {
+                return Err(error(format!("more than {} rows", map.rows)));
+            }
             let mut count = 0_u32;
             let mut filled = 0_u32;
             let mut digits = false;
@@ -106,7 +109,7 @@ impl SurfaceMap {
                     .filter(|&s| s < Surface::ALL.len() as u32)
                     .ok_or_else(|| error(format!("`{letter}` is no surface")))?;
                 let run = if digits { count } else { 1 };
-                filled += run;
+                filled = filled.saturating_add(run);
                 if filled > map.columns {
                     return Err(error(format!("more than {} squares", map.columns)));
                 }
@@ -209,6 +212,9 @@ mod tests {
             ("surfaces 0 0 1 2 1\ni", 2, "1 squares"),
             ("surfaces 0 0 1 2 1\n2z", 2, "no surface"),
             ("surfaces 0 0 1 2 2\n2a", 2, "1 rows"),
+            ("surfaces 0 0 1 2 1\n2a\n2a", 3, "more than 1 rows"),
+            // A run that would wrap the count round to fit.
+            ("surfaces 0 0 1 2 1\n1a4294967295a", 2, "more than 2"),
             ("surfaces 0 0 0 2 1\n2a", 1, "above 0"),
             ("# nothing", 1, "no `surfaces`"),
         ] {

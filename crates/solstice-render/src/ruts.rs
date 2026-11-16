@@ -50,10 +50,18 @@ pub trait RutSource {
 }
 
 /// The squares of ruts round the camera, on the GPU.
+///
+/// Until something is first pressed it holds a stand-in of one square, which the shader never
+/// reads (the window is empty), so a scene nobody drives on does not pay for the whole of it:
+/// tens of megabytes on a desktop. The first press makes the whole texture; whoever bound the
+/// stand-in binds [`RutMap::view`] again when [`RutMap::generation`] changes.
 pub struct RutMap {
+    device: wgpu::Device,
     queue: wgpu::Queue,
     texture: wgpu::Texture,
     pub view: wgpu::TextureView,
+    /// Whether `texture` is the whole window, not the stand-in.
+    whole: bool,
     /// Which square of ground each place in the texture holds, and that square's count of
     /// changes when it was copied. `None` is untouched ground.
     held: Vec<Option<((i32, i32), u32)>>,
@@ -67,50 +75,23 @@ pub struct RutMap {
 
 impl RutMap {
     pub fn new(gpu: &Gpu) -> Self {
-        let side = TILES * TILE;
-        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ruts"),
-            size: wgpu::Extent3d {
-                width: side,
-                height: side,
-                depth_or_array_layers: 2,
-            },
-            mip_level_count: LEVELS,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        // Untouched ground is not all zeros: its height is the middle of the range.
-        for level in 0..LEVELS {
-            let side = side >> level;
-            for (layer, cell) in UNTOUCHED.iter().enumerate() {
-                let texels = cell.repeat((side * side) as usize);
-                write(
-                    &gpu.queue,
-                    &texture,
-                    level,
-                    layer as u32,
-                    (0, 0),
-                    side,
-                    &texels,
-                );
-            }
-        }
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
+        let (texture, view) = make(&gpu.device, &gpu.queue, TILE);
         Self {
+            device: gpu.device.clone(),
             queue: gpu.queue.clone(),
             texture,
             view,
+            whole: false,
             held: vec![None; (TILES * TILES) as usize],
             cell: 0.04,
             middle: (0, 0),
             filled: 0,
         }
+    }
+
+    /// Counts the textures made: 0 for the stand-in, 1 once the whole window is.
+    pub fn generation(&self) -> u32 {
+        u32::from(self.whole)
     }
 
     /// Brings the texture up to date with the map, round `centre`: the world's x and z of
@@ -120,6 +101,10 @@ impl RutMap {
         // maps.
         if source.is_empty() && self.filled == 0 {
             return 0;
+        }
+        if !self.whole {
+            (self.texture, self.view) = make(&self.device, &self.queue, TILES * TILE);
+            self.whole = true;
         }
         self.cell = source.cell();
         let metres = TILE as f32 * self.cell;
@@ -221,6 +206,41 @@ impl RutMap {
     pub fn filled(&self) -> usize {
         self.filled
     }
+}
+
+/// A texture of ruts `side` texels a side, at every size, all of it untouched ground.
+fn make(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    side: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ruts"),
+        size: wgpu::Extent3d {
+            width: side,
+            height: side,
+            depth_or_array_layers: 2,
+        },
+        mip_level_count: LEVELS,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Untouched ground is not all zeros: its height is the middle of the range.
+    for level in 0..LEVELS {
+        let side = side >> level;
+        for (layer, cell) in UNTOUCHED.iter().enumerate() {
+            let texels = cell.repeat((side * side) as usize);
+            write(queue, &texture, level, layer as u32, (0, 0), side, &texels);
+        }
+    }
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
 }
 
 /// Copies a square of texels into one size of one layer.

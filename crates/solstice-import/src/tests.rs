@@ -457,6 +457,19 @@ fn a_blended_material_is_glass() {
     assert!(imported.warnings.iter().all(|w| !w.contains("Blend")));
 }
 
+/// A blended material whose colour is opaque is not glass: it is drawn opaque, as before glass,
+/// and says so.
+#[test]
+fn a_blended_material_with_an_opaque_colour_is_not_glass() {
+    let dir = TempDir::new();
+    let materials = r#", "materials": [{"alphaMode": "BLEND",
+        "pbrMetallicRoughness": {"baseColorFactor": [0.4, 0.5, 0.2, 1.0]}}]"#;
+    let path = write_model(&dir, r#"[{"mesh": 0}]"#, r#", "material": 0"#, materials);
+    let imported = import(&path);
+    assert_eq!(imported.scene.materials[0].flags & Material::GLASS, 0);
+    assert!(imported.warnings.iter().any(|w| w.contains("Blend")));
+}
+
 /// Writes a model with two images, each a flat 2x2 colour, and the given materials over them,
 /// with the cube using material 0.
 fn masked_model(dir: &TempDir, first: [u8; 4], second: [u8; 4], materials: &str) -> PathBuf {
