@@ -5,6 +5,8 @@ pub mod bob;
 pub mod camera_path;
 #[cfg(feature = "gameplay")]
 pub mod play;
+#[cfg(feature = "gameplay")]
+pub mod shared;
 #[cfg(target_arch = "wasm32")]
 mod web;
 

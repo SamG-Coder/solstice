@@ -6204,3 +6204,73 @@ fn a_pick_finds_the_instance_under_a_point() {
     assert_eq!(pick(0.79, 0.5).instance, Some(2));
     assert_eq!(pick(0.5, 0.05).instance, None, "the sky above them");
 }
+
+/// A map of ruts with one square pressed a little everywhere.
+struct OnePressedSquare;
+
+impl solstice_render::RutSource for OnePressedSquare {
+    fn cell(&self) -> f32 {
+        0.04
+    }
+    fn is_empty(&self) -> bool {
+        false
+    }
+    fn version(&self, tile: (i32, i32)) -> u32 {
+        u32::from(tile == (0, 0))
+    }
+    fn levels(&self, tile: (i32, i32), layer: usize) -> Option<Vec<Vec<u8>>> {
+        use solstice_render::ruts::{LEVELS, TILE};
+        (tile == (0, 0)).then(|| {
+            let cell: [u8; 4] = if layer == 0 {
+                [127, 0, 128, 200]
+            } else {
+                [128, 128, 200, 255]
+            };
+            (0..LEVELS)
+                .map(|level| cell.repeat(((TILE >> level) * (TILE >> level)) as usize))
+                .collect()
+        })
+    }
+}
+
+/// The ruts' texture is a stand-in until the first press, and is made whole then: the frames
+/// either side of that draw without errors, with the resolve pass bound to the new texture.
+#[test]
+fn ruts_are_drawn_from_the_first_press_without_errors() {
+    let Some(gpu) = request_gpu() else { return };
+    let mesh = build_virtual_mesh(&sphere(2), &BuildOptions::default());
+    let scene = SceneAsset {
+        meshes: vec![mesh],
+        materials: vec![white_material()],
+        instances: vec![instance(0, Mat4::IDENTITY)],
+        ..Default::default()
+    };
+    let camera = Camera {
+        position: Vec3::new(0.0, 0.0, 5.0),
+        ..Default::default()
+    };
+    let errors: Arc<Mutex<Vec<String>>> = Default::default();
+    let sink = errors.clone();
+    gpu.device
+        .on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+            sink.lock().unwrap().push(error.to_string());
+        }));
+    let mut renderer = Renderer::new(&gpu, &paginate(&scene), FORMAT, RendererSettings::default());
+    let target = test_target(&gpu, 64);
+    let view = target.create_view(&Default::default());
+    for _ in 0..2 {
+        renderer.render(&gpu, &camera, &darkness(), &view, (64, 64), 1.0 / 60.0);
+    }
+    assert_eq!(renderer.sync_ruts(glam::Vec2::ZERO, &OnePressedSquare), 1);
+    for _ in 0..2 {
+        renderer.render(&gpu, &camera, &darkness(), &view, (64, 64), 1.0 / 60.0);
+    }
+    // Nothing changed since: nothing is copied again.
+    assert_eq!(renderer.sync_ruts(glam::Vec2::ZERO, &OnePressedSquare), 0);
+    renderer.render(&gpu, &camera, &darkness(), &view, (64, 64), 1.0 / 60.0);
+    gpu.device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+    let errors = errors.lock().unwrap();
+    assert!(errors.is_empty(), "GPU errors: {}", errors.join("\n"));
+}

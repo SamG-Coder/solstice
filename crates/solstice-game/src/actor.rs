@@ -162,6 +162,20 @@ pub struct ActorFile {
     pub animation: Option<String>,
     /// Makes it a car: its `.vehicle` file, relative to the actor file.
     pub vehicle: Option<Vehicle>,
+    /// It is carried by a car's driver: with them, at their feet and turned as they are,
+    /// while they are out of the car, and put away while they are in it.
+    pub carried: bool,
+    /// Its mesh is a kit: a bare thing and what can be fitted to it, each a named piece.
+    /// This file, relative to the actor file, says which pieces are which (`kit PATH`); the
+    /// bake writes beside it which instances draw each piece ([`pieces_file`]).
+    pub kit: Option<String>,
+}
+
+/// The name of the gameplay file that says which of an actor's instances draw each named
+/// piece of its mesh: a line a piece, `NAME FIRST COUNT`, counted from the actor's first
+/// instance. The bake writes it for an actor with a `kit`.
+pub fn pieces_file(actor_file: &str) -> String {
+    format!("{actor_file}.pieces")
 }
 
 /// A car's numbers, and who changes gear.
@@ -236,6 +250,8 @@ impl ActorFile {
             character: None,
             animation: None,
             vehicle: None,
+            carried: false,
+            kit: None,
         };
         for (line, words) in lines(text) {
             let error = |message: String| FileError { line, message };
@@ -342,6 +358,15 @@ impl ActorFile {
                 "collider" => {
                     once(actor.collider.is_some())?;
                     actor.collider = Some(parse_collider(values).map_err(error)?);
+                }
+                "carried" => {
+                    count(0..=0, "nothing after it")?;
+                    actor.carried = true;
+                }
+                "kit" => {
+                    count(1..=1, "PATH")?;
+                    once(actor.kit.is_some())?;
+                    actor.kit = Some(values[0].to_owned());
                 }
                 "character" => {
                     count(2..=2, "RADIUS HEIGHT")?;

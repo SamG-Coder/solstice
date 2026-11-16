@@ -101,9 +101,21 @@ look_round key KeyJ -1
 look_over gamepad right_y
 look_over key KeyI
 look_over key KeyK -1
+# The mouse swings the view right round the car, and up over it.
+orbit mouse x -0.0032
+orbit_up mouse y 0.0026
 # P hands the car to a driver of its own, round the circuit, and takes it back.
 autopilot key KeyP
 autopilot gamepad start
+# A four-wheel drive: T moves its transfer case on, from two-wheel drive to four high to four
+# low; G locks its differentials, the rear, then both, then neither.
+drive_mode key KeyT
+drive_mode gamepad west
+diff_lock key KeyG
+diff_lock gamepad south
+# Y lets its tyres down for mud and sand, and pumps them up again for hard ground.
+tyres key KeyY
+tyres gamepad up
 ";
 
 /// A kind of input device.
@@ -288,6 +300,10 @@ pub const STICK_DEAD_ZONE: f32 = 0.15;
 pub struct Devices {
     values: HashMap<(Device, String), f32>,
     pressed: HashSet<(Device, String)>,
+    /// How many times as fast as it was made to a controller's right stick looks round: as
+    /// it was made, if this is nothing. What is bound to the stick is a rate, so more of
+    /// the stick is more of the rate.
+    pub look: f32,
 }
 
 impl Devices {
@@ -354,6 +370,8 @@ impl Devices {
         } else {
             value.signum() * ((size - STICK_DEAD_ZONE) / (1.0 - STICK_DEAD_ZONE)).min(1.0)
         };
+        let faster = axis.starts_with("right_") && self.look > 0.0;
+        let value = if faster { value * self.look } else { value };
         self.set(Device::Gamepad, axis, value);
     }
 
@@ -390,6 +408,14 @@ impl Devices {
     pub fn clear_movement(&mut self) {
         self.values
             .retain(|(device, control), _| !device.is_movement(control));
+    }
+
+    /// Whether anything of a device's was pressed this frame: a key or a button going down,
+    /// a trigger pulled or a stick pushed past half way. What is only resting off its
+    /// middle, a worn stick, never is; nor is the mouse being moved. So it says which
+    /// device a hand is on, for whoever names its buttons.
+    pub fn pressed_on(&self, device: Device) -> bool {
+        self.pressed.iter().any(|(of, _)| *of == device)
     }
 }
 
@@ -509,6 +535,24 @@ mod tests {
         devices.gamepad_button("south", 1.0);
         presses += u32::from(map.actions(&devices, 0.1).pressed("jump"));
         assert_eq!(presses, 2, "pressed, held, released, pressed again");
+    }
+
+    #[test]
+    fn the_device_in_hand_is_the_one_that_was_pressed() {
+        let mut devices = Devices::new();
+        // A worn stick resting off its middle, and the mouse moving, are nobody's hand.
+        devices.gamepad_axis("left_x", 0.3);
+        devices.mouse_motion(40.0, 0.0);
+        assert!(!devices.pressed_on(Device::Gamepad) && !devices.pressed_on(Device::Mouse));
+        // A trigger pulled past half way is, once: held, it is not pressed again.
+        devices.gamepad_button("r2", 0.8);
+        assert!(devices.pressed_on(Device::Gamepad) && !devices.pressed_on(Device::Key));
+        devices.end_frame();
+        devices.gamepad_button("r2", 0.9);
+        assert!(!devices.pressed_on(Device::Gamepad));
+        devices.key("KeyW", true);
+        devices.mouse_button("left", true);
+        assert!(devices.pressed_on(Device::Key) && devices.pressed_on(Device::Mouse));
     }
 
     #[test]

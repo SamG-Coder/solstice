@@ -26,7 +26,7 @@ struct Triangle { a: vec4f, b: vec4f, c: vec4f }
 @group(0) @binding(1) var<storage, read_write> pixels: array<u32>;
 fn depth_bias(a: vec3f, b: vec3f, c: vec3f) -> f32 { return 0.0; }
 fn cover_triangle(x: u32, y: u32, z: u32, a: vec3f, b: vec3f, c: vec3f, instance: u32) {}
-fn covered(a: f32, b: f32, c: f32) -> bool { return true; }
+fn covered(a: f32, b: f32, c: f32, pixel: vec2f) -> bool { return true; }
 fn write_visibility(pixel: u32, depth: f32, id: u32) {
     pixels[id * 256u + pixel] = bitcast<u32>(depth);
 }

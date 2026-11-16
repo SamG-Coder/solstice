@@ -7,6 +7,7 @@
 //!   rigid body they move.
 //! * [`driver`]: what a key or a stick is turned into at the wheel and pedals.
 //! * [`surface`]: asphalt, kerb, grass and gravel, as a tyre feels them.
+//! * [`rut`]: the ruts tyres press into soft ground, which stay.
 //!
 //! Nothing here touches the GPU, the physics engine or the world: a car is stepped against a
 //! [`Ground`] it casts rays at, so it runs headless, and a run repeats exactly. `solstice-physics`
@@ -20,13 +21,18 @@
 
 pub mod driver;
 pub mod drivetrain;
+pub mod rut;
 pub mod spec;
 pub mod surface;
 pub mod tyre;
 pub mod vehicle;
 
 pub use driver::{Asked, Driver};
+pub use rut::{Press, Ruts};
+pub use spec::Transfer;
 pub use spec::{SpecError, VehicleSpec};
 pub use surface::Surface;
 pub use tyre::Tyre;
-pub use vehicle::{Body, Contact, Controls, Flat, Ground, Telemetry, Vehicle, Wheel, SUBSTEPS};
+pub use vehicle::{
+    Body, Contact, Controls, DriveMode, Flat, Ground, Telemetry, Vehicle, Wheel, SUBSTEPS,
+};

@@ -547,7 +547,7 @@ pub(crate) mod tests {
             ("p 0 0 0 1 0 0 6", 1, "expected `p X Y Z"),
             ("name A\np 0 0 0 2 0 0 6 6", 2, "unit vector"),
             ("p 0 0 0 1 0 0 6 0", 1, "width must be above 0"),
-            ("p 0 0 0 1 0 0 6 6 l=mud:3", 1, "not a surface"),
+            ("p 0 0 0 1 0 0 6 6 l=lava:3", 1, "not a surface"),
             ("p 0 0 0 1 0 0 6 6 x=kerb:3", 1, "l=... or r=..."),
             ("p 0 0 0 1 0 0 6 6 l=kerb", 1, "SURFACE:WIDTH"),
             ("lap 3", 1, "unknown line `lap`"),

@@ -37,6 +37,7 @@ pub const SOURCES: &[(&str, &str)] = shader_table![
     "common/skin_vertex.wgsl",
     "common/frame.wgsl",
     "common/wetness.wgsl",
+    "ground/ruts.wgsl",
     "common/brdf.wgsl",
     "common/atmosphere.wgsl",
     "clouds/params.wgsl",
@@ -458,7 +459,7 @@ mod tests {
     #[test]
     fn resolve_without_glow_binds_and_mentions_none_of_it() {
         let source = without_glow(&expand("vg/resolve.wgsl"));
-        for gone in ["glow_maps", "glow:begin", "MATERIAL_GLOW", "binding(15)"] {
+        for gone in ["glow_maps", "glow:begin", "MATERIAL_GLOW", "binding(16)"] {
             assert!(!source.contains(gone), "{gone} is still there");
         }
         let module = naga::front::wgsl::parse_str(&source).expect("the shader parses");

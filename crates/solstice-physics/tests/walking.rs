@@ -131,9 +131,13 @@ fn a_character_walks_as_far_as_it_is_told() {
         "two metres in a second at 2 m/s: {at}"
     );
     assert!(at.y.abs() < 0.05 && at.z.abs() < 1.0e-3, "{at}");
-    // Walking up is not a thing: only across the ground counts.
+    // What a walk says of going up is a jump: off the ground, and back down onto it.
     walk(&mut game, hero, Vec3::new(0.0, 5.0, 0.0));
-    steps(&mut game, 30);
+    steps(&mut game, 12);
+    let up = place(&game, hero).y;
+    assert!(up > 0.3, "it has left the ground: {up}");
+    walk(&mut game, hero, Vec3::ZERO);
+    steps(&mut game, 120);
     assert!(place(&game, hero).y.abs() < 0.05, "{}", place(&game, hero));
 }
 

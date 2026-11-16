@@ -20,6 +20,9 @@
 //! input cove/play.input                # the input actions, if not the built-in ones
 //! track circuit/circuit.track          # a circuit: its centre line, and what lies beside it
 //! circuit 1900                         # the land, road and planting round that track, this wide
+//! surfaces cove/ground.surfaces        # what the ground is made of, place by place, off a track
+//! actor cove/car.actor 0 0 0 0 shared   # an actor whose model is in the file read with this one
+//! lends                                # this scene lends all it has to those read with it (`lend.rs`)
 //! land 10 6                            # the terrain in bands: sand this far in, then dirt, then grass
 //! path 22 0 60 -30 3                   # a dirt path: from x z, to x z, width
 //! yard -21 -21 21 21                   # a dirt yard: opposite corners x z
@@ -128,6 +131,11 @@ pub(crate) enum Command {
     Track(String),
     /// The land round the scene's track, this many metres across.
     Circuit(f32),
+    /// The map of what the ground is made of, place by place (`solstice_game::SurfaceMap`).
+    Surfaces(String),
+    /// This scene lends every mesh and texture it has to the scenes read with it
+    /// (`crate::lend`).
+    Lends,
 }
 
 pub(crate) fn parse_line(line: &str) -> Result<Option<Command>, String> {
@@ -336,6 +344,14 @@ pub(crate) fn parse_line(line: &str) -> Result<Option<Command>, String> {
         "track" => {
             expect(1)?;
             Command::Track(values[0].to_string())
+        }
+        "surfaces" => {
+            expect(1)?;
+            Command::Surfaces(values[0].to_string())
+        }
+        "lends" => {
+            expect(0)?;
+            Command::Lends
         }
         "circuit" => {
             expect(1)?;
@@ -622,7 +638,28 @@ struct Gameplay {
     /// For each actor with a mesh: which actor, which model, and which of its placements.
     meshes: Vec<(usize, PathBuf, Placed)>,
     /// Whether an actor has a camera already: only one can.
-    has_player: bool,
+    has_player: [bool; 2],
+    /// The actors whose meshes are kits: the pieces of each are listed for the game.
+    kits: Vec<usize>,
+}
+
+/// Which of an actor's instances draw each named piece of its mesh, as text: a line a piece,
+/// `NAME FIRST COUNT`, counted from the actor's first instance. A piece of several materials
+/// is several instances, one after another.
+fn pieces_text(names: &[String]) -> String {
+    let mut text = String::new();
+    let mut first = 0;
+    while first < names.len() {
+        let count = names[first..]
+            .iter()
+            .take_while(|name| **name == names[first])
+            .count();
+        if !names[first].is_empty() {
+            text.push_str(&format!("{} {first} {count}\n", names[first]));
+        }
+        first += count;
+    }
+    text
 }
 
 impl Gameplay {
@@ -655,13 +692,15 @@ impl Gameplay {
             return Err(format!("{} has no script, so no properties", line.file));
         }
         if actor.camera.is_some() {
-            if self.has_player {
+            // One actor is played; or two, a car and whoever drives it, who gets out.
+            let car = usize::from(actor.vehicle.is_some());
+            if self.has_player[car] {
                 return Err(format!(
-                    "{} has a camera, and another actor already does: only one can",
+                    "{} has a camera, and another actor already does: only one can, or a car and its driver",
                     line.file
                 ));
             }
-            self.has_player = true;
+            self.has_player[car] = true;
         }
         for (name, value) in &line.settings {
             let property = actor
@@ -697,7 +736,18 @@ impl Gameplay {
             solstice_game::VehicleSpec::parse(self.read(base, &name)?)
                 .map_err(|e| format!("{name}: {e}"))?;
         }
-        let mesh = actor.mesh.as_ref().map(|mesh| {
+        if let Some(kit) = &actor.kit {
+            // The game reads it: here it is only brought along.
+            let name = resolve(&line.file, kit);
+            self.read(base, &name)?;
+            self.kits.push(self.game.actors.len());
+        }
+        // Its model may be in the file every map shares, and not in this one. Baked whole,
+        // to be looked at on its own, it is in this one after all.
+        if std::env::var_os("SOLSTICE_WHOLE").is_some() {
+            line.shared = false;
+        }
+        let mesh = actor.mesh.as_ref().filter(|_| !line.shared).map(|mesh| {
             (
                 resolve(&line.file, &mesh.path),
                 mesh.scale,
@@ -730,12 +780,26 @@ impl Gameplay {
         Ok(())
     }
 
+    /// The map of what the ground is made of, which each tyre reads the square it is on of:
+    /// for land that is not a circuit, whose track says what lies beside its road.
+    fn set_surfaces(&mut self, base: &Path, name: &str) -> Result<(), String> {
+        if self.game.surfaces.is_some() {
+            return Err("`surfaces` is given twice".to_owned());
+        }
+        let name = resolve(GAME_FILE, name);
+        solstice_game::SurfaceMap::parse(self.read(base, &name)?)
+            .map_err(|e| format!("{name}: {e}"))?;
+        self.game.surfaces = Some(name);
+        Ok(())
+    }
+
     /// The scene's gameplay files, with the list of its actors first, or none if it has none.
     fn finish(mut self) -> Vec<GameFile> {
         if self.game.actors.is_empty()
             && self.game.blockers.is_empty()
             && self.game.input.is_none()
             && self.game.track.is_none()
+            && self.game.surfaces.is_none()
         {
             return Vec::new();
         }
@@ -892,6 +956,7 @@ pub(crate) fn build_commands(
     let mut land_plan = crate::land::Plan::default();
     let mut water = None;
     let mut circuit = None;
+    let mut lends = false;
     // Whether there has been a circuit, and a line of land, to refuse the two together.
     let (mut has_land, mut has_circuit) = (false, false);
     // Grouped by file, keeping first-seen order, so that each model is imported only once.
@@ -1087,7 +1152,9 @@ pub(crate) fn build_commands(
             Some(Command::Blocker(blocker)) => gameplay.game.blockers.push(blocker),
             Some(Command::Input(input)) => gameplay.set_input(base, &input).map_err(at)?,
             Some(Command::Track(track)) => gameplay.set_track(base, &track).map_err(at)?,
+            Some(Command::Surfaces(file)) => gameplay.set_surfaces(base, &file).map_err(at)?,
             Some(Command::Circuit(size)) => circuit = Some(size),
+            Some(Command::Lends) => lends = true,
         }
     }
 
@@ -1134,6 +1201,8 @@ pub(crate) fn build_commands(
                 placed.whole_owners.push(owner.clone());
             }
         }
+        let names = imported.names.clone();
+        let mut kit_pieces: Vec<GameFile> = Vec::new();
         let ranges = append_model(&mut scene, imported, &models[model])
             .map_err(|e| format!("{}: {e}", model.display()))?;
         for (_, graph_file) in animations.iter().filter(|(m, _)| m == model) {
@@ -1163,6 +1232,18 @@ pub(crate) fn build_commands(
                 Placed::Part(i) => whole_count + i,
             };
             gameplay.game.actors[*actor].instances = Some(ranges[index].clone());
+            // A kit's pieces are listed, for the game to show some and not others.
+            if gameplay.kits.contains(actor) && matches!(placed, Placed::Whole(_)) {
+                kit_pieces.push(GameFile {
+                    name: solstice_game::actor::pieces_file(&gameplay.game.actors[*actor].file),
+                    text: pieces_text(&names),
+                });
+            }
+        }
+        for file in kit_pieces.drain(..) {
+            if !gameplay.files.iter().any(|f| f.name == file.name) {
+                gameplay.files.push(file);
+            }
         }
         let collide = collides.remove(model).unwrap_or_default();
         scene.collide.resize(scene.instances.len(), Collide::Auto);
@@ -1254,6 +1335,13 @@ pub(crate) fn build_commands(
         }
     }
     scene.sources.sort_by_key(|source| source.instances.start);
+    // A scene that lends says what it has, for those baked beside it to leave out.
+    if lends {
+        scene.gameplay.push(GameFile {
+            name: solstice_asset::join::LENDS.to_owned(),
+            text: crate::lend::lends(&scene),
+        });
+    }
     Ok((scene, warnings))
 }
 
@@ -1754,6 +1842,69 @@ wood 0 0 40 9
         ]);
         let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
         assert!(error.contains(":3: `wood` with `circuit`"), "{error}");
+    }
+
+    #[test]
+    fn a_scene_names_the_map_of_its_ground_and_one_that_lends_lists_what_it_has() {
+        let (gltf, bin) = two_triangles();
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"model tri.gltf 0 0 0 0 1
+surfaces ground.surfaces
+lends
+",
+            ),
+            ("tri.gltf", &gltf),
+            ("tri.bin", &bin),
+            // Four squares of mud and four of rock.
+            (
+                "ground.surfaces",
+                b"surfaces -2 -1 1 4 2
+4g
+4j
+",
+            ),
+        ]);
+        let (scene, _) = build(&folder.0.join("scene.txt"), None).unwrap();
+        let file = |name: &str| {
+            let found = scene.gameplay.iter().find(|file| file.name == name);
+            found.map(|file| file.text.as_str())
+        };
+        // The game is told of the map, which is brought along as it was written.
+        let game = SceneGame::parse(file(GAME_FILE).expect("the scene has a game")).unwrap();
+        assert_eq!(game.surfaces.as_deref(), Some("ground.surfaces"));
+        let map = solstice_game::SurfaceMap::parse(file("ground.surfaces").unwrap()).unwrap();
+        let at = |z: f32| map.at(Vec3::new(0.0, 0.0, z));
+        assert_eq!(
+            (at(-0.5), at(0.5)),
+            (solstice_game::Surface::Mud, solstice_game::Surface::Rock)
+        );
+        // And it lists every mesh it has, each with its key, for scenes baked beside it.
+        let lends = file(solstice_asset::join::LENDS).expect("it lends");
+        let meshes = lends
+            .lines()
+            .filter(|line| line.starts_with("mesh "))
+            .count();
+        assert_eq!(meshes, scene.meshes.len());
+        assert!(meshes > 0);
+
+        // A map that cannot be read is found while baking, with its line.
+        let folder = Folder::with(&[
+            (
+                "scene.txt",
+                b"surfaces ground.surfaces
+",
+            ),
+            (
+                "ground.surfaces",
+                b"4g
+",
+            ),
+        ]);
+        let error = build(&folder.0.join("scene.txt"), None).unwrap_err();
+        assert!(error.contains("ground.surfaces"), "{error}");
+        assert!(error.contains("expected `surfaces"), "{error}");
     }
 
     #[test]

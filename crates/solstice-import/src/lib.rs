@@ -64,6 +64,10 @@ pub struct Imported {
     /// The instances of each named node, at the node's own origin, for placing the pieces of
     /// a modular kit one by one. Mesh and material numbers refer to `scene`.
     pub parts: HashMap<String, Vec<Instance>>,
+    /// What the node of each of `scene`'s instances is called, in their order, or nothing
+    /// for one with no name: so that a thing made of named pieces, as a truck is, can have
+    /// some shown and some not.
+    pub names: Vec<String>,
     /// Things in the file that the result does not reproduce.
     pub warnings: Vec<String>,
 }
@@ -156,7 +160,9 @@ pub fn import_gltf(
     let mut keys: Vec<MeshKey> = Vec::new();
     let mut instances = Vec::with_capacity(placements.len());
     let mut parts: HashMap<String, Vec<Instance>> = HashMap::new();
+    let mut names = Vec::with_capacity(placements.len());
     for placement in &placements {
+        names.push(placement.node_name.clone().unwrap_or_default());
         let material = materials.slot(&document, placement.material, &mut warnings);
         // A skinned mesh is drawn as its skeleton says: glTF ignores where its node stands.
         let skinned = options.skinned && placement.bound;
@@ -274,6 +280,7 @@ pub fn import_gltf(
             ..Default::default()
         },
         parts,
+        names,
         warnings,
     })
 }

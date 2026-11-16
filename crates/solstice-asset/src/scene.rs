@@ -94,6 +94,21 @@ impl Material {
     /// texture layers come right after this one's. The mesh's texture coordinates hold how much
     /// of the second and the third there is, and every texture is laid by the world's x and z.
     pub const BLENDS: u32 = 32;
+    /// The paint of something driven: the game can give it another colour, and it is what
+    /// rusts (`Coat` in `solstice-render`). An importer marks a material whose name begins
+    /// `paint`.
+    pub const PAINT: u32 = 64;
+    /// Inside something driven, out of the weather: its cab, its engine bay. It takes no
+    /// dust or mud. An importer marks a material whose name begins `inside`.
+    pub const INSIDE: u32 = 128;
+    /// Glass, seen through: of the pixels it covers it is drawn in a share, its colour's
+    /// alpha, and what is behind it shows in the rest, a different share each frame so that
+    /// the two blend (`vg/mask.wgsl`). An importer marks a material whose alpha is blended.
+    pub const GLASS: u32 = 256;
+    /// Mud: where ground blended of three kinds ([`Material::BLENDS`]) is this kind, it is
+    /// drawn as mud lies, wet at its heart and dried to a cracked crust at its rim
+    /// (`ground/ruts.wgsl`, `docs/ruts.md`). Older files' mud is drawn as any ground is.
+    pub const MUD: u32 = 512;
     /// `flags` above this bit hold one more than the material's layer in [`GlowMaps`], or zero
     /// for a material whose emissive colour is even all over.
     pub const GLOW_SHIFT: u32 = 16;

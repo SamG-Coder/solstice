@@ -1,5 +1,14 @@
 // Per-frame constants for the main view. Twin of `FrameUniform` in frame.rs.
 
+// A run of instances in a colour of their own (`Respray` in frame.rs): a truck that stands
+// about, which nobody drives. None of them when `count` is 0.
+struct Respray {
+    paint: vec3f,
+    first: u32,
+    was: vec3f,
+    count: u32,
+}
+
 struct Frame {
     view_proj: mat4x4f,           // Includes the temporal jitter.
     inv_view_proj: mat4x4f,       // Inverse of the jittered matrix.
@@ -42,6 +51,43 @@ struct Frame {
     sea_level: f32,
     moon_disc: vec3f,
     _pad2: f32,
+    // The lamps of whatever is driven, as one beam: where it shines from and how far it
+    // reaches (no lamp when that is 0), the way it points and the cosine of half its spread,
+    // and how bright it is.
+    lamp_position: vec3f,
+    lamp_range: f32,
+    lamp_direction: vec3f,
+    lamp_spread: f32,
+    lamp_intensity: vec3f,
+    _pad3: f32,
+    // The coat of whatever is driven (`Coat` in frame.rs): its paint's colour, and its rust,
+    // dust and mud. The rows that take a place in the world to the car's own space, metres
+    // from the ground under its middle, x to its right, y up, z to its back; nothing wears
+    // a coat when `coat_count` is 0.
+    coat_x: vec4f,
+    coat_y: vec4f,
+    coat_z: vec4f,
+    coat_paint: vec3f,
+    coat_rust: f32,
+    coat_soil: vec3f,
+    coat_mud: f32,
+    coat_was: vec3f,
+    coat_dust: f32,
+    coat_first: u32,
+    coat_count: u32,
+    coat_seed: u32,
+    coat_wet: f32,
+    // Where its front and rear axles are along z, half its track, and its wheels' radius.
+    coat_axles: vec4f,
+    // Trucks that stand about, each in its own colour.
+    resprays: array<Respray, 8>,
+    // The ruts pressed into the ground (ruts.rs, ground/ruts.wgsl): the middle of the square
+    // of them that is held, in the world's x and z; half its width in metres, 0 when nothing
+    // is held; and one over the width of ground the map of them wraps round in.
+    rut_window: vec4f,
+    // The colour of churned soil, and the width of a cell of that map, in metres.
+    rut_soil: vec3f,
+    rut_cell: f32,
 }
 
 const DEBUG_NONE: u32 = 0u;

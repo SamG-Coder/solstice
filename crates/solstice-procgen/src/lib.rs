@@ -7,10 +7,12 @@
 //! * [`cracks`] grows a crack network the way drying really cracks a surface.
 //! * [`surface`] turns fields into material textures.
 //! * [`surfaces`] is a library of ready-made surfaces, each fully described by a name and a seed.
+//! * [`bush`] adds the ground of the Australian bush to it: clay, mud, gum litter and straw.
 //!
 //! Nothing here touches files or threads directly, and the same seed gives the same result on
 //! every platform, so a scene can hold a recipe in place of the data it produces.
 
+pub mod bush;
 pub mod cracks;
 pub mod field;
 pub mod foliage;

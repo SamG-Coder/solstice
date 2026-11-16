@@ -143,6 +143,11 @@ pub struct Gearbox {
     pub efficiency: f32,
     /// The most torque the clutch can carry.
     pub clutch: f32,
+    /// How early an automatic changes up with the throttle barely open, as a share of the
+    /// engine speed it changes up at flat out. A racing car's is 1: it holds every gear to the
+    /// limiter. A road car's is under a half, and its gearbox kicks down when the foot goes
+    /// down.
+    pub cruise: f32,
 }
 
 /// A clutch-pack limited-slip differential: it resists its two wheels turning at different
@@ -154,6 +159,25 @@ pub struct Differential {
     /// More, as a share of the torque it carries, under power and on the overrun.
     pub power: f32,
     pub coast: f32,
+}
+
+/// A four-wheel drive's transfer case: what joins the gearbox to both axles.
+///
+/// A part-time system, as utes and most off-roaders have: in two-wheel drive only the rear axle
+/// is driven; in four-wheel drive the front and rear propshafts are locked together, so that
+/// neither axle can spin away from the other; and low range puts a second reduction after the
+/// gearbox, for crawling. Each axle's differential can also be locked, which makes its two
+/// wheels turn as one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transfer {
+    /// Low range's reduction: every gear's ratio is this many times shorter.
+    pub low: f32,
+    /// The front axle's share of the drive in four-wheel drive, as the load on it is shared.
+    pub front_share: f32,
+    /// The most torque the lock between the two propshafts carries, in newton metres.
+    pub lock: f32,
+    /// The most torque a locked differential carries across its axle.
+    pub locker: f32,
 }
 
 /// The air.
@@ -181,18 +205,35 @@ pub struct VehicleSpec {
     /// The box it hits walls and other cars with: its full size, and where its middle is.
     pub body_size: Vec3,
     pub body_at: Vec3,
+    /// A truck's tray, if it has one: an open box things are carried in. Its size inside,
+    /// across, deep and long, and where the middle of its floor is. The body is then that
+    /// box cut out of the back of it, so that what is put in the tray lies in it.
+    pub tray: Option<(Vec3, Vec3)>,
+    /// The places inside it that things can be put: a seat, a boot. Each a box shut in on
+    /// every side, its size across, high and long, and where the middle of its floor is.
+    /// The body is hollow there, so that what is put in one lies in it and stays in it.
+    pub holds: Vec<(Vec3, Vec3)>,
+    /// Whether its driver sits on the right, and gets out on that side: `driver right`.
+    pub driver_right: bool,
     pub front: Axle,
     pub rear: Axle,
     pub tyre: Tyre,
     pub engine: Engine,
     pub gearbox: Gearbox,
     pub differential: Differential,
+    /// The front axle's differential, on a car that drives both: open, on most.
+    pub front_differential: Differential,
+    /// What joins the two axles, on a car that drives both.
+    pub transfer: Option<Transfer>,
     pub aero: Aero,
     /// The most the front wheels turn, in radians, with the inner wheel at this.
     pub steering_lock: f32,
     /// How much more the inner wheel turns than the outer: 1 is true Ackermann, where every
     /// wheel rolls about one point, and 0 is parallel.
     pub ackermann: f32,
+    /// How quickly its wheel is turned from lock to lock, as a share of a racing car's: a
+    /// truck's steering is slow and heavy, and a driver's hands with it.
+    pub steering_quick: f32,
     /// The share of weight transfer under braking and under power that the suspension's links
     /// carry rather than its springs, which is what stops a car diving and squatting.
     pub anti_dive: f32,
@@ -203,6 +244,22 @@ pub struct VehicleSpec {
     /// Whether a tail that steps out is caught: the engine eased, the rear brakes let go,
     /// and the outside front wheel braked, as a road car's stability control does.
     pub stability: bool,
+    /// Whether, in low range with the driver's feet off the pedals, it holds itself to a
+    /// walking pace down a hill with its brakes: hill descent control.
+    pub hill_descent: bool,
+}
+
+impl Transfer {
+    /// A part-time transfer case, as a ute's: a 2.64 low range, the drive shared evenly, and
+    /// locks strong enough to hold whatever the engine sends.
+    pub fn part_time() -> Self {
+        Self {
+            low: 2.64,
+            front_share: 0.5,
+            lock: 30_000.0,
+            locker: 30_000.0,
+        }
+    }
 }
 
 impl VehicleSpec {
@@ -220,6 +277,9 @@ impl VehicleSpec {
             centre: Vec3::new(0.0, 0.4, 0.04),
             body_size: Vec3::new(1.9, 0.9, 4.5),
             body_at: Vec3::new(0.0, 0.65, 0.0),
+            tray: None,
+            holds: Vec::new(),
+            driver_right: false,
             front: Axle {
                 at: 1.32,
                 track: 1.66,
@@ -280,12 +340,19 @@ impl VehicleSpec {
                 shift_seconds: 0.06,
                 efficiency: 0.93,
                 clutch: 900.0,
+                cruise: 1.0,
             },
             differential: Differential {
                 preload: 60.0,
                 power: 0.45,
                 coast: 0.3,
             },
+            front_differential: Differential {
+                preload: 0.0,
+                power: 0.0,
+                coast: 0.0,
+            },
+            transfer: None,
             aero: Aero {
                 drag: 0.92,
                 downforce: 1.9,
@@ -293,11 +360,13 @@ impl VehicleSpec {
             },
             steering_lock: 26.0_f32.to_radians(),
             ackermann: 0.6,
+            steering_quick: 1.0,
             anti_dive: 0.25,
             anti_squat: 0.3,
             abs: true,
             traction_control: true,
             stability: true,
+            hill_descent: false,
         }
     }
 
@@ -372,10 +441,10 @@ impl VehicleSpec {
                 values.iter().map(|w| number(w).map_err(&error)).collect()
             };
             let settings: Vec<String> = match keyword {
-                // A line for each point of the curve.
-                "torque" => Vec::new(),
-                "front" | "rear" | "tyre" | "engine" | "gearbox" | "diff" | "aero" | "steering"
-                | "geometry" | "assists" => values
+                // A line for each point of the curve, and for each place things can be put.
+                "torque" | "hold" => Vec::new(),
+                "front" | "rear" | "tyre" | "engine" | "gearbox" | "diff" | "front_diff"
+                | "transfer" | "aero" | "steering" | "geometry" | "assists" => values
                     .iter()
                     .filter_map(|word| word.split_once('='))
                     .map(|(key, _)| format!("{keyword} {key}"))
@@ -402,6 +471,42 @@ impl VehicleSpec {
                     let read = |w: &str| number(w).map_err(&error);
                     spec.body_size = Vec3::new(read(sx)?, read(sy)?, read(sz)?);
                     spec.body_at = Vec3::new(read(x)?, read(y)?, read(z)?);
+                }
+                "tray" => {
+                    let form = "expected `tray WIDTH DEPTH LENGTH at X Y Z`";
+                    let [sx, sy, sz, "at", x, y, z] = values else {
+                        return Err(error(form.to_owned()));
+                    };
+                    let read = |w: &str| number(w).map_err(&error);
+                    let size = Vec3::new(read(sx)?, read(sy)?, read(sz)?);
+                    if !(size.min_element() > 0.05 && size.max_element() < 10.0) {
+                        return Err(error("a tray is from 5 cm to 10 m each way".to_owned()));
+                    }
+                    spec.tray = Some((size, Vec3::new(read(x)?, read(y)?, read(z)?)));
+                }
+                "driver" => {
+                    spec.driver_right = match values {
+                        ["left"] => false,
+                        ["right"] => true,
+                        _ => {
+                            return Err(error(
+                                "expected `driver left` or `driver right`".to_owned(),
+                            ))
+                        }
+                    };
+                }
+                "hold" => {
+                    let form = "expected `hold WIDTH HEIGHT LENGTH at X Y Z`";
+                    let [sx, sy, sz, "at", x, y, z] = values else {
+                        return Err(error(form.to_owned()));
+                    };
+                    let read = |w: &str| number(w).map_err(&error);
+                    let size = Vec3::new(read(sx)?, read(sy)?, read(sz)?);
+                    if !(size.min_element() > 0.05 && size.max_element() < 10.0) {
+                        return Err(error("a hold is from 5 cm to 10 m each way".to_owned()));
+                    }
+                    spec.holds
+                        .push((size, Vec3::new(read(x)?, read(y)?, read(z)?)));
                 }
                 "front" | "rear" => {
                     let axle = if keyword == "front" {
@@ -452,6 +557,7 @@ impl VehicleSpec {
                             "shift" => spec.gearbox.shift_seconds = read,
                             "efficiency" => spec.gearbox.efficiency = read,
                             "clutch" => spec.gearbox.clutch = read,
+                            "cruise" => spec.gearbox.cruise = read,
                             other => return Err(error(unknown("gearbox", other))),
                         }
                     }
@@ -464,6 +570,30 @@ impl VehicleSpec {
                             "power" => spec.differential.power = read,
                             "coast" => spec.differential.coast = read,
                             other => return Err(error(unknown("diff", other))),
+                        }
+                    }
+                }
+                "front_diff" => {
+                    for (key, value) in pairs(values).map_err(&error)? {
+                        let read = number(value).map_err(&error)?;
+                        match key {
+                            "preload" => spec.front_differential.preload = read,
+                            "power" => spec.front_differential.power = read,
+                            "coast" => spec.front_differential.coast = read,
+                            other => return Err(error(unknown("front_diff", other))),
+                        }
+                    }
+                }
+                "transfer" => {
+                    let transfer = spec.transfer.get_or_insert(Transfer::part_time());
+                    for (key, value) in pairs(values).map_err(&error)? {
+                        let read = number(value).map_err(&error)?;
+                        match key {
+                            "low" => transfer.low = read,
+                            "front" => transfer.front_share = read,
+                            "lock" => transfer.lock = read,
+                            "locker" => transfer.locker = read,
+                            other => return Err(error(unknown("transfer", other))),
                         }
                     }
                 }
@@ -484,6 +614,7 @@ impl VehicleSpec {
                         match key {
                             "lock" => spec.steering_lock = read.to_radians(),
                             "ackermann" => spec.ackermann = read,
+                            "quick" => spec.steering_quick = read,
                             other => return Err(error(unknown("steering", other))),
                         }
                     }
@@ -505,6 +636,7 @@ impl VehicleSpec {
                             "abs" => spec.abs = on,
                             "traction" => spec.traction_control = on,
                             "stability" => spec.stability = on,
+                            "descent" => spec.hill_descent = on,
                             other => return Err(error(unknown("assists", other))),
                         }
                     }
@@ -513,7 +645,7 @@ impl VehicleSpec {
                     return Err(error(format!(
                         "unknown line `{other}`: a vehicle file has mass, inertia, centre, body, \
                          front, rear, tyre, engine, torque, gears, final, reverse, gearbox, diff, \
-                         aero, steering, geometry and assists lines"
+                         front_diff, transfer, aero, steering, geometry and assists lines"
                     )))
                 }
             }
@@ -603,8 +735,25 @@ impl VehicleSpec {
         if !self.front.driven && !self.rear.driven {
             return Err("one axle must be driven".into());
         }
-        if self.front.driven && self.rear.driven {
-            return Err("four-wheel drive isn't built yet: drive one axle".into());
+        match (&self.transfer, self.front.driven && self.rear.driven) {
+            (None, true) => {
+                return Err(
+                    "four-wheel drive needs a `transfer` line: what joins the two axles".into(),
+                )
+            }
+            (Some(_), false) => {
+                return Err("a `transfer` joins two driven axles: drive both".into());
+            }
+            (Some(transfer), true) => {
+                within("the transfer's low range", transfer.low, 1.0, 10.0)?;
+                share("the transfer's front share", transfer.front_share)?;
+                if !(0.0..=1.0e6).contains(&transfer.lock)
+                    || !(0.0..=1.0e6).contains(&transfer.locker)
+                {
+                    return Err("the transfer's locks carry from 0 to 1,000,000 N m".into());
+                }
+            }
+            (None, false) => {}
         }
         let tyre = &self.tyre;
         for (name, value, low, high) in [
@@ -638,6 +787,9 @@ impl VehicleSpec {
         }
         if !(0.0..1.0).contains(&tyre.load_sensitivity) {
             return Err("the tyre's load sensitivity is between 0 and 1".into());
+        }
+        if !(0.3..=2.0).contains(&tyre.tread.0) || !(0.3..=2.0).contains(&tyre.tread.1) {
+            return Err("the tyre's tread is between 0.3 and 2 on firm ground and on soft".into());
         }
         let engine = &self.engine;
         if engine.torque.len() < 2 {
@@ -687,13 +839,18 @@ impl VehicleSpec {
         if !(0.5..=1.0).contains(&gearbox.efficiency) {
             return Err("the gearbox's efficiency is between 0.5 and 1".into());
         }
-        let diff = &self.differential;
-        if !(0.0..=10_000.0).contains(&diff.preload) || !(0.0..=1.0).contains(&diff.power) {
-            return Err(
-                "the diff's preload is from 0 to 10,000 N m, and its power lock from 0 to 1".into(),
-            );
+        if !(0.2..=1.0).contains(&gearbox.cruise) {
+            return Err("the gearbox's cruise is a share of its change-up speed, 0.2 to 1".into());
         }
-        share("the diff's coast lock", diff.coast)?;
+        for diff in [&self.differential, &self.front_differential] {
+            if !(0.0..=10_000.0).contains(&diff.preload) || !(0.0..=1.0).contains(&diff.power) {
+                return Err(
+                    "the diff's preload is from 0 to 10,000 N m, and its power lock from 0 to 1"
+                        .into(),
+                );
+            }
+            share("the diff's coast lock", diff.coast)?;
+        }
         let aero = 0.0..=50.0;
         if !aero.contains(&self.aero.drag) || !aero.contains(&self.aero.downforce) {
             return Err("drag and downforce are from 0 to 50".into());
@@ -703,6 +860,9 @@ impl VehicleSpec {
             return Err("the steering lock is above 0 and below 68 degrees".into());
         }
         share("ackermann", self.ackermann)?;
+        if !(0.1..=2.0).contains(&self.steering_quick) {
+            return Err("how quick the steering is, is from 0.1 to 2".into());
+        }
         share("anti_dive", self.anti_dive)?;
         share("anti_squat", self.anti_squat)?;
         Ok(())
@@ -723,6 +883,23 @@ impl VehicleSpec {
             "body {} {} {} at {} {} {}",
             s.x, s.y, s.z, a.x, a.y, a.z
         );
+        if let Some((s, a)) = self.tray {
+            let _ = writeln!(
+                text,
+                "tray {} {} {} at {} {} {}",
+                s.x, s.y, s.z, a.x, a.y, a.z
+            );
+        }
+        if self.driver_right {
+            let _ = writeln!(text, "driver right");
+        }
+        for (s, a) in &self.holds {
+            let _ = writeln!(
+                text,
+                "hold {} {} {} at {} {} {}",
+                s.x, s.y, s.z, a.x, a.y, a.z
+            );
+        }
         for (name, axle) in [("front", &self.front), ("rear", &self.rear)] {
             let _ = writeln!(
                 text,
@@ -761,8 +938,8 @@ impl VehicleSpec {
         );
         let _ = writeln!(
             text,
-            "tyre load={} sensitivity={} relaxation={}",
-            t.nominal_load, t.load_sensitivity, t.relaxation
+            "tyre load={} sensitivity={} relaxation={} tread={},{}",
+            t.nominal_load, t.load_sensitivity, t.relaxation, t.tread.0, t.tread.1
         );
         let e = &self.engine;
         let _ = writeln!(
@@ -780,8 +957,8 @@ impl VehicleSpec {
         let _ = writeln!(text, "reverse {}", g.reverse);
         let _ = writeln!(
             text,
-            "gearbox shift={} efficiency={} clutch={}",
-            g.shift_seconds, g.efficiency, g.clutch
+            "gearbox shift={} efficiency={} clutch={} cruise={}",
+            g.shift_seconds, g.efficiency, g.clutch, g.cruise
         );
         let d = &self.differential;
         let _ = writeln!(
@@ -789,6 +966,19 @@ impl VehicleSpec {
             "diff preload={} power={} coast={}",
             d.preload, d.power, d.coast
         );
+        if let Some(transfer) = &self.transfer {
+            let d = &self.front_differential;
+            let _ = writeln!(
+                text,
+                "front_diff preload={} power={} coast={}",
+                d.preload, d.power, d.coast
+            );
+            let _ = writeln!(
+                text,
+                "transfer low={} front={} lock={} locker={}",
+                transfer.low, transfer.front_share, transfer.lock, transfer.locker
+            );
+        }
         let _ = writeln!(
             text,
             "aero drag={} downforce={} balance={}",
@@ -796,9 +986,15 @@ impl VehicleSpec {
         );
         let _ = writeln!(
             text,
-            "steering lock={} ackermann={}",
+            "steering lock={} ackermann={}{}",
             self.steering_lock.to_degrees(),
-            self.ackermann
+            self.ackermann,
+            // Only a car whose steering is not a racing car's says so.
+            if self.steering_quick == 1.0 {
+                String::new()
+            } else {
+                format!(" quick={}", self.steering_quick)
+            }
         );
         let _ = writeln!(
             text,
@@ -807,10 +1003,16 @@ impl VehicleSpec {
         );
         let _ = writeln!(
             text,
-            "assists abs={} traction={} stability={}",
+            "assists abs={} traction={} stability={}{}",
             yes(self.abs),
             yes(self.traction_control),
-            yes(self.stability)
+            yes(self.stability),
+            // Only a car that has it says so: every other file reads as it always did.
+            if self.hill_descent {
+                " descent=yes"
+            } else {
+                ""
+            }
         );
         text
     }
@@ -891,6 +1093,7 @@ fn set_tyre(tyre: &mut Tyre, key: &str, value: &str) -> Result<(), String> {
         "load" => tyre.nominal_load = number(value)?,
         "sensitivity" => tyre.load_sensitivity = number(value)?,
         "relaxation" => tyre.relaxation = number(value)?,
+        "tread" => tyre.tread = pair(value)?,
         other => return Err(unknown("tyre", other)),
     }
     Ok(())
@@ -984,6 +1187,28 @@ mod tests {
     }
 
     #[test]
+    fn a_four_wheel_drive_reads_back_what_it_wrote() {
+        let mut spec = VehicleSpec::gt();
+        spec.front.driven = true;
+        spec.transfer = Some(Transfer {
+            low: 2.72,
+            front_share: 0.45,
+            lock: 12_000.0,
+            locker: 9000.0,
+        });
+        spec.front_differential.preload = 25.0;
+        spec.check().unwrap();
+        let text = spec.to_text();
+        let back = VehicleSpec::parse(&text).unwrap();
+        assert_eq!(back.transfer, spec.transfer);
+        assert_eq!(back.front_differential, spec.front_differential);
+        assert_eq!(back.to_text(), text);
+        // Without the line that joins the axles, it is a mistake.
+        spec.transfer = None;
+        assert!(spec.check().is_err());
+    }
+
+    #[test]
     fn an_empty_file_is_the_gt() {
         assert_eq!(
             VehicleSpec::parse("# nothing\n\n").unwrap(),
@@ -1005,6 +1230,8 @@ mod tests {
             ("torque 2000 300\ntorque 1000 300", 1, "rise in rpm"),
             ("centre 0 0.4 3", 1, "between the axles"),
             ("front driven=yes", 1, "four-wheel drive"),
+            ("transfer low=2.6", 1, "drive both"),
+            ("front driven=yes\ntransfer low=0.5", 1, "low range"),
             ("assists abs=maybe", 1, "yes or no"),
             ("body 1 1 1", 1, "body SX SY SZ at"),
             ("tyre along=2.5,0", 1, "C between 1 and 2"),

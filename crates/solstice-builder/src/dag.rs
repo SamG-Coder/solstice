@@ -30,6 +30,11 @@ pub struct BuildOptions {
     pub min_reduction: f32,
     /// Fraction of triangles a group tries to keep per level.
     pub target_ratio: f32,
+    /// Leaves the mesh as its finest clusters alone, with nothing coarser made from them: all
+    /// of it is drawn however far off it is. For a small mesh whose points are to be written
+    /// over as it is drawn (a thing made as the game is played), which anything simplified
+    /// from them would not follow.
+    pub flat: bool,
 }
 
 impl Default for BuildOptions {
@@ -39,6 +44,7 @@ impl Default for BuildOptions {
             max_cluster_vertices: MAX_CLUSTER_VERTICES,
             min_reduction: 0.85,
             target_ratio: 0.5,
+            flat: false,
         }
     }
 }
@@ -141,7 +147,7 @@ fn build(mesh: &Mesh, skins: Option<&[PackedSkin]>, options: &BuildOptions) -> V
     let mut active: Vec<u32> = (0..clusters.len() as u32).collect();
     let mut level = 0;
 
-    while active.len() > 1 {
+    while active.len() > 1 && !options.flat {
         level += 1;
         active = build_level(
             &mut welded,

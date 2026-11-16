@@ -76,6 +76,30 @@ fn contact_shadow(world: vec3f, normal: vec3f, view: vec3f, distance: f32, noise
     return 1.0;
 }
 
+// The lamps of what is driven: one beam, brightest along its middle and gone at its edge,
+// falling off with the square of the distance. It casts no shadows.
+fn lamp_light(s: Surface, view: vec3f, world: vec3f) -> vec3f {
+    let to_lamp = frame.lamp_position - world;
+    let distance = length(to_lamp);
+    if distance >= frame.lamp_range {
+        return vec3f(0.0);
+    }
+    let direction = to_lamp / distance;
+    if dot(s.normal, direction) <= 0.0 {
+        return vec3f(0.0);
+    }
+    let along = dot(-direction, frame.lamp_direction);
+    let beam = smoothstep(frame.lamp_spread, mix(frame.lamp_spread, 1.0, 0.85), along);
+    if beam <= 0.0 {
+        return vec3f(0.0);
+    }
+    let window = sq(clamp(1.0 - sq(sq(distance / frame.lamp_range)), 0.0, 1.0));
+    // Two lamps a little apart, each with a reflector, are not a point: close to, their light
+    // is spread, and what is under the car's nose is not burnt white.
+    let falloff = window / (distance * distance + 55.0);
+    return shade_light(s, view, direction) * frame.lamp_intensity * falloff * beam;
+}
+
 fn local_light(index: u32, s: Surface, view: vec3f, world: vec3f) -> vec3f {
     let light = lights[index];
     let to_light = light.position - world;
@@ -229,6 +253,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let tile_lights = light_tiles[tile];
     for (var i = 0u; i < tile_lights; i++) {
         color += local_light(light_tiles[tile + 1u + i], surface, view, world);
+    }
+    if frame.lamp_range > 0.0 {
+        color += lamp_light(surface, view, world);
     }
 
     // Indirect diffuse. Cavity darkens crevices the probes are too coarse to resolve.

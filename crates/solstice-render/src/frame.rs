@@ -1,7 +1,7 @@
 //! The camera and the per-frame constants derived from it.
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 
 /// A perspective camera with reversed depth and an infinite far plane.
 ///
@@ -192,6 +192,21 @@ impl DebugView {
 /// is under water or wet from it.
 pub const NO_SEA: f32 = -1.0e30;
 
+/// How many trucks that stand about can each be in a colour of their own.
+pub const RESPRAYS: usize = 8;
+
+/// A run of instances in a colour of their own: a truck that stands about, which nobody
+/// drives. Its paint is `paint` wherever it was made `was`, as a [`Coat`]'s is. Twin of
+/// `Respray` in `common/frame.wgsl`; none of them when `count` is 0.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Respray {
+    pub paint: Vec3,
+    pub first: u32,
+    pub was: Vec3,
+    pub count: u32,
+}
+
 /// Twin of `Frame` in `common/frame.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -235,6 +250,90 @@ pub struct FrameUniform {
     pub sea_level: f32,
     pub moon_disc: Vec3,
     pub _pad2: f32,
+    /// The lamps of whatever is driven: see [`Lamp`]. No lamp when the range is 0.
+    pub lamp_position: Vec3,
+    pub lamp_range: f32,
+    pub lamp_direction: Vec3,
+    pub lamp_spread: f32,
+    pub lamp_intensity: Vec3,
+    pub _pad3: f32,
+    /// The coat of whatever is driven: see [`Coat`]. Nothing wears one when `coat_count` is 0.
+    /// The rows that take a place in the world to the car's own space.
+    pub coat_x: Vec4,
+    pub coat_y: Vec4,
+    pub coat_z: Vec4,
+    pub coat_paint: Vec3,
+    pub coat_rust: f32,
+    pub coat_soil: Vec3,
+    pub coat_mud: f32,
+    pub coat_was: Vec3,
+    pub coat_dust: f32,
+    pub coat_first: u32,
+    pub coat_count: u32,
+    pub coat_seed: u32,
+    pub coat_wet: f32,
+    /// Where its axles are along it, half its track, and its wheels' radius.
+    pub coat_axles: Vec4,
+    /// Trucks that stand about, each in its own colour.
+    pub resprays: [Respray; RESPRAYS],
+    /// The ruts pressed into the ground (`crate::ruts::RutMap::window`): the middle of the
+    /// square of them that is held, half its width, 0 when nothing is held, and one over
+    /// the width of ground the map wraps round in.
+    pub rut_window: Vec4,
+    /// The colour of churned soil, and the width of a cell of that map, in metres.
+    pub rut_soil: Vec3,
+    pub rut_cell: f32,
+}
+
+/// What whatever is driven wears: the colour of its paint, and what the country has put on
+/// it. All of it is worked out where the car is drawn, from where each point of it is in
+/// the car's own space, so none of it is a texture and any of it can change from one frame
+/// to the next.
+///
+/// - **Paint.** A material marked `Material::PAINT` is given `paint` in place of the colour
+///   it was made in, `was`, keeping its shade: what in its texture is some other colour
+///   (a stripe, a badge) is left alone.
+/// - **Rust**, from 0 to 1, on the paint: low on the panels and round the wheel arches
+///   first, in blotches that spread and run.
+/// - **Dust**, from 0 to 1: a film over everything out in the weather, thickest on what
+///   faces up and towards the back.
+/// - **Mud**, from 0 to 1: caked from the ground up, thrown up behind each wheel, spattered
+///   above that; `wet` says how fresh it is, from 0, dried, to 1.
+///
+/// A material marked `Material::INSIDE` takes no dust or mud.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Coat {
+    /// Where the car is: its own space is metres from the ground under its middle, x to
+    /// its right, y up, z to its back.
+    pub car: Mat4,
+    pub paint: Vec3,
+    /// The colour its paint was made in, to tell paint from what is painted on it.
+    pub was: Vec3,
+    pub rust: f32,
+    pub dust: f32,
+    pub mud: f32,
+    pub wet: f32,
+    /// The colour of the ground it has been driven on: its mud's, and its dust's.
+    pub soil: Vec3,
+    /// Makes one car's rust and mud its own.
+    pub seed: u32,
+    /// Where its front and rear axles are along z, half its track, and its wheels' radius.
+    pub axles: [f32; 4],
+}
+
+/// The lamps of whatever is driven, as one beam: a car's headlights. It moves with the car,
+/// and casts no shadows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lamp {
+    pub position: Vec3,
+    /// The way it points: a unit vector.
+    pub direction: Vec3,
+    /// Half the beam's spread, in radians: it is brightest along its middle and gone here.
+    pub half_angle: f32,
+    /// How far it reaches, in metres.
+    pub range: f32,
+    /// Linear RGB intensity, in candela, as a scene's lights are.
+    pub intensity: Vec3,
 }
 
 /// Sub-pixel offset for frame `index`, from the Halton (2, 3) sequence, in `-0.5..0.5`.
@@ -319,7 +418,12 @@ mod tests {
             frame_seconds,
             sun_disc,
             sea_level,
-            moon_disc
+            moon_disc,
+            coat_axles,
+            resprays,
+            rut_window,
+            rut_soil,
+            rut_cell
         );
         for (name, offset) in rust {
             let member = members
